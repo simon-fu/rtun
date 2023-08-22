@@ -1,0 +1,113 @@
+syntax = "proto3";
+package rtun.pb;
+
+// enum Version {
+//     VER_RESERVED = 0;
+//     VER_1 = 1;
+// }
+
+// enum DeviceType {
+//     DEV_RESERVED = 0;
+//     DEV_AGENT = 1;
+//     DEV_CLIENT = 2;
+// }
+
+// message HanshakeRequestPacket {
+//     Version version             = 1;
+//     DeviceType device_type      = 2;
+//     uint64  nonce               = 3;
+// }
+
+// message HanshakeResponsePacket {
+//     uint64  nonce               = 1;
+// }
+
+message RawPacket {
+    uint64  ch_id                       = 1;
+    bytes payload                       = 2;
+}
+
+// client -> agent request
+message C2ARequest {
+    oneof c2a_req_args {
+        OpenShellArgs open_sell         = 1;
+    }
+}
+
+// client <- agent request
+message C2AResponse {
+    int32 status                        = 1;
+    string reason                       = 2;
+}
+
+message OpenShellArgs  {
+    uint64 ch_id                        = 1;
+    string agent                        = 2;
+    uint32 cols                         = 3;
+    uint32 rows                         = 4;
+    // string term = 5; // "xterm-256color"
+}
+
+// c -> a
+message PtyInputPacket{
+    oneof pty_input_args {
+        bytes stdin_data                = 1;
+        PtyResizeArgs resize            = 2;
+    }
+}
+
+message PtyResizeArgs {
+    uint32 cols                         = 1;
+    uint32 rows                         = 2;
+}
+
+// c <- a
+message PtyOutputPacket{
+    oneof pty_output_args {
+        bytes stdout_data               = 1;
+    }
+}
+
+
+// message ShellArgs {
+
+// }
+
+// message AgentServerInPacket {
+//     oneof agent_server_in {
+//         OpenChannel open_channel        = 1;
+//         ChannelData ch_data             = 2;
+//     }
+// }
+
+// message OpenChannel {
+//     uint64  ch_id                       = 1;
+//     oneof channel_arg {
+//         ShellArgs sell_args             = 2;
+//     }
+// }
+
+
+
+// message AgentClientOutPacket {
+//     oneof agent_client_out {
+//         ChannelData ch_data = 1;
+//     }
+// }
+
+// message ChannelData {
+//     uint64  ch_id               = 1;
+//     bytes payload               = 2;
+// }
+
+
+
+
+
+
+
+// message RequestHanshake {
+//     Version version = 1;
+//     DeviceType device_type = 2;
+// }
+
