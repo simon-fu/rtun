@@ -11,7 +11,7 @@ use futures::{ready, StreamExt};
 
 use anyhow::{Result, Context};
 
-use rtun::{term::{get_shell_program, term_std::{make_async_input, get_term_size}}, pty::PtyEvent};
+use rtun::{term::{get_shell_program, async_input::{make_async_input, get_term_size}}, pty::PtyEvent};
 use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, ReadBuf};
 // use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio_pty_process::{AsyncPtyMaster, PtyMaster, CommandExt};

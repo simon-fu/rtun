@@ -9,6 +9,8 @@ pub mod ws_server_agent;
 
 pub mod ws_server_session;
 
+pub mod local_bridge;
+
 pub mod agent_invoker;
 
 pub mod agent_ch_ctrl;

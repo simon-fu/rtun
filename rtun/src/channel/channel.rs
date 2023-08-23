@@ -10,6 +10,18 @@ pub struct ChData {
     pub payload: Bytes,
 }
 
+pub struct ChPair {
+    pub tx: ChSender,
+    pub rx: ChReceiver,
+}
+
+impl ChPair {
+    #[inline]
+    pub fn split(self) -> (ChSender, ChReceiver) {
+        (self.tx, self.rx)
+    }
+}
+
 pub struct ChSender {
     ch_id: ChId,
     outgoing_tx: mpsc::Sender<ChData>,
@@ -52,6 +64,7 @@ impl ChReceiver {
     }
 }
 
+pub const CHANNEL_SIZE: usize = 256;
 
 // pub struct OpAddChannel;
 

@@ -6,6 +6,7 @@ mod rserver;
 
 mod agent;
 
+mod bridge_ws;
 
 
 fn main() -> Result<()> {
@@ -17,7 +18,7 @@ fn main() -> Result<()> {
     tracing::debug!("running rserver");
 
     // let _r = async_rt::run_multi_thread(rserver::run())??;
-    let _r = async_rt::run_multi_thread(async move{
+    let _r = async_rt::run_multi_thread(async move {
         Result::<()>::Ok(())
     })??;
     Ok(())

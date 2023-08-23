@@ -10,11 +10,11 @@ pub mod test_portable_pty;
 
 pub mod test_pty_process;
 
+pub mod test_tokio_pty_process;
+
 pub mod rclient;
 
 pub mod client_invoker;
-
-pub mod client_ch_ctrl;
 
 pub mod client_ch_pty;
 
@@ -32,12 +32,17 @@ fn main() -> Result<()> {
     .with_env_filter("rtun=debug,rclient=debug")
     .init();
 
+    // // aaa
+    // tokio_pty_process::AsyncPtyMaster::open()?;
+    // pty_process::Pty::new()?;
+
     let _r = async_rt::run_multi_thread(async move {
         // let r = test_tokio::test_tokio_main().await;
         // let r = test_async_process::test_main().await;
         // let r = test_pty_process::test_main().await;
+        // let r = test_tokio_pty_process::test_main().await;
         let r = rclient::run().await;
-        // debug!("finish with {:?}", r);
+        tracing::debug!("main finshed with {:?}", r);
         r
     })??;
     Ok(())

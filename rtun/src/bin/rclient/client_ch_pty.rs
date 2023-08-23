@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow, Context};
 use bytes::Bytes;
 use protobuf::Message;
-use rtun::{channel::{ChSender, ChReceiver}, proto::{PtyOutputPacket, PtyInputPacket, pty_input_packet::Pty_input_args, PtyResizeArgs}, pty::{PtyEvent, PtySize}};
+use rtun::{channel::{ChSender, ChReceiver}, proto::{PtyOutputPacket, PtyInputPacket, pty_input_packet::Pty_input_args, PtyResizeArgs, ShutdownArgs}, pty::{PtyEvent, PtySize}};
 
 pub struct PtyChReceiver {
     ch_rx: ChReceiver,
@@ -15,10 +15,12 @@ impl PtyChReceiver {
     pub async fn recv_packet(&mut self, ) -> Result<Option<PtyOutputPacket>> {
         let r = self.ch_rx.recv_data().await;
         match r {
-            Some(data) => Ok(Some(
-                PtyOutputPacket::parse_from_tokio_bytes(&data)
-                .with_context(||"invalid PtyInputPacket")?
-            )),
+            Some(data) => {
+                Ok(Some(
+                    PtyOutputPacket::parse_from_tokio_bytes(&data)
+                    .with_context(||"invalid PtyInputPacket")?
+                ))
+            },
             None => Ok(None),
         }
     }
@@ -48,7 +50,7 @@ impl PtyChSender {
     }
 }
 
-pub async fn process_recv_result(result: Result<Option<PtyOutputPacket>>) -> Result<()> {
+pub async fn process_recv_result(result: Result<Option<PtyOutputPacket>>) -> Result<Option<ShutdownArgs>> {
     use std::io::Write;
     use rtun::proto::pty_output_packet::Pty_output_args;
 
@@ -60,15 +62,26 @@ pub async fn process_recv_result(result: Result<Option<PtyOutputPacket>>) -> Res
         Pty_output_args::StdoutData(data) => {
             // use rtun::hex::BinStrLine;
             // tracing::debug!("{}", d.bin_str());
+            
+            // if data.len() == 0 {
+            //     return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into())
+            // }
+
             let stdout = std::io::stdout();
             let mut stdout = stdout.lock();
             stdout.write_all(&data[..])?;
             stdout.flush()?;
         },
-        _ => todo!(),
+        Pty_output_args::Shutdown(v) => {
+            tracing::debug!("recv shutdown packet {}", v);
+            return Ok(Some(v))
+        },
+        _ => {
+            tracing::debug!("recv unknown packet");
+        },
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn se_pty_stdin_packet(data: Bytes) -> Result<Bytes> {

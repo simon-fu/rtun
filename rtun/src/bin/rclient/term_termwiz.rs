@@ -30,12 +30,14 @@ pub async fn run(ch_tx: ChSender, ch_rx: ChReceiver) -> Result<()> {
                 // tx.send_stdin_data(data.to_vec().into()).await.map_err(|_e|anyhow!("send_data fail"))?; 
             },
             r = rx.recv_packet() => {
-                process_recv_result(r).await?;
+                if let Some(_shutdown) = process_recv_result(r).await? {
+                    break;
+                }
             }
         }
     }
 
-    // Ok(())
+    Ok(())
 }
 
 

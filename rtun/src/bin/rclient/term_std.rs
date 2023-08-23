@@ -3,14 +3,19 @@
 use anyhow::{Result, anyhow, bail};
 
 use bytes::Bytes;
-use rtun::{async_stdin::async_std_in, channel::{ChSender, ChReceiver}, pty::PtyEvent};
+use futures::StreamExt;
+use rtun::{channel::{ChSender, ChReceiver}, pty::PtyEvent, term::async_input::make_async_input};
 
 use crate::client_ch_pty::{PtyChSender, PtyChReceiver, process_recv_result};
 
 pub async fn run(tx: ChSender, rx: ChReceiver) -> Result<()> {
+    
     crossterm::terminal::enable_raw_mode()?;
+
     let result = do_run(tx, rx).await;
+
     crossterm::terminal::disable_raw_mode()?;
+    
     result
 }
 
@@ -23,25 +28,52 @@ pub async fn do_run(ch_tx: ChSender, ch_rx: ChReceiver) -> Result<()> {
         vec![0x1a, 0x01, 0x1a, 0x01], // ctrl + 'zaza'
     ));
 
-    let mut fin = async_std_in();
-    
+    let mut input = make_async_input()?;
+    tracing::debug!("running input loop\r");
+
     loop {
         tokio::select! {
-            r = fin.read() => {
-                let data = r?;
+            r = input.next() => {
+                let ev = match r {
+                    Some(r) => r?,
+                    None => break,
+                };
 
-                if data.len() > 0 {
+                if let PtyEvent::StdinData(data) = &ev {
                     if detector.detect(&data) {
-                        bail!("force exit")
+                        bail!("match input pattern, force exit")
                     }
-                    tx.send_event(PtyEvent::StdinData(data.to_vec().into())).await.map_err(|_e|anyhow!("send_data fail"))?; 
                 }
+                tx.send_event(ev).await.map_err(|_e|anyhow!("send_data fail"))?; 
             },
             r = rx.recv_packet() => {
-                process_recv_result(r).await?;
+                if let Some(_shutdown) = process_recv_result(r).await? {
+                    break;
+                }
             }
         }
     }
+
+    Ok(())
+    // let mut fin = async_std_in();
+    
+    // loop {
+    //     tokio::select! {
+    //         r = fin.read() => {
+    //             let data = r?;
+
+    //             if data.len() > 0 {
+    //                 if detector.detect(&data) {
+    //                     bail!("force exit")
+    //                 }
+    //                 tx.send_event(PtyEvent::StdinData(data.to_vec().into())).await.map_err(|_e|anyhow!("send_data fail"))?; 
+    //             }
+    //         },
+    //         r = rx.recv_packet() => {
+    //             process_recv_result(r).await?;
+    //         }
+    //     }
+    // }
 }
 
 #[derive(Debug)]

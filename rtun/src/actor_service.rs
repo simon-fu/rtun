@@ -108,10 +108,10 @@ impl<E: ActorEntity> ActorBuilder<E> {
         
         let task_handle = spawn_with_name(name, async move {
             let r = run_actor(&mut task).await;
-            if let Err(e) = r {
+            if let Err(e) = &r {
                 warn!("finish with err [{:?}]", e)
             }
-            task.actor.entity.into_result()
+            task.actor.entity.into_result(r)
         });
         
         ActorHandle {
@@ -170,7 +170,7 @@ pub trait ActorEntity: Send + 'static {
 
     type Result: Send + 'static;
 
-    fn into_result(self) -> Self::Result;
+    fn into_result(self, result: Result<()>) -> Self::Result;
 
 }
 

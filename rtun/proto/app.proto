@@ -22,6 +22,10 @@ package rtun.pb;
 //     uint64  nonce               = 1;
 // }
 
+message ServerHi {
+    uint64  ch_id                       = 1; // ctrl channel id
+}
+
 message RawPacket {
     uint64  ch_id                       = 1;
     bytes payload                       = 2;
@@ -34,25 +38,38 @@ message C2ARequest {
     }
 }
 
-// client <- agent request
-message C2AResponse {
-    int32 status                        = 1;
-    string reason                       = 2;
-}
+// // client <- agent request
+// message C2AResponse {
+//     int32 status                        = 1;
+//     string reason                       = 2;
+// }
 
 message OpenShellArgs  {
-    uint64 ch_id                        = 1;
-    string agent                        = 2;
+    // uint64 ch_id                        = 1;
+    // string agent                        = 2;
     uint32 cols                         = 3;
     uint32 rows                         = 4;
     // string term = 5; // "xterm-256color"
 }
 
+message OpenChannelResponse {
+    oneof open_ch_rsp {
+        uint64 ch_id                    = 1; // allocated channel id
+        ResponseStatus status           = 2;
+    }
+}
+
+message ResponseStatus {
+    int32 code                          = 1;
+    string reason                       = 2;
+}
+
 // c -> a
 message PtyInputPacket{
     oneof pty_input_args {
-        bytes stdin_data                = 1;
-        PtyResizeArgs resize            = 2;
+        ShutdownArgs shutdown           = 1;
+        bytes stdin_data                = 2;
+        PtyResizeArgs resize            = 3;
     }
 }
 
@@ -64,10 +81,14 @@ message PtyResizeArgs {
 // c <- a
 message PtyOutputPacket{
     oneof pty_output_args {
-        bytes stdout_data               = 1;
+        ShutdownArgs shutdown           = 1;
+        bytes stdout_data               = 2;
     }
 }
 
+message ShutdownArgs {
+    int32 code                          = 1;
+}
 
 // message ShellArgs {
 

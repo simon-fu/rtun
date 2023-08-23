@@ -4,17 +4,21 @@ use anyhow::{Result, bail};
 use axum::extract::ws::{WebSocket, Message as WsMessage};
 use bytes::Bytes;
 use protobuf::Message;
-use rtun::{actor_service::{ActorEntity, start_actor, handle_first_none, Action, AsyncHandler, ActorHandle}, proto::RawPacket, util::recv_ws_packet, huid::HUId, channel::{ChId, ChSender, ChReceiver, ChData}};
+use rtun::{actor_service::{ActorEntity, start_actor, handle_first_none, Action, AsyncHandler, ActorHandle}, proto::RawPacket, util::recv_ws_packet, huid::HUId, channel::{ChId, ChSender, ChReceiver, ChData, ChPair, CHANNEL_SIZE}};
 use tokio::sync::mpsc;
 
-use crate::{agent_invoker::{AgentInvoker, AgentEntity, OpAddChannel}, agent_ch_ctrl::spawn_agent_ctrl};
+use rtun::swtich::{SwitchInvoker, AgentEntity, OpRemoveChannel, OpAddChannel};
 
 
 pub struct WsServerSession {
     handle: ActorHandle<Entity>,
 }
 
-impl  WsServerSession {
+impl  WsServerSession { 
+    pub fn clone_agent(&self) -> SwitchInvoker<Entity> {
+        SwitchInvoker::new(self.handle.invoker().clone())
+    }
+
     pub async fn wait_for_completed(&mut self) -> Result<()> {
         self.handle.wait_for_completed().await?;
         Ok(())
@@ -25,13 +29,13 @@ impl  WsServerSession {
 
 pub async fn make_ws_server_session(uid: HUId, socket: WebSocket) -> Result<WsServerSession> {
     
-    let (outgoing_tx, outgoing_rx) = mpsc::channel(512);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel(CHANNEL_SIZE);
 
     let entity = Entity {
         socket,
         // invoker: None,
         channels: Default::default(),
-        // gen_ch_id: ChId(0),
+        gen_ch_id: ChId(0),
         outgoing_tx,
         outgoing_rx
     };
@@ -45,14 +49,9 @@ pub async fn make_ws_server_session(uid: HUId, socket: WebSocket) -> Result<WsSe
         handle_msg,
     );
 
-    // let invoker = handle.invoker().downgrade();
-    // handle.invoker().invoke(SetInvoker(invoker)).await??;
-
-    let session = AgentInvoker::new(handle.invoker().clone());
-    spawn_agent_ctrl(uid, session);
-
-    // let wait4completed = handle.take_completed()
-    // .with_context(||"must have wait4completed")?;
+    // let agent = AgentInvoker::new(handle.invoker().clone());
+    // let chpair = agent.alloc_channel().await?;
+    // spawn_agent_ctrl(uid, agent, chpair);
 
     Ok(WsServerSession {
         handle,
@@ -74,22 +73,49 @@ pub async fn make_ws_server_session(uid: HUId, socket: WebSocket) -> Result<WsSe
 // }
 
 
-
-
 #[async_trait::async_trait]
 impl AsyncHandler<OpAddChannel> for Entity {
-    type Response = Result<(ChSender, ChReceiver)>; 
+    type Response = Result<ChPair>; 
 
     async fn handle(&mut self, req: OpAddChannel) -> Self::Response {
-        // let ch_id = self.next_ch_id();
-        let ch_id = req.0;
-        let (tx, rx) = mpsc::channel(256);
+        assert!(req.0.is_none(), "{req:?}");
+        let ch_id = self.next_ch_id();
+        let (tx, rx) = mpsc::channel(CHANNEL_SIZE);
         self.channels.insert(ch_id, ChannelItem { tx });
-        
-        Ok((
-            ChSender::new(ch_id, self.outgoing_tx.clone()),
-            ChReceiver::new(rx),
-        ))
+        tracing::debug!("add channel {ch_id:?}");
+        Ok(ChPair {
+            tx: ChSender::new(ch_id, self.outgoing_tx.clone()),
+            rx: ChReceiver::new(rx),
+        })
+    }
+}
+
+// #[async_trait::async_trait]
+// impl AsyncHandler<OpAddChannel> for Entity {
+//     type Response = Result<ChPair>; 
+
+//     async fn handle(&mut self, req: OpAddChannel) -> Self::Response {
+//         // let ch_id = self.next_ch_id();
+//         let ch_id = req.0;
+//         let (tx, rx) = mpsc::channel(CHANNEL_SIZE);
+//         self.channels.insert(ch_id, ChannelItem { tx });
+//         tracing::debug!("add channel {ch_id:?}");
+//         Ok(ChPair {
+//             tx: ChSender::new(ch_id, self.outgoing_tx.clone()),
+//             rx: ChReceiver::new(rx),
+//         })
+//     }
+// }
+
+#[async_trait::async_trait]
+impl AsyncHandler<OpRemoveChannel> for Entity {
+    type Response = Result<bool>; 
+
+    async fn handle(&mut self, req: OpRemoveChannel) -> Self::Response {
+        let ch_id = req.0;
+        let exist = self.channels.remove(&ch_id).is_some();
+        tracing::debug!("remove channel {ch_id:?} {exist}");
+        Ok(exist)
     }
 }
 
@@ -147,55 +173,6 @@ async fn handle_next(entity: &mut Entity, next: Next) -> Result<Action> {
 
 
 
-// type Next = Result<AgentServerInPacket>;
-
-// #[inline]
-// async fn wait_next(entity: &mut Entity) -> Next {
-//     recv_ws_packet::<_, AgentServerInPacket>(&mut entity.socket).await
-//     // entity.socket.recv().await
-//     //     .map(|x|x.with_context(||"recv failed"))
-// }
-
-// async fn handle_next(entity: &mut Entity, next: Next) -> Result<Action> {
-//     let packet = next?
-//     .agent_server_in
-//     .with_context(||"invalid AgentServerInPacket")?;
-//     match packet {
-//         Agent_server_in::OpenChannel(op) => {
-//             let ch_id = ChannelId(op.ch_id());
-//             let arg = op.channel_arg.with_context(||"no channel_arg")? ;
-//             match arg {
-//                 Channel_arg::OpenShell(shell_arg) => {
-//                     // let program = std::env::var("SHELL").unwrap_or("bash".to_string());
-//                     let program = "bash".to_string();
-//                     tracing::debug!("opening shell... [{}]", program);
-//                     let (pty_sender, pty_recver) = make_async_pty_process(&program, &["-i"], shell_arg.row as u16, shell_arg.col as u16).await?;
-//                     tracing::debug!("opened shell [{}]", program);
-
-//                     let invoker = entity.invoker()?;
-//                     let (tx, rx) = mpsc::channel(256);
-//                     entity.channels.insert(ch_id, ChannelItem { tx });
-//                     spawn_with_name("", async move {
-//                         let r = copy_pty_channel(ch_id, pty_sender, pty_recver, invoker, rx).await;
-//                         tracing::debug!("copy_pty_channel finished with [{:?}]", r);
-//                     });
-//                 },
-//                 _ => {},
-//             }
-            
-//         },
-//         Agent_server_in::ChData(ch_data) => {
-//             let ch_id = ChannelId(ch_data.ch_id);
-//             if let Some(item) = entity.channels.get(&ch_id) {
-//                 let _r = item.tx.send(ch_data.payload).await; 
-//                 // TODO: remove channel if fail
-//             }
-//         }
-//         _ => {},
-//     }
-//     Ok(Action::None)
-// }
-
 
 struct ChannelItem {
     tx: mpsc::Sender<Bytes>,
@@ -209,25 +186,18 @@ async fn handle_msg(_entity: &mut Entity, _msg: Msg) -> Result<Action> {
 
 pub struct Entity {
     socket: WebSocket,
-    // invoker: Option<WeakInvoker<Self>>,
     channels: HashMap<ChId, ChannelItem>,
-    // gen_ch_id: ChId,
+    gen_ch_id: ChId,
     outgoing_tx: mpsc::Sender<ChData>,
     outgoing_rx: mpsc::Receiver<ChData>,
 }
 
 impl Entity {
-    // fn invoker(&self) -> Result<Invoker<Self>> {
-    //     self.invoker.as_ref().
-    //     with_context(||"no invoker")?
-    //     .upgrade()
-    //     .with_context(||"invoker gone")
-    // }
-
-    // fn next_ch_id(&mut self) -> ChId {
-    //     self.gen_ch_id.0 += 1;
-    //     self.gen_ch_id
-    // }
+    fn next_ch_id(&mut self) -> ChId {
+        let ch_id = self.gen_ch_id;
+        self.gen_ch_id.0 += 1;
+        ch_id
+    }
 }
 
 pub enum Msg {
@@ -239,10 +209,10 @@ impl ActorEntity for Entity {
 
     type Msg = Msg;
 
-    type Result = Self;
+    type Result = ();
 
-    fn into_result(self) -> Self::Result {
-        self
+    fn into_result(self, _r: Result<()>) -> Self::Result {
+        ()
     }
 }
 

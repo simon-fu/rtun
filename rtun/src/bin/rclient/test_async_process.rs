@@ -1,16 +1,17 @@
 
-use anyhow::Result;
+use anyhow::{Result, Context};
 use async_process::{Command, Stdio};
 use bytes::BytesMut;
-use futures::AsyncWriteExt as FAsyncWriteExt;
-use rtun::async_stdin::async_std_in;
+use futures::{AsyncWriteExt as FAsyncWriteExt, StreamExt};
+use rtun::{async_stdin::async_std_in, term::get_shell_program};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::debug;
 
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 pub async fn test_main() -> Result<()> {
-    let mut child = Command::new("bash")
+    let program = get_shell_program();
+    let mut child = Command::new(program)
     // .args([
     //     "-c",
     //     "for i in {1..4}; do echo \"Welcome $i/4\" && sleep 1;done",
@@ -54,7 +55,8 @@ pub async fn test_main() -> Result<()> {
             debug!("999");
             // tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             // debug!("999-000");
-            let packet = ain.read().await?;
+            let packet = ain.next().await
+            .with_context(||"stdin eof")??;
             debug!("999-111 {:?}", std::str::from_utf8(&packet[..]));
             // if sub process exit, here got "Broken pipe" error
             stdin.write_all(&packet[..]).await?;

@@ -5,13 +5,14 @@
 use anyhow::Result;
 use axum::Extension;
 use parking_lot::Mutex;
-use rtun::huid::{gen_huid::gen_huid, HUId};
+use protobuf::Message;
+use rtun::{huid::{gen_huid::gen_huid, HUId}, proto::ServerHi, channel::ChId};
 use std::sync::Arc;
 use std::net::SocketAddr;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use axum::{
     extract::{
-        ws::{WebSocket, WebSocketUpgrade},
+        ws::{WebSocket, WebSocketUpgrade, Message as WsMessage},
         TypedHeader,
         connect_info::ConnectInfo,
     },
@@ -20,19 +21,22 @@ use axum::{
     Router, headers,
 };
 
-use crate::ws_server_session::make_ws_server_session;
+use crate::{ws_server_session::make_ws_server_session, agent_ch_ctrl::spawn_agent_ctrl, local_bridge::{make_local_bridge, LocalBridge}};
 
 
 pub async fn run() -> Result<()> {
 
+    let local_bridge = make_local_bridge(gen_huid()).await?;
+
     let shared = Arc::new(Shared {
         _data: Default::default(),
+        local_bridge,
     });
 
     // build our application with some routes
     let app = Router::new()
         // .fallback_service(ServeDir::new(assets_dir).append_index_html_on_directories(true))
-        .route("/ws", get(ws_handler))
+        .route("/agents/local/sub", get(ws_handler))
         .layer(Extension(shared))
         .layer(
             TraceLayer::new_for_http()
@@ -67,6 +71,7 @@ async fn ws_handler(
 }
 
 struct Shared {
+    local_bridge: LocalBridge,
     _data: Mutex<SharedData>,
 }
 
@@ -81,11 +86,54 @@ async fn handle_socket(shared: Arc<Shared>, socket: WebSocket) {
     tracing::debug!("conn finished with [{:?}]", r);
 }
 
-async fn handle_conn(_shared: Arc<Shared>, uid: HUId, socket: WebSocket) -> Result<()>{
+// async fn handle_conn(shared: Arc<Shared>, uid: HUId, mut socket: WebSocket) -> Result<()>{
+    
+//     // handle_handshake(shared, &mut socket).await?;
+
+//     let invoker = shared.local_bridge.clone_invoker();
+//     let chpair = invoker.alloc_channel().await?;
+
+//     let ch_id = chpair.tx.ch_id();
+
+//     let packet = ServerHi {
+//         ch_id: ch_id.0,
+//         ..Default::default()
+//     }.write_to_bytes()?;
+
+//     socket.send(WsMessage::Binary(packet.into())).await?;
+
+//     let mut session = make_ws_server_session(uid, socket).await?;
+//     let agent = session.clone_agent();
+    
+//     let chpair = agent.alloc_channel().await?;
+//     assert_eq!(ch_id, chpair.tx.ch_id());
+//     spawn_agent_ctrl(uid, agent, chpair);
+
+//     session.wait_for_completed().await?;
+
+//     Ok(())
+// }
+
+
+async fn handle_conn(_shared: Arc<Shared>, uid: HUId, mut socket: WebSocket) -> Result<()>{
     
     // handle_handshake(shared, &mut socket).await?;
 
+    let ch_id = ChId(0);
+
+    let packet = ServerHi {
+        ch_id: ch_id.0,
+        ..Default::default()
+    }.write_to_bytes()?;
+
+    socket.send(WsMessage::Binary(packet.into())).await?;
+
     let mut session = make_ws_server_session(uid, socket).await?;
+    let agent = session.clone_agent();
+    
+    let chpair = agent.alloc_channel().await?;
+    assert_eq!(ch_id, chpair.tx.ch_id());
+    spawn_agent_ctrl(uid, agent, chpair);
 
     session.wait_for_completed().await?;
 

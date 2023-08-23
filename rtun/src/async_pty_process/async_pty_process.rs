@@ -367,6 +367,18 @@ where
         .spawn(&pts)
         .with_context(||"spawn command fail")?;
 
+    // unsafe {
+    //     let fd = pty.as_fd().as_raw_fd();
+    //     let flags = nix::libc::fcntl(fd, nix::libc::F_GETFL, 0);
+    //     if flags < 0 {
+    //         return Err(std::io::Error::last_os_error().into());
+    //     }
+
+    //     if nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) == -1 {
+    //         return Err(std::io::Error::last_os_error().into());
+    //     }
+    // }
+
     Ok(PtySession {
         fd: pty.as_fd().as_raw_fd(),
         buf: BytesMut::new(),

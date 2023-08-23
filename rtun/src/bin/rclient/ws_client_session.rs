@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, Context};
 use tokio_tungstenite::tungstenite::{Message as WsMessage, self};
 use bytes::Bytes;
 use futures::{StreamExt, SinkExt};
 use protobuf::Message;
-use rtun::{actor_service::{ActorEntity, start_actor, handle_first_none, Action, AsyncHandler, ActorHandle}, proto::RawPacket, huid::HUId, channel::{ChId, ChSender, ChReceiver, ChData}};
+use rtun::{actor_service::{ActorEntity, start_actor, handle_first_none, Action, AsyncHandler, ActorHandle}, proto::RawPacket, huid::HUId, channel::{ChId, ChSender, ChReceiver, ChData, ChPair, CHANNEL_SIZE}, swtich::{OpAddChannel, AgentEntity, SwitchInvoker, OpRemoveChannel}};
 use tokio::sync::mpsc;
 
 
-use crate::{client_invoker::{OpAddChannel, ClientEntity, ClientInvoker}, rclient::ws_client_recv_packet};
+use crate::rclient::ws_client_recv_packet;
 
 
 pub struct WsClientSession<S: 'static + Send> {
@@ -20,7 +20,8 @@ impl<S>  WsClientSession<S>
 where
     S: 'static + Send
 {
-    pub async fn wait_for_completed(&mut self) -> Result<()> {
+    pub async fn shutdown_and_waitfor(&mut self) -> Result<()> {
+        self.handle.invoker().shutdown().await;
         self.handle.wait_for_completed().await?;
         Ok(())
     }
@@ -34,8 +35,8 @@ where
         + SinkExt<WsMessage, Error = tungstenite::Error> 
         + Unpin,
 {
-    pub fn invoker(&self) -> ClientInvoker<Entity<S>> {
-            ClientInvoker::new(self.handle.invoker().clone())
+    pub fn invoker(&self) -> SwitchInvoker<Entity<S>> {
+            SwitchInvoker::new(self.handle.invoker().clone())
     }
 }
 
@@ -49,7 +50,7 @@ where
         + Unpin,
 {
     
-    let (outgoing_tx, outgoing_rx) = mpsc::channel(512);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel(CHANNEL_SIZE);
 
     let entity = Entity {
         socket,
@@ -61,7 +62,7 @@ where
     };
 
     let handle = start_actor(
-        format!("ws-serv-{}", uid),
+        format!("ws-client-{}", uid),
         entity, 
         handle_first_none,
         wait_next, 
@@ -80,8 +81,6 @@ where
 
 
 
-
-
 #[async_trait::async_trait]
 impl<S> AsyncHandler<OpAddChannel> for Entity<S> 
 where
@@ -91,22 +90,42 @@ where
         + Unpin,
 
 {
-    type Response = Result<(ChSender, ChReceiver)>; 
+    type Response = Result<ChPair>; 
 
     async fn handle(&mut self, req: OpAddChannel) -> Self::Response {
         // let ch_id = self.next_ch_id();
-        let ch_id = req.0;
-        let (tx, rx) = mpsc::channel(256);
+        let ch_id = req.0.with_context(||"add channel need ch_id")?;
+        let (tx, rx) = mpsc::channel(CHANNEL_SIZE);
         self.channels.insert(ch_id, ChannelItem { tx });
         
-        Ok((
-            ChSender::new(ch_id, self.outgoing_tx.clone()),
-            ChReceiver::new(rx),
-        ))
+        Ok(ChPair {
+            tx: ChSender::new(ch_id, self.outgoing_tx.clone()),
+            rx: ChReceiver::new(rx),
+        })
     }
 }
 
-impl<S> ClientEntity for Entity<S> 
+#[async_trait::async_trait]
+impl<S> AsyncHandler<OpRemoveChannel> for Entity<S> 
+where
+    S: 'static 
+        + Send
+        + StreamExt<Item = Result<WsMessage, tungstenite::Error>> 
+        + Unpin,
+
+{
+    type Response = Result<bool>; 
+
+    async fn handle(&mut self, req: OpRemoveChannel) -> Self::Response {
+        let ch_id = req.0;
+        let exist = self.channels.remove(&ch_id).is_some();
+        tracing::debug!("remove channel {ch_id:?} {exist}");
+        Ok(exist)
+    }
+}
+
+
+impl<S> AgentEntity for Entity<S> 
 where
     S: 'static 
         + Send
@@ -224,10 +243,10 @@ where
 
     type Msg = Msg;
 
-    type Result = Self;
+    type Result = ();
 
-    fn into_result(self) -> Self::Result {
-        self
+    fn into_result(self, _r: Result<()>) -> Self::Result {
+        ()
     }
 }
 
