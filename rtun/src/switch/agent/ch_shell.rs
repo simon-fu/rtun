@@ -1,11 +1,11 @@
 use anyhow::{Result, anyhow, Context};
 use bytes::Bytes;
 use protobuf::Message;
-use rtun::switch::agent_invoker::{AgentInvoker, AgentEntity};
-use rtun::{async_rt::spawn_with_name, huid::gen_huid::gen_huid, proto::{OpenShellArgs, PtyOutputPacket, pty_output_packet::Pty_output_args, PtyInputPacket, pty_input_packet::Pty_input_args, ShutdownArgs}, channel::{ChSender, ChReceiver, ChId}, async_pty_process::{Sender as PtySender, Receiver as PtyRecver, make_async_pty_process}, term::get_shell_program};
+use crate::huid::HUId;
+use crate::{async_rt::spawn_with_name, huid::gen_huid::gen_huid, proto::{OpenShellArgs, PtyOutputPacket, pty_output_packet::Pty_output_args, PtyInputPacket, pty_input_packet::Pty_input_args, ShutdownArgs}, channel::{ChSender, ChReceiver}, async_pty_process::{Sender as PtySender, Receiver as PtyRecver, make_async_pty_process}, term::get_shell_program};
 
 
-pub async fn open_agent_shell<E: AgentEntity>(agent: &AgentInvoker<E>, args: OpenShellArgs) -> Result<ChId> {
+pub async fn open_shell(args: OpenShellArgs) -> Result<ChShell> {
     let program = get_shell_program();
                 
     let (pty_sender, pty_recver) = make_async_pty_process(
@@ -14,35 +14,43 @@ pub async fn open_agent_shell<E: AgentEntity>(agent: &AgentInvoker<E>, args: Ope
         args.cols as u16,
     ).await?;
 
-    // let ch_id = ChId(args.ch_id);
-    let (tx, rx) = agent.alloc_channel().await?.split();
-    let ch_id = tx.ch_id();
-
     let uid = gen_huid();
-    tracing::debug!("open shell {:?}, [{}]", tx.ch_id(), uid);
-
-    let weak = agent.downgrade();
+    tracing::debug!("open shell [{}]", uid);
     
-    spawn_with_name(format!("shell-{}", uid), async move {
-        let r = copy_pty_channel(pty_sender, pty_recver, tx, rx).await;
-        tracing::debug!("finished with [{:?}]", r);
-        if let Some(invoker) = weak.upgrade() {
-            let _r = invoker.remove_channel(ch_id).await;
-        }
-    });
+    Ok(ChShell {
+        uid,
+        pty_sender,
+        pty_recver,
+    } )
+}
 
-    Ok(ch_id)
+pub struct ChShell {
+    uid: HUId,
+    pty_sender: PtySender,
+    pty_recver: PtyRecver,
+}
+
+impl ChShell {
+    pub fn spawn(self, name: Option<String>, tx: ChSender, rx: ChReceiver)  {
+        let name = name.unwrap_or_else(||format!("shell-{}", self.uid));
+        spawn_with_name(name, async move {
+            let r = copy_pty_channel(self,  tx, rx).await;
+            tracing::debug!("finished with [{:?}]", r);
+            // if let Some(invoker) = weak.upgrade() {
+            //     let _r = invoker.remote_channel(ch_id).await;
+            // }
+        });
+    }
 }
 
 async fn copy_pty_channel(
-    pty_sender: PtySender,
-    mut pty_recver: PtyRecver,
+    mut shell: ChShell,
     ch_tx: ChSender,
     mut ch_rx: ChReceiver,
 ) -> Result<()> {
     loop {
         tokio::select! {
-            r = pty_recver.recv() => {
+            r = shell.pty_recver.recv() => {
                 match r {
                     Some(data) => {
                         ch_tx.send_data(se_pty_stdout_packet(data)?)
@@ -63,7 +71,7 @@ async fn copy_pty_channel(
             r = ch_rx.recv_data() => {
                 match r {
                     Some(packet) => {
-                        if let Some(_shutdown) = process_pty_input_packet(&pty_sender, packet.payload).await? {
+                        if let Some(_shutdown) = process_pty_input_packet(&shell.pty_sender, packet.payload).await? {
                             break;
                         }
                     },
@@ -93,9 +101,6 @@ async fn process_pty_input_packet(pty_sender: &PtySender, data: Bytes) -> Result
             tracing::debug!("recv shutdown {}", args);
             return Ok(Some(args))
         }
-        _ => {
-            tracing::debug!("unknown pty_input_args")
-        },
     }
 
     Ok(None)

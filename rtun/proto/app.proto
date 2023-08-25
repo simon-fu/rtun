@@ -45,11 +45,17 @@ message C2ARequest {
 // }
 
 message OpenShellArgs  {
-    // uint64 ch_id                        = 1;
+    optional uint64 ch_id               = 1;
     // string agent                        = 2;
     uint32 cols                         = 3;
     uint32 rows                         = 4;
     // string term = 5; // "xterm-256color"
+}
+
+message OpenChannelRequest {
+    oneof open_ch_req {
+        uint64 ch_id                    = 1; // request channel id
+    }
 }
 
 message OpenChannelResponse {

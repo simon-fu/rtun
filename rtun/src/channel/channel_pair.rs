@@ -5,7 +5,13 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChId(pub u64);
 
-pub struct ChData {
+impl std::fmt::Display for ChId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+pub struct ChPacket {
     pub ch_id: ChId,
     pub payload: Bytes,
 }
@@ -16,19 +22,33 @@ pub struct ChPair {
 }
 
 impl ChPair {
+    pub fn new(ch_id: ChId) -> Self {
+        let (tx, rx) = mpsc::channel(CHANNEL_SIZE);
+        Self { 
+            tx: ChSender::new(ch_id, tx), 
+            rx: ChReceiver::new(rx),
+        }
+    }
+}
+
+impl ChPair {
     #[inline]
     pub fn split(self) -> (ChSender, ChReceiver) {
         (self.tx, self.rx)
     }
 }
 
+pub type ChTx = mpsc::Sender<ChPacket>;
+pub type ChRx = mpsc::Receiver<ChPacket>;
+
+#[derive(Debug)]
 pub struct ChSender {
     ch_id: ChId,
-    outgoing_tx: mpsc::Sender<ChData>,
+    outgoing_tx: ChTx,
 }
 
 impl ChSender {
-    pub fn new(ch_id: ChId, outgoing_tx: mpsc::Sender<ChData>) -> Self {
+    pub fn new(ch_id: ChId, outgoing_tx: ChTx) -> Self {
         Self {
             ch_id,
             outgoing_tx,
@@ -40,7 +60,7 @@ impl ChSender {
     }
 
     pub async fn send_data(&self, data: Bytes) -> Result<(), Bytes> {
-        self.outgoing_tx.send(ChData { 
+        self.outgoing_tx.send(ChPacket { 
             ch_id: self.ch_id, 
             payload: data, 
         }).await
@@ -49,17 +69,17 @@ impl ChSender {
 }
 
 pub struct ChReceiver {
-    rx: mpsc::Receiver<Bytes>,
+    rx: ChRx,
 }
 
 impl ChReceiver {
-    pub fn new(rx: mpsc::Receiver<Bytes>) -> Self {
+    pub fn new(rx: ChRx) -> Self {
         Self {
             rx,
         }
     }
 
-    pub async fn recv_data(&mut self) -> Option<Bytes> {
+    pub async fn recv_data(&mut self) -> Option<ChPacket> {
         self.rx.recv().await
     }
 }

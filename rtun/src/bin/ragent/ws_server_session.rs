@@ -2,12 +2,11 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use axum::extract::ws::{WebSocket, Message as WsMessage};
-use bytes::Bytes;
 use protobuf::Message;
-use rtun::{actor_service::{ActorEntity, start_actor, handle_first_none, Action, AsyncHandler, ActorHandle}, proto::RawPacket, util::recv_ws_packet, huid::HUId, channel::{ChId, ChSender, ChReceiver, ChData, ChPair, CHANNEL_SIZE}};
+use rtun::{actor_service::{ActorEntity, start_actor, handle_first_none, Action, AsyncHandler, ActorHandle}, proto::RawPacket, util::recv_ws_packet, huid::HUId, channel::{ChId, ChSender, ChReceiver, ChPacket, ChPair, CHANNEL_SIZE}};
 use tokio::sync::mpsc;
 
-use rtun::swtich::{SwitchInvoker, AgentEntity, OpRemoveChannel, OpAddChannel};
+use rtun::switch::agent_invoker::{AgentInvoker, AgentEntity, OpRemoveChannel, OpAddChannel};
 
 
 pub struct WsServerSession {
@@ -15,8 +14,8 @@ pub struct WsServerSession {
 }
 
 impl  WsServerSession { 
-    pub fn clone_agent(&self) -> SwitchInvoker<Entity> {
-        SwitchInvoker::new(self.handle.invoker().clone())
+    pub fn clone_agent(&self) -> AgentInvoker<Entity> {
+        AgentInvoker::new(self.handle.invoker().clone())
     }
 
     pub async fn wait_for_completed(&mut self) -> Result<()> {
@@ -90,22 +89,23 @@ impl AsyncHandler<OpAddChannel> for Entity {
     }
 }
 
-// #[async_trait::async_trait]
-// impl AsyncHandler<OpAddChannel> for Entity {
-//     type Response = Result<ChPair>; 
+// #[derive(Debug)]
+// pub struct OpOpenMux {
+//     tx: mpsc::Sender<ChData>,
+// }
 
-//     async fn handle(&mut self, req: OpAddChannel) -> Self::Response {
-//         // let ch_id = self.next_ch_id();
-//         let ch_id = req.0;
-//         let (tx, rx) = mpsc::channel(CHANNEL_SIZE);
-//         self.channels.insert(ch_id, ChannelItem { tx });
+// #[async_trait::async_trait]
+// impl AsyncHandler<OpOpenMux> for Entity {
+//     type Response = Result<ChSender>; 
+
+//     async fn handle(&mut self, req: OpOpenMux) -> Self::Response {
+//         let ch_id = self.next_ch_id();
+//         self.channels.insert(ch_id, ChannelItem { tx: req.tx });
 //         tracing::debug!("add channel {ch_id:?}");
-//         Ok(ChPair {
-//             tx: ChSender::new(ch_id, self.outgoing_tx.clone()),
-//             rx: ChReceiver::new(rx),
-//         })
+//         Ok(ChSender::new(ch_id, self.outgoing_tx.clone()))
 //     }
 // }
+
 
 #[async_trait::async_trait]
 impl AsyncHandler<OpRemoveChannel> for Entity {
@@ -125,7 +125,7 @@ impl AgentEntity for Entity {}
 type Next = Result<NextPacket>;
 
 pub enum NextPacket {
-    ChData(ChData),
+    ChData(ChPacket),
     RawPacket(RawPacket),
 }
 
@@ -160,9 +160,12 @@ async fn handle_next(entity: &mut Entity, next: Next) -> Result<Action> {
             entity.socket.send(WsMessage::Binary(raw)).await?;
         },
         NextPacket::RawPacket(packet) => {
-            let ch_id = ChId(packet.ch_id);
-            if let Some(item) = entity.channels.get(&ch_id) {
-                let _r = item.tx.send(packet.payload).await; 
+            let packet = ChPacket {
+                ch_id: ChId(packet.ch_id),
+                payload: packet.payload,
+            };
+            if let Some(item) = entity.channels.get(&packet.ch_id) {
+                let _r = item.tx.send( packet ).await; 
                 // TODO: remove channel if fail
             }
         },
@@ -175,7 +178,7 @@ async fn handle_next(entity: &mut Entity, next: Next) -> Result<Action> {
 
 
 struct ChannelItem {
-    tx: mpsc::Sender<Bytes>,
+    tx: mpsc::Sender<ChPacket>,
 }
 
 async fn handle_msg(_entity: &mut Entity, _msg: Msg) -> Result<Action> {
@@ -188,8 +191,8 @@ pub struct Entity {
     socket: WebSocket,
     channels: HashMap<ChId, ChannelItem>,
     gen_ch_id: ChId,
-    outgoing_tx: mpsc::Sender<ChData>,
-    outgoing_rx: mpsc::Receiver<ChData>,
+    outgoing_tx: mpsc::Sender<ChPacket>,
+    outgoing_rx: mpsc::Receiver<ChPacket>,
 }
 
 impl Entity {

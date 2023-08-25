@@ -3,16 +3,15 @@
 */
 
 use anyhow::Result;
-use axum::Extension;
+use axum::{Extension, extract::Path, http::StatusCode};
 use parking_lot::Mutex;
-use protobuf::Message;
-use rtun::{huid::{gen_huid::gen_huid, HUId}, proto::ServerHi, channel::ChId};
-use std::sync::Arc;
+use rtun::{huid::{gen_huid::gen_huid, HUId}, channel::{ChId, ChPair}, switch::{switch_ws_server::make_ws_server_switch, ctrl_service::spawn_ctrl_service, agent::ctrl::make_agent_ctrl, switch_stream::{make_stream_switch, Entity as StreamSwitchEntity}, ctrl_client::{make_ctrl_client, self}, invoker_ctrl::{CtrlInvoker, CtrlHandler}}, ws::server::WsStreamAxum};
+use std::{sync::Arc, collections::HashMap};
 use std::net::SocketAddr;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use axum::{
     extract::{
-        ws::{WebSocket, WebSocketUpgrade, Message as WsMessage},
+        ws::{WebSocket, WebSocketUpgrade},
         TypedHeader,
         connect_info::ConnectInfo,
     },
@@ -21,22 +20,24 @@ use axum::{
     Router, headers,
 };
 
-use crate::{ws_server_session::make_ws_server_session, agent_ch_ctrl::spawn_agent_ctrl, local_bridge::{make_local_bridge, LocalBridge}};
+// use crate::local_bridge::{make_local_bridge, LocalBridge};
 
 
 pub async fn run() -> Result<()> {
 
-    let local_bridge = make_local_bridge(gen_huid()).await?;
+    // let local_bridge = make_local_bridge(gen_huid()).await?;
 
     let shared = Arc::new(Shared {
-        _data: Default::default(),
-        local_bridge,
+        data: Default::default(),
+        // local_bridge,
     });
 
     // build our application with some routes
     let app = Router::new()
         // .fallback_service(ServeDir::new(assets_dir).append_index_html_on_directories(true))
-        .route("/agents/local/sub", get(ws_handler))
+        .route("/agents/local/sub", get(local_sub_ws_handler))
+        .route("/agents/pub", get(agent_pub_ws_handler))
+        .route("/agents/sessions/:session", get(agent_sub_ws_handler))
         .layer(Extension(shared))
         .layer(
             TraceLayer::new_for_http()
@@ -53,8 +54,7 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-
-async fn ws_handler(
+async fn agent_pub_ws_handler(
     Extension(shared): Extension<Arc<Shared>>,
     ws: WebSocketUpgrade,
     user_agent: Option<TypedHeader<headers::UserAgent>>,
@@ -67,22 +67,107 @@ async fn ws_handler(
     };
     tracing::debug!("connected from {addr}, with agent [{user_agent}].");
 
-    ws.on_upgrade(move |socket| handle_socket(shared, socket))
+    ws.on_upgrade(move |socket| handle_agent_pub(shared, socket, addr))
 }
 
-struct Shared {
-    local_bridge: LocalBridge,
-    _data: Mutex<SharedData>,
-}
-
-#[derive(Default)]
-struct SharedData {
-
-}
-
-async fn handle_socket(shared: Arc<Shared>, socket: WebSocket) {
+async fn handle_agent_pub(shared: Arc<Shared>, socket: WebSocket, addr: SocketAddr) {
     let uid = gen_huid();
-    let r = handle_conn(shared, uid, socket).await;
+    let r = handle_agent_pub_conn(shared, uid, socket, addr).await;
+    tracing::debug!("conn finished with [{:?}]", r);
+}
+
+async fn handle_agent_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr: SocketAddr) -> Result<()>{
+    
+    let mut session = make_stream_switch(uid, WsStreamAxum::new(socket)).await?;
+    let switch = session.clone_invoker();
+
+    let ctrl_ch_id = ChId(0);
+    let (ctrl_tx, ctrl_rx) = ChPair::new(ctrl_ch_id).split();
+    let ctrl_tx = switch.add_channel(ctrl_ch_id, ctrl_tx).await?;
+    let ctrl_pair = ChPair { tx: ctrl_tx, rx: ctrl_rx };
+
+    let mut ctrl_client = make_ctrl_client(uid, ctrl_pair, switch)?;
+    
+    let key = uid.to_string();
+    {
+        let ctrl_invoker = ctrl_client.clone_invoker();
+        shared.data.lock().agent_clients.insert(key.clone(), ctrl_invoker);
+    }
+    tracing::debug!("add agent session [{}], addr [{}]", uid, addr);
+
+    let _r = session.wait_for_completed().await; 
+    
+    let _r = {
+        shared.data.lock().agent_clients.remove(&key)
+    };
+    tracing::debug!("remove agent session [{}], addr [{}]", uid, addr);
+
+    let _r = ctrl_client.wait_for_completed().await?;
+
+    Ok(())
+}
+
+
+
+async fn agent_sub_ws_handler(
+    Extension(shared): Extension<Arc<Shared>>,
+    ws: WebSocketUpgrade,
+    user_agent: Option<TypedHeader<headers::UserAgent>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(agent_name): Path<String>,
+) -> impl IntoResponse {
+    let user_agent = if let Some(TypedHeader(user_agent)) = user_agent {
+        user_agent.to_string()
+    } else {
+        String::from("Unknown browser")
+    };
+    tracing::debug!("connected from {addr}, with agent [{user_agent}], sub to [{}]", agent_name);
+    
+    let r = {
+        shared.data.lock().agent_clients.get(&agent_name).map(|x|x.clone()) 
+    };
+
+    match r {
+        Some(ctrl) => {
+            tracing::debug!("sub agent [{}]", agent_name);
+            ws.on_upgrade(move |socket| async move {
+                let uid = gen_huid();
+                let r = run_sub_agent(ctrl, uid, socket).await;
+                tracing::debug!("conn finished with [{:?}]", r);
+            })
+        },
+        None => {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Not found agent [{}]", agent_name),
+            ).into_response()
+        },
+    }
+}
+
+
+
+async fn local_sub_ws_handler(
+    Extension(shared): Extension<Arc<Shared>>,
+    ws: WebSocketUpgrade,
+    user_agent: Option<TypedHeader<headers::UserAgent>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> impl IntoResponse {
+    let user_agent = if let Some(TypedHeader(user_agent)) = user_agent {
+        user_agent.to_string()
+    } else {
+        String::from("Unknown browser")
+    };
+    tracing::debug!("connected from {addr}, with agent [{user_agent}].");
+
+    ws.on_upgrade(move |socket| handle_local_sub(shared, socket))
+}
+
+
+
+async fn handle_local_sub(shared: Arc<Shared>, socket: WebSocket) {
+    let uid = gen_huid();
+    let r = handle_local_sub_conn(shared, uid, socket).await;
     tracing::debug!("conn finished with [{:?}]", r);
 }
 
@@ -115,30 +200,70 @@ async fn handle_socket(shared: Arc<Shared>, socket: WebSocket) {
 // }
 
 
-async fn handle_conn(_shared: Arc<Shared>, uid: HUId, mut socket: WebSocket) -> Result<()>{
+
+async fn handle_local_sub_conn(_shared: Arc<Shared>, uid: HUId, socket: WebSocket) -> Result<()>{
     
     // handle_handshake(shared, &mut socket).await?;
 
-    let ch_id = ChId(0);
 
-    let packet = ServerHi {
-        ch_id: ch_id.0,
-        ..Default::default()
-    }.write_to_bytes()?;
+    // let packet = ServerHi {
+    //     ch_id: ctrl_ch_id.0,
+    //     ..Default::default()
+    // }.write_to_bytes()?;
 
-    socket.send(WsMessage::Binary(packet.into())).await?;
+    // socket.send(WsMessage::Binary(packet.into())).await?;
 
-    let mut session = make_ws_server_session(uid, socket).await?;
-    let agent = session.clone_agent();
-    
-    let chpair = agent.alloc_channel().await?;
-    assert_eq!(ch_id, chpair.tx.ch_id());
-    spawn_agent_ctrl(uid, agent, chpair);
+    let mut agent = make_agent_ctrl(uid)?;
+    let ctrl = agent.clone_ctrl();
+    let ctrl = ctrl.clone();
 
-    session.wait_for_completed().await?;
+    let run_result = run_sub_agent(ctrl, uid, socket).await;
+    agent.shutdown().await;
+    let _r = agent.wait_for_completed().await?;
+
+    run_result
+}
+
+async fn run_sub_agent<H1: CtrlHandler>(ctrl: CtrlInvoker<H1>, uid: HUId, socket: WebSocket) -> Result<()> {
+    let mut session = make_ws_server_switch(uid, socket).await?;
+    let switch = session.clone_switch();
+
+    let ctrl_ch_id = ChId(0);
+    let (ctrl_tx, ctrl_rx) = ChPair::new(ctrl_ch_id).split();
+    let ctrl_tx = switch.add_channel(ctrl_ch_id, ctrl_tx).await?;
+
+    spawn_ctrl_service(uid, ctrl, switch, ChPair { tx: ctrl_tx, rx: ctrl_rx });
+
+    let _r = session.wait_for_completed().await;
+
 
     Ok(())
 }
+
+// async fn handle_conn(_shared: Arc<Shared>, uid: HUId, mut socket: WebSocket) -> Result<()>{
+    
+//     // handle_handshake(shared, &mut socket).await?;
+
+//     let ch_id = ChId(0);
+
+//     let packet = ServerHi {
+//         ch_id: ch_id.0,
+//         ..Default::default()
+//     }.write_to_bytes()?;
+
+//     socket.send(WsMessage::Binary(packet.into())).await?;
+
+//     let mut session = make_ws_server_session(uid, socket).await?;
+//     let agent = session.clone_agent();
+    
+//     let chpair = agent.alloc_channel().await?;
+//     assert_eq!(ch_id, chpair.tx.ch_id());
+//     spawn_agent_ctrl(uid, agent, chpair);
+
+//     session.wait_for_completed().await?;
+
+//     Ok(())
+// }
 
 
 
@@ -168,6 +293,20 @@ async fn handle_conn(_shared: Arc<Shared>, uid: HUId, mut socket: WebSocket) -> 
 
 
 
+
+struct Shared {
+    // local_bridge: LocalBridge,
+    data: Mutex<SharedData>,
+}
+
+#[derive(Default)]
+struct SharedData {
+    // agent_clients: HashMap<String, CtrlClient<StreamSwitchEntity<WsStreamAxum<WebSocket>>> >, 
+    agent_clients: HashMap<String, AgentClient >, 
+}
+
+
+type AgentClient =  CtrlInvoker<ctrl_client::Entity<StreamSwitchEntity<WsStreamAxum<WebSocket>>>>;
 
 
 

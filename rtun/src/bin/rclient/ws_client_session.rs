@@ -2,10 +2,9 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail, Context};
 use tokio_tungstenite::tungstenite::{Message as WsMessage, self};
-use bytes::Bytes;
 use futures::{StreamExt, SinkExt};
 use protobuf::Message;
-use rtun::{actor_service::{ActorEntity, start_actor, handle_first_none, Action, AsyncHandler, ActorHandle}, proto::RawPacket, huid::HUId, channel::{ChId, ChSender, ChReceiver, ChData, ChPair, CHANNEL_SIZE}, swtich::{OpAddChannel, AgentEntity, SwitchInvoker, OpRemoveChannel}};
+use rtun::{actor_service::{ActorEntity, start_actor, handle_first_none, Action, AsyncHandler, ActorHandle}, proto::RawPacket, huid::HUId, channel::{ChId, ChSender, ChReceiver, ChPacket, ChPair, CHANNEL_SIZE}, switch::agent_invoker::{OpAddChannel, AgentEntity, AgentInvoker, OpRemoveChannel}};
 use tokio::sync::mpsc;
 
 
@@ -35,8 +34,8 @@ where
         + SinkExt<WsMessage, Error = tungstenite::Error> 
         + Unpin,
 {
-    pub fn invoker(&self) -> SwitchInvoker<Entity<S>> {
-            SwitchInvoker::new(self.handle.invoker().clone())
+    pub fn invoker(&self) -> AgentInvoker<Entity<S>> {
+            AgentInvoker::new(self.handle.invoker().clone())
     }
 }
 
@@ -137,7 +136,7 @@ where
 type Next = Result<NextPacket>;
 
 pub enum NextPacket {
-    ChData(ChData),
+    ChData(ChPacket),
     RawPacket(RawPacket),
 }
 
@@ -184,9 +183,13 @@ where
             entity.socket.send(WsMessage::Binary(raw)).await?;
         },
         NextPacket::RawPacket(packet) => {
-            let ch_id = ChId(packet.ch_id);
-            if let Some(item) = entity.channels.get(&ch_id) {
-                let _r = item.tx.send(packet.payload).await; 
+            let packet = ChPacket {
+                ch_id: ChId(packet.ch_id),
+                payload: packet.payload,
+            };
+
+            if let Some(item) = entity.channels.get(&packet.ch_id) {
+                let _r = item.tx.send(packet).await; 
                 // TODO: remove channel if fail
             }
         },
@@ -199,7 +202,7 @@ where
 
 
 struct ChannelItem {
-    tx: mpsc::Sender<Bytes>,
+    tx: mpsc::Sender<ChPacket>,
 }
 
 async fn handle_msg<S>(_entity: &mut Entity<S>, _msg: Msg) -> Result<Action> {
@@ -213,8 +216,8 @@ pub struct Entity<S> {
     // invoker: Option<WeakInvoker<Self>>,
     channels: HashMap<ChId, ChannelItem>,
     // gen_ch_id: ChId,
-    outgoing_tx: mpsc::Sender<ChData>,
-    outgoing_rx: mpsc::Receiver<ChData>,
+    outgoing_tx: mpsc::Sender<ChPacket>,
+    outgoing_rx: mpsc::Receiver<ChPacket>,
 }
 
 impl<S> Entity<S> {

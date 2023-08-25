@@ -12,11 +12,11 @@ pub trait AgentEntity: ActorEntity
 }
 
 #[derive(Clone)]
-pub struct SwitchInvoker<E: AgentEntity> {
+pub struct AgentInvoker<E: AgentEntity> {
     invoker: Invoker<E>,
 }
 
-impl<E> SwitchInvoker<E> 
+impl<E> AgentInvoker<E> 
 where
     E: AgentEntity,
 {
@@ -44,7 +44,7 @@ where
     //     self.invoker.invoke(OpAddChannel(ch_id)).await?
     // }
 
-    pub async fn remote_channel(&self, ch_id: ChId) -> Result<bool> {
+    pub async fn remove_channel(&self, ch_id: ChId) -> Result<bool> {
         self.invoker.invoke(OpRemoveChannel(ch_id)).await?
     }
 }
@@ -54,8 +54,8 @@ pub struct AgentWeakInvoker<E: AgentEntity> {
 }
 
 impl <E: AgentEntity> AgentWeakInvoker<E> {
-    pub fn upgrade(&self) -> Option<SwitchInvoker<E>> {
-        self.weak.upgrade().map(|invoker| SwitchInvoker {
+    pub fn upgrade(&self) -> Option<AgentInvoker<E>> {
+        self.weak.upgrade().map(|invoker| AgentInvoker {
             invoker,
         })
     }

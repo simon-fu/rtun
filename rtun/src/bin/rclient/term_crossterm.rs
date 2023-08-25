@@ -41,12 +41,12 @@ async fn do_run(tx: ChSender, mut rx: ChReceiver)-> Result<()> {
                 }
             },
             r = rx.recv_data() => {
-                let d = r.with_context(||"recv stream failed")?;
+                let packet = r.with_context(||"recv stream failed")?;
                 // use rtun::hex::BinStrLine;
                 // tracing::debug!("{}", d.bin_str());
                 let stdout = std::io::stdout();
                 let mut stdout = stdout.lock();
-                stdout.write_all(&d[..]).unwrap();
+                stdout.write_all(&packet.payload[..]).unwrap();
                 stdout.flush().unwrap();
             }
         }

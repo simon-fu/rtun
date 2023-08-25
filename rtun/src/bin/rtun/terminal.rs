@@ -6,9 +6,13 @@ use bytes::Bytes;
 use futures::StreamExt;
 use rtun::{channel::{ChSender, ChReceiver, ChPair}, pty::PtyEvent, term::async_input::make_async_input};
 
+
 use crate::client_ch_pty::{PtyChSender, PtyChReceiver, process_recv_result};
 
-pub async fn run(pair: ChPair) -> Result<()> {
+
+
+
+pub async fn run_term(pair: ChPair) -> Result<()> {
     
     crossterm::terminal::enable_raw_mode()?;
 
@@ -109,4 +113,16 @@ impl PatternDetector  {
         self.index = 0;
         false
     }
+}
+
+
+use termwiz::{terminal::{ScreenSize, new_terminal, Terminal}, caps::Capabilities};
+pub async fn get_terminal_size() -> Result<ScreenSize> {
+    let size = tokio::task::spawn_blocking(|| {
+        let caps = Capabilities::new_from_env()?;
+        let mut terminal = new_terminal(caps)?;
+        let size  = terminal.get_screen_size()?;
+        Result::<_>::Ok(size)
+    }).await??;
+    Ok(size)
 }

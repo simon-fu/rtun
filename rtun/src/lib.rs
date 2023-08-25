@@ -25,4 +25,6 @@ pub mod pty;
 
 pub mod term;
 
-pub mod swtich;
+pub mod switch;
+
+pub mod ws;

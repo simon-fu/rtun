@@ -1,29 +1,29 @@
 use anyhow::{Result, Context, anyhow};
 use crate::agent_ch_pty::open_agent_shell;
 use protobuf::Message;
-use rtun::{async_rt::spawn_with_name, huid::HUId, proto::{C2ARequest, c2arequest::C2a_req_args, OpenChannelResponse, open_channel_response::Open_ch_rsp, ResponseStatus}, channel::ChPair, swtich::{AgentEntity, SwitchInvoker}};
+use rtun::{async_rt::spawn_with_name, huid::HUId, proto::{C2ARequest, c2arequest::C2a_req_args, OpenChannelResponse, open_channel_response::Open_ch_rsp, ResponseStatus}, channel::ChPair, switch::agent_invoker::{AgentEntity, AgentInvoker}};
 
 
-pub fn spawn_agent_ctrl<E: AgentEntity>(uid: HUId, agent: SwitchInvoker<E>, chpair: ChPair) {
+pub fn spawn_agent_ctrl<E: AgentEntity>(uid: HUId, agent: AgentInvoker<E>, chpair: ChPair) {
     spawn_with_name(format!("ctrl-{}", uid), async move {
         let r = ctrl_loop(&agent, chpair).await;
         tracing::debug!("finished with [{:?}]", r);
     });
 }
 
-async fn ctrl_loop<E: AgentEntity>(agent: &SwitchInvoker<E>, chpair: ChPair) -> Result<()> {
+async fn ctrl_loop<E: AgentEntity>(agent: &AgentInvoker<E>, chpair: ChPair) -> Result<()> {
     
     let tx = chpair.tx;
     let mut rx = chpair.rx;
 
     loop {
         let r = rx.recv_data().await;
-        let data = match r {
+        let packet = match r {
             Some(v) => v,
             None => break,
         };
 
-        let cmd = C2ARequest::parse_from_bytes(&data)?
+        let cmd = C2ARequest::parse_from_bytes(&packet.payload)?
         .c2a_req_args
         .with_context(||"no c2a_req_args")?;
         match cmd {

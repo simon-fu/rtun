@@ -46,7 +46,7 @@
 //     //     self.invoker.invoke(OpAddChannel(ch_id)).await?
 //     // }
 
-//     pub async fn remote_channel(&self, ch_id: ChId) -> Result<bool> {
+//     pub async fn remove_channel(&self, ch_id: ChId) -> Result<bool> {
 //         self.invoker.invoke(OpRemoveChannel(ch_id)).await?
 //     }
 // }
