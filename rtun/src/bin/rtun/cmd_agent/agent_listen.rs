@@ -3,11 +3,13 @@
     websocket refer: https://github.com/tokio-rs/axum/blob/axum-v0.6.20/examples/websockets/src/main.rs
 */
 
-use anyhow::{Result, Context};
+use anyhow::{Result, Context, bail};
+use axum_server::{Handle, tls_rustls::RustlsConfig};
 use clap::Parser;
 use axum::{Extension, extract::Query, http::StatusCode, Json};
 use parking_lot::Mutex;
-use rtun::{huid::{gen_huid::gen_huid, HUId}, channel::{ChId, ChPair}, switch::{ctrl_service::spawn_ctrl_service, agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker}, switch_stream::{make_stream_switch, Entity as StreamSwitchEntity}, ctrl_client::{make_ctrl_client, self}, invoker_ctrl::{CtrlInvoker, CtrlHandler}}, ws::server::WsStreamAxum};
+use rtun::{huid::{gen_huid::gen_huid, HUId}, channel::{ChId, ChPair}, switch::{ctrl_service::spawn_ctrl_service, agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker}, switch_stream::{make_stream_switch, Entity as StreamSwitchEntity}, ctrl_client::{make_ctrl_client, self}, invoker_ctrl::{CtrlInvoker, CtrlHandler}}, ws::server::WsStreamAxum, async_rt::spawn_with_name};
+use tokio::net::TcpListener;
 
 use std::{sync::Arc, collections::HashMap};
 use std::net::SocketAddr;
@@ -52,17 +54,60 @@ pub async fn run(args: CmdArgs) -> Result<()> {
     //     app = app.route("/agents/local/sub", get(local_sub_ws_handler));
     // }
 
-    let app = app
-        .layer(Extension(shared))
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::default().include_headers(true)),
-        );
+    let router = app
+    .layer(Extension(shared))
+    .layer(
+        TraceLayer::new_for_http()
+            .make_span_with(DefaultMakeSpan::default().include_headers(true)),
+    );
 
-    tracing::debug!("agent listening on http://{}", addr);
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-        .await?;
+    let tls_cfg = try_load_https_cert(
+        args.https_key.as_deref(), 
+        args.https_cert.as_deref(),
+    ).await
+    .with_context(|| "open https key/cert file failed")?;
+
+    let is_https = tls_cfg.is_some();
+
+    let listener = TcpListener::bind(addr).await
+    .with_context(||format!("fail to bind [{}]", addr))?
+    .into_std()
+    .with_context(||"tcp listener into std failed")?;
+
+    let tls_cfg = None;
+    let server_handle = Handle::new();
+
+    let task_name = format!("server");
+    let task = spawn_with_name(task_name, async move {
+        match tls_cfg {
+            Some(tls_cfg) => {
+                axum_server::from_tcp_rustls(listener, tls_cfg)
+                .handle(server_handle)
+                .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+            },
+            None => {
+                axum_server::from_tcp(listener)
+                .handle(server_handle)
+                .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+            },
+        }
+        
+    });
+    
+    if is_https {
+        tracing::debug!("agent listening on https://{}", addr);
+    } else {
+        tracing::debug!("agent listening on http://{}", addr);
+    }
+    
+
+    let _r = task.await;
+
+    // axum::Server::bind(&addr)
+    // .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+    // .await?;
 
     if let Some(agent) = local_agent.as_mut() {
         agent.shutdown().await;
@@ -70,6 +115,29 @@ pub async fn run(args: CmdArgs) -> Result<()> {
     }
     
     Ok(())
+}
+
+async fn try_load_https_cert(key_file: Option<&str>, cert_file: Option<&str>) -> Result<Option<RustlsConfig>> {
+    if let (Some(key_file), Some(cert_file)) = (key_file, cert_file) {
+        let cfg = RustlsConfig::from_pem_file(
+            cert_file,
+            key_file,
+        )
+        .await?;
+        return Ok(Some(cfg))
+    }
+
+    if key_file.is_some() || cert_file.is_some() {
+        if key_file.is_none() {
+            bail!("no key file")
+        }
+        
+        if cert_file.is_none() {
+            bail!("no cert file")
+        }
+    }
+
+    Ok(None)
 }
 
 async fn handle_ws_pub(
@@ -298,5 +366,17 @@ pub struct CmdArgs {
         long_help = "run as bridge only",
     )]
     bridge: bool,
+
+    #[clap(
+        long = "https-cert",
+        long_help = "https cert file",
+    )]
+    https_cert: Option<String>,
+
+    #[clap(
+        long = "https-key",
+        long_help = "http key file",
+    )]
+    https_key: Option<String>,
 }
 
