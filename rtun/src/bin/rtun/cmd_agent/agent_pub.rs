@@ -65,7 +65,7 @@ pub struct CmdArgs {
 
     #[clap(
         short = 'a',
-        long = "name",
+        long = "agent",
         long_help = "agent name",
         // multiple_occurrences = true
     )]

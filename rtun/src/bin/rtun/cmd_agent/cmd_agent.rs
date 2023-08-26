@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use super::{agent_connect, agent_listen};
+use super::{agent_pub, agent_listen};
 
 // refer https://github.com/clap-rs/clap/tree/master/clap_derive/examples
 #[derive(Parser, Debug)]
@@ -12,13 +12,13 @@ pub struct CmdArgs {
 
 #[derive(Parser, Debug)]
 pub enum SubCmd {
-    Conn(agent_connect::CmdArgs),
+    Pub(agent_pub::CmdArgs),
     Listen(agent_listen::CmdArgs),
 }
 
 pub async fn run(args: CmdArgs) -> Result<()> {
     match args.cmd {
-        SubCmd::Conn(args) => agent_connect::run(args).await,
+        SubCmd::Pub(args) => agent_pub::run(args).await,
         SubCmd::Listen(args) => agent_listen::run(args).await,
     }
 }

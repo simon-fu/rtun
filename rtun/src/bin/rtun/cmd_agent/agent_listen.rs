@@ -48,11 +48,8 @@ pub async fn run(args: CmdArgs) -> Result<()> {
     let app = Router::new()
     .route(PUB_WS, get(handle_ws_pub))
     .route(SUB_WS, get(handle_ws_sub))
-    .route(PUB_SESSIONS, get(get_pub_sessions));
-
-    // if !args.bridge {
-    //     app = app.route("/agents/local/sub", get(local_sub_ws_handler));
-    // }
+    .route(PUB_SESSIONS, get(get_pub_sessions))
+    .route("/echo/ws", get(handle_ws_echo));
 
     let router = app
     .layer(Extension(shared))
@@ -74,20 +71,21 @@ pub async fn run(args: CmdArgs) -> Result<()> {
     .into_std()
     .with_context(||"tcp listener into std failed")?;
 
-    let tls_cfg = None;
     let server_handle = Handle::new();
-
+    
     let task_name = format!("server");
     let task = spawn_with_name(task_name, async move {
         match tls_cfg {
             Some(tls_cfg) => {
                 axum_server::from_tcp_rustls(listener, tls_cfg)
+                // axum_server::bind_rustls(addr, tls_cfg)
                 .handle(server_handle)
                 .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                 .await
             },
             None => {
                 axum_server::from_tcp(listener)
+                // axum_server::bind(addr)
                 .handle(server_handle)
                 .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                 .await
@@ -116,6 +114,42 @@ pub async fn run(args: CmdArgs) -> Result<()> {
     
     Ok(())
 }
+
+
+
+async fn handle_ws_echo(
+    Extension(_shared): Extension<Arc<Shared>>,
+    ws: WebSocketUpgrade,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> impl IntoResponse {
+
+    let uid = gen_huid();
+    tracing::debug!("[{}] echo connected from {addr}", uid);
+    
+
+    ws.on_upgrade(move |socket| async move {
+        
+        let r = ws_echo_loop(socket).await;
+        tracing::debug!("echo conn finished with [{:?}]", r);
+    })
+}
+
+async fn ws_echo_loop(mut socket: WebSocket) -> Result<()> {
+    use axum::extract::ws::Message;
+    while let Some(r) = socket.recv().await {
+        let msg = r.with_context(||"recv fail")?;
+        match msg {
+            Message::Text(s) => {
+                socket.send(Message::Text(s)).await
+                .with_context(||"send fail")?;
+            },
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+
 
 async fn try_load_https_cert(key_file: Option<&str>, cert_file: Option<&str>) -> Result<Option<RustlsConfig>> {
     if let (Some(key_file), Some(cert_file)) = (key_file, cert_file) {
