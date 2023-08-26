@@ -116,13 +116,13 @@ impl PatternDetector  {
 }
 
 
-use termwiz::{terminal::{ScreenSize, new_terminal, Terminal}, caps::Capabilities};
-pub async fn get_terminal_size() -> Result<ScreenSize> {
-    let size = tokio::task::spawn_blocking(|| {
-        let caps = Capabilities::new_from_env()?;
-        let mut terminal = new_terminal(caps)?;
-        let size  = terminal.get_screen_size()?;
-        Result::<_>::Ok(size)
-    }).await??;
-    Ok(size)
-}
+// use termwiz::{terminal::{ScreenSize, new_terminal, Terminal}, caps::Capabilities};
+// pub async fn get_terminal_size() -> Result<ScreenSize> {
+//     let size = tokio::task::spawn_blocking(|| {
+//         let caps = Capabilities::new_from_env()?;
+//         let mut terminal = new_terminal(caps)?;
+//         let size  = terminal.get_screen_size()?;
+//         Result::<_>::Ok(size)
+//     }).await??;
+//     Ok(size)
+// }

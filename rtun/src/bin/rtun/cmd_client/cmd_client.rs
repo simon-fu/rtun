@@ -1,8 +1,8 @@
 use anyhow::{Result, Context, bail};
 use clap::Parser;
-use rtun::{ws::client::ws_connect_to, switch::{switch_stream::make_stream_switch, ctrl_client::make_ctrl_client}, huid::gen_huid::gen_huid, channel::{ChId, ChPair}, proto::OpenShellArgs};
+use rtun::{ws::client::ws_connect_to, switch::{switch_stream::make_stream_switch, ctrl_client::make_ctrl_client}, huid::gen_huid::gen_huid, channel::{ChId, ChPair}, proto::OpenShellArgs, term::async_input::get_term_size};
 
-use crate::{terminal::{run_term, get_terminal_size}, rest_proto::{AgentInfo, make_pub_sessions, make_sub_url, make_ws_scheme}};
+use crate::{terminal::run_term, rest_proto::{AgentInfo, make_pub_sessions, make_sub_url, make_ws_scheme}};
 
 pub async fn run(args: CmdArgs) -> Result<()> { 
 
@@ -53,7 +53,9 @@ pub async fn run(args: CmdArgs) -> Result<()> {
     let ctrl = ctrl_session.clone_invoker();
 
     // let ch_id = ChId(1);
-    let size = get_terminal_size().await?;
+    // let size = get_terminal_size().await?;
+    let size = get_term_size()
+    .with_context(||"get terminal size failed")?;
     let shell_args = OpenShellArgs {
         // ch_id: ch_id.0,
         // agent: "".into(),
