@@ -1,12 +1,4 @@
-/* 
-TODO:
-    - agent 端 shell 结束后要发送 0 包给对方，所有 channel 在关闭时都应该发送 0 包
-    - AsynInput 实现 poll_next ， 以便于统一使用 stream 接口
-    - 动态调整 终端 大小
-    - 合并 resize 事件 : AsynInput 里已经实现
-    - 调用系统默认 shell，不是写死 bash: 修改 get_shell_program 即可
-    - 支持 wss
-*/
+
 
 
 use anyhow::{Result, Context, bail};

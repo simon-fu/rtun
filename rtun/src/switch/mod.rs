@@ -5,7 +5,7 @@ pub mod invoker_ctrl;
 
 pub mod invoker_switch;
 
-pub mod switch_ws_server;
+// pub mod switch_ws_server;
 
 pub mod ctrl_client;
 

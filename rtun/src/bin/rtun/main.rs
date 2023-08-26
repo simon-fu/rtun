@@ -1,3 +1,14 @@
+/* 
+TODO:
+    - client 通过 bridge 连接 agent， agent结束后， client 端卡死
+    - agent 端 shell 结束后要发送 0 包给对方，所有 channel 在关闭时都应该发送 0 包
+    - AsynInput 实现 poll_next ， 以便于统一使用 stream 接口
+    - 动态调整 终端 大小
+    - 合并 resize 事件 : AsynInput 里已经实现
+    - 调用系统默认 shell，不是写死 bash: 修改 get_shell_program 即可
+    - 支持 wss
+*/
+
 use anyhow::Result;
 use rtun::async_rt;
 use clap::Parser;
@@ -6,11 +17,11 @@ pub mod cmd_client;
 
 pub mod cmd_agent;
 
-pub mod cmd_server;
-
 pub mod terminal;
 
 pub mod client_ch_pty;
+
+pub mod rest_proto;
 
 // refer https://github.com/clap-rs/clap/tree/master/clap_derive/examples
 #[derive(Parser, Debug)]

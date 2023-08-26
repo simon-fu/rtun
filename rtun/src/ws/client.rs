@@ -9,9 +9,9 @@ use crate::{proto::RawPacket, channel::ChPacket, switch::switch_stream::{SinkErr
 use tokio_tungstenite::{connect_async, tungstenite::{Message as WsMessage, Error as WsError}, WebSocketStream, MaybeTlsStream};
 
 
-pub async fn ws_connect_to(url: &str) -> Result<WsClientStream<WsRawStream>> {
-    let (stream, _response) = connect_async(url).await?;
-    Ok(WsClientStream(stream))
+pub async fn ws_connect_to(url: &str) -> Result<(WsClientStream<WsRawStream>, tokio_tungstenite::tungstenite::handshake::client::Response)> {
+    let r = connect_async(url).await?;
+    Ok((WsClientStream(r.0), r.1))
 }
 
 pub type WsRawStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
