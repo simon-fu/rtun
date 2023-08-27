@@ -33,7 +33,7 @@ pub async fn run(args: CmdArgs) -> Result<()> {
 
     let mut local_agent = if !args.bridge {
         let uid = gen_huid();
-        let agent = make_agent_ctrl(uid)?;
+        let agent = make_agent_ctrl(uid).await?;
         Some(agent)
     } else {
         None

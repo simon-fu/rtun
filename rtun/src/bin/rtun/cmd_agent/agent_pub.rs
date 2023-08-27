@@ -30,7 +30,7 @@ pub async fn run(args0: CmdArgs) -> Result<()> {
     let mut switch_session = make_stream_switch(uid, stream).await?;
     let switch = switch_session.clone_invoker();
 
-    let mut agent = make_agent_ctrl(uid)?;
+    let mut agent = make_agent_ctrl(uid).await?;
     let ctrl = agent.clone_ctrl();
     
     let ctrl_ch_id = ChId(0);

@@ -17,6 +17,8 @@ pub mod cmd_client;
 
 pub mod cmd_agent;
 
+pub mod cmd_socks;
+
 pub mod terminal;
 
 pub mod client_ch_pty;
@@ -34,6 +36,7 @@ struct CmdArgs {
 #[derive(Parser, Debug)]
 enum SubCmd {
     Client(cmd_client::CmdArgs),
+    Socks(cmd_socks::CmdArgs),
     Agent(cmd_agent::CmdArgs),
 }
 
@@ -52,6 +55,7 @@ fn main() -> Result<()> {
     let r = async_rt::run_multi_thread(async move { 
         return match args.cmd {
             SubCmd::Client(args) => cmd_client::run(args).await,
+            SubCmd::Socks(args) => cmd_socks::run(args).await,
             SubCmd::Agent(args) => cmd_agent::run(args).await,
         }
         

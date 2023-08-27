@@ -2,12 +2,13 @@
 
 
 use anyhow::Result;
-use crate::{channel::{ChId, ChSender}, actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker}, proto::OpenShellArgs};
+use crate::{channel::{ChId, ChSender}, actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker}, proto::{OpenShellArgs, OpenSocksArgs}};
 
 pub trait CtrlHandler: ActorEntity 
 + AsyncHandler<OpOpenChannel, Response = OpenChannelResult>
 + AsyncHandler<OpCloseChannel, Response = CloseChannelResult>
 + AsyncHandler<OpOpenShell, Response = OpOpenShellResult>
++ AsyncHandler<OpOpenSocks, Response = OpOpenSocksResult>
 {
 
 }
@@ -58,6 +59,10 @@ where
     pub async fn open_shell(&self, ch_tx: ChSender, args: OpenShellArgs) -> OpOpenShellResult {
         self.invoker.invoke(OpOpenShell(ch_tx, args)).await?
     }
+
+    pub async fn open_socks(&self, ch_tx: ChSender, args: OpenSocksArgs) -> OpOpenShellResult {
+        self.invoker.invoke(OpOpenSocks(ch_tx, args)).await?
+    }
 }
 
 pub struct CtrlWeak<E: CtrlHandler> {
@@ -87,7 +92,9 @@ pub struct OpOpenShell(pub ChSender, pub OpenShellArgs);
 
 pub type OpOpenShellResult = Result<ChSender>;
 
+#[derive(Debug)]
+pub struct OpOpenSocks(pub ChSender, pub OpenSocksArgs);
 
-
+pub type OpOpenSocksResult = Result<ChSender>;
 
 

@@ -35,6 +35,7 @@ message RawPacket {
 message C2ARequest {
     oneof c2a_req_args {
         OpenShellArgs open_sell         = 1;
+        OpenSocksArgs open_socks        = 2;
     }
 }
 
@@ -50,6 +51,11 @@ message OpenShellArgs  {
     uint32 cols                         = 3;
     uint32 rows                         = 4;
     // string term = 5; // "xterm-256color"
+}
+
+message OpenSocksArgs  {
+    optional uint64 ch_id               = 1;
+    string peer_addr                    = 2;
 }
 
 message OpenChannelRequest {

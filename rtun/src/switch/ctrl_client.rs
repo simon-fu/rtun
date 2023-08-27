@@ -3,10 +3,11 @@
 use anyhow::{Result, anyhow, bail, Context};
 use protobuf::Message;
 
-use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, wait_next_none, handle_next_none, handle_msg_none}, huid::HUId, channel::{ChId, ChPair}, proto::{OpenChannelRequest, OpenChannelResponse, open_channel_response::Open_ch_rsp, OpenShellArgs, C2ARequest, c2arequest::C2a_req_args}};
+use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, wait_next_none, handle_next_none, handle_msg_none}, huid::HUId, channel::{ChId, ChPair}, proto::{OpenChannelRequest, OpenChannelResponse, open_channel_response::Open_ch_rsp, OpenShellArgs, C2ARequest, c2arequest::C2a_req_args, OpenSocksArgs}};
 
-use super::{invoker_ctrl::{OpOpenChannel, CloseChannelResult, OpenChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker, OpOpenShell, OpOpenShellResult}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId};
+use super::{invoker_ctrl::{OpOpenChannel, CloseChannelResult, OpenChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker, OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId};
 
+pub type CtrlClientInvoker<H> = CtrlInvoker<Entity<H>>;
 
 pub struct CtrlClient<H: SwitchHanlder> {
     handle: ActorHandle<Entity<H>>,
@@ -129,6 +130,30 @@ impl<H: SwitchHanlder> AsyncHandler<OpOpenShell> for Entity<H> {
     }
 }
 
+#[async_trait::async_trait]
+impl<H: SwitchHanlder> AsyncHandler<OpOpenSocks> for Entity<H> {
+    type Response = OpOpenSocksResult; 
+
+    async fn handle(&mut self, mut req: OpOpenSocks) -> Self::Response {
+
+        let req_ch_id = self.next_ch_id.next_ch_id();
+        req.1.ch_id = Some(req_ch_id.0);
+
+        let tx = self.switch.add_channel(req_ch_id, req.0).await?;
+
+        let r = c2a_open_socks(&mut self.pair, req.1).await;
+        match r {
+            Ok(v) => {
+                assert_eq!(v, req_ch_id);
+                Ok(tx)
+            }
+            Err(e) => {
+                let _r = self.switch.remove_channel(req_ch_id).await;
+                Err(e)
+            }
+        }
+    }
+}
 
 impl<H: SwitchHanlder> CtrlHandler for Entity<H> {}
 
@@ -189,3 +214,29 @@ pub async fn c2a_open_shell(pair: &mut ChPair, args: OpenShellArgs) -> Result<Ch
     // let pair = self.invoker.add_channel(shell_ch_id).await?;
     Ok(shell_ch_id)
 }
+
+pub async fn c2a_open_socks(pair: &mut ChPair, args: OpenSocksArgs) -> Result<ChId> {
+    let data = C2ARequest {
+        c2a_req_args: Some(C2a_req_args::OpenSocks(args)),
+        ..Default::default()
+    }.write_to_bytes()?;
+
+    pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send open shell failed"))?;
+
+    let packet = pair.rx.recv_data().await.with_context(||"recv open shell response failed")?;
+
+    // let rsp = C2AResponse::parse_from_bytes(&data).with_context(||"parse open shell response failed")?;
+    let rsp = OpenChannelResponse::parse_from_bytes(&packet.payload)
+    .with_context(||"parse open socks response failed")?
+    .open_ch_rsp.with_context(||"has no response")?;
+
+    let opened_ch_id = match rsp {
+        Open_ch_rsp::ChId(v) => ChId(v),
+        Open_ch_rsp::Status(status) => bail!("open shell response status {:?}", status),
+        // _ => bail!("unknown"),
+    };
+
+    // let pair = self.invoker.add_channel(shell_ch_id).await?;
+    Ok(opened_ch_id)
+}
+

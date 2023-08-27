@@ -63,6 +63,29 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                     switch.add_channel(ch_id, ch_tx).await?;
                 }
             },
+
+            C2a_req_args::OpenSocks(args) => {
+                let ch_id = args.ch_id
+                .map(|x|ChId(x))
+                .unwrap_or_else(||next_ch_id.next_ch_id());
+  
+                let r = {
+                    let mux_tx = ChSender::new(ch_id, mux_tx.clone());
+                    agent.open_socks(mux_tx, args).await
+                };
+
+                let (rsp, ch_tx) = match r {
+                    Ok(v) => (make_open_shell_response_ok(ch_id.0), Some(v)),
+                    Err(e) => (make_open_shell_response_error(e), None),
+                };
+
+                tx.send_data(rsp.write_to_bytes()?.into()).await
+                .map_err(|_x|anyhow!("send data fail"))?;
+
+                if let Some(ch_tx) = ch_tx {
+                    switch.add_channel(ch_id, ch_tx).await?;
+                }
+            }
         }
     }
     Ok(())

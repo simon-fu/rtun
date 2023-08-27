@@ -34,6 +34,9 @@ pub(super) async fn channel_service(tx: ChSender, mut rx: ChReceiver) -> Result<
                 shell.spawn(None, tx, rx);
             }
         },
+        _ => {
+            todo!() // aaa
+        }
     }
     Ok(())
 }

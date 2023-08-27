@@ -43,8 +43,8 @@ pub type ChRx = mpsc::Receiver<ChPacket>;
 
 #[derive(Debug)]
 pub struct ChSender {
-    ch_id: ChId,
-    outgoing_tx: ChTx,
+    pub(super) ch_id: ChId,
+    pub(super) outgoing_tx: ChTx,
 }
 
 impl ChSender {
@@ -69,7 +69,7 @@ impl ChSender {
 }
 
 pub struct ChReceiver {
-    rx: ChRx,
+    pub(super) rx: ChRx,
 }
 
 impl ChReceiver {
@@ -85,24 +85,5 @@ impl ChReceiver {
 }
 
 pub const CHANNEL_SIZE: usize = 256;
-
-// pub struct OpAddChannel;
-
-// #[async_trait::async_trait]
-// impl AsyncHandler<OpAddChannel> for Entity {
-//     type Response = Result<(ChId, ChSender, ChReceiver)>; 
-
-//     async fn handle(&mut self, _req: OpAddChannel) -> Self::Response {
-//         let ch_id = self.next_ch_id();
-//         let (tx, rx) = mpsc::channel(256);
-//         self.channels.insert(ch_id, ChannelItem { tx });
-        
-//         Ok((
-//             ch_id, 
-//             ChSender::new(ch_id, self.outgoing_tx.clone()),
-//             ChReceiver::new(rx),
-//         ))
-//     }
-// }
 
 

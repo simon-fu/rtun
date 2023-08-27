@@ -28,3 +28,5 @@ pub mod term;
 pub mod switch;
 
 pub mod ws;
+
+pub mod socks;
