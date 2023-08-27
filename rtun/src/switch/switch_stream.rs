@@ -241,6 +241,12 @@ struct ChannelItem {
     tx: ChSender,
 }
 
+impl Drop for ChannelItem {
+    fn drop(&mut self) {
+        let _r = self.tx.try_send_zero();
+    }
+}
+
 async fn handle_msg<S>(_entity: &mut Entity<S>, _msg: Msg) -> Result<Action> {
     Ok(Action::None)
 }

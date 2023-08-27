@@ -4,14 +4,19 @@
 use std::{task::Poll, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 
 use futures::Future;
-use tracing::{info, warn};
+
 use anyhow::{Result, anyhow, Context as AnyhowContext};
 use tokio::{ task::JoinHandle, sync::{mpsc::{self, error::{TrySendError, TryRecvError}}, oneshot}};
 
 use crate::async_rt::spawn_with_name;
 
+use tracing::debug;
 
-
+macro_rules! dbgd {
+    ($($arg:tt)* ) => (
+        // tracing::debug!($($arg)*)
+    );
+}
 
 
 pub fn start_actor<E, F0, F1, F2, F3>(
@@ -109,7 +114,7 @@ impl<E: ActorEntity> ActorBuilder<E> {
         let task_handle = spawn_with_name(name, async move {
             let r = run_actor(&mut task).await;
             if let Err(e) = &r {
-                warn!("finish with err [{:?}]", e)
+                debug!("finish with err [{:?}]", e)
             }
             task.actor.entity.into_result(r)
         });
@@ -284,7 +289,7 @@ where
 {
     let r = task.actor.handle_first.call_me(&mut task.actor.entity).await?;
     if let Action::Finished = r {
-        info!("handle first and finished");
+        dbgd!("handle first and finished");
         return Ok(());
     }    
 
@@ -302,7 +307,7 @@ where
                         }
                     },
                     None => {
-                        info!("no one care, done");
+                        dbgd!("no one care, done");
                         break;
                     }
                 }
@@ -347,7 +352,7 @@ where
                 match e {
                     TryRecvError::Empty => break,
                     TryRecvError::Disconnected => {
-                        info!("recv more but got disconnected");
+                        dbgd!("recv more but got disconnected");
                         return Ok(Action::Finished)
                     },
                 }
@@ -357,7 +362,7 @@ where
 
     let is_drop = task.is_drop.load(Ordering::Acquire);
     if is_drop {
-        info!("got drop");
+        dbgd!("got drop");
         Ok(Action::Finished)
     } else {
         Ok(Action::None)
@@ -374,7 +379,7 @@ where
 {
     match op {
         Op::Shutdown => {
-            info!("got shutdown");
+            dbgd!("got shutdown");
             return Ok(Action::Finished)
         },
         Op::Invoke(mut envelope) => {

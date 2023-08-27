@@ -3,7 +3,7 @@
 use anyhow::{Result, anyhow, bail, Context};
 use protobuf::Message;
 
-use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, wait_next_none, handle_next_none, handle_msg_none}, huid::HUId, channel::{ChId, ChPair}, proto::{OpenChannelRequest, OpenChannelResponse, open_channel_response::Open_ch_rsp, OpenShellArgs, C2ARequest, c2arequest::C2a_req_args, OpenSocksArgs}};
+use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, wait_next_none, handle_next_none, handle_msg_none}, huid::HUId, channel::{ChId, ChPair}, proto::{OpenChannelRequest, OpenChannelResponse, open_channel_response::Open_ch_rsp, OpenShellArgs, C2ARequest, c2arequest::C2a_req_args, OpenSocksArgs, CloseChannelArgs, ResponseStatus}};
 
 use super::{invoker_ctrl::{OpOpenChannel, CloseChannelResult, OpenChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker, OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId};
 
@@ -76,7 +76,7 @@ impl<H: SwitchHanlder> AsyncHandler<OpOpenChannel> for Entity<H> {
 
         self.pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send failed"))?;
 
-        let packet = self.pair.rx.recv_data().await.with_context(||"recv failed")?;
+        let packet = self.pair.rx.recv_packet().await.with_context(||"recv failed")?;
 
         let rsp = OpenChannelResponse::parse_from_bytes(&packet.payload)
         .with_context(||"parse response failed")?
@@ -99,7 +99,17 @@ impl<H: SwitchHanlder> AsyncHandler<OpCloseChannel> for Entity<H> {
     type Response = CloseChannelResult; 
 
     async fn handle(&mut self, req: OpCloseChannel) -> Self::Response { 
-        // TODO: call remote 
+
+        let r = c2a_close_channel(&mut self.pair, CloseChannelArgs {
+            ch_id: req.0.0,
+            ..Default::default()
+        }).await;
+
+        // tracing::debug!("close channel result [{r:?}]");
+        if let Err(e) = r {
+            tracing::debug!("close remote channel failed [{e:?}]");
+        }
+
         let r = self.switch.remove_channel(req.0).await?;
         Ok(r)
     }
@@ -198,7 +208,7 @@ pub async fn c2a_open_shell(pair: &mut ChPair, args: OpenShellArgs) -> Result<Ch
 
     pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send open shell failed"))?;
 
-    let packet = pair.rx.recv_data().await.with_context(||"recv open shell response failed")?;
+    let packet = pair.rx.recv_packet().await.with_context(||"recv open shell response failed")?;
 
     // let rsp = C2AResponse::parse_from_bytes(&data).with_context(||"parse open shell response failed")?;
     let rsp = OpenChannelResponse::parse_from_bytes(&packet.payload)
@@ -221,18 +231,18 @@ pub async fn c2a_open_socks(pair: &mut ChPair, args: OpenSocksArgs) -> Result<Ch
         ..Default::default()
     }.write_to_bytes()?;
 
-    pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send open shell failed"))?;
+    pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send open socks failed"))?;
 
-    let packet = pair.rx.recv_data().await.with_context(||"recv open shell response failed")?;
+    let packet = pair.rx.recv_packet().await.with_context(||"recv open socks response failed")?;
 
-    // let rsp = C2AResponse::parse_from_bytes(&data).with_context(||"parse open shell response failed")?;
+    // let rsp = C2AResponse::parse_from_bytes(&data).with_context(||"parse open socks response failed")?;
     let rsp = OpenChannelResponse::parse_from_bytes(&packet.payload)
     .with_context(||"parse open socks response failed")?
     .open_ch_rsp.with_context(||"has no response")?;
 
     let opened_ch_id = match rsp {
         Open_ch_rsp::ChId(v) => ChId(v),
-        Open_ch_rsp::Status(status) => bail!("open shell response status {:?}", status),
+        Open_ch_rsp::Status(status) => bail!("open socks response status {:?}", status),
         // _ => bail!("unknown"),
     };
 
@@ -240,3 +250,22 @@ pub async fn c2a_open_socks(pair: &mut ChPair, args: OpenSocksArgs) -> Result<Ch
     Ok(opened_ch_id)
 }
 
+pub async fn c2a_close_channel(pair: &mut ChPair, args: CloseChannelArgs) -> Result<ResponseStatus> {
+    let ch_id = ChId(args.ch_id);
+
+    let data = C2ARequest {
+        c2a_req_args: Some(C2a_req_args::CloseChannel(args)),
+        ..Default::default()
+    }.write_to_bytes()?;
+
+    pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send close ch failed"))?;
+
+    let packet = pair.rx.recv_packet().await
+    .with_context(||format!("recv close ch response failed {:?}", ch_id))?;
+
+    // let rsp = C2AResponse::parse_from_bytes(&data).with_context(||"parse close ch response failed")?;
+    let status = ResponseStatus::parse_from_bytes(&packet.payload)
+    .with_context(||"parse close ch response failed")?;
+
+    Ok(status)
+}

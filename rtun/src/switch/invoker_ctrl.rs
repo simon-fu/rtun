@@ -14,27 +14,27 @@ pub trait CtrlHandler: ActorEntity
 }
 
 
-pub struct CtrlInvoker<E: CtrlHandler> {
-    invoker: Invoker<E>,
+pub struct CtrlInvoker<H: CtrlHandler> {
+    invoker: Invoker<H>,
 }
 
-impl<E: CtrlHandler> Clone for CtrlInvoker<E> {
+impl<H: CtrlHandler> Clone for CtrlInvoker<H> {
     fn clone(&self) -> Self {
         Self { invoker: self.invoker.clone() }
     }
 }
 
-impl<E> CtrlInvoker<E> 
+impl<H> CtrlInvoker<H> 
 where
-    E: CtrlHandler,
+    H: CtrlHandler,
 {
-    pub fn new(invoker: Invoker<E>) -> Self {
+    pub fn new(invoker: Invoker<H>) -> Self {
         Self {
             invoker,
         }
     }
 
-    pub fn downgrade(&self) -> CtrlWeak<E> {
+    pub fn downgrade(&self) -> CtrlWeak<H> {
         CtrlWeak {
             weak: self.invoker.downgrade(),
         }
@@ -65,12 +65,18 @@ where
     }
 }
 
-pub struct CtrlWeak<E: CtrlHandler> {
-    weak: WeakInvoker<E>,
+pub struct CtrlWeak<H: CtrlHandler> {
+    weak: WeakInvoker<H>,
 }
 
-impl <E: CtrlHandler> CtrlWeak<E> {
-    pub fn upgrade(&self) -> Option<CtrlInvoker<E>> {
+impl<H: CtrlHandler> Clone for CtrlWeak<H> {
+    fn clone(&self) -> Self {
+        Self { weak: self.weak.clone() }
+    }
+}
+
+impl <H: CtrlHandler> CtrlWeak<H> {
+    pub fn upgrade(&self) -> Option<CtrlInvoker<H>> {
         self.weak.upgrade().map(|invoker| CtrlInvoker {
             invoker,
         })

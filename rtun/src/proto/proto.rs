@@ -32,5 +32,17 @@ pub fn make_open_channel_response_error<D: std::fmt::Debug>(error: D) -> OpenCha
     }
 }
 
+pub fn make_response_status_ok() -> ResponseStatus {
+    // be careful that code 0 and reason "" will generate zero bytes, 
+    make_response_status_raw(0, "ok")
+}
+
+pub fn make_response_status_raw<I: Into<String>>(code: i32, reason: I) -> ResponseStatus {
+    ResponseStatus{
+        code,
+        reason: reason.into().into(),
+        ..Default::default()
+    }
+}
 
 

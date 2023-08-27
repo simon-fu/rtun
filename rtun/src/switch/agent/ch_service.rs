@@ -1,16 +1,12 @@
-use anyhow::{Result, Context, anyhow, bail};
+use anyhow::{Result, Context, anyhow};
 use protobuf::Message;
-use crate::{channel::{ChSender, ChReceiver}, proto::{C2ARequest, c2arequest::C2a_req_args, make_open_shell_response_ok, make_open_channel_response_error}};
+use crate::{channel::{ChSender, ChReceiver}, proto::{C2ARequest, c2arequest::C2a_req_args, make_open_shell_response_ok, make_open_channel_response_error}, async_rt::spawn_with_name, huid::gen_huid::gen_huid};
 
 use super::ch_shell::open_shell;
 
 
 pub(super) async fn channel_service(tx: ChSender, mut rx: ChReceiver) -> Result<()> {
-    let r = rx.recv_data().await;
-    let packet = match r {
-        Some(v) => v,
-        None => bail!("channel closed"),
-    };
+    let packet = rx.recv_packet().await?;
 
     let cmd = C2ARequest::parse_from_bytes(&packet.payload)?
     .c2a_req_args
@@ -31,7 +27,20 @@ pub(super) async fn channel_service(tx: ChSender, mut rx: ChReceiver) -> Result<
             .map_err(|_x|anyhow!("send data fail"))?;
 
             if let Some(shell) = shell {
-                shell.spawn(None, tx, rx);
+
+                let uid = gen_huid();
+                tracing::debug!("open shell [{}]", uid);
+                
+                let name = format!("shell-{}", uid);
+                spawn_with_name(name, async move {
+                    
+                    let r = shell.run(tx, rx).await;
+                    tracing::debug!("finished with [{:?}]", r);
+        
+                    // TODO: remove channel
+        
+                });
+
             }
         },
         _ => {

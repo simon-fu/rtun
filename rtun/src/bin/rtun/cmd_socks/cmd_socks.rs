@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use anyhow::{Result, Context, bail, anyhow};
 use bytes::BytesMut;
 use clap::Parser;
-use rtun::{ws::client::ws_connect_to, switch::{switch_stream::make_stream_switch, ctrl_client::make_ctrl_client, invoker_ctrl::{CtrlHandler, CtrlInvoker}, next_ch_id::NextChId}, huid::gen_huid::gen_huid, channel::{ChId, ChPair}, proto::OpenSocksArgs};
+use rtun::{ws::client::ws_connect_to, switch::{switch_stream::make_stream_switch, ctrl_client::make_ctrl_client, invoker_ctrl::{CtrlHandler, CtrlInvoker}, next_ch_id::NextChId}, huid::gen_huid::gen_huid, channel::{ChId, ChPair, ChSender, ChReceiver}, proto::OpenSocksArgs};
 use tokio::{net::{TcpListener, TcpStream}, io::{AsyncReadExt, AsyncWriteExt}};
 
 use crate::rest_proto::{AgentInfo, make_pub_sessions, make_sub_url, make_ws_scheme};
@@ -60,7 +60,15 @@ pub async fn run(args: CmdArgs) -> Result<()> {
     .with_context(||format!("fail to bind address [{}]", args.listen))?;
     tracing::debug!("socks5 listen on [{}]", args.listen);
     
-    run_socks_server(ctrl, listener).await?;
+    tokio::select! {
+        r = run_socks_server(ctrl, listener) => {
+            tracing::debug!("socks server completed {:?}", r);
+        }
+        r = switch_session.wait_for_completed() => {
+            tracing::debug!("connection completed {:?}", r);
+        }
+    }
+    
 
     println!("\r");
     switch_session.shutdown_and_waitfor().await?;
@@ -110,12 +118,18 @@ async fn handle_client<H: CtrlHandler>(
     let ch_tx = ctrl.open_socks(ch_tx, open_args).await?;
     tracing::debug!("opened socks {} -> {:?}", peer_addr, ch_tx.ch_id());
 
-    let mut buf = BytesMut::new();
+    let r = copy_loop(&mut stream, &ch_tx, &mut ch_rx).await;
+    let _r = ctrl.close_channel(ch_id).await;
+    r
+}
 
+async fn copy_loop(stream: &mut TcpStream, ch_tx: &ChSender, ch_rx: &mut ChReceiver) -> Result<()> {
+    let mut buf = BytesMut::new();
     loop {
         tokio::select! {
-            r = ch_rx.recv_data() => {
+            r = ch_rx.recv_packet() => {
                 let packet = r.with_context(||"recv but channel closed")?;
+
                 stream.write_all(&packet.payload[..]).await?;
             },
             r = stream.read_buf(&mut buf) => {

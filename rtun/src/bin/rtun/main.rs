@@ -61,6 +61,7 @@ fn main() -> Result<()> {
         
     });
     tracing::debug!("main finished with {:?}", r);
+    r??;
     Ok(())
 }
 

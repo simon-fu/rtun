@@ -130,7 +130,7 @@ async fn handle_ws_echo(
     ws.on_upgrade(move |socket| async move {
         
         let r = ws_echo_loop(socket).await;
-        tracing::debug!("echo conn finished with [{:?}]", r);
+        tracing::debug!("[{}] echo conn finished with [{:?}]", uid, r);
     })
 }
 
@@ -196,7 +196,7 @@ async fn handle_ws_pub(
     let mut rsp = ws.on_upgrade(move |socket| async move {
         
         let r = handle_pub_conn(shared, uid, socket, addr, params).await;
-        tracing::debug!("pub conn finished with [{:?}]", r);
+        tracing::debug!("[{}] pub conn finished with [{:?}]", uid, r);
     });
     
     let value = match agent_name.parse() {
@@ -279,7 +279,7 @@ async fn handle_ws_sub(
             return ws.on_upgrade(move |socket| async move {
                 // let r = handle_local_sub_conn(shared, uid, socket).await;
                 let r = run_sub_agent(ctrl, uid, socket).await;
-                tracing::debug!("conn finished with [{:?}]", r);
+                tracing::debug!("[{}] sub conn finished with [{:?}]", uid, r);
             })
         }
     }
@@ -293,7 +293,7 @@ async fn handle_ws_sub(
 
         return ws.on_upgrade(move |socket| async move {
             let r = run_sub_agent(ctrl, uid, socket).await;
-            tracing::debug!("conn finished with [{:?}]", r);
+            tracing::debug!("[{}] sub conn finished with [{:?}]", uid, r);
         })
     }
 

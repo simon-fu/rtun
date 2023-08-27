@@ -1,6 +1,6 @@
 use std::{io::{ErrorKind, self}, net::SocketAddr, sync::Arc};
 
-use crate::{channel::{ChSender, ChReceiver, ch_stream::ChStream}, async_rt::spawn_with_name, proto::OpenSocksArgs};
+use crate::{channel::{ChSender, ChReceiver, ch_stream::ChStream}, proto::OpenSocksArgs};
 
 use anyhow::{anyhow, Result};
 use crate::socks::server::{socks5::Socks5TcpHandler, socks4::Socks4TcpHandler};
@@ -10,27 +10,22 @@ use tracing::error;
 
 
 pub struct ChSocks {
-    stream: ChStream,
+    peer_addr: SocketAddr,
 }
 
 impl ChSocks {
-    pub fn new(tx: ChSender, rx: ChReceiver) -> Self {
-        Self {
-            stream: ChStream::new2(tx, rx),
-        }
+    pub fn try_new(args: OpenSocksArgs) -> Result<Self> {
+        Ok(Self {
+            peer_addr: args.peer_addr.parse()?,
+        })
     }
 
-    pub async fn spawn(self, server: Server, name: String, args: OpenSocksArgs) -> Result<()> {
-        
-        let peer_addr = args.peer_addr.parse()?;
-        // let server = Server::try_new("127.0.0.1:1080").await?;
-
-        spawn_with_name(name, async move {
-            let r = run_socks(self.stream, peer_addr, server).await;
-            tracing::debug!("finished with [{:?}]", r);
-        });
+    pub async fn run(self, server: Server, tx: ChSender, rx: ChReceiver ) -> Result<()> {
+        let stream = ChStream::new2(tx, rx);
+        run_socks(stream, self.peer_addr, server).await?;
         Ok(())
     }
+
 }
 
 async fn run_socks(mut stream: ChStream, peer_addr: SocketAddr, server: Server) -> io::Result<()> {

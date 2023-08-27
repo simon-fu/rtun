@@ -36,6 +36,7 @@ message C2ARequest {
     oneof c2a_req_args {
         OpenShellArgs open_sell         = 1;
         OpenSocksArgs open_socks        = 2;
+        CloseChannelArgs close_channel  = 3;
     }
 }
 
@@ -56,6 +57,10 @@ message OpenShellArgs  {
 message OpenSocksArgs  {
     optional uint64 ch_id               = 1;
     string peer_addr                    = 2;
+}
+
+message CloseChannelArgs  {
+    uint64 ch_id                        = 1;
 }
 
 message OpenChannelRequest {

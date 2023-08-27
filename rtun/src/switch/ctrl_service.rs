@@ -1,7 +1,8 @@
 use anyhow::{Result, anyhow, Context};
 
+use bytes::Bytes;
 use protobuf::Message;
-use crate::{async_rt::spawn_with_name, huid::HUId, proto::{C2ARequest, c2arequest::C2a_req_args, make_open_shell_response_ok, make_open_shell_response_error}, channel::{ChPair, ChId, ChSender}};
+use crate::{async_rt::spawn_with_name, huid::HUId, proto::{C2ARequest, c2arequest::C2a_req_args, make_open_shell_response_ok, make_open_shell_response_error, make_response_status_ok}, channel::{ChPair, ChId, ChSender}};
 
 use super::{invoker_ctrl::{CtrlHandler, CtrlInvoker}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId};
 
@@ -25,17 +26,13 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
     ctrl_pair: ChPair,
 ) -> Result<()> {
     
-    let tx = ctrl_pair.tx;
-    let mut rx = ctrl_pair.rx;
+    let ctrl_tx = ctrl_pair.tx;
+    let mut ctrl_rx = ctrl_pair.rx;
     let mux_tx = switch.get_mux_tx().await?;
     let mut next_ch_id = NextChId::default();
 
     loop {
-        let r = rx.recv_data().await;
-        let packet = match r {
-            Some(v) => v,
-            None => break,
-        };
+        let packet = ctrl_rx.recv_packet().await?;
 
         let cmd = C2ARequest::parse_from_bytes(&packet.payload)?
         .c2a_req_args
@@ -56,7 +53,7 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                     Err(e) => (make_open_shell_response_error(e), None),
                 };
 
-                tx.send_data(rsp.write_to_bytes()?.into()).await
+                ctrl_tx.send_data(rsp.write_to_bytes()?.into()).await
                 .map_err(|_x|anyhow!("send data fail"))?;
 
                 if let Some(ch_tx) = ch_tx {
@@ -79,16 +76,29 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                     Err(e) => (make_open_shell_response_error(e), None),
                 };
 
-                tx.send_data(rsp.write_to_bytes()?.into()).await
+                ctrl_tx.send_data(rsp.write_to_bytes()?.into()).await
                 .map_err(|_x|anyhow!("send data fail"))?;
 
                 if let Some(ch_tx) = ch_tx {
                     switch.add_channel(ch_id, ch_tx).await?;
                 }
+            }, 
+
+            C2a_req_args::CloseChannel(args) => {
+                // tracing::debug!("recv closing ch req {}", args);
+                let _r = switch.remove_channel(ChId(args.ch_id)).await?;
+
+                let rsp = make_response_status_ok();
+
+                let data: Bytes = rsp.write_to_bytes()?.into();
+                // tracing::debug!("send closing ch rsp len {}", data.len());
+
+                ctrl_tx.send_data(data).await
+                .map_err(|_x|anyhow!("send data fail"))?;
+                // tracing::debug!("send closing ch ok");
             }
         }
     }
-    Ok(())
 }
 
 

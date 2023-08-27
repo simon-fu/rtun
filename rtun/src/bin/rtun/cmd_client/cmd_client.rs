@@ -5,9 +5,6 @@ use rtun::{ws::client::ws_connect_to, switch::{switch_stream::make_stream_switch
 use crate::{terminal::run_term, rest_proto::{AgentInfo, make_pub_sessions, make_sub_url, make_ws_scheme}};
 
 pub async fn run(args: CmdArgs) -> Result<()> { 
-    if !args.url.is_empty() {
-        return super::socks5_server::run().await;
-    }
 
     let mut url = url::Url::parse(&args.url)
     .with_context(||"invalid url")?;

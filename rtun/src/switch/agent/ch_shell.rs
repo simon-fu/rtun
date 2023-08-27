@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow, Context};
 use bytes::Bytes;
 use protobuf::Message;
-use crate::huid::HUId;
-use crate::{async_rt::spawn_with_name, huid::gen_huid::gen_huid, proto::{OpenShellArgs, PtyOutputPacket, pty_output_packet::Pty_output_args, PtyInputPacket, pty_input_packet::Pty_input_args, ShutdownArgs}, channel::{ChSender, ChReceiver}, async_pty_process::{Sender as PtySender, Receiver as PtyRecver, make_async_pty_process}, term::get_shell_program};
+
+use crate::{proto::{OpenShellArgs, PtyOutputPacket, pty_output_packet::Pty_output_args, PtyInputPacket, pty_input_packet::Pty_input_args, ShutdownArgs}, channel::{ChSender, ChReceiver}, async_pty_process::{Sender as PtySender, Receiver as PtyRecver, make_async_pty_process}, term::get_shell_program};
 
 
 pub async fn open_shell(args: OpenShellArgs) -> Result<ChShell> {
@@ -14,33 +14,42 @@ pub async fn open_shell(args: OpenShellArgs) -> Result<ChShell> {
         args.cols as u16,
     ).await?;
 
-    let uid = gen_huid();
-    tracing::debug!("open shell [{}]", uid);
+    // let uid = gen_huid();
+    // tracing::debug!("open shell [{}]", uid);
     
     Ok(ChShell {
-        uid,
+        // uid,
         pty_sender,
         pty_recver,
     } )
 }
 
 pub struct ChShell {
-    uid: HUId,
+    // uid: HUId,
     pty_sender: PtySender,
     pty_recver: PtyRecver,
 }
 
 impl ChShell {
-    pub fn spawn(self, name: Option<String>, tx: ChSender, rx: ChReceiver)  {
-        let name = name.unwrap_or_else(||format!("shell-{}", self.uid));
-        spawn_with_name(name, async move {
-            let r = copy_pty_channel(self,  tx, rx).await;
-            tracing::debug!("finished with [{:?}]", r);
-            // if let Some(invoker) = weak.upgrade() {
-            //     let _r = invoker.remote_channel(ch_id).await;
-            // }
-        });
+    pub async fn run(self, tx: ChSender, rx: ChReceiver ) -> Result<()> {
+        copy_pty_channel(self,  tx, rx).await
     }
+
+    // pub fn spawn<H: CtrlHandler>(self, name: Option<String>, tx: ChSender, rx: ChReceiver, weak: Option<CtrlWeak<H>>, local_ch_id: ChId)  {
+    //     let name = name.unwrap_or_else(||format!("shell-{}", self.uid));
+    //     spawn_with_name(name, async move {
+
+    //         let r = copy_pty_channel(self,  tx, rx).await;
+    //         tracing::debug!("finished with [{:?}]", r);
+
+    //         if let Some(weak) = weak {
+    //             if let Some(ctrl) = weak.upgrade() {
+    //                 let _r = ctrl.close_channel(local_ch_id).await;
+    //             }
+    //         }
+
+    //     });
+    // }
 }
 
 async fn copy_pty_channel(
@@ -68,14 +77,10 @@ async fn copy_pty_channel(
                     },
                 }
             },
-            r = ch_rx.recv_data() => {
-                match r {
-                    Some(packet) => {
-                        if let Some(_shutdown) = process_pty_input_packet(&shell.pty_sender, packet.payload).await? {
-                            break;
-                        }
-                    },
-                    None => break,
+            r = ch_rx.recv_packet() => {
+                let packet = r?;
+                if let Some(_shutdown) = process_pty_input_packet(&shell.pty_sender, packet.payload).await? {
+                    break;
                 }
             }
         }

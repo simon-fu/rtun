@@ -1,4 +1,4 @@
-use std::{task::{Poll, self}, pin::Pin, io::{self, ErrorKind}};
+use std::{task::{Poll, self}, pin::Pin, io};
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -32,17 +32,12 @@ impl ChRecvStream {
     }
 
     async fn recv_next(&mut self) -> io::Result<()> {
-        let r = self.rx.recv_data().await;
-        match r {
-            Some(packet) => {
-                self.reader = Some(Reader { 
-                    data: packet.payload, 
-                    pos: 0,
-                });
-                Ok(())
-            },
-            None => Err(ErrorKind::ConnectionAborted.into()),
-        }
+        let packet = self.rx.recv_packet().await?;
+        self.reader = Some(Reader { 
+            data: packet.payload, 
+            pos: 0,
+        });
+        Ok(())
     }
 }
 
@@ -64,6 +59,10 @@ impl AsyncRead for ChRecvStream {
     ) -> Poll<io::Result<()>> {
 
         if let Some(reader) = &mut self.reader {
+            if reader.data.len() == 0 {
+                return Poll::Ready(Ok(()))
+            }
+
             let num = reader.read_buf(buf);
             if num > 0 {
                 return Poll::Ready(Ok(()))
@@ -72,10 +71,10 @@ impl AsyncRead for ChRecvStream {
             self.reader = None;
         }
 
-        match self.rx.rx.poll_recv(cx) {
+        match self.rx.poll_recv(cx) {
             Poll::Ready(r) => {
                 match r {
-                    Some(packet) => {
+                    Ok(packet) => {
                         let mut reader = Reader { 
                             data: packet.payload, 
                             pos: 0,
@@ -84,10 +83,11 @@ impl AsyncRead for ChRecvStream {
                         reader.read_buf(buf);
 
                         self.reader = Some(reader);
+                        Poll::Ready(Ok(()))
                     },
-                    None => { },
+                    Err(e) => { Poll::Ready(Err(e.into())) },
                 }
-                Poll::Ready(Ok(()))
+                
             },
             Poll::Pending => Poll::Pending,
         }

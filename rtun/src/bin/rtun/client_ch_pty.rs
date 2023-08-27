@@ -12,17 +12,25 @@ impl PtyChReceiver {
         Self { ch_rx }
     }
 
-    pub async fn recv_packet(&mut self, ) -> Result<Option<PtyOutputPacket>> {
-        let r = self.ch_rx.recv_data().await;
-        match r {
-            Some(packet) => {
-                Ok(Some(
-                    PtyOutputPacket::parse_from_tokio_bytes(&packet.payload)
-                    .with_context(||"invalid PtyInputPacket")?
-                ))
-            },
-            None => Ok(None),
-        }
+    // pub async fn recv_packet(&mut self, ) -> Result<Option<PtyOutputPacket>> {
+    //     let r = self.ch_rx.recv_packet().await;
+    //     match r {
+    //         Some(packet) => {
+    //             Ok(Some(
+    //                 PtyOutputPacket::parse_from_tokio_bytes(&packet.payload)
+    //                 .with_context(||"invalid PtyInputPacket")?
+    //             ))
+    //         },
+    //         None => Ok(None),
+    //     }
+    // }
+
+    pub async fn recv_packet(&mut self, ) -> Result<PtyOutputPacket> {
+        let packet = self.ch_rx.recv_packet().await?;
+        Ok(
+            PtyOutputPacket::parse_from_tokio_bytes(&packet.payload)
+            .with_context(||"invalid PtyOutputPacket")?
+        )
     }
 }
 
@@ -50,12 +58,12 @@ impl PtyChSender {
     }
 }
 
-pub async fn process_recv_result(result: Result<Option<PtyOutputPacket>>) -> Result<Option<ShutdownArgs>> {
+pub async fn process_recv_result(result: Result<PtyOutputPacket>) -> Result<Option<ShutdownArgs>> {
     use std::io::Write;
     use rtun::proto::pty_output_packet::Pty_output_args;
 
     let args = result.with_context(||"recv packet failed")?
-    .with_context(||"channel closed")?
+    // .with_context(||"channel closed")?
     .pty_output_args.with_context(||"empty pty_output_args")?;
 
     match args {
