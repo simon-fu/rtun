@@ -1,0 +1,20 @@
+name: Run agent
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Run
+      run: |
+        echo ${{ secrets.MY_CONN_URL }}
+        cargo run --release --bin rtun -- agent pub "${{ secrets.MY_CONN_URL }}" --agent rtun
+
