@@ -15,6 +15,7 @@ jobs:
     - uses: actions/checkout@v2
     - name: Run
       run: |
+        cd rtun
         echo ${{ secrets.MY_CONN_URL }}
         cargo run --release --bin rtun -- agent pub "${{ secrets.MY_CONN_URL }}" --agent rtun
 
