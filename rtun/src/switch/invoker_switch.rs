@@ -4,6 +4,8 @@
 use anyhow::Result;
 use crate::{channel::{ChId, ChSender, ChTx}, actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker}};
 
+use super::entity_watch::{OpWatch, WatchResult};
+
 #[derive(Debug)]
 pub struct ReqAddChannel(pub ChId, pub ChSender);
 
@@ -23,6 +25,7 @@ pub trait SwitchHanlder: ActorEntity
 + AsyncHandler<ReqAddChannel, Response = AddChannelResult>
 + AsyncHandler<ReqRemoveChannel, Response = RemoveChannelResult>
 + AsyncHandler<ReqGetMuxTx, Response = ReqGetMuxTxResult>
++ AsyncHandler<OpWatch, Response = WatchResult>
 {
 
 }
@@ -46,6 +49,14 @@ where
         SwitchInvokerWeak {
             weak: self.invoker.downgrade(),
         }
+    }
+
+    pub async fn shutdown(&self) {
+        self.invoker.shutdown().await
+    }
+
+    pub async fn watch(&self) -> WatchResult {
+        self.invoker.invoke(OpWatch).await?
     }
 
     pub async fn add_channel(&self, ch_id: ChId, sender: ChSender) -> AddChannelResult {

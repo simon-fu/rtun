@@ -3,9 +3,9 @@
 use anyhow::{Result, anyhow, bail, Context};
 use protobuf::Message;
 
-use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, wait_next_none, handle_next_none, handle_msg_none}, huid::HUId, channel::{ChId, ChPair}, proto::{OpenChannelRequest, OpenChannelResponse, open_channel_response::Open_ch_rsp, OpenShellArgs, C2ARequest, c2arequest::C2a_req_args, OpenSocksArgs, CloseChannelArgs, ResponseStatus}};
+use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, handle_msg_none, Action}, huid::HUId, channel::{ChId, ChPair}, proto::{OpenChannelRequest, OpenChannelResponse, open_channel_response::Open_ch_rsp, OpenShellArgs, C2ARequest, c2arequest::C2a_req_args, OpenSocksArgs, CloseChannelArgs, ResponseStatus}};
 
-use super::{invoker_ctrl::{OpOpenChannel, CloseChannelResult, OpenChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker, OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId};
+use super::{invoker_ctrl::{OpOpenChannel, CloseChannelResult, OpenChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker, OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId, entity_watch::{OpWatch, WatchResult, CtrlGuard, CtrlWatch}};
 
 pub type CtrlClientInvoker<H> = CtrlInvoker<Entity<H>>;
 
@@ -36,9 +36,10 @@ impl<H: SwitchHanlder>  CtrlClient<H> {
 }
 
 
-pub fn make_ctrl_client<H: SwitchHanlder>(uid: HUId, pair: ChPair, switch: SwitchInvoker<H>) -> Result<CtrlClient<H>> {
+pub async fn make_ctrl_client<H: SwitchHanlder>(uid: HUId, pair: ChPair, switch: SwitchInvoker<H>) -> Result<CtrlClient<H>> {
 
     // let mux_tx = switch.get_mux_tx().await?;
+    let switch_watch = switch.watch().await?;
 
     let entity = Entity {
         // gen_ch_id: ChId(0),
@@ -47,14 +48,16 @@ pub fn make_ctrl_client<H: SwitchHanlder>(uid: HUId, pair: ChPair, switch: Switc
         switch,
         // mux_tx,
         next_ch_id: Default::default(),
+        guard: CtrlGuard::new(),
+        switch_watch,
     };
 
     let handle = start_actor(
         format!("ctrl-client-{}", uid),
         entity, 
         handle_first_none,
-        wait_next_none, 
-        handle_next_none, 
+        wait_next, 
+        handle_next, 
         handle_msg_none,
     );
 
@@ -165,6 +168,16 @@ impl<H: SwitchHanlder> AsyncHandler<OpOpenSocks> for Entity<H> {
     }
 }
 
+#[async_trait::async_trait]
+impl<H: SwitchHanlder> AsyncHandler<OpWatch> for Entity<H> {
+    type Response = WatchResult; 
+
+    async fn handle(&mut self, _req: OpWatch) -> Self::Response {
+        Ok(self.guard.watch())
+    }
+}
+
+
 impl<H: SwitchHanlder> CtrlHandler for Entity<H> {}
 
 
@@ -176,6 +189,8 @@ pub struct Entity<H: SwitchHanlder> {
     switch: SwitchInvoker<H>,
     // mux_tx: ChTx,
     next_ch_id: NextChId,
+    guard: CtrlGuard,
+    switch_watch: CtrlWatch,
 }
 
 // impl<H: SwitchHanlder> Entity<H> {
@@ -186,6 +201,16 @@ pub struct Entity<H: SwitchHanlder> {
 //     }
 // }
 
+async fn wait_next<H: SwitchHanlder>(entity: &mut Entity<H>) -> () {
+    tokio::select! {
+        _r = entity.switch_watch.watch() => { tracing::debug!("switch has gone"); }
+        _r = entity.pair.rx.recv_packet() => { tracing::debug!("ctrl channel broken"); }
+    }
+}
+
+async fn handle_next<H: SwitchHanlder>(_entity: &mut Entity<H>, _next: ()) -> Result<Action> {
+    Ok(Action::Finished)
+}
 
 impl<H: SwitchHanlder> ActorEntity for Entity<H> {
     type Next = ();

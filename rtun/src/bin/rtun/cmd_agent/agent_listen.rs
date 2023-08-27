@@ -220,7 +220,7 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
     let ctrl_tx = switch.add_channel(ctrl_ch_id, ctrl_tx).await?;
     let ctrl_pair = ChPair { tx: ctrl_tx, rx: ctrl_rx };
 
-    let mut ctrl_client = make_ctrl_client(uid, ctrl_pair, switch)?;
+    let mut ctrl_client = make_ctrl_client(uid, ctrl_pair, switch).await?;
     
     let key = params.agent.unwrap_or_else(||uid.to_string());
     {

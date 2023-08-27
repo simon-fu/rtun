@@ -6,31 +6,6 @@ use crate::{terminal::run_term, client_utils::client_select_url};
 
 pub async fn run(args: CmdArgs) -> Result<()> { 
 
-    // let mut url = url::Url::parse(&args.url)
-    // .with_context(||"invalid url")?;
-
-    // let url = if url.scheme().eq_ignore_ascii_case("ws") 
-    //     || url.scheme().eq_ignore_ascii_case("wss") {
-    //     url.as_str()
-    // } else if url.scheme().eq_ignore_ascii_case("http") 
-    //     || url.scheme().eq_ignore_ascii_case("https") {
-    //         match args.agent.as_deref() {
-    //             Some(agent) => {
-    //                 make_sub_url(&mut url, Some(agent))?;
-    //             },
-    //             None => {
-    //                 let agent = query_and_select_agent(&url).await?;
-    //                 make_sub_url(&mut url, Some(agent.name.as_str()))?
-    //             },
-    //         }
-            
-    //         make_ws_scheme(&mut url)?;
-    //         url.as_str()
-    // }
-    // else {
-    //     bail!("unsupport protocol [{}]", url.scheme())
-    // };
-
     let url = client_select_url(&args.url, args.agent.as_deref()).await?;
     let url = url.as_str();
 
@@ -51,7 +26,7 @@ pub async fn run(args: CmdArgs) -> Result<()> {
     let pair = ChPair { tx: ctrl_tx, rx: ctrl_rx };
 
     // let mut ctrl = ClientChannelCtrl::new(pair, invoker);
-    let mut ctrl_session = make_ctrl_client(uid, pair, switch)?;
+    let mut ctrl_session = make_ctrl_client(uid, pair, switch).await?;
     let ctrl = ctrl_session.clone_invoker();
 
     // let ch_id = ChId(1);

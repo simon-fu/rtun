@@ -16,3 +16,5 @@ pub mod agent;
 pub mod switch_stream;
 
 pub mod next_ch_id;
+
+pub mod entity_watch;

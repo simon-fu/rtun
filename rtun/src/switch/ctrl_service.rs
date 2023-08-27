@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, Context};
+use anyhow::{Result, anyhow, Context, bail};
 
 use bytes::Bytes;
 use protobuf::Message;
@@ -11,11 +11,13 @@ pub fn spawn_ctrl_service<H1: CtrlHandler, H2: SwitchHanlder>(
     uid: HUId, 
     agent: CtrlInvoker<H1>, 
     switch: SwitchInvoker<H2>, 
-    chpair: ChPair) 
+    mut chpair: ChPair,
+) 
 {
     spawn_with_name(format!("ctrl-service-{}", uid), async move {
-        let r = ctrl_loop_full(&agent, &switch, chpair).await;
+        let r = ctrl_loop_full(&agent, &switch, &mut chpair).await;
         tracing::debug!("finished with [{:?}]", r);
+        switch.shutdown().await;
     });
 }
 
@@ -23,16 +25,24 @@ pub fn spawn_ctrl_service<H1: CtrlHandler, H2: SwitchHanlder>(
 async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
     agent: &CtrlInvoker<H1>, 
     switch: &SwitchInvoker<H2>, 
-    ctrl_pair: ChPair,
+    ctrl_pair: &mut ChPair,
 ) -> Result<()> {
     
-    let ctrl_tx = ctrl_pair.tx;
-    let mut ctrl_rx = ctrl_pair.rx;
+    let ctrl_tx = &mut ctrl_pair.tx;
+    let ctrl_rx = &mut ctrl_pair.rx;
+    
     let mux_tx = switch.get_mux_tx().await?;
+    let mut agent_watch = agent.watch().await?;
+
     let mut next_ch_id = NextChId::default();
 
     loop {
-        let packet = ctrl_rx.recv_packet().await?;
+        // let packet = ctrl_rx.recv_packet().await?;
+
+        let packet = tokio::select! {
+            _r = agent_watch.watch() => bail!("agent has gone"),
+            r = ctrl_rx.recv_packet() => r?,
+        };
 
         let cmd = C2ARequest::parse_from_bytes(&packet.payload)?
         .c2a_req_args

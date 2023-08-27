@@ -296,7 +296,10 @@ where
     loop {
         tokio::select! {
             r = task.actor.wait_next.call_me(&mut task.actor.entity) => {
-                task.actor.handle_next.call_me(&mut task.actor.entity, r).await?;
+                let r = task.actor.handle_next.call_me(&mut task.actor.entity, r).await?;
+                if let Action::Finished = r {
+                    break;
+                }
             }
             r = task.op_rx.recv() => {
                 match r {

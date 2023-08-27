@@ -1,5 +1,11 @@
 /* 
 TODO:
+    - 支持 cmd exec 
+    - 支持 agent 和 client 鉴权
+    - 支持 环境变量 设置 日志级别
+    - 支持 agent pub 断开重试
+    = 支持 socks client 断开重试
+    
     - client 通过 bridge 连接 agent， agent结束后， client 端卡死
     - agent 端 shell 结束后要发送 0 包给对方，所有 channel 在关闭时都应该发送 0 包
     - AsynInput 实现 poll_next ， 以便于统一使用 stream 接口

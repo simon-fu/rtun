@@ -6,7 +6,7 @@ use protobuf::Message;
 use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, Action, AsyncHandler, ActorHandle}, huid::HUId, channel::{ChId, ChSender, ChPacket, CHANNEL_SIZE}, proto::RawPacket};
 use tokio::sync::mpsc;
 
-use super::invoker_switch::{SwitchHanlder, SwitchInvoker, ReqAddChannel, AddChannelResult, ReqRemoveChannel, RemoveChannelResult, ReqGetMuxTx, ReqGetMuxTxResult};
+use super::{invoker_switch::{SwitchHanlder, SwitchInvoker, ReqAddChannel, AddChannelResult, ReqRemoveChannel, RemoveChannelResult, ReqGetMuxTx, ReqGetMuxTxResult}, entity_watch::{OpWatch, WatchResult, CtrlGuard}};
 
 
 pub async fn make_stream_switch<S>(uid: HUId, socket: S) -> Result<StreamSwitch<S>> 
@@ -26,7 +26,8 @@ where
         channels: Default::default(),
         // gen_ch_id: ChId(0),
         outgoing_tx,
-        outgoing_rx
+        outgoing_rx,
+        guard: CtrlGuard::new(),
     };
 
     let handle = start_actor(
@@ -151,6 +152,20 @@ where
     }
 }
 
+#[async_trait::async_trait]
+impl<S> AsyncHandler<OpWatch> for Entity<S> 
+where
+    S: 'static 
+        + Send
+        + StreamExt<Item = Result<StreamPacket, StreamError>> 
+        + Unpin,
+{
+    type Response = WatchResult; 
+
+    async fn handle(&mut self, _req: OpWatch) -> Self::Response {
+        Ok(self.guard.watch())
+    }
+}
 
 impl<S> SwitchHanlder for Entity<S> 
 where
@@ -260,6 +275,7 @@ pub struct Entity<S> {
     // gen_ch_id: ChId,
     outgoing_tx: mpsc::Sender<ChPacket>,
     outgoing_rx: mpsc::Receiver<ChPacket>,
+    guard: CtrlGuard,
 }
 
 impl<S> Entity<S> {

@@ -4,7 +4,10 @@
 use anyhow::Result;
 use crate::{channel::{ChId, ChSender}, actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker}, proto::{OpenShellArgs, OpenSocksArgs}};
 
+use super::entity_watch::{OpWatch, WatchResult};
+
 pub trait CtrlHandler: ActorEntity 
++ AsyncHandler<OpWatch, Response = WatchResult>
 + AsyncHandler<OpOpenChannel, Response = OpenChannelResult>
 + AsyncHandler<OpCloseChannel, Response = CloseChannelResult>
 + AsyncHandler<OpOpenShell, Response = OpOpenShellResult>
@@ -38,6 +41,10 @@ where
         CtrlWeak {
             weak: self.invoker.downgrade(),
         }
+    }
+
+    pub async fn watch(&self) -> WatchResult {
+        self.invoker.invoke(OpWatch).await?
     }
 
     // pub async fn open_channel_easy(&self, ch_id: ChId) -> Result<ChPair> {
@@ -82,6 +89,7 @@ impl <H: CtrlHandler> CtrlWeak<H> {
         })
     }
 }
+
 
 #[derive(Debug)]
 pub struct OpOpenChannel(pub ChSender);
