@@ -8,7 +8,7 @@ use axum_server::{Handle, tls_rustls::RustlsConfig};
 use clap::Parser;
 use axum::{Extension, extract::Query, http::StatusCode, Json};
 use parking_lot::Mutex;
-use rtun::{huid::{gen_huid::gen_huid, HUId}, channel::{ChId, ChPair}, switch::{ctrl_service::spawn_ctrl_service, agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker}, switch_stream::{make_stream_switch, Entity as StreamSwitchEntity}, ctrl_client::{make_ctrl_client, self}, invoker_ctrl::{CtrlInvoker, CtrlHandler}}, ws::server::WsStreamAxum, async_rt::spawn_with_name};
+use rtun::{huid::{gen_huid::gen_huid, HUId}, channel::{ChId, ChPair}, switch::{ctrl_service::spawn_ctrl_service, agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker}, switch_stream::{make_stream_switch, Entity as StreamSwitchEntity}, ctrl_client, invoker_ctrl::{CtrlInvoker, CtrlHandler}, session_stream::make_stream_session}, ws::server::WsStreamAxum, async_rt::spawn_with_name};
 use tokio::net::TcpListener;
 
 use std::{sync::Arc, collections::HashMap};
@@ -211,20 +211,21 @@ async fn handle_ws_pub(
 
 
 async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr: SocketAddr, params: PubParams) -> Result<()>{
-    
-    let mut session = make_stream_switch(uid, WsStreamAxum::new(socket)).await?;
-    let switch = session.clone_invoker();
+    let mut session = make_stream_session(WsStreamAxum::new(socket)).await?;
 
-    let ctrl_ch_id = ChId(0);
-    let (ctrl_tx, ctrl_rx) = ChPair::new(ctrl_ch_id).split();
-    let ctrl_tx = switch.add_channel(ctrl_ch_id, ctrl_tx).await?;
-    let ctrl_pair = ChPair { tx: ctrl_tx, rx: ctrl_rx };
+    // let mut session = make_stream_switch(uid, WsStreamAxum::new(socket)).await?;
+    // let switch = session.clone_invoker();
 
-    let mut ctrl_client = make_ctrl_client(uid, ctrl_pair, switch).await?;
+    // let ctrl_ch_id = ChId(0);
+    // let (ctrl_tx, ctrl_rx) = ChPair::new(ctrl_ch_id).split();
+    // let ctrl_tx = switch.add_channel(ctrl_ch_id, ctrl_tx).await?;
+    // let ctrl_pair = ChPair { tx: ctrl_tx, rx: ctrl_rx };
+
+    // let mut ctrl_client = make_ctrl_client(uid, ctrl_pair, switch).await?;
     
     let key = params.agent.unwrap_or_else(||uid.to_string());
     {
-        let ctrl_invoker = ctrl_client.clone_invoker();
+        let ctrl_invoker = session.ctrl_client().clone_invoker();
         shared.data.lock().agent_clients.insert(key.clone(), AgentSession { 
             addr, 
             ctrl_invoker,
@@ -239,7 +240,7 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
     };
     tracing::debug!("remove agent session [{}], addr [{}]", uid, addr);
 
-    let _r = ctrl_client.wait_for_completed().await?;
+    // let _r = ctrl_client.wait_for_completed().await?;
 
     Ok(())
 }

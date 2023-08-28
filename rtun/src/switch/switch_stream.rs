@@ -6,16 +6,18 @@ use protobuf::Message;
 use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, Action, AsyncHandler, ActorHandle}, huid::HUId, channel::{ChId, ChSender, ChPacket, CHANNEL_SIZE}, proto::RawPacket};
 use tokio::sync::mpsc;
 
-use super::{invoker_switch::{SwitchHanlder, SwitchInvoker, ReqAddChannel, AddChannelResult, ReqRemoveChannel, RemoveChannelResult, ReqGetMuxTx, ReqGetMuxTxResult}, entity_watch::{OpWatch, WatchResult, CtrlGuard}};
+use super::{invoker_switch::{SwitchHanlder, SwitchInvoker, ReqAddChannel, AddChannelResult, ReqRemoveChannel, RemoveChannelResult, ReqGetMuxTx, ReqGetMuxTxResult}, entity_watch::{OpWatch, WatchResult, CtrlGuard}, ctrl_client::CtrlClient};
+
 
 
 pub async fn make_stream_switch<S>(uid: HUId, socket: S) -> Result<StreamSwitch<S>> 
 where
-    S: 'static 
-        + Send
-        + StreamExt<Item = Result<StreamPacket, StreamError>> 
-        + SinkExt<SinkPacket, Error = SinkError> 
-        + Unpin,
+    S: PacketStream,
+    // S: 'static 
+    //     + Send
+    //     + StreamExt<Item = Result<StreamPacket, StreamError>> 
+    //     + SinkExt<SinkPacket, Error = SinkError> 
+    //     + Unpin,
 {
     
     let (outgoing_tx, outgoing_rx) = mpsc::channel(CHANNEL_SIZE);
@@ -49,6 +51,27 @@ pub type StreamPacket = Vec<u8>;
 pub type StreamError = anyhow::Error;
 pub type SinkPacket = ChPacket;
 pub type SinkError = anyhow::Error;
+
+pub trait PacketStream: 'static 
++ Send
++ StreamExt<Item = Result<StreamPacket, StreamError>> 
++ SinkExt<SinkPacket, Error = SinkError> 
++ Unpin
+{
+
+}
+
+
+
+// pub trait SwitchOps {
+
+// }
+
+// pub struct SwitchSession<E: ActorEntity> {
+//     handle: ActorHandle<E>,
+// }
+
+
 
 
 pub struct StreamSwitch<S: 'static + Send> {
@@ -84,8 +107,8 @@ where
 }
 
 pub type StreamSwitchInvoker<S> = SwitchInvoker<Entity<S>>;
-
-
+// pub type StreamSwitchEntity<S> = Entity<S>;
+pub type StreamSwitchCtrlClient<S> = CtrlClient<Entity<S>>;
 
 
 #[async_trait::async_trait]

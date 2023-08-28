@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use futures::{StreamExt, Sink, SinkExt, Stream};
 use protobuf::Message as PbMessage;
 
-use crate::{proto::RawPacket, channel::ChPacket, switch::switch_stream::{SinkError, StreamPacket, StreamError}};
+use crate::{proto::RawPacket, channel::ChPacket, switch::switch_stream::{SinkError, StreamPacket, StreamError, PacketStream}};
 
 // use tokio_tungstenite::{connect_async, tungstenite::{Message as WsMessage, Error as WsError}, WebSocketStream, MaybeTlsStream};
 
@@ -85,4 +85,13 @@ where
     }
 
 }
+
+impl<S> PacketStream for WsStreamAxum<S> 
+where
+    S: 'static
+    + Unpin
+    + Send
+    + StreamExt<Item = Result<WsMessage, WsError>> 
+    + Sink<WsMessage, Error = WsError>
+{ }
 

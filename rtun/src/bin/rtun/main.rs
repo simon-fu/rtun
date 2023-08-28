@@ -2,6 +2,7 @@
 TODO:
     - 支持 cmd exec 
     - 支持 agent 和 client 鉴权
+    
     - 支持 环境变量 设置 日志级别
     - 支持 agent pub 断开重试
     = 支持 socks client 断开重试
@@ -18,6 +19,7 @@ TODO:
 use anyhow::Result;
 use rtun::async_rt;
 use clap::Parser;
+use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 
 pub mod cmd_shell;
 
@@ -48,13 +50,6 @@ enum SubCmd {
     Agent(cmd_agent::CmdArgs),
 }
 
-fn init_log() {
-    tracing_subscriber::fmt()
-    .with_max_level(tracing::metadata::LevelFilter::DEBUG)
-    .with_env_filter("rtun=debug,rserver=debug")
-    .init();
-}
-
 fn main() -> Result<()> {
 
     init_log();
@@ -66,11 +61,25 @@ fn main() -> Result<()> {
             SubCmd::Socks(args) => cmd_socks::run(args).await,
             SubCmd::Agent(args) => cmd_agent::run(args).await,
         }
-        
     });
     tracing::debug!("main finished with {:?}", r);
     r??;
     Ok(())
 }
 
+fn init_log() {
 
+    let filter = if cfg!(debug_assertions) {
+        "rtun=debug".into()
+    } else {
+        EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy()
+    };
+        
+    tracing_subscriber::fmt()
+    .with_max_level(tracing::metadata::LevelFilter::DEBUG)
+    .with_env_filter(filter)
+    // .with_env_filter("rtun=debug,rserver=debug")
+    .init();
+}

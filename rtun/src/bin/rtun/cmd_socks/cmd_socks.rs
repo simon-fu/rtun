@@ -1,81 +1,116 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Result, Context, bail, anyhow};
 use bytes::BytesMut;
 use clap::Parser;
-use rtun::{ws::client::ws_connect_to, switch::{switch_stream::make_stream_switch, ctrl_client::make_ctrl_client, invoker_ctrl::{CtrlHandler, CtrlInvoker}, next_ch_id::NextChId}, huid::gen_huid::gen_huid, channel::{ChId, ChPair, ChSender, ChReceiver}, proto::OpenSocksArgs};
+use parking_lot::Mutex;
+use rtun::{ws::client::ws_connect_to, switch::{switch_stream::PacketStream, invoker_ctrl::{CtrlHandler, CtrlInvoker}, next_ch_id::NextChId, session_stream::make_stream_session}, channel::{ChId, ChPair, ChSender, ChReceiver}, proto::OpenSocksArgs, async_rt::spawn_with_name};
 use tokio::{net::{TcpListener, TcpStream}, io::{AsyncReadExt, AsyncWriteExt}};
 
 use crate::client_utils::client_select_url;
 
 pub async fn run(args: CmdArgs) -> Result<()> { 
 
+    let shared = Arc::new(Shared {
+        data: Mutex::new(SharedData {
+            ctrl: None,
+        }),
+    });
+
+    {
+        let listener = TcpListener::bind(&args.listen).await
+        .with_context(||format!("fail to bind address [{}]", args.listen))?;
+        tracing::info!("socks5 listen on [{}]", args.listen);
+
+        let shared = shared.clone();
+
+        spawn_with_name("local_sock", async move {
+            let r = run_socks_server(shared, listener).await;
+            r
+        });
+    }
+
+    let mut last_success = true;
+
+    loop {
+
+        let r = try_connect(&args).await;
+        match r {
+            Ok(stream) => {
+                tracing::info!("session connected");
+                last_success = true;
+
+                let mut session = make_stream_session(stream).await?;
+
+                {
+                    shared.data.lock().ctrl = Some(session.ctrl_client().clone_invoker());
+                }
+                
+                let r = session.wait_for_completed().await;
+                tracing::info!("session finished {r:?}");
+            },
+            Err(e) => {
+                if last_success {
+                    last_success = false;
+                    tracing::warn!("connect failed [{e:?}]");
+                    tracing::info!("try reconnecting...");
+                }
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            },
+        }
+    }
+
+}
+
+
+struct Shared<H: CtrlHandler> {
+    data: Mutex<SharedData<H>>,
+}
+
+struct SharedData<H: CtrlHandler> {
+    ctrl: Option<CtrlInvoker<H>>,
+}
+
+async fn try_connect(args: &CmdArgs) -> Result<impl PacketStream> {
     let url = client_select_url(&args.url, args.agent.as_deref()).await?;
     let url = url.as_str();
 
     let (stream, _r) = ws_connect_to(url).await
     .with_context(||format!("fail to connect to [{}]", url))?;
-
-    tracing::debug!("connected to [{}]", url);
-
-    let uid = gen_huid();
-    let mut switch_session = make_stream_switch(uid, stream).await?;
-    let switch = switch_session.clone_invoker();
-
-    let ctrl_ch_id = ChId(0);
-
-    let (ctrl_tx, ctrl_rx) = ChPair::new(ctrl_ch_id).split();
-    let ctrl_tx = switch.add_channel(ctrl_ch_id, ctrl_tx).await?;
-    
-    let pair = ChPair { tx: ctrl_tx, rx: ctrl_rx };
-
-    // let mut ctrl = ClientChannelCtrl::new(pair, invoker);
-    let mut ctrl_session = make_ctrl_client(uid, pair, switch).await?;
-    let ctrl = ctrl_session.clone_invoker();
-
-    let listener = TcpListener::bind(&args.listen).await
-    .with_context(||format!("fail to bind address [{}]", args.listen))?;
-    tracing::debug!("socks5 listen on [{}]", args.listen);
-    
-    let mut watch = ctrl.watch().await?;
-
-    tokio::select! {
-        r = run_socks_server(ctrl, listener) => {
-            tracing::debug!("socks server completed {:?}", r);
-        }
-        r = watch.watch() => {
-            tracing::debug!("connection completed {:?}", r);
-        }
-    }
-    
-
-    println!("\r");
-    switch_session.shutdown_and_waitfor().await?;
-    ctrl_session.shutdown_and_waitfor().await?;
-
-    Ok(())
+    Ok(stream)
 }
 
-async fn run_socks_server<H: CtrlHandler>( ctrl: CtrlInvoker<H>, listener: TcpListener ) -> Result<()> {
+
+
+async fn run_socks_server<H: CtrlHandler>( shared: Arc<Shared<H>>, listener: TcpListener ) -> Result<()> {
     let mut next_ch_id = NextChId::default();
     loop {
         let (stream, peer_addr)  = listener.accept().await.with_context(||"accept tcp failed")?;
         
         tracing::debug!("[{peer_addr}] client connected");
-        let ctrl = ctrl.clone();
-        let ch_id = next_ch_id.next_ch_id();
 
-        tokio::spawn(async move {
-            
-            let r = handle_client(
-                ctrl,
-                ch_id,
-                stream, 
-                peer_addr,
-            ).await;
-            tracing::debug!("[{peer_addr}] client finished with {r:?}");
-            r
-        });
+        let r = {
+            shared.data.lock().ctrl.clone()
+        };
+
+        match r {
+            Some(ctrl) => {
+                let ch_id = next_ch_id.next_ch_id();
+        
+                tokio::spawn(async move {
+                    
+                    let r = handle_client(
+                        ctrl,
+                        ch_id,
+                        stream, 
+                        peer_addr,
+                    ).await;
+                    tracing::debug!("[{peer_addr}] client finished with {r:?}");
+                    r
+                });
+            },
+            None => {},
+        }
     }
 }
 
