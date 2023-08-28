@@ -106,10 +106,16 @@ async fn run_loop(url: &url::Url, expire_in: Duration) {
                 let r = session.wait_for_completed().await;
                 tracing::info!("session finished {r:?}");
             },
-            Err(e) => {
+            Err(_e) => {
                 if last_success {
                     last_success = false;
-                    tracing::warn!("connect failed [{e:?}]");
+
+                    if cfg!(debug_assertions) {
+                        tracing::warn!("connect failed [{_e:?}]");
+                    } else {
+                        tracing::warn!("connect failed");
+                    }
+                    
                     tracing::info!("try reconnecting...");
                 }
                 tokio::time::sleep(Duration::from_millis(1000)).await;
