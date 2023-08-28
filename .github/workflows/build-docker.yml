@@ -20,6 +20,7 @@ jobs:
       run: |
         cd rtun
         cargo build --release
+        cp ./target/release/rtun ../docker/build/
         cd ../docker/build 
         docker build -t ubuntu-rtun .
 

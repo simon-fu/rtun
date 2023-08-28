@@ -1,6 +1,6 @@
 FROM ubuntu:23.10
 
-COPY ../../../target/release/rtun /usr/bin/rtun
+COPY rtun /usr/bin/rtun
 RUN chmod +x /usr/bin/rtun
 
 COPY entrypoint.sh /usr/bin/entrypoint.sh
