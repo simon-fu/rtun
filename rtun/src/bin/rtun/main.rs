@@ -2,7 +2,7 @@
 TODO:
     - 支持 cmd exec 
     - 支持 agent 和 client 鉴权
-    
+
     - 支持 环境变量 设置 日志级别
     - 支持 agent pub 断开重试
     = 支持 socks client 断开重试
@@ -34,6 +34,8 @@ pub mod client_ch_pty;
 pub mod rest_proto;
 
 pub mod client_utils;
+
+pub mod secret;
 
 // refer https://github.com/clap-rs/clap/tree/master/clap_derive/examples
 #[derive(Parser, Debug)]

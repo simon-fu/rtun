@@ -13,7 +13,7 @@ pub async fn run(args0: CmdArgs) -> Result<()> {
     let mut url = url::Url::parse(&args0.url)
     .with_context(||"invalid url")?;
 
-    make_pub_url(&mut url, args0.agent.as_deref())?; 
+    make_pub_url(&mut url, args0.agent.as_deref(), args0.secret.as_deref())?; 
     make_ws_scheme(&mut url)?;
     
     let url = url.as_str();
@@ -119,6 +119,12 @@ pub struct CmdArgs {
         // multiple_occurrences = true
     )]
     agent: Option<String>,
+
+    #[clap(
+        long = "secret",
+        long_help = "authentication secret",
+    )]
+    secret: Option<String>,
 
     // #[clap(
     //     short = 'r',

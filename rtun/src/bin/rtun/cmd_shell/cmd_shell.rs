@@ -6,7 +6,7 @@ use crate::{terminal::run_term, client_utils::client_select_url};
 
 pub async fn run(args: CmdArgs) -> Result<()> { 
 
-    let url = client_select_url(&args.url, args.agent.as_deref()).await?;
+    let url = client_select_url(&args.url, args.agent.as_deref(), args.secret.as_deref()).await?;
     let url = url.as_str();
 
     let (stream, _r) = ws_connect_to(url).await
@@ -109,6 +109,12 @@ pub struct CmdArgs {
         long_help = "agent name",
     )]
     agent: Option<String>,
+
+    #[clap(
+        long = "secret",
+        long_help = "authentication secret",
+    )]
+    secret: Option<String>,
 }
 
 

@@ -64,6 +64,11 @@ shadowsocks = "=1.15.4"
 shadowsocks-service = { version = "=1.15.4", features = ["local", "local-socks4"] }
 byte_string = "=1.0.0"
 
+hmac = "=0.12.1"
+sha2 = "=0.10.7"
+base64 = "=0.21.3"
+chrono = "=0.4.26"
+
 # 试验性
 # snafu = "=0.7.5"
 # snafu = { version = "0.5", features = ["futures-01"] }

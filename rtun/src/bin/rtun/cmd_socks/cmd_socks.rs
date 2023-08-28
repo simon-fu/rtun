@@ -72,7 +72,7 @@ struct SharedData<H: CtrlHandler> {
 }
 
 async fn try_connect(args: &CmdArgs) -> Result<impl PacketStream> {
-    let url = client_select_url(&args.url, args.agent.as_deref()).await?;
+    let url = client_select_url(&args.url, args.agent.as_deref(), args.secret.as_deref()).await?;
     let url = url.as_str();
 
     let (stream, _r) = ws_connect_to(url).await
@@ -181,5 +181,11 @@ pub struct CmdArgs {
         default_value = "0.0.0.0:2080",
     )]
     listen: String,
+
+    #[clap(
+        long = "secret",
+        long_help = "authentication secret",
+    )]
+    secret: Option<String>,
 }
 

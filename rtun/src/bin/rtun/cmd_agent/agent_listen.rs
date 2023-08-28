@@ -24,7 +24,7 @@ use axum::{
     Router,
 };
 
-use crate::rest_proto::{PUB_WS, SUB_WS, PUB_SESSIONS, PubParams, SubParams, AgentInfo};
+use crate::{rest_proto::{PUB_WS, SUB_WS, PUB_SESSIONS, PubParams, SubParams, AgentInfo}, secret::token_verify};
 
 
 pub async fn run(args: CmdArgs) -> Result<()> {
@@ -38,10 +38,10 @@ pub async fn run(args: CmdArgs) -> Result<()> {
     } else {
         None
     };
-    
 
     let shared = Arc::new(Shared {
         local: local_agent.as_ref().map(|x|x.clone_ctrl()),
+        secret: args.secret.clone(),
         data: Default::default(),
     });
 
@@ -95,9 +95,9 @@ pub async fn run(args: CmdArgs) -> Result<()> {
     });
     
     if is_https {
-        tracing::debug!("agent listening on https://{}", addr);
+        tracing::info!("agent listening on https://{}", addr);
     } else {
-        tracing::debug!("agent listening on http://{}", addr);
+        tracing::info!("agent listening on http://{}", addr);
     }
     
 
@@ -181,6 +181,10 @@ async fn handle_ws_pub(
     Query(mut params): Query<PubParams>,
 ) -> impl IntoResponse {
 
+    if let Err(_e) = token_verify(shared.secret.as_deref(), &params.token) {
+        return StatusCode::UNAUTHORIZED.into_response()
+    }
+
     let uid = gen_huid();
     tracing::debug!("[{}] pub connected from {addr}, {params:?}", uid);
     
@@ -231,14 +235,14 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
             ctrl_invoker,
         });
     }
-    tracing::debug!("add agent session [{key}]-[{}], addr [{}]", uid, addr);
+    tracing::info!("add agent session [{key}]-[{}], addr [{}]", uid, addr);
 
     let _r = session.wait_for_completed().await; 
     
     let _r = {
         shared.data.lock().agent_clients.remove(&key)
     };
-    tracing::debug!("remove agent session [{}], addr [{}]", uid, addr);
+    tracing::info!("remove agent session [{}], addr [{}]", uid, addr);
 
     // let _r = ctrl_client.wait_for_completed().await?;
 
@@ -249,6 +253,11 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
 async fn get_pub_sessions (
     Extension(shared): Extension<Arc<Shared>>,
 ) -> impl IntoResponse {
+
+    // if let Err(_e) = token_verify(shared.secret.as_deref(), &params.token) {
+    //     return StatusCode::UNAUTHORIZED.into_response()
+    // }
+
     let sessions: Vec<AgentInfo> = {
         shared.data.lock().agent_clients.iter().map(|x|{
             AgentInfo {
@@ -268,6 +277,10 @@ async fn handle_ws_sub(
     Query(params): Query<SubParams>,
 ) -> impl IntoResponse {
 
+    if let Err(_e) = token_verify(shared.secret.as_deref(), &params.token) {
+        return StatusCode::UNAUTHORIZED.into_response()
+    }
+
     tracing::debug!("connected from {addr}, {params:?}", );
 
     let agent_name = params.agent.as_deref().unwrap_or("local");
@@ -275,12 +288,12 @@ async fn handle_ws_sub(
         if let Some(local) = shared.local.as_ref() {
             let uid = gen_huid();
             let ctrl = local.clone();
-            tracing::debug!("sub local [{uid}]");
+            tracing::info!("[{uid}] [{addr}] sub local ");
     
             return ws.on_upgrade(move |socket| async move {
                 // let r = handle_local_sub_conn(shared, uid, socket).await;
                 let r = run_sub_agent(ctrl, uid, socket).await;
-                tracing::debug!("[{}] sub conn finished with [{:?}]", uid, r);
+                tracing::info!("[{}] sub conn finished with [{:?}]", uid, r);
             })
         }
     }
@@ -290,11 +303,11 @@ async fn handle_ws_sub(
     };
     if let Some(ctrl) = r {
         let uid = gen_huid();
-        tracing::debug!("sub agent [{}]", agent_name);
+        tracing::info!("[{uid}] [{addr}] sub agent [{agent_name}]");
 
         return ws.on_upgrade(move |socket| async move {
             let r = run_sub_agent(ctrl, uid, socket).await;
-            tracing::debug!("[{}] sub conn finished with [{:?}]", uid, r);
+            tracing::info!("[{}] sub conn finished with [{:?}]", uid, r);
         })
     }
 
@@ -363,6 +376,7 @@ async fn run_sub_agent<H1: CtrlHandler>(ctrl: CtrlInvoker<H1>, uid: HUId, socket
 
 
 struct Shared {
+    secret: Option<String>,
     local: Option<AgentCtrlInvoker>,
     data: Mutex<SharedData>,
 }
@@ -413,5 +427,11 @@ pub struct CmdArgs {
         long_help = "http key file",
     )]
     https_key: Option<String>,
+
+    #[clap(
+        long = "secret",
+        long_help = "authentication secret",
+    )]
+    secret: Option<String>,
 }
 
