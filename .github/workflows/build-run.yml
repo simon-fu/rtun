@@ -7,7 +7,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  build-run-agent:
 
     runs-on: ubuntu-latest
 

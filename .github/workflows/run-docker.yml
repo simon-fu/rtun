@@ -1,0 +1,22 @@
+name: Run docker
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  REPO_GIT_HASH: ${{ github.sha }}
+
+jobs:
+  run-agent:
+
+    runs-on: ubuntu-latest
+    container: simonfucn/ubuntu-rtun:latest
+
+    steps:
+
+    - name: run-agent
+      run: |
+        /user/bin/rtun agent pub "${{ secrets.MY_CONN_URL }}" --agent rtun
+
+
