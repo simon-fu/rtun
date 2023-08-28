@@ -17,6 +17,6 @@ jobs:
 
     - name: run-agent
       run: |
-        rtun agent pub "${{ secrets.MY_CONN_URL }}" --agent rtun --expire_in 60
+        rtun agent pub "${{ secrets.MY_CONN_URL }}" --agent rtun --expire_in 60 --secret ${{ secrets.MY_CONN_SECRET }}
 
 
