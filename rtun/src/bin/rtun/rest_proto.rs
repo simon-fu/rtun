@@ -1,4 +1,6 @@
 
+use std::borrow::Cow;
+
 use anyhow::{Result, bail, anyhow};
 use chrono::Local;
 use serde::{ Serialize, Deserialize };
@@ -8,6 +10,13 @@ use crate::secret::token_gen;
 pub const PUB_WS: &str = "/pub/ws";
 pub const SUB_WS: &str = "/sub/ws";
 pub const PUB_SESSIONS: &str = "/pub/sessions";
+
+pub fn get_agent_from_url(url: &url::Url) -> Option<Cow<'_, str>> {
+    let r = url.query_pairs()
+    .find(|x|x.0 == "agent")
+    .map(|x|x.1);
+    r
+}
 
 pub fn make_pub_url(url: &mut url::Url, agent_name: Option<&str>, secret: Option<&str>) -> Result<()> {
     let path = url.path().trim_end_matches('/');

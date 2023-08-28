@@ -2,17 +2,18 @@ use anyhow::{Result, Context};
 use clap::Parser;
 use rtun::{ws::client::ws_connect_to, switch::{switch_stream::make_stream_switch, ctrl_client::make_ctrl_client}, huid::gen_huid::gen_huid, channel::{ChId, ChPair}, proto::OpenShellArgs, term::async_input::get_term_size};
 
-use crate::{terminal::run_term, client_utils::client_select_url};
+use crate::{terminal::run_term, client_utils::client_select_url, rest_proto::get_agent_from_url};
 
 pub async fn run(args: CmdArgs) -> Result<()> { 
 
     let url = client_select_url(&args.url, args.agent.as_deref(), args.secret.as_deref()).await?;
-    let url = url.as_str();
+    let url_str = url.as_str();
 
-    let (stream, _r) = ws_connect_to(url).await
-    .with_context(||format!("fail to connect to [{}]", url))?;
+    let (stream, _r) = ws_connect_to(url_str).await
+    .with_context(||format!("fail to connect to [{}]", url_str))?;
 
-    tracing::debug!("connected to [{}]", url);
+    tracing::info!("select agent {:?}", get_agent_from_url(&url));
+    tracing::debug!("connected to [{}]", url_str);
 
     let uid = gen_huid();
     let mut switch_session = make_stream_switch(uid, stream).await?;

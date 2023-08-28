@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use rtun::{ws::client::ws_connect_to, switch::{switch_stream::PacketStream, invoker_ctrl::{CtrlHandler, CtrlInvoker}, next_ch_id::NextChId, session_stream::make_stream_session}, channel::{ChId, ChPair, ChSender, ChReceiver}, proto::OpenSocksArgs, async_rt::spawn_with_name};
 use tokio::{net::{TcpListener, TcpStream}, io::{AsyncReadExt, AsyncWriteExt}};
 
-use crate::client_utils::client_select_url;
+use crate::{client_utils::client_select_url, rest_proto::get_agent_from_url};
 
 pub async fn run(args: CmdArgs) -> Result<()> { 
 
@@ -73,10 +73,13 @@ struct SharedData<H: CtrlHandler> {
 
 async fn try_connect(args: &CmdArgs) -> Result<impl PacketStream> {
     let url = client_select_url(&args.url, args.agent.as_deref(), args.secret.as_deref()).await?;
-    let url = url.as_str();
+    let url_str = url.as_str();
 
-    let (stream, _r) = ws_connect_to(url).await
-    .with_context(||format!("fail to connect to [{}]", url))?;
+    let (stream, _r) = ws_connect_to(url_str).await
+    .with_context(||format!("fail to connect to [{}]", url_str))?;
+
+    tracing::info!("select agent {:?}", get_agent_from_url(&url));
+    
     Ok(stream)
 }
 
