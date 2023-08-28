@@ -40,6 +40,9 @@ async fn query_and_select_agent(url: &url::Url) -> Result<AgentInfo> {
         bail!("agent list empty")
     }
 
+    agents.sort_by(|a, b|b.expire_at.cmp(&a.expire_at));
+    tracing::debug!("sorted agents {agents:?}");
+
     Ok(agents.swap_remove(0))
 }
 

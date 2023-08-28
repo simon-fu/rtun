@@ -1,5 +1,5 @@
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, Context};
 use clap::Parser;
@@ -15,32 +15,26 @@ pub async fn run(args0: CmdArgs) -> Result<()> {
 
     make_pub_url(&mut url, args0.agent.as_deref(), args0.secret.as_deref())?; 
     make_ws_scheme(&mut url)?;
-    
-    let url = url.as_str();
 
-    let mut last_success = true;
-    loop {
-        let r = try_connect(url).await;
-        match r {
-            Ok((name, mut session)) => {
-                tracing::info!("session connected, agent [{name}]");
-                last_success = true;
-                // let r = stream.next().await;
-                // let mut session = make_agent_session(stream).await?;
-                let r = session.wait_for_completed().await;
-                tracing::info!("session finished {r:?}");
-            },
-            Err(e) => {
-                if last_success {
-                    last_success = false;
-                    tracing::warn!("connect failed [{e:?}]");
-                    tracing::info!("try reconnecting...");
-                }
-                tokio::time::sleep(Duration::from_millis(1000)).await;
-            },
+    let expire_in = if let Some(minutes) = args0.expire_in {
+        tracing::info!("will expire in {minutes} minutes");
+        let expire_in = minutes * 60;
+        Duration::from_secs(expire_in as u64)
+    } else {
+        Duration::from_secs(9999999999 * 60)
+    };
+    
+    // let url = url.as_str();
+    tokio::select! {
+        _r = tokio::time::sleep(expire_in) => {
+            tracing::info!("running expired")
         }
-        
+        _r = run_loop(&url, expire_in) => {
+
+        }
     }
+
+    Ok(())
 
     // use rtun::huid::gen_huid::gen_huid;
     // use rtun::switch::switch_stream::make_stream_switch;
@@ -85,6 +79,46 @@ pub async fn run(args0: CmdArgs) -> Result<()> {
 
 }
 
+async fn run_loop(url: &url::Url, expire_in: Duration) {
+    let expire_at = Instant::now() + expire_in;
+
+    let mut last_success = true;
+    loop {
+        
+        let url = {
+            let now = Instant::now();
+            if now >= expire_at {
+                return
+            }
+            let expire_in = expire_at - now;
+            let mut url = url.clone();
+            url.query_pairs_mut().append_pair("expire_in", expire_in.as_millis().to_string().as_str());
+            url
+        };
+
+        let r = try_connect(url.as_str()).await;
+        match r {
+            Ok((name, mut session)) => {
+                tracing::info!("session connected, agent [{name}]");
+                last_success = true;
+                // let r = stream.next().await;
+                // let mut session = make_agent_session(stream).await?;
+                let r = session.wait_for_completed().await;
+                tracing::info!("session finished {r:?}");
+            },
+            Err(e) => {
+                if last_success {
+                    last_success = false;
+                    tracing::warn!("connect failed [{e:?}]");
+                    tracing::info!("try reconnecting...");
+                }
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            },
+        }
+        
+    }
+}
+
 async fn try_connect(url: &str) -> Result<(String, AgentSession<impl PacketStream>)> {
     let (stream, rsp) = ws_connect_to(url).await
     .with_context(||format!("fail to connect to [{}]", url))?;
@@ -121,10 +155,18 @@ pub struct CmdArgs {
     agent: Option<String>,
 
     #[clap(
+        short = 's',
         long = "secret",
         long_help = "authentication secret",
     )]
     secret: Option<String>,
+
+    #[clap(
+        short = 'd',
+        long = "expire_in",
+        long_help = "expire duration in unit of minutes",
+    )]
+    expire_in: Option<i64>,
 
     // #[clap(
     //     short = 'r',

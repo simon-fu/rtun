@@ -5,6 +5,7 @@
 
 use anyhow::{Result, Context, bail};
 use axum_server::{Handle, tls_rustls::RustlsConfig};
+use chrono::Local;
 use clap::Parser;
 use axum::{Extension, extract::Query, http::StatusCode, Json};
 use parking_lot::Mutex;
@@ -233,6 +234,9 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
         shared.data.lock().agent_clients.insert(key.clone(), AgentSession { 
             addr, 
             ctrl_invoker,
+            expire_at: params.expire_in.map(
+                |x|Local::now().timestamp_millis() as u64  + x 
+            ) .unwrap_or(u64::MAX/2),
         });
     }
     tracing::info!("add agent session [{key}]-[{}], addr [{}]", uid, addr);
@@ -263,6 +267,7 @@ async fn get_pub_sessions (
             AgentInfo {
                 name: x.0.clone(),
                 addr: x.1.addr.to_string(),
+                expire_at: x.1.expire_at,
             }
         }).collect()
     };
@@ -389,6 +394,7 @@ struct SharedData {
 struct AgentSession {
     addr: SocketAddr,
     ctrl_invoker: CtrlClientAgent,
+    expire_at: u64,
 }
 
 

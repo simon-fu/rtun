@@ -62,12 +62,14 @@ pub fn make_ws_scheme(url: &mut url::Url) -> Result<()> {
 pub struct AgentInfo {
     pub name: String,
     pub addr: String,
+    pub expire_at: u64,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PubParams {
     pub agent: Option<String>,
     pub token: String,
+    pub expire_in: Option<u64>,
 }
 
 pub type SubParams = PubParams;
