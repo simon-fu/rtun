@@ -19,7 +19,7 @@ jobs:
     - name: Build Docker image
       run: |
         cd rtun
-        cargo run --release
+        cargo build --release
         cd docker/build 
         docker build -t ubuntu-rtun .
 

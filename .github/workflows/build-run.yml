@@ -1,4 +1,4 @@
-name: Run agent
+name: Build and run agent
 
 on:
   workflow_dispatch:
