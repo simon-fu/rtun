@@ -20,7 +20,7 @@ jobs:
       run: |
         cd rtun
         cargo build --release
-        cd docker/build 
+        cd ../docker/build 
         docker build -t ubuntu-rtun .
 
     - name: Log in to Docker Hub
