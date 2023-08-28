@@ -200,7 +200,7 @@ impl Socks5TcpHandler {
                 return Ok(());
             }
             Err(err) => {
-                error!("socks5 handshake error: {}", err);
+                debug!("socks5 handshake error: {}", err);
                 return Err(err.into());
             }
         };
@@ -212,7 +212,7 @@ impl Socks5TcpHandler {
         let header = match TcpRequestHeader::read_from(&mut stream).await {
             Ok(h) => h,
             Err(err) => {
-                error!("failed to get TcpRequestHeader: {}, peer: {}", err, peer_addr);
+                debug!("failed to get TcpRequestHeader: {}, peer: {}", err, peer_addr);
                 let rh = TcpResponseHeader::new(err.as_reply(), Address::SocketAddress(peer_addr));
                 rh.write_to(&mut stream).await?;
                 return Err(err.into());

@@ -147,7 +147,7 @@ impl Socks5UdpServer {
                     let (n, peer_addr) = match recv_result {
                         Ok(s) => s,
                         Err(err) => {
-                            error!("udp server recv_from failed with error: {}", err);
+                            debug!("udp server recv_from failed with error: {}", err);
                             time::sleep(Duration::from_secs(1)).await;
                             continue;
                         }
@@ -160,13 +160,13 @@ impl Socks5UdpServer {
                     let header = match UdpAssociateHeader::read_from(&mut cur).await {
                         Ok(h) => h,
                         Err(..) => {
-                            error!("received invalid UDP associate packet: {:?}", ByteStr::new(data));
+                            debug!("received invalid UDP associate packet: {:?}", ByteStr::new(data));
                             continue;
                         }
                     };
 
                     if header.frag != 0 {
-                        error!("received UDP associate with frag != 0, which is not supported by shadowsocks");
+                        debug!("received UDP associate with frag != 0, which is not supported by shadowsocks");
                         continue;
                     }
 

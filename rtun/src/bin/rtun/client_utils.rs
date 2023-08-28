@@ -19,7 +19,7 @@ pub async fn client_select_url(url_str: &str, agent: Option<&str>, secret: Optio
                 None => {
                     let agent = query_and_select_agent(&url).await?;
                     make_sub_url(&mut url, Some(agent.name.as_str()), secret)?;
-                    tracing::debug!("select agent [{}]", agent.name);
+                    tracing::info!("select agent [{}]", agent.name);
                 },
             }
             

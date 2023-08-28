@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, trace, warn};
 use shadowsocks::config::Mode;
 use tokio::{
     io::{AsyncWriteExt, BufReader, AsyncRead, AsyncWrite},
@@ -61,7 +61,7 @@ impl Socks4TcpHandler {
                 return Ok(());
             }
             Err(err) => {
-                error!("socks4 handshake error: {}", err);
+                debug!("socks4 handshake error: {}", err);
                 return Err(err.into());
             }
         };
