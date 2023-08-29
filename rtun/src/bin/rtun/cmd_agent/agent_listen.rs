@@ -10,7 +10,7 @@ use clap::Parser;
 use axum::{Extension, extract::Query, http::StatusCode, Json};
 use futures::{StreamExt, stream::SplitStream};
 use parking_lot::Mutex;
-use rtun::{huid::{gen_huid::gen_huid, HUId}, channel::{ChId, ChPair}, switch::{ctrl_service::spawn_ctrl_service, agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker}, ctrl_client, invoker_ctrl::{CtrlInvoker, CtrlHandler}, session_stream::make_stream_session, switch_pair::SwitchPairEntity}, ws::server::{WsStreamAxum, WsSource}, async_rt::spawn_with_name};
+use rtun::{huid::{gen_huid::gen_huid, HUId}, channel::{ChId, ChPair}, switch::{ctrl_service::spawn_ctrl_service, agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker}, ctrl_client, invoker_ctrl::{CtrlInvoker, CtrlHandler}, session_stream::make_stream_session, switch_pair::{SwitchPairEntity, make_switch_pair}}, ws::server::{WsStreamAxum, WsSource}, async_rt::spawn_with_name};
 use tokio::net::TcpListener;
 
 use std::{sync::Arc, collections::HashMap};
@@ -365,8 +365,12 @@ async fn run_sub_agent<H1: CtrlHandler>(ctrl: CtrlInvoker<H1>, uid: HUId, socket
     // let mut session = make_ws_server_switch(uid, socket).await?;
 
     // let mut session = make_stream_switch(uid, WsStreamAxum::new(socket.split())).await?;
-    let mut session = make_stream_session( WsStreamAxum::new(socket.split()).split() ).await?;
-    let switch = session.switch().clone_invoker();
+    let mut session = make_switch_pair(uid, WsStreamAxum::new(socket.split()).split()).await?;
+    let switch = session.clone_invoker();
+
+    // let mut session = make_stream_session( WsStreamAxum::new(socket.split()).split() ).await?;
+    // let switch = session.switch().clone_invoker();
+
 
     let ctrl_ch_id = ChId(0);
     let (ctrl_tx, ctrl_rx) = ChPair::new(ctrl_ch_id).split();

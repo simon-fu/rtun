@@ -139,9 +139,11 @@ async fn handle_client<H: CtrlHandler>(
     let ch_tx = ctrl.open_socks(ch_tx, open_args).await?;
     tracing::debug!("opened socks {} -> {:?}", peer_addr, ch_tx.ch_id());
 
-    // let r = copy_loop(&mut stream, &ch_tx, &mut ch_rx).await;
+    // let mut ch_rx = ch_rx;
+    // let r = copy::copy_loop(&mut stream, &ch_tx, &mut ch_rx).await;
 
     let mut ch_stream = ChStream::new2(ch_tx, ch_rx);
+    // let r = copy_stream_bidir(&mut stream, &mut ch_stream).await;
     let r = tokio::io::copy_bidirectional(&mut stream, &mut ch_stream).await;
     
     let _r = ctrl.close_channel(ch_id).await;
@@ -149,27 +151,36 @@ async fn handle_client<H: CtrlHandler>(
     Ok(())
 }
 
-// async fn copy_loop(stream: &mut TcpStream, ch_tx: &ChSender, ch_rx: &mut ChReceiver) -> Result<()> {
-//     let mut buf = BytesMut::new();
-//     loop {
-//         tokio::select! {
-//             r = ch_rx.recv_packet() => {
-//                 let packet = r.with_context(||"recv but channel closed")?;
+// mod copy {
+//     use anyhow::{Result, bail, Context, anyhow};
+//     use bytes::BytesMut;
+//     use rtun::channel::{ChSender, ChReceiver};
+//     use tokio::{net::TcpStream, io::{AsyncWriteExt, AsyncReadExt}};
 
-//                 stream.write_all(&packet.payload[..]).await?;
-//             },
-//             r = stream.read_buf(&mut buf) => {
-//                 let n = r?;
-//                 if n == 0 {
-//                     bail!("socket closed")
+//     pub async fn copy_loop(stream: &mut TcpStream, ch_tx: &ChSender, ch_rx: &mut ChReceiver) -> Result<()> {
+//         let mut buf = BytesMut::new();
+//         loop {
+//             tokio::select! {
+//                 r = ch_rx.recv_packet() => {
+//                     let packet = r.with_context(||"recv but channel closed")?;
+    
+//                     stream.write_all(&packet.payload[..]).await
+//                     .with_context(||"write but stream closed")?;
+//                 },
+//                 r = stream.read_buf(&mut buf) => {
+//                     let n = r.with_context(||"recv but stream closed")?;
+//                     if n == 0 {
+//                         bail!("socket recv-zero closed")
+//                     }
+//                     let payload = buf.split().freeze();
+//                     ch_tx.send_data(payload).await
+//                     .map_err(|_e|anyhow!("send but channel closed"))?;
 //                 }
-//                 let payload = buf.split().freeze();
-//                 ch_tx.send_data(payload).await
-//                 .map_err(|_e|anyhow!("send but channel closed"))?;
 //             }
 //         }
 //     }
 // }
+
 
 
 #[derive(Parser, Debug)]

@@ -44,3 +44,15 @@ where
     let span = tracing::span!(parent:None, tracing::Level::INFO, "", s = &name[..]);
     tokio::spawn(tracing::Instrument::instrument(fut, span))
 }
+
+#[inline]
+pub fn spawn_with_inherit<I, T>(name: I, fut: T) -> tokio::task::JoinHandle<T::Output>
+where
+    I: Into<String>,
+    T: std::future::Future + Send + 'static,
+    T::Output: Send + 'static,
+{
+    let name:String = name.into();
+    let span = tracing::span!(tracing::Level::INFO, "", s = &name[..]);
+    tokio::spawn(tracing::Instrument::instrument(fut, span))
+}

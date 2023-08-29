@@ -226,12 +226,32 @@ async fn handle_next<H: SwitchHanlder>(entity: &mut Entity<H>, next: Next) -> Re
         Next::SwitchGone => { tracing::debug!("switch has gone"); },
         Next::CtrlChBroken => { tracing::debug!("ctrl channel broken"); },
         Next::Ping => {
-            let pong = c2a_ping(&mut entity.pair, Ping {
+            let timeout = Duration::from_millis(90*1000);
+            let r = tokio::time::timeout(timeout, c2a_ping(&mut entity.pair, Ping {
                 timestamp: Local::now().timestamp_millis(),
                 ..Default::default()
-            }).await?;
-            let elapsed = Local::now().timestamp_millis() - pong.timestamp;
-            tracing::debug!("ping/pong elapsed {elapsed} ms\r");
+            })).await;
+
+            match r {
+                Ok(r) => {
+                    let pong = r?;
+                    let elapsed = Local::now().timestamp_millis() - pong.timestamp;
+                    tracing::debug!("ping/pong elapsed {elapsed} ms\r");
+                },
+                Err(_elapsed) => {
+                    tracing::warn!("ping/pong timeout {timeout:?}, shutdown switch\r");
+                    entity.switch.shutdown().await
+                },
+            }
+
+            // let pong = c2a_ping(&mut entity.pair, Ping {
+            //     timestamp: Local::now().timestamp_millis(),
+            //     ..Default::default()
+            // }).await?;
+            // let elapsed = Local::now().timestamp_millis() - pong.timestamp;
+            // tracing::debug!("ping/pong elapsed {elapsed} ms\r");
+
+            
             return Ok(Action::None)
         },
     }
