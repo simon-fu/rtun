@@ -1,11 +1,11 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use anyhow::{Result, Context, bail, anyhow};
-use bytes::BytesMut;
+use anyhow::{Result, Context};
+
 use clap::Parser;
 use parking_lot::Mutex;
-use rtun::{ws::client::ws_connect_to, switch::{switch_stream::PacketStream, invoker_ctrl::{CtrlHandler, CtrlInvoker}, next_ch_id::NextChId, session_stream::make_stream_session}, channel::{ChId, ChPair, ChSender, ChReceiver}, proto::OpenSocksArgs, async_rt::spawn_with_name};
-use tokio::{net::{TcpListener, TcpStream}, io::{AsyncReadExt, AsyncWriteExt}};
+use rtun::{ws::client::ws_connect_to, switch::{invoker_ctrl::{CtrlHandler, CtrlInvoker}, next_ch_id::NextChId, session_stream::{make_stream_session, StreamSession}, switch_sink::PacketSink, switch_source::PacketSource}, channel::{ChId, ChPair, ch_stream::ChStream}, proto::OpenSocksArgs, async_rt::spawn_with_name};
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::{client_utils::client_select_url, rest_proto::get_agent_from_url};
 
@@ -36,11 +36,11 @@ pub async fn run(args: CmdArgs) -> Result<()> {
 
         let r = try_connect(&args).await;
         match r {
-            Ok(stream) => {
+            Ok(mut session) => {
                 tracing::info!("session connected");
                 last_success = true;
 
-                let mut session = make_stream_session(stream).await?;
+                // let mut session = make_stream_session(stream).await?;
 
                 {
                     shared.data.lock().ctrl = Some(session.ctrl_client().clone_invoker());
@@ -71,7 +71,7 @@ struct SharedData<H: CtrlHandler> {
     ctrl: Option<CtrlInvoker<H>>,
 }
 
-async fn try_connect(args: &CmdArgs) -> Result<impl PacketStream> {
+async fn try_connect(args: &CmdArgs) -> Result<StreamSession<impl PacketSink, impl PacketSource>> {
     let url = client_select_url(&args.url, args.agent.as_deref(), args.secret.as_deref()).await?;
     let url_str = url.as_str();
 
@@ -79,8 +79,12 @@ async fn try_connect(args: &CmdArgs) -> Result<impl PacketStream> {
     .with_context(||format!("fail to connect to [{}]", url_str))?;
 
     tracing::info!("select agent {:?}", get_agent_from_url(&url));
+
+    // let uid = gen_huid();
+    // let mut switch = make_switch_pair(uid, stream.split()).await?;
+    let session = make_stream_session(stream.split()).await?;
     
-    Ok(stream)
+    Ok(session)
 }
 
 
@@ -124,7 +128,7 @@ async fn handle_client<H: CtrlHandler>(
     peer_addr: SocketAddr 
 ) -> Result<()> {
 
-    let (ch_tx, mut ch_rx) = ChPair::new(ch_id).split();
+    let (ch_tx, ch_rx) = ChPair::new(ch_id).split();
 
     let open_args = OpenSocksArgs {
         ch_id: Some(ch_id.0),
@@ -135,32 +139,37 @@ async fn handle_client<H: CtrlHandler>(
     let ch_tx = ctrl.open_socks(ch_tx, open_args).await?;
     tracing::debug!("opened socks {} -> {:?}", peer_addr, ch_tx.ch_id());
 
-    let r = copy_loop(&mut stream, &ch_tx, &mut ch_rx).await;
+    // let r = copy_loop(&mut stream, &ch_tx, &mut ch_rx).await;
+
+    let mut ch_stream = ChStream::new2(ch_tx, ch_rx);
+    let r = tokio::io::copy_bidirectional(&mut stream, &mut ch_stream).await;
+    
     let _r = ctrl.close_channel(ch_id).await;
-    r
+    r?;
+    Ok(())
 }
 
-async fn copy_loop(stream: &mut TcpStream, ch_tx: &ChSender, ch_rx: &mut ChReceiver) -> Result<()> {
-    let mut buf = BytesMut::new();
-    loop {
-        tokio::select! {
-            r = ch_rx.recv_packet() => {
-                let packet = r.with_context(||"recv but channel closed")?;
+// async fn copy_loop(stream: &mut TcpStream, ch_tx: &ChSender, ch_rx: &mut ChReceiver) -> Result<()> {
+//     let mut buf = BytesMut::new();
+//     loop {
+//         tokio::select! {
+//             r = ch_rx.recv_packet() => {
+//                 let packet = r.with_context(||"recv but channel closed")?;
 
-                stream.write_all(&packet.payload[..]).await?;
-            },
-            r = stream.read_buf(&mut buf) => {
-                let n = r?;
-                if n == 0 {
-                    bail!("socket closed")
-                }
-                let payload = buf.split().freeze();
-                ch_tx.send_data(payload).await
-                .map_err(|_e|anyhow!("send but channel closed"))?;
-            }
-        }
-    }
-}
+//                 stream.write_all(&packet.payload[..]).await?;
+//             },
+//             r = stream.read_buf(&mut buf) => {
+//                 let n = r?;
+//                 if n == 0 {
+//                     bail!("socket closed")
+//                 }
+//                 let payload = buf.split().freeze();
+//                 ch_tx.send_data(payload).await
+//                 .map_err(|_e|anyhow!("send but channel closed"))?;
+//             }
+//         }
+//     }
+// }
 
 
 #[derive(Parser, Debug)]
@@ -181,7 +190,7 @@ pub struct CmdArgs {
         short = 'l',
         long = "listen",
         long_help = "listen address",
-        default_value = "0.0.0.0:2080",
+        default_value = "0.0.0.0:12080",
     )]
     listen: String,
 

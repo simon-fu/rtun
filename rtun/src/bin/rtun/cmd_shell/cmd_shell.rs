@@ -1,6 +1,6 @@
 use anyhow::{Result, Context};
 use clap::Parser;
-use rtun::{ws::client::ws_connect_to, switch::{switch_stream::make_stream_switch, ctrl_client::make_ctrl_client}, huid::gen_huid::gen_huid, channel::{ChId, ChPair}, proto::OpenShellArgs, term::async_input::get_term_size};
+use rtun::{ws::client::ws_connect_to, switch::{ctrl_client::make_ctrl_client, switch_pair::make_switch_pair}, huid::gen_huid::gen_huid, channel::{ChId, ChPair}, proto::OpenShellArgs, term::async_input::get_term_size};
 
 use crate::{terminal::run_term, client_utils::client_select_url, rest_proto::get_agent_from_url};
 
@@ -16,7 +16,8 @@ pub async fn run(args: CmdArgs) -> Result<()> {
     tracing::debug!("connected to [{}]", url_str);
 
     let uid = gen_huid();
-    let mut switch_session = make_stream_switch(uid, stream).await?;
+    // let mut switch_session = make_stream_switch(uid, stream).await?;
+    let mut switch_session = make_switch_pair( uid, stream.split() ).await?;
     let switch = switch_session.clone_invoker();
 
     let ctrl_ch_id = ChId(0);

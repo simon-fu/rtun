@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, Context, bail};
 
 use bytes::Bytes;
 use protobuf::Message;
-use crate::{async_rt::spawn_with_name, huid::HUId, proto::{C2ARequest, c2arequest::C2a_req_args, make_open_shell_response_ok, make_open_shell_response_error, make_response_status_ok}, channel::{ChPair, ChId, ChSender}};
+use crate::{async_rt::spawn_with_name, huid::HUId, proto::{C2ARequest, c2arequest::C2a_req_args, make_open_shell_response_ok, make_open_shell_response_error, make_response_status_ok, Pong}, channel::{ChPair, ChId, ChSender}};
 
 use super::{invoker_ctrl::{CtrlHandler, CtrlInvoker}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId};
 
@@ -106,6 +106,17 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                 ctrl_tx.send_data(data).await
                 .map_err(|_x|anyhow!("send data fail"))?;
                 // tracing::debug!("send closing ch ok");
+            },
+
+            C2a_req_args::Ping(args) => {
+                let rsp = Pong {
+                    timestamp: args.timestamp,
+                    ..Default::default()
+                };
+
+                let data: Bytes = rsp.write_to_bytes()?.into();
+                ctrl_tx.send_data(data).await
+                .map_err(|_x|anyhow!("send data fail"))?;
             }
         }
     }

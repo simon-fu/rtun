@@ -1,11 +1,14 @@
 
 
+use std::time::Duration;
+
 use anyhow::{Result, anyhow, bail, Context};
+use chrono::Local;
 use protobuf::Message;
 
-use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, handle_msg_none, Action}, huid::HUId, channel::{ChId, ChPair}, proto::{OpenChannelRequest, OpenChannelResponse, open_channel_response::Open_ch_rsp, OpenShellArgs, C2ARequest, c2arequest::C2a_req_args, OpenSocksArgs, CloseChannelArgs, ResponseStatus}};
+use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, handle_msg_none, Action}, huid::HUId, channel::{ChId, ChPair}, proto::{OpenChannelResponse, open_channel_response::Open_ch_rsp, OpenShellArgs, C2ARequest, c2arequest::C2a_req_args, OpenSocksArgs, CloseChannelArgs, ResponseStatus, Ping, Pong}};
 
-use super::{invoker_ctrl::{OpOpenChannel, CloseChannelResult, OpenChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker, OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId, entity_watch::{OpWatch, WatchResult, CtrlGuard, CtrlWatch}};
+use super::{invoker_ctrl::{CloseChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker, OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId, entity_watch::{OpWatch, WatchResult, CtrlGuard, CtrlWatch}};
 
 pub type CtrlClientSession<H> = CtrlClient<Entity<H>>;
 pub type CtrlClientInvoker<H> = CtrlInvoker<Entity<H>>;
@@ -69,35 +72,35 @@ pub async fn make_ctrl_client<H: SwitchHanlder>(uid: HUId, pair: ChPair, switch:
 }
 
 
-#[async_trait::async_trait]
-impl<H: SwitchHanlder> AsyncHandler<OpOpenChannel> for Entity<H> {
-    type Response = OpenChannelResult; 
+// #[async_trait::async_trait]
+// impl<H: SwitchHanlder> AsyncHandler<OpOpenChannel> for Entity<H> {
+//     type Response = OpenChannelResult; 
 
-    async fn handle(&mut self, req: OpOpenChannel) -> Self::Response {
-        let data = OpenChannelRequest {
-            open_ch_req: None,
-            ..Default::default()
-        }.write_to_bytes()?;
+//     async fn handle(&mut self, req: OpOpenChannel) -> Self::Response {
+//         let data = OpenChannelRequest {
+//             open_ch_req: None,
+//             ..Default::default()
+//         }.write_to_bytes()?;
 
-        self.pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send failed"))?;
+//         self.pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send failed"))?;
 
-        let packet = self.pair.rx.recv_packet().await.with_context(||"recv failed")?;
+//         let packet = self.pair.rx.recv_packet().await.with_context(||"recv failed")?;
 
-        let rsp = OpenChannelResponse::parse_from_bytes(&packet.payload)
-        .with_context(||"parse response failed")?
-        .open_ch_rsp.with_context(||"has no response")?;
+//         let rsp = OpenChannelResponse::parse_from_bytes(&packet.payload)
+//         .with_context(||"parse response failed")?
+//         .open_ch_rsp.with_context(||"has no response")?;
         
-        let ch_id = match rsp {
-            Open_ch_rsp::ChId(v) => ChId(v),
-            Open_ch_rsp::Status(status) => bail!("response status {:?}", status),
-            // _ => bail!("unknown"),
-        };
+//         let ch_id = match rsp {
+//             Open_ch_rsp::ChId(v) => ChId(v),
+//             Open_ch_rsp::Status(status) => bail!("response status {:?}", status),
+//             // _ => bail!("unknown"),
+//         };
 
-        let tx = self.switch.add_channel(ch_id, req.0).await?;
+//         let tx = self.switch.add_channel(ch_id, req.0).await?;
         
-        Ok(tx)
-    }
-}
+//         Ok(tx)
+//     }
+// }
 
 #[async_trait::async_trait]
 impl<H: SwitchHanlder> AsyncHandler<OpCloseChannel> for Entity<H> {
@@ -203,19 +206,40 @@ pub struct Entity<H: SwitchHanlder> {
 //     }
 // }
 
-async fn wait_next<H: SwitchHanlder>(entity: &mut Entity<H>) -> () {
+pub enum Next {
+    SwitchGone,
+    CtrlChBroken,
+    Ping,
+}
+
+async fn wait_next<H: SwitchHanlder>(entity: &mut Entity<H>) -> Next {
+    let duration = Duration::from_secs(10);
     tokio::select! {
-        _r = entity.switch_watch.watch() => { tracing::debug!("switch has gone"); }
-        _r = entity.pair.rx.recv_packet() => { tracing::debug!("ctrl channel broken"); }
+        _r = entity.switch_watch.watch() => Next::SwitchGone,
+        _r = entity.pair.rx.recv_packet() => Next::CtrlChBroken,
+        _r = tokio::time::sleep(duration) => Next::Ping,
     }
 }
 
-async fn handle_next<H: SwitchHanlder>(_entity: &mut Entity<H>, _next: ()) -> Result<Action> {
+async fn handle_next<H: SwitchHanlder>(entity: &mut Entity<H>, next: Next) -> Result<Action> {
+    match next {
+        Next::SwitchGone => { tracing::debug!("switch has gone"); },
+        Next::CtrlChBroken => { tracing::debug!("ctrl channel broken"); },
+        Next::Ping => {
+            let pong = c2a_ping(&mut entity.pair, Ping {
+                timestamp: Local::now().timestamp_millis(),
+                ..Default::default()
+            }).await?;
+            let elapsed = Local::now().timestamp_millis() - pong.timestamp;
+            tracing::debug!("ping/pong elapsed {elapsed} ms\r");
+            return Ok(Action::None)
+        },
+    }
     Ok(Action::Finished)
 }
 
 impl<H: SwitchHanlder> ActorEntity for Entity<H> {
-    type Next = ();
+    type Next = Next;
 
     type Msg = ();
 
@@ -295,4 +319,22 @@ pub async fn c2a_close_channel(pair: &mut ChPair, args: CloseChannelArgs) -> Res
     .with_context(||"parse close ch response failed")?;
 
     Ok(status)
+}
+
+pub async fn c2a_ping(pair: &mut ChPair, args: Ping) -> Result<Pong> {
+
+    let data = C2ARequest {
+        c2a_req_args: Some(C2a_req_args::Ping(args)),
+        ..Default::default()
+    }.write_to_bytes()?;
+
+    pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send close ch failed"))?;
+
+    let packet = pair.rx.recv_packet().await
+    .with_context(||"recv ping failed")?;
+
+    let pong = Pong::parse_from_bytes(&packet.payload)
+    .with_context(||"parse pong failed")?;
+
+    Ok(pong)
 }

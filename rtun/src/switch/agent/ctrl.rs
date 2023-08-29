@@ -7,8 +7,8 @@ use anyhow::Result;
 use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, wait_next_none, handle_next_none, handle_msg_none}, huid::HUId, channel::{ChSender, CHANNEL_SIZE, ChReceiver, ChId, ChSenderWeak}, async_rt::spawn_with_name, switch::{invoker_ctrl::{OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, CtrlWeak}, next_ch_id::NextChId, agent::ch_socks::ChSocks, entity_watch::{CtrlGuard, OpWatch, WatchResult}}};
 use tokio::sync::mpsc;
 
-use super::super::invoker_ctrl::{OpOpenChannel, CloseChannelResult, OpenChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker};
-use super::ch_service::channel_service;
+use super::super::invoker_ctrl::{CloseChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker};
+
 use super::ch_shell::open_shell;
 
 pub type AgentCtrlInvoker = CtrlInvoker<Entity>;
@@ -66,38 +66,38 @@ pub async fn make_agent_ctrl(uid: HUId) -> Result<AgentCtrl> {
 }
 
 
-#[async_trait::async_trait]
-impl AsyncHandler<OpOpenChannel> for Entity {
-    type Response = OpenChannelResult; 
+// #[async_trait::async_trait]
+// impl AsyncHandler<OpOpenChannel> for Entity {
+//     type Response = OpenChannelResult; 
 
-    async fn handle(&mut self, req: OpOpenChannel) -> Self::Response {
-        let local_ch_id = self.next_ch_id.next_ch_id();
-        let peer_tx = req.0;
+//     async fn handle(&mut self, req: OpOpenChannel) -> Self::Response {
+//         let local_ch_id = self.next_ch_id.next_ch_id();
+//         let peer_tx = req.0;
 
-        // let (mux_tx, mux_rx) = mpsc::channel(CHANNEL_SIZE);
-        let (local_tx, local_rx) = self.add_channel(local_ch_id, &peer_tx);
+//         // let (mux_tx, mux_rx) = mpsc::channel(CHANNEL_SIZE);
+//         let (local_tx, local_rx) = self.add_channel(local_ch_id, &peer_tx);
         
-        tracing::debug!("open channel {local_ch_id:?} -> {:?}", peer_tx.ch_id());
+//         tracing::debug!("open channel {local_ch_id:?} -> {:?}", peer_tx.ch_id());
 
-        let name = format!("{}-ch-{}->{}", self.uid, local_ch_id, peer_tx.ch_id());
+//         let name = format!("{}-ch-{}->{}", self.uid, local_ch_id, peer_tx.ch_id());
 
-        {
-            let weak = self.weak.clone();
-            spawn_with_name(name,  async move {
-                let r = channel_service(peer_tx, local_rx ).await;
-                tracing::debug!("finished with {:?}", r);
+//         {
+//             let weak = self.weak.clone();
+//             spawn_with_name(name,  async move {
+//                 let r = channel_service(peer_tx, local_rx ).await;
+//                 tracing::debug!("finished with {:?}", r);
 
-                if let Some(weak) = weak {
-                    if let Some(ctrl) = weak.upgrade() {
-                        let _r = ctrl.close_channel(local_ch_id).await;
-                    }
-                }
-            });
-        }
+//                 if let Some(weak) = weak {
+//                     if let Some(ctrl) = weak.upgrade() {
+//                         let _r = ctrl.close_channel(local_ch_id).await;
+//                     }
+//                 }
+//             });
+//         }
         
-        Ok(local_tx)
-    }
-}
+//         Ok(local_tx)
+//     }
+// }
 
 #[async_trait::async_trait]
 impl AsyncHandler<OpCloseChannel> for Entity {

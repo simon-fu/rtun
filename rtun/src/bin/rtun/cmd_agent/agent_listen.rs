@@ -8,8 +8,9 @@ use axum_server::{Handle, tls_rustls::RustlsConfig};
 use chrono::Local;
 use clap::Parser;
 use axum::{Extension, extract::Query, http::StatusCode, Json};
+use futures::{StreamExt, stream::SplitStream};
 use parking_lot::Mutex;
-use rtun::{huid::{gen_huid::gen_huid, HUId}, channel::{ChId, ChPair}, switch::{ctrl_service::spawn_ctrl_service, agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker}, switch_stream::{make_stream_switch, Entity as StreamSwitchEntity}, ctrl_client, invoker_ctrl::{CtrlInvoker, CtrlHandler}, session_stream::make_stream_session}, ws::server::WsStreamAxum, async_rt::spawn_with_name};
+use rtun::{huid::{gen_huid::gen_huid, HUId}, channel::{ChId, ChPair}, switch::{ctrl_service::spawn_ctrl_service, agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker}, ctrl_client, invoker_ctrl::{CtrlInvoker, CtrlHandler}, session_stream::make_stream_session, switch_pair::SwitchPairEntity}, ws::server::{WsStreamAxum, WsSource}, async_rt::spawn_with_name};
 use tokio::net::TcpListener;
 
 use std::{sync::Arc, collections::HashMap};
@@ -215,8 +216,9 @@ async fn handle_ws_pub(
 
 
 
-async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr: SocketAddr, params: PubParams) -> Result<()>{
-    let mut session = make_stream_session(WsStreamAxum::new(socket)).await?;
+async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr: SocketAddr, params: PubParams) -> Result<()> {
+
+    let mut session = make_stream_session(WsStreamAxum::new(socket.split()).split()).await?;
 
     // let mut session = make_stream_switch(uid, WsStreamAxum::new(socket)).await?;
     // let switch = session.clone_invoker();
@@ -361,9 +363,10 @@ async fn handle_ws_sub(
 
 async fn run_sub_agent<H1: CtrlHandler>(ctrl: CtrlInvoker<H1>, uid: HUId, socket: WebSocket) -> Result<()> {
     // let mut session = make_ws_server_switch(uid, socket).await?;
-    let mut session = make_stream_switch(uid, WsStreamAxum::new(socket)).await?;
 
-    let switch = session.clone_invoker();
+    // let mut session = make_stream_switch(uid, WsStreamAxum::new(socket.split())).await?;
+    let mut session = make_stream_session( WsStreamAxum::new(socket.split()).split() ).await?;
+    let switch = session.switch().clone_invoker();
 
     let ctrl_ch_id = ChId(0);
     let (ctrl_tx, ctrl_rx) = ChPair::new(ctrl_ch_id).split();
@@ -398,8 +401,8 @@ struct AgentSession {
 }
 
 
-type CtrlClientAgent =  CtrlInvoker<ctrl_client::Entity<StreamSwitchEntity<WsStreamAxum<WebSocket>>>>;
-
+// type CtrlClientAgent =  CtrlInvoker<ctrl_client::Entity<StreamSwitchEntity<WsStreamAxum<WebSocket>>>>;
+type CtrlClientAgent =  CtrlInvoker<ctrl_client::Entity<SwitchPairEntity< WsSource<SplitStream<WebSocket>> >>>;
 
 
 
@@ -411,7 +414,7 @@ pub struct CmdArgs {
     #[clap(
         long = "addr",
         long_help = "listen address",
-        default_value = "0.0.0.0:9888",
+        default_value = "0.0.0.0:19888",
     )]
     addr: String,
 

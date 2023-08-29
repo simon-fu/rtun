@@ -15,6 +15,12 @@ pub mod agent;
 
 pub mod switch_stream;
 
+pub mod switch_sink;
+
+pub mod switch_source;
+
+pub mod switch_pair;
+
 pub mod session_stream;
 
 pub mod session_agent;

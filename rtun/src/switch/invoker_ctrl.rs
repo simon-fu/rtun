@@ -8,7 +8,7 @@ use super::entity_watch::{OpWatch, WatchResult};
 
 pub trait CtrlHandler: ActorEntity 
 + AsyncHandler<OpWatch, Response = WatchResult>
-+ AsyncHandler<OpOpenChannel, Response = OpenChannelResult>
+// + AsyncHandler<OpOpenChannel, Response = OpenChannelResult>
 + AsyncHandler<OpCloseChannel, Response = CloseChannelResult>
 + AsyncHandler<OpOpenShell, Response = OpOpenShellResult>
 + AsyncHandler<OpOpenSocks, Response = OpOpenSocksResult>
@@ -55,9 +55,9 @@ where
     //     })
     // }
 
-    pub async fn open_channel(&self, ch_tx: ChSender) -> OpenChannelResult {
-        self.invoker.invoke(OpOpenChannel(ch_tx)).await?
-    }
+    // pub async fn open_channel(&self, ch_tx: ChSender) -> OpenChannelResult {
+    //     self.invoker.invoke(OpOpenChannel(ch_tx)).await?
+    // }
 
     pub async fn close_channel(&self, ch_id: ChId) -> CloseChannelResult {
         self.invoker.invoke(OpCloseChannel(ch_id)).await?
@@ -91,10 +91,10 @@ impl <H: CtrlHandler> CtrlWeak<H> {
 }
 
 
-#[derive(Debug)]
-pub struct OpOpenChannel(pub ChSender);
+// #[derive(Debug)]
+// pub struct OpOpenChannel(pub ChSender);
 
-pub type OpenChannelResult = Result<ChSender>;
+// pub type OpenChannelResult = Result<ChSender>;
 
 #[derive(Debug)]
 pub struct OpCloseChannel(pub ChId);

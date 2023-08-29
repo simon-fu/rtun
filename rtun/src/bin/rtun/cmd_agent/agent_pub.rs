@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, Context};
 use clap::Parser;
-use rtun::{ws::client::ws_connect_to, switch::{switch_stream::PacketStream, session_agent::{make_agent_session, AgentSession}}};
+use rtun::{ws::client::ws_connect_to, switch::{session_agent::{make_agent_session, AgentSession}, switch_sink::PacketSink, switch_source::PacketSource, switch_pair::make_switch_pair}, huid::gen_huid::gen_huid};
 
 
 use crate::rest_proto::{make_pub_url, make_ws_scheme};
@@ -125,7 +125,8 @@ async fn run_loop(url: &url::Url, expire_in: Duration) {
     }
 }
 
-async fn try_connect(url: &str) -> Result<(String, AgentSession<impl PacketStream>)> {
+async fn try_connect(url: &str) -> Result<(String, AgentSession<impl PacketSink, impl PacketSource>)> {
+
     let (stream, rsp) = ws_connect_to(url).await
     .with_context(||format!("fail to connect to [{}]", url))?;
 
@@ -134,9 +135,27 @@ async fn try_connect(url: &str) -> Result<(String, AgentSession<impl PacketStrea
     .to_str()
     .with_context(||"invalid response header")?;
 
-    let session = make_agent_session(stream).await?;
+    let uid = gen_huid();
+    // let (sink, source) = stream.split();
+    let switch_session = make_switch_pair(uid, stream.split()).await?;
+
+
+    let session = make_agent_session(switch_session).await?;
 
     Ok((agent_name.into(), session))
+
+
+    // let (stream, rsp) = ws_connect_to(url).await
+    // .with_context(||format!("fail to connect to [{}]", url))?;
+
+    // let agent_name = rsp.headers().get("agent_name")
+    // .with_context(||"No agent_name field in response headers")?
+    // .to_str()
+    // .with_context(||"invalid response header")?;
+
+    // let session = make_agent_session(stream).await?;
+
+    // Ok((agent_name.into(), session))
 }
 
 
