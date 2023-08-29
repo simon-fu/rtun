@@ -20,10 +20,9 @@ jobs:
 
     - name: Build Docker image
       run: |
-        cd rtun
         cargo build --release
-        cp ./target/release/rtun ../docker/build/
-        cd ../docker/build 
+        cp ./target/release/rtun ./docker/build/
+        cd ./docker/build 
         docker build -t ubuntu-rtun .
 
     - name: Log in to Docker Hub

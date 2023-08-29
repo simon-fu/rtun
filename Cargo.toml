@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "rtun",
+    "app_version",
+]
+exclude = [
+
+]
+
+[workspace.package]
+version = "0.2.0"
+
+# [profile.release-with-debug]
+# # cargo run --profile=release-with-debug  --bin xxx
+# # cargo build --profile=release-with-debug
+# inherits = "release"
+# debug = true
+# # opt-level = 0
+# overflow-checks = true
+
+# # lto = true
+# # codegen-units = 1
+# # panic = "abort"
+# # opt-level = "z"  # Optimize for size.
+# # strip = true
+
+# # [profile.release]
+# # opt-level = 'z'  # Optimize for size.
+# # lto = true
+# # codegen-units = 1
+# # incremental = false
+# # # panic = 'abort'
