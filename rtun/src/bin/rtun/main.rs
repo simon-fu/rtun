@@ -1,5 +1,6 @@
 /* 
 TODO:
+    - 支持 TERM 环境变量
     - 支持 cmd exec 
     - 支持 agent 和 client 鉴权
 
@@ -17,7 +18,7 @@ TODO:
 */
 
 use anyhow::Result;
-use rtun::async_rt;
+use rtun::{async_rt, version::ver_full};
 use clap::Parser;
 use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 
@@ -39,7 +40,7 @@ pub mod secret;
 
 // refer https://github.com/clap-rs/clap/tree/master/clap_derive/examples
 #[derive(Parser, Debug)]
-#[clap(name = "rtun", author, about, version)]
+#[clap(name = "rtun", author, about, version=ver_full())]
 struct CmdArgs {
     #[clap(subcommand)]
     cmd: SubCmd,
@@ -55,6 +56,7 @@ enum SubCmd {
 fn main() -> Result<()> {
 
     init_log();
+    tracing::info!("rtun {}", ver_full());
     let args = CmdArgs::parse();
 
     let r = async_rt::run_multi_thread(async move { 
@@ -72,7 +74,11 @@ fn main() -> Result<()> {
 fn init_log() {
 
     let filter = if cfg!(debug_assertions) {
-        "rtun=debug".into()
+        if let Ok(v) = std::env::var(EnvFilter::DEFAULT_ENV) {
+            v.into()
+        } else {
+            "rtun=debug".into()
+        }
     } else {
         EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())

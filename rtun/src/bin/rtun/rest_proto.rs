@@ -3,6 +3,7 @@ use std::borrow::Cow;
 
 use anyhow::{Result, bail, anyhow};
 use chrono::Local;
+use rtun::version::ver_brief;
 use serde::{ Serialize, Deserialize };
 
 use crate::secret::token_gen;
@@ -28,6 +29,8 @@ pub fn make_pub_url(url: &mut url::Url, agent_name: Option<&str>, secret: Option
 
     let token: String = token_gen(secret, Local::now().timestamp_millis() as  u64)?;
     url.query_pairs_mut().append_pair("token", token.as_str());
+
+    url.query_pairs_mut().append_pair("ver", ver_brief());
 
     Ok(())
 }
@@ -72,6 +75,8 @@ pub struct AgentInfo {
     pub name: String,
     pub addr: String,
     pub expire_at: u64,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub ver: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +84,7 @@ pub struct PubParams {
     pub agent: Option<String>,
     pub token: String,
     pub expire_in: Option<u64>,
+    pub ver: Option<String>,
 }
 
 pub type SubParams = PubParams;

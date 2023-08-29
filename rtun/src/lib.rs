@@ -30,3 +30,5 @@ pub mod switch;
 pub mod ws;
 
 pub mod socks;
+
+pub mod version;

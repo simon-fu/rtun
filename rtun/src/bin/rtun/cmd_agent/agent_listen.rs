@@ -239,6 +239,7 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
             expire_at: params.expire_in.map(
                 |x|Local::now().timestamp_millis() as u64  + x 
             ) .unwrap_or(u64::MAX/2),
+            ver: params.ver.clone(),
         });
     }
     tracing::info!("add agent session [{key}]-[{}], addr [{}]", uid, addr);
@@ -270,6 +271,7 @@ async fn get_pub_sessions (
                 name: x.0.clone(),
                 addr: x.1.addr.to_string(),
                 expire_at: x.1.expire_at,
+                ver: x.1.ver.clone(),
             }
         }).collect()
     };
@@ -402,6 +404,7 @@ struct AgentSession {
     addr: SocketAddr,
     ctrl_invoker: CtrlClientAgent,
     expire_at: u64,
+    ver: Option<String>,
 }
 
 

@@ -57,10 +57,16 @@ message Pong  {
 
 message OpenShellArgs  {
     optional uint64 ch_id               = 1;
-    // string agent                        = 2;
-    uint32 cols                         = 3;
+    ProgramArgs program_args            = 2;
+    uint32 cols                         = 3; 
     uint32 rows                         = 4;
     // string term = 5; // "xterm-256color"
+}
+
+message ProgramArgs {
+    uint32 cols                         = 1;
+    uint32 rows                         = 2;
+    map<string, string> env_vars        = 3;
 }
 
 message OpenSocksArgs  {

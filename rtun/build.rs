@@ -4,6 +4,11 @@ use protobuf_codegen::Customize;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 
+    println!("cargo:rerun-if-changed=build.rs");
+
+    let ver = app_version::AppVersion::try_new().unwrap();
+    ver.write_to_rustc_env();
+    
     println!("cargo:rerun-if-changed=proto/app.proto");
 
     let proto_files = [

@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use anyhow::{Result, Context};
 use clap::Parser;
-use rtun::{ws::client::ws_connect_to, switch::{ctrl_client::make_ctrl_client, switch_pair::make_switch_pair}, huid::gen_huid::gen_huid, channel::{ChId, ChPair}, proto::OpenShellArgs, term::async_input::get_term_size};
+use rtun::{ws::client::ws_connect_to, switch::{ctrl_client::make_ctrl_client, switch_pair::make_switch_pair}, huid::gen_huid::gen_huid, channel::{ChId, ChPair}, proto::{OpenShellArgs, ProgramArgs}, term::async_input::get_term_size};
 
 use crate::{terminal::run_term, client_utils::client_select_url, rest_proto::get_agent_from_url};
 
@@ -35,12 +37,26 @@ pub async fn run(args: CmdArgs) -> Result<()> {
     // let size = get_terminal_size().await?;
     let size = get_term_size()
     .with_context(||"get terminal size failed")?;
+
+    const TERM: &str = "TERM";
+    let mut env_vars: HashMap<protobuf::Chars, protobuf::Chars> = HashMap::new();
+    match std::env::var(TERM).ok() {
+        Some(v) => { env_vars.insert(TERM.into(), v.into()); },
+        None => {},
+    }
+
     let shell_args = OpenShellArgs {
         // ch_id: ch_id.0,
         // agent: "".into(),
         // term: "xterm-256color".into(),
         cols: size.cols as u32,
         rows: size.rows as u32,
+        program_args: Some(ProgramArgs{
+            cols: size.cols as u32,
+            rows: size.rows as u32,
+            env_vars,
+            ..Default::default()
+        }).into(),
         ..Default::default()
     };
 

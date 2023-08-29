@@ -12,16 +12,20 @@ use crate::async_mpsc_fd;
 use anyhow::{Result, Context, bail};
 
 
-pub async fn make_async_pty_process<S1, S2, I,>(
+pub async fn make_async_pty_process<S1, S2, I, K, V, I3>(
     program: S1, 
     args: I,
     row: u16, 
     col: u16,
+    env_vars: I3,
 ) -> Result<(Sender, Receiver)>
 where
     S1: AsRef<std::ffi::OsStr>,
     S2: AsRef<std::ffi::OsStr>,
     I: IntoIterator<Item = S2>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I3: Iterator<Item = (K, V)>,
 {
     lazy_static::lazy_static! {
         static ref MSG_TX: Mutex<async_mpsc_fd::Sender<Msg>> = {
@@ -35,7 +39,7 @@ where
 
     let (tx, rx) = mpsc::channel(128);
 
-    let session = make_pty_session(program, args, tx, row, col)?;
+    let session = make_pty_session(program, args, tx, row, col, env_vars)?;
 
     let mut msg_tx = {
         MSG_TX.lock().clone()
@@ -340,17 +344,21 @@ impl PtySession {
 #[derive(Eq, Hash, PartialEq)]
 struct PtyId(u64);
 
-fn make_pty_session<S1, S2, I,>(
+fn make_pty_session<S1, S2, I2, K, V, I3>(
     program: S1, 
-    args: I, 
+    args: I2, 
     tx: mpsc::Sender<Bytes>,
     row: u16, 
     col: u16,
+    env_vars: I3,
 ) -> Result<PtySession>
 where
     S1: AsRef<std::ffi::OsStr>,
     S2: AsRef<std::ffi::OsStr>,
-    I: IntoIterator<Item = S2>,
+    I2: IntoIterator<Item = S2>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I3: Iterator<Item = (K, V)>,
 {
     let pty = pty_process::blocking::Pty::new()
         .with_context(||"new pty fail")?;
@@ -362,10 +370,17 @@ where
     pty.resize(pty_process::Size::new(row, col))
         .with_context(||"resize pty fail")?;
 
-    let child = pty_process::blocking::Command::new(program)
-        .args(args)
-        .spawn(&pts)
-        .with_context(||"spawn command fail")?;
+    let child = {
+        let mut command = pty_process::blocking::Command::new(program);
+        command.args(args);
+        // .env("TERM", "xterm-256color")
+
+        for (k, v) in env_vars {
+            command.env(k.as_ref(), v.as_ref());
+        }
+        
+        command.spawn(&pts).with_context(||"spawn command fail")?
+    };
 
     // unsafe {
     //     let fd = pty.as_fd().as_raw_fd();

@@ -1,3 +1,5 @@
+use std::{ops::Deref, collections::HashMap};
+
 use anyhow::{Result, anyhow, Context};
 use bytes::Bytes;
 use protobuf::Message;
@@ -7,12 +9,33 @@ use crate::{proto::{OpenShellArgs, PtyOutputPacket, pty_output_packet::Pty_outpu
 
 pub async fn open_shell(args: OpenShellArgs) -> Result<ChShell> {
     let program = get_shell_program();
+    
+    let (pty_sender, pty_recver) = match args.program_args.0 {
+        Some(v) => {
+            // v.env_vars.iter()
+            // .map(|x|(x.0.deref(), x.1.deref()));
+            make_async_pty_process(
+                &program, &["-i"], 
+                v.rows as u16, 
+                v.cols as u16,
+                v.env_vars.iter().map(|x|(x.0.deref(), x.1.deref())),
+            ).await?
+        },
+        None => {
+            make_async_pty_process(
+                &program, &["-i"], 
+                args.rows as u16, 
+                args.cols as u16,
+                HashMap::<String, String>::new().iter(),
+            ).await?
+        },
+    };
                 
-    let (pty_sender, pty_recver) = make_async_pty_process(
-        &program, &["-i"], 
-        args.rows as u16, 
-        args.cols as u16,
-    ).await?;
+    // let (pty_sender, pty_recver) = make_async_pty_process(
+    //     &program, &["-i"], 
+    //     args.rows as u16, 
+    //     args.cols as u16,
+    // ).await?;
 
     // let uid = gen_huid();
     // tracing::debug!("open shell [{}]", uid);
