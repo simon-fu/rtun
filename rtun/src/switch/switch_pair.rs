@@ -47,7 +47,7 @@ where
 
     pub async fn wait_for_completed(&mut self) -> Result<Option<()>> {
         self.source.wait_for_completed().await?;
-        self.sink.wait_for_completed().await?;
+        self.sink.shutdown_and_waitfor().await?;
         Ok(None)
     }
 }

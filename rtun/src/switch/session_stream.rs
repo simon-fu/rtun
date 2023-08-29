@@ -52,7 +52,6 @@ where
     }
 
     pub async fn wait_for_completed(&mut self) -> Result<()> {
-        
         let switch_r = self.switch_session.wait_for_completed().await;
         let ctrl_r = self.ctrl_session.wait_for_completed().await;
 
