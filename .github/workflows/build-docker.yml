@@ -5,6 +5,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  REPO_GIT_BRANCH: ${{ github.ref_name }}
+  REPO_GIT_HASH: ${{ github.sha }}
 
 jobs:
 
@@ -32,6 +34,10 @@ jobs:
 
     - name: Push Docker image
       run: |
+        TAG_VER=$(date "+^C%m%d.%H%M%S").${REPO_GIT_HASH:0:7}
+        echo "TAG_VER=$TAG_VER"
+        docker tag ubuntu-rtun simonfucn/ubuntu-rtun:$TAG_VER
+        docker push simonfucn/ubuntu-rtun:$TAG_VER
         docker tag ubuntu-rtun simonfucn/ubuntu-rtun
         docker push simonfucn/ubuntu-rtun
 

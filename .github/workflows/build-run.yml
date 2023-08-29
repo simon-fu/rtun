@@ -17,5 +17,5 @@ jobs:
       run: |
         cd rtun
         echo ${{ secrets.MY_CONN_URL_DEV }}
-        cargo run --release --bin rtun -- agent pub "${{ secrets.MY_CONN_URL_DEV }}" --agent rtun --expire_in 60
+        cargo run --release --bin rtun -- agent pub "${{ secrets.MY_CONN_URL_DEV }}" --agent rtun --expire_in 240
 
