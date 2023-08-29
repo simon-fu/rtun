@@ -80,4 +80,5 @@ chrono = "=0.4.26"
 # protobuf-codegen-pure = "=2"
 # protobuf-codegen = "=2.27.1"
 protobuf-codegen = "=3.2.0"
-app_version ={ path = "/Users/simon/simon/src/rtun/app_version" }
+app_version ={ path = "../app_version" }
+# app_version ={ path = "/Users/simon/simon/src/rtun/app_version" }
