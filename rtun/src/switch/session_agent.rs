@@ -1,8 +1,9 @@
 
 use anyhow::Result;
+use tokio::task::JoinHandle;
 use crate::{huid::gen_huid::gen_huid, channel::{ChId, ChPair}};
 
-use super::{agent::ctrl::{make_agent_ctrl, AgentCtrl}, ctrl_service::spawn_ctrl_service, switch_pair::SwitchPair, switch_source::PacketSource, switch_sink::PacketSink};
+use super::{agent::ctrl::{make_agent_ctrl, AgentCtrl}, ctrl_service::{spawn_ctrl_service, ExitReason}, switch_pair::SwitchPair, switch_source::PacketSource, switch_sink::PacketSink};
 
 
 pub async fn make_agent_session<S1: PacketSink, S2: PacketSource>(switch_session: SwitchPair<S1, S2>) -> Result<AgentSession<S1, S2>> {
@@ -18,9 +19,13 @@ pub async fn make_agent_session<S1: PacketSink, S2: PacketSource>(switch_session
     let ctrl_tx = switch.add_channel(ctrl_ch_id, ctrl_tx).await?;
     let pair = ChPair { tx: ctrl_tx, rx: ctrl_rx };
 
-    spawn_ctrl_service(uid, ctrl, switch, pair);
+    let task = spawn_ctrl_service(uid, ctrl, switch, pair);
     
-    Ok(AgentSession{switch_session, ctrl_session})
+    Ok(AgentSession{
+        switch_session, 
+        ctrl_session,
+        ctrl_service: Some(task),
+    })
 
 }
 
@@ -28,6 +33,7 @@ pub async fn make_agent_session<S1: PacketSink, S2: PacketSource>(switch_session
 pub struct AgentSession<S1: PacketSink, S2: PacketSource> {
     switch_session: SwitchPair<S1, S2>,
     ctrl_session: AgentCtrl,
+    ctrl_service: Option<JoinHandle<Result<ExitReason>>>,
 }
 
 impl<S1: PacketSink, S2: PacketSource> AgentSession<S1, S2> {
@@ -39,7 +45,7 @@ impl<S1: PacketSink, S2: PacketSource> AgentSession<S1, S2> {
         &self.ctrl_session
     }
 
-    pub async fn wait_for_completed(&mut self) -> Result<()> {
+    pub async fn wait_for_completed(&mut self) -> Result<Option<ExitReason>> {
         
         let switch_r = self.switch_session.wait_for_completed().await;
         tracing::debug!("switch session finished {switch_r:?}");
@@ -48,11 +54,17 @@ impl<S1: PacketSink, S2: PacketSource> AgentSession<S1, S2> {
         
         let ctrl_r = self.ctrl_session.wait_for_completed().await;
         tracing::debug!("ctrl session finished {ctrl_r:?}");
+
+        if let Some(task) = self.ctrl_service.take() {
+            let r = task.await;
+            let reason = r??;
+            return Ok(Some(reason))
+        }
         
         switch_r?;
         ctrl_r?;
 
-        Ok(())
+        Ok(None)
     }
 }
 

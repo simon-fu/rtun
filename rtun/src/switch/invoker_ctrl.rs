@@ -2,7 +2,7 @@
 
 
 use anyhow::Result;
-use crate::{channel::{ChId, ChSender}, actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker}, proto::{OpenShellArgs, OpenSocksArgs}};
+use crate::{channel::{ChId, ChSender}, actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker}, proto::{OpenShellArgs, OpenSocksArgs, KickDownArgs}};
 
 use super::entity_watch::{OpWatch, WatchResult};
 
@@ -12,6 +12,7 @@ pub trait CtrlHandler: ActorEntity
 + AsyncHandler<OpCloseChannel, Response = CloseChannelResult>
 + AsyncHandler<OpOpenShell, Response = OpOpenShellResult>
 + AsyncHandler<OpOpenSocks, Response = OpOpenSocksResult>
++ AsyncHandler<OpKickDown, Response = OpKickDownResult>
 {
 
 }
@@ -70,6 +71,10 @@ where
     pub async fn open_socks(&self, ch_tx: ChSender, args: OpenSocksArgs) -> OpOpenShellResult {
         self.invoker.invoke(OpOpenSocks(ch_tx, args)).await?
     }
+
+    pub async fn kick_down(&self, args: KickDownArgs) -> OpKickDownResult {
+        self.invoker.invoke(OpKickDown(args)).await?
+    }
 }
 
 pub struct CtrlWeak<H: CtrlHandler> {
@@ -111,4 +116,9 @@ pub struct OpOpenSocks(pub ChSender, pub OpenSocksArgs);
 
 pub type OpOpenSocksResult = Result<ChSender>;
 
+
+#[derive(Debug)]
+pub struct OpKickDown(pub KickDownArgs);
+
+pub type OpKickDownResult = Result<()>;
 

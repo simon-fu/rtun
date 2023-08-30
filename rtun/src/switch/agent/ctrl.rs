@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, wait_next_none, handle_next_none, handle_msg_none}, huid::HUId, channel::{ChSender, CHANNEL_SIZE, ChReceiver, ChId, ChSenderWeak}, async_rt::spawn_with_name, switch::{invoker_ctrl::{OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, CtrlWeak}, next_ch_id::NextChId, agent::ch_socks::ChSocks, entity_watch::{CtrlGuard, OpWatch, WatchResult}}};
+use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, wait_next_none, handle_next_none, handle_msg_none}, huid::HUId, channel::{ChSender, CHANNEL_SIZE, ChReceiver, ChId, ChSenderWeak}, async_rt::spawn_with_name, switch::{invoker_ctrl::{OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, CtrlWeak, OpKickDown, OpKickDownResult}, next_ch_id::NextChId, agent::ch_socks::ChSocks, entity_watch::{CtrlGuard, OpWatch, WatchResult}}};
 use tokio::sync::mpsc;
 
 use super::super::invoker_ctrl::{CloseChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker};
@@ -194,6 +194,15 @@ impl AsyncHandler<OpWatch> for Entity {
 
     async fn handle(&mut self, _req: OpWatch) -> Self::Response {
         Ok(self.guard.watch())
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncHandler<OpKickDown> for Entity {
+    type Response = OpKickDownResult; 
+
+    async fn handle(&mut self, _req: OpKickDown) -> Self::Response {
+        Ok(())
     }
 }
 

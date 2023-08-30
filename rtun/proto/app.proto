@@ -38,6 +38,7 @@ message C2ARequest {
         OpenSocksArgs open_socks        = 2;
         CloseChannelArgs close_channel  = 3;
         Ping ping                       = 4;
+        KickDownArgs kick_down          = 5;
     }
 }
 
@@ -92,6 +93,11 @@ message OpenChannelResponse {
 }
 
 message ResponseStatus {
+    int32 code                          = 1;
+    string reason                       = 2;
+}
+
+message KickDownArgs {
     int32 code                          = 1;
     string reason                       = 2;
 }

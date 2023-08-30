@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, Context};
 use clap::Parser;
-use rtun::{ws::client::ws_connect_to, switch::{session_agent::{make_agent_session, AgentSession}, switch_sink::PacketSink, switch_source::PacketSource, switch_pair::make_switch_pair}, huid::gen_huid::gen_huid};
+use rtun::{ws::client::ws_connect_to, switch::{session_agent::{make_agent_session, AgentSession}, switch_sink::PacketSink, switch_source::PacketSource, switch_pair::make_switch_pair, ctrl_service::ExitReason}, huid::gen_huid::gen_huid};
 
 
 use crate::rest_proto::{make_pub_url, make_ws_scheme};
@@ -105,6 +105,13 @@ async fn run_loop(url: &url::Url, expire_in: Duration) {
                 // let mut session = make_agent_session(stream).await?;
                 let r = session.wait_for_completed().await;
                 tracing::info!("session finished {r:?}");
+                if let Ok(Some(reason)) = r {
+                    match reason {
+                        ExitReason::KickDown(_v) => {
+                            return;
+                        },
+                    }
+                }
             },
             Err(_e) => {
                 if last_success {

@@ -2,7 +2,8 @@ use anyhow::{Result, anyhow, Context, bail};
 
 use bytes::Bytes;
 use protobuf::Message;
-use crate::{async_rt::spawn_with_name, huid::HUId, proto::{C2ARequest, c2arequest::C2a_req_args, make_open_shell_response_ok, make_open_shell_response_error, make_response_status_ok, Pong}, channel::{ChPair, ChId, ChSender}};
+use tokio::task::JoinHandle;
+use crate::{async_rt::spawn_with_name, huid::HUId, proto::{C2ARequest, c2arequest::C2a_req_args, make_open_shell_response_ok, make_open_shell_response_error, make_response_status_ok, Pong, KickDownArgs}, channel::{ChPair, ChId, ChSender}};
 
 use super::{invoker_ctrl::{CtrlHandler, CtrlInvoker}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId};
 
@@ -12,13 +13,20 @@ pub fn spawn_ctrl_service<H1: CtrlHandler, H2: SwitchHanlder>(
     agent: CtrlInvoker<H1>, 
     switch: SwitchInvoker<H2>, 
     mut chpair: ChPair,
-) 
+) -> JoinHandle<Result<ExitReason>>
 {
-    spawn_with_name(format!("ctrl-service-{}", uid), async move {
+    let task = spawn_with_name(format!("ctrl-service-{}", uid), async move {
         let r = ctrl_loop_full(&agent, &switch, &mut chpair).await;
         tracing::debug!("finished with [{:?}]", r);
         switch.shutdown().await;
+        r
     });
+    task
+}
+
+#[derive(Debug)]
+pub enum ExitReason {
+    KickDown(KickDownArgs),
 }
 
 
@@ -26,7 +34,7 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
     agent: &CtrlInvoker<H1>, 
     switch: &SwitchInvoker<H2>, 
     ctrl_pair: &mut ChPair,
-) -> Result<()> {
+) -> Result<ExitReason> {
     
     let ctrl_tx = &mut ctrl_pair.tx;
     let ctrl_rx = &mut ctrl_pair.rx;
@@ -117,6 +125,17 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                 let data: Bytes = rsp.write_to_bytes()?.into();
                 ctrl_tx.send_data(data).await
                 .map_err(|_x|anyhow!("send data fail"))?;
+            },
+
+            C2a_req_args::KickDown(args) => {
+                
+                let rsp = make_response_status_ok();
+                let data: Bytes = rsp.write_to_bytes()?.into();
+                ctrl_tx.send_data(data).await
+                .map_err(|_x|anyhow!("send data fail"))?;
+                
+                tracing::warn!("recv kick down {args}");
+                return Ok(ExitReason::KickDown(args));
             }
         }
     }

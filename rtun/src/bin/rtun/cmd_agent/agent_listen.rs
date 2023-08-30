@@ -10,7 +10,7 @@ use clap::Parser;
 use axum::{Extension, extract::Query, http::StatusCode, Json};
 use futures::{StreamExt, stream::SplitStream};
 use parking_lot::Mutex;
-use rtun::{huid::{gen_huid::gen_huid, HUId}, channel::{ChId, ChPair}, switch::{ctrl_service::spawn_ctrl_service, agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker}, ctrl_client, invoker_ctrl::{CtrlInvoker, CtrlHandler}, session_stream::make_stream_session, switch_pair::{SwitchPairEntity, make_switch_pair}}, ws::server::{WsStreamAxum, WsSource}, async_rt::spawn_with_name};
+use rtun::{huid::{gen_huid::gen_huid, HUId}, channel::{ChId, ChPair}, switch::{ctrl_service::spawn_ctrl_service, agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker}, ctrl_client, invoker_ctrl::{CtrlInvoker, CtrlHandler}, session_stream::make_stream_session, switch_pair::{SwitchPairEntity, make_switch_pair}}, ws::server::{WsStreamAxum, WsSource}, async_rt::spawn_with_name, proto::KickDownArgs};
 use tokio::net::TcpListener;
 
 use std::{sync::Arc, collections::HashMap};
@@ -231,25 +231,53 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
     // let mut ctrl_client = make_ctrl_client(uid, ctrl_pair, switch).await?;
     
     let key = params.agent.unwrap_or_else(||uid.to_string());
-    {
+    let old = {
         let ctrl_invoker = session.ctrl_client().clone_invoker();
         shared.data.lock().agent_clients.insert(key.clone(), AgentSession { 
+            uid,
             addr, 
             ctrl_invoker,
             expire_at: params.expire_in.map(
                 |x|Local::now().timestamp_millis() as u64  + x 
             ) .unwrap_or(u64::MAX/2),
             ver: params.ver.clone(),
-        });
+        })
+    };
+    
+    if let Some(old) = old {
+        tracing::info!("kick agent session [{key}]-[{}], addr [{}]", old.uid, old.addr);
+        let _r = old.ctrl_invoker.kick_down(KickDownArgs {
+            code: -1,
+            reason: "replace by other session".into(),
+            ..Default::default()
+        }).await;
     }
+    
     tracing::info!("add agent session [{key}]-[{}], addr [{}]", uid, addr);
 
     let _r = session.wait_for_completed().await; 
     
     let _r = {
-        shared.data.lock().agent_clients.remove(&key)
+        let mut data = shared.data.lock();
+        let r = data.agent_clients.remove_entry(&key);
+        match r {
+            Some((key, value)) => {
+                if value.uid == uid {
+                    Some(value)
+                } else {
+                    // put back
+                    data.agent_clients.insert(key, value);
+                    None
+                }
+            },
+            None => None,
+        }
     };
-    tracing::info!("remove agent session [{}], addr [{}]", uid, addr);
+
+    if _r.is_some() {
+        tracing::info!("remove agent session [{key}]-[{uid}], addr [{addr}]");
+    }
+    
 
     // let _r = ctrl_client.wait_for_completed().await?;
 
@@ -401,6 +429,7 @@ struct SharedData {
 }
 
 struct AgentSession {
+    uid: HUId,
     addr: SocketAddr,
     ctrl_invoker: CtrlClientAgent,
     expire_at: u64,

@@ -1,7 +1,20 @@
 /* 
 TODO:
-    - 支持 TERM 环境变量
     - 支持 cmd exec 
+    - 支持 channel flow control 
+    - 支持 agent pub 多个实例
+    - 支持 client 连接多个 agent 实例 
+    - https://gitlab.com
+        - github 账号 https://gitlab.com/simon-fu
+        - 谷歌账号 https://gitlab.com/simon-ning
+        - 每月50000分钟： https://about.gitlab.com/pricing/#is-there-a-different-compute-minutes-limit-for-public-projects
+        - job 运行最长1个月： https://docs.gitlab.com/ee/ci/pipelines/settings.html#set-a-limit-for-how-long-jobs-can-run
+        - 用了不同的 ssh key， https://superuser.com/questions/1628183/how-do-i-configure-git-to-use-multiple-ssh-keys-for-different-accounts
+        - 谷歌账号用的是 ssh key 是 id_gitlab_ning.pub
+    - 研究是否支持运行docker https://driverfarfar.jetbrains.space/p/main ，已用谷歌账号注册
+
+Done: 
+    - 支持 TERM 环境变量
     - 支持 agent 和 client 鉴权
 
     - 支持 环境变量 设置 日志级别

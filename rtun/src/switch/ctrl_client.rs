@@ -6,9 +6,9 @@ use anyhow::{Result, anyhow, bail, Context};
 use chrono::Local;
 use protobuf::Message;
 
-use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, handle_msg_none, Action}, huid::HUId, channel::{ChId, ChPair}, proto::{OpenChannelResponse, open_channel_response::Open_ch_rsp, OpenShellArgs, C2ARequest, c2arequest::C2a_req_args, OpenSocksArgs, CloseChannelArgs, ResponseStatus, Ping, Pong}};
+use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, handle_msg_none, Action}, huid::HUId, channel::{ChId, ChPair}, proto::{OpenChannelResponse, open_channel_response::Open_ch_rsp, OpenShellArgs, C2ARequest, c2arequest::C2a_req_args, OpenSocksArgs, CloseChannelArgs, ResponseStatus, Ping, Pong, KickDownArgs}};
 
-use super::{invoker_ctrl::{CloseChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker, OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId, entity_watch::{OpWatch, WatchResult, CtrlGuard, CtrlWatch}};
+use super::{invoker_ctrl::{CloseChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker, OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, OpKickDown, OpKickDownResult}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId, entity_watch::{OpWatch, WatchResult, CtrlGuard, CtrlWatch}};
 
 pub type CtrlClientSession<H> = CtrlClient<Entity<H>>;
 pub type CtrlClientInvoker<H> = CtrlInvoker<Entity<H>>;
@@ -179,6 +179,23 @@ impl<H: SwitchHanlder> AsyncHandler<OpWatch> for Entity<H> {
 
     async fn handle(&mut self, _req: OpWatch) -> Self::Response {
         Ok(self.guard.watch())
+    }
+}
+
+#[async_trait::async_trait]
+impl<H: SwitchHanlder> AsyncHandler<OpKickDown> for Entity<H> {
+    type Response = OpKickDownResult; 
+
+    async fn handle(&mut self, req: OpKickDown) -> Self::Response {
+        let r = c2a_kick_down(&mut self.pair, req.0).await;
+        match r {
+            Ok(_v) => {
+                Ok(())
+            }
+            Err(e) => {
+                Err(e)
+            }
+        }
     }
 }
 
@@ -357,4 +374,22 @@ pub async fn c2a_ping(pair: &mut ChPair, args: Ping) -> Result<Pong> {
     .with_context(||"parse pong failed")?;
 
     Ok(pong)
+}
+
+pub async fn c2a_kick_down(pair: &mut ChPair, args: KickDownArgs) -> Result<ResponseStatus> {
+
+    let data = C2ARequest {
+        c2a_req_args: Some(C2a_req_args::KickDown(args)),
+        ..Default::default()
+    }.write_to_bytes()?;
+
+    pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send close ch failed"))?;
+
+    let packet = pair.rx.recv_packet().await
+    .with_context(||"recv ping failed")?;
+
+    let status = ResponseStatus::parse_from_bytes(&packet.payload)
+    .with_context(||"parse kick down response failed")?;
+
+    Ok(status)
 }
