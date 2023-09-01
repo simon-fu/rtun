@@ -22,6 +22,8 @@ jobs:
 
     - name: build rtun
       run: |
+        mkdir run-rtun
+        cd run-rtun
         docker run --rm simonfucn/ubuntu-rtun cat /usr/bin/rtun > ./rtun
         chmod +x ./rtun
         ./rtun agent pub "${{ secrets.MY_RTUN_URL_DEV }}" --agent mydocker --expire_in 240 
