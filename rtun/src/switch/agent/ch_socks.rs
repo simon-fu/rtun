@@ -3,6 +3,7 @@ use std::{io::{ErrorKind, self}, net::SocketAddr, sync::Arc};
 use crate::{channel::{ChSender, ChReceiver, ch_stream::ChStream}, proto::OpenSocksArgs};
 
 use anyhow::{anyhow, Result};
+use tokio::io::{AsyncRead, AsyncWrite};
 use crate::socks::server::{socks5::Socks5TcpHandler, socks4::Socks4TcpHandler};
 use shadowsocks::{config::Mode, ServerAddr};
 use shadowsocks_service::local::{loadbalancing::{PingBalancerBuilder, PingBalancer}, context::ServiceContext, socks::config::Socks5AuthConfig};
@@ -21,22 +22,33 @@ impl ChSocks {
     }
 
     pub async fn run(self, server: Server, tx: ChSender, rx: ChReceiver ) -> Result<()> {
-        let stream = ChStream::new2(tx, rx);
-        run_socks(stream, self.peer_addr, server).await?;
-        Ok(())
+        let mut stream = ChStream::new2(tx, rx);
+
+        let mut version_buffer = [0u8; 1];
+
+        let n = stream.peek(&mut version_buffer).await?;
+        if n == 0 {
+            return Err(io::Error::from(ErrorKind::UnexpectedEof).into());
+        }
+        
+        run_socks_conn(&version_buffer[..], stream, self.peer_addr, server).await?;
+        Result::<()>::Ok(())
     }
 
 }
 
-async fn run_socks(mut stream: ChStream, peer_addr: SocketAddr, server: Server) -> io::Result<()> {
+pub async fn run_socks_conn<S>(version_buffer: &[u8], stream: S, peer_addr: SocketAddr, server: Server) -> io::Result<()> 
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // tracing::info!("[{peer_addr}] run_socks");
 
-    let mut version_buffer = [0u8; 1];
+    // let mut version_buffer = [0u8; 1];
 
-    let n = stream.peek(&mut version_buffer).await?;
-    if n == 0 {
-        return Err(ErrorKind::UnexpectedEof.into());
-    }
+    // let n = stream.peek(&mut version_buffer).await?;
+    // if n == 0 {
+    //     return Err(ErrorKind::UnexpectedEof.into());
+    // }
 
     match version_buffer[0] {
         0x04 => {
