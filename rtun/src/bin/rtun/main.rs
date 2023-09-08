@@ -36,6 +36,8 @@ pub mod cmd_socks;
 
 pub mod cmd_local;
 
+// pub mod cmd_kcp;
+
 pub mod terminal;
 
 pub mod client_ch_pty;
@@ -60,6 +62,7 @@ enum SubCmd {
     Socks(cmd_socks::CmdArgs),
     Agent(cmd_agent::CmdArgs),
     Local(cmd_local::CmdArgs),
+    // Kcp(cmd_kcp::CmdArgs),
 }
 
 fn main() -> Result<()> {
@@ -74,6 +77,7 @@ fn main() -> Result<()> {
             SubCmd::Socks(args) => cmd_socks::run(args).await,
             SubCmd::Agent(args) => cmd_agent::run(args).await,
             SubCmd::Local(args) => cmd_local::run(args).await,
+            // SubCmd::Kcp(args) => cmd_kcp::run(args).await,
         }
     });
     tracing::debug!("main finished with {:?}", r);

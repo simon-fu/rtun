@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{Result, Context};
 
-use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, wait_next_none, handle_next_none, handle_msg_none}, huid::HUId, channel::{ChSender, CHANNEL_SIZE, ChReceiver, ChId, ChSenderWeak}, async_rt::spawn_with_name, switch::{invoker_ctrl::{OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, CtrlWeak, OpKickDown, OpKickDownResult}, next_ch_id::NextChId, agent::ch_socks::ChSocks, entity_watch::{CtrlGuard, OpWatch, WatchResult}}};
+use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, wait_next_none, handle_next_none, handle_msg_none}, huid::HUId, channel::{ChSender, CHANNEL_SIZE, ChReceiver, ChId, ChSenderWeak}, async_rt::spawn_with_name, switch::{invoker_ctrl::{OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, CtrlWeak, OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult}, next_ch_id::NextChId, agent::ch_socks::ChSocks, entity_watch::{CtrlGuard, OpWatch, WatchResult}}, stun::punch::{IcePeer, IceConfig}, proto::{OpenP2PResponse, open_p2presponse::Open_p2p_rsp}};
 use tokio::sync::mpsc;
 
 use super::super::invoker_ctrl::{CloseChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker};
@@ -205,6 +205,76 @@ impl AsyncHandler<OpKickDown> for Entity {
         Ok(())
     }
 }
+
+#[async_trait::async_trait]
+impl AsyncHandler<OpOpenP2P> for Entity {
+    type Response = OpOpenP2PResult; 
+
+    async fn handle(&mut self, mut req: OpOpenP2P) -> Self::Response {
+        let remote_args = req.0.args.take().with_context(||"no remote p2p args")?.into();
+
+        let mut peer = IcePeer::with_config(IceConfig {
+            servers: vec![
+                "stun:stun1.l.google.com:19302".into(),
+                "stun:stun2.l.google.com:19302".into(),
+                "stun:stun.qq.com:3478".into(),
+            ],
+        });
+        
+        let local_args = peer.gather_until_done().await?;
+        
+        spawn_with_name("p2p-server", async move {
+            let conn = peer.accept(remote_args).await?;
+            conn.send_data("I'am server".as_bytes()).await?;
+            let mut buf = vec![0; 1700];
+            let n = conn.recv_data(&mut buf).await?;
+            let msg = std::str::from_utf8(&buf[..n])?;
+            tracing::debug!("recv {msg:?}");
+            Result::<()>::Ok(())
+        });
+        
+        let rsp = OpenP2PResponse {
+            open_p2p_rsp: Some(Open_p2p_rsp::Args(local_args.into())),
+            ..Default::default()
+        };
+
+        Ok(rsp)
+
+        // let r = PunchPeer::bind_and_detect("0.0.0.0:0").await;
+        // match r {
+        //     Ok((peer, nat)) => {
+        //         let nat_type = nat.nat_type();
+        //         if nat_type != Some(NatType::Cone) {
+        //             tracing::warn!("nat type {nat_type:?}");
+        //         } else {
+        //             tracing::debug!("nat type {nat_type:?}");
+        //         }
+
+        //         let local_ufrag = peer.local_ufrag().to_string();
+        //         let mapped = nat.into_mapped().with_context(||"empty mapped address")?;
+        //         let args = req.0.args.take().with_context(||"no remote p2p args")?;
+
+        //         tracing::debug!("remote p2p args {args:?}");
+        //         let remote_addr = args.addr.parse().with_context(||"parse remote addr failed")?;
+
+        //         launch_p2p(peer, args.ufrag.into(), remote_addr)?;
+                
+        //         let rsp = OpenP2PResponse {
+        //             open_p2p_rsp: Some(Open_p2p_rsp::Args(P2PArgs {
+        //                 ufrag: local_ufrag.into(),
+        //                 addr: mapped.to_string().into(),
+        //                 ..Default::default()
+        //             })),
+        //             ..Default::default()
+        //         };
+
+        //         Ok(rsp)
+        //     },
+        //     Err(e) => Err(e.into()),
+        // }
+    }
+}
+
 
 impl CtrlHandler for Entity {}
 

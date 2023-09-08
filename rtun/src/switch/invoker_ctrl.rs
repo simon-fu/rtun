@@ -2,7 +2,7 @@
 
 
 use anyhow::Result;
-use crate::{channel::{ChId, ChSender}, actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker}, proto::{OpenShellArgs, OpenSocksArgs, KickDownArgs}};
+use crate::{channel::{ChId, ChSender}, actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker}, proto::{OpenShellArgs, OpenSocksArgs, KickDownArgs, OpenP2PArgs, OpenP2PResponse}};
 
 use super::entity_watch::{OpWatch, WatchResult};
 
@@ -13,6 +13,7 @@ pub trait CtrlHandler: ActorEntity
 + AsyncHandler<OpOpenShell, Response = OpOpenShellResult>
 + AsyncHandler<OpOpenSocks, Response = OpOpenSocksResult>
 + AsyncHandler<OpKickDown, Response = OpKickDownResult>
++ AsyncHandler<OpOpenP2P, Response = OpOpenP2PResult>
 {
 
 }
@@ -75,6 +76,10 @@ where
     pub async fn kick_down(&self, args: KickDownArgs) -> OpKickDownResult {
         self.invoker.invoke(OpKickDown(args)).await?
     }
+
+    pub async fn open_p2p(&self, args: OpenP2PArgs) -> OpOpenP2PResult {
+        self.invoker.invoke(OpOpenP2P(args)).await?
+    }
 }
 
 pub struct CtrlWeak<H: CtrlHandler> {
@@ -122,3 +127,8 @@ pub struct OpKickDown(pub KickDownArgs);
 
 pub type OpKickDownResult = Result<()>;
 
+
+#[derive(Debug)]
+pub struct OpOpenP2P(pub OpenP2PArgs);
+
+pub type OpOpenP2PResult = Result<OpenP2PResponse>;

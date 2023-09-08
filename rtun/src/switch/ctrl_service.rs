@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow, Context, bail};
 use bytes::Bytes;
 use protobuf::Message;
 use tokio::task::JoinHandle;
-use crate::{async_rt::spawn_with_name, huid::HUId, proto::{C2ARequest, c2arequest::C2a_req_args, make_open_shell_response_ok, make_open_shell_response_error, make_response_status_ok, Pong, KickDownArgs}, channel::{ChPair, ChId, ChSender}};
+use crate::{async_rt::spawn_with_name, huid::HUId, proto::{C2ARequest, c2arequest::C2a_req_args, make_open_shell_response_ok, make_open_shell_response_error, make_response_status_ok, Pong, KickDownArgs, make_open_p2p_response_error}, channel::{ChPair, ChId, ChSender}};
 
 use super::{invoker_ctrl::{CtrlHandler, CtrlInvoker}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId};
 
@@ -136,11 +136,51 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                 
                 tracing::warn!("recv kick down {args}");
                 return Ok(ExitReason::KickDown(args));
+            }, 
+
+            C2a_req_args::OpenP2p(args) => {
+                let r = agent.open_p2p(args).await;
+
+                // let r = handle_open_p2p(args).await;
+                let rsp = match r {
+                    Ok(rsp) => {
+                        rsp
+                    },
+                    Err(e) => make_open_p2p_response_error(e),
+                };
+
+                let data: Bytes = rsp.write_to_bytes()?.into();
+                ctrl_tx.send_data(data).await
+                .map_err(|_x|anyhow!("send data fail"))?;
             }
         }
     }
 }
 
+// async fn handle_open_p2p(mut args: OpenP2PArgs) -> Result<(String, SocketAddr)> {
+//     let (peer, nat) = PunchPeer::bind_and_detect("0.0.0.0:0").await?;
+
+//     let local_ufrag = peer.local_ufrag().to_string();
+
+//     let nat_type = nat.nat_type();
+//     if nat_type != Some(NatType::Cone) {
+//         tracing::warn!("nat type {nat_type:?}");
+//     } else {
+//         tracing::debug!("nat type {nat_type:?}");
+//     }
+
+//     let mapped = nat.into_mapped().with_context(||"empty mapped address")?;
+
+//     let args = args.args.take().with_context(||"no p2p args")?;
+    
+//     let mut tun = launch_tun_peer(peer, args.ufrag.into(), args.addr.parse()?, false);
+//     spawn_with_name("", async move {
+//         tun.wait_for_completed().await
+//     });
+
+//     Ok((local_ufrag, mapped))
+
+// }
 
 // async fn ctrl_loop_pure_ch<H1: CtrlHandler, H2: SwitchHanlder>(
 //     agent: &CtrlInvoker<H1>, 

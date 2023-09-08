@@ -39,6 +39,7 @@ message C2ARequest {
         CloseChannelArgs close_channel  = 3;
         Ping ping                       = 4;
         KickDownArgs kick_down          = 5;
+        OpenP2PArgs open_p2p            = 6;
     }
 }
 
@@ -77,6 +78,24 @@ message OpenSocksArgs  {
 
 message CloseChannelArgs  {
     uint64 ch_id                        = 1;
+}
+
+message P2PArgs  {
+    string ufrag                        = 1;
+    // string addr                         = 2;
+    string pwd                          = 2;
+    repeated string candidates          = 3;
+}
+
+message OpenP2PArgs  {
+    P2PArgs args                        = 1;
+}
+
+message OpenP2PResponse {
+    oneof open_p2p_rsp {
+        P2PArgs args                    = 1;
+        ResponseStatus status           = 2;
+    }
 }
 
 message OpenChannelRequest {

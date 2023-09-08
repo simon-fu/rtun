@@ -4,7 +4,7 @@ use anyhow::{Result, Context};
 
 use clap::Parser;
 use parking_lot::Mutex;
-use rtun::{ws::client::ws_connect_to, switch::{invoker_ctrl::{CtrlHandler, CtrlInvoker}, next_ch_id::NextChId, session_stream::{make_stream_session, StreamSession}, switch_sink::PacketSink, switch_source::PacketSource}, channel::{ChId, ChPair, ch_stream::ChStream}, proto::OpenSocksArgs, async_rt::spawn_with_name};
+use rtun::{ws::client::ws_connect_to, switch::{invoker_ctrl::{CtrlHandler, CtrlInvoker}, next_ch_id::NextChId, session_stream::{make_stream_session, StreamSession}, switch_sink::PacketSink, switch_source::PacketSource}, channel::{ChId, ChPair, ch_stream::ChStream}, proto::{OpenSocksArgs, OpenP2PArgs, open_p2presponse::Open_p2p_rsp}, async_rt::spawn_with_name, stun::punch::{IcePeer, IceConfig}};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::{client_utils::client_select_url, rest_proto::get_agent_from_url};
@@ -43,6 +43,107 @@ pub async fn run(args: CmdArgs) -> Result<()> {
                 // let mut session = make_stream_session(stream).await?;
 
                 {
+                    // let ice_agent = Arc::new(
+                    //     IceAgent::new(AgentConfig {
+                    //         urls: vec![
+                    //             webrtc_ice::url::Url::parse_url("stun:stun1.l.google.com:19302")?,
+                    //             webrtc_ice::url::Url::parse_url("stun:stun2.l.google.com:19302")?,
+                    //             webrtc_ice::url::Url::parse_url("stun:stun.qq.com:3478")?,
+                    //         ],
+                    //         network_types: vec![NetworkType::Udp4],
+                    //         udp_network: UDPNetwork::Ephemeral(Default::default()),
+                    //         ..Default::default()
+                    //     })
+                    //     .await?,
+                    // );
+
+                    // ice_agent.on_connection_state_change(Box::new(move |c: ConnectionState| {
+                    //     tracing::debug!("ICE Connection State has changed: {c}");
+                    //     if c == ConnectionState::Failed {
+                            
+                    //     }
+                    //     Box::pin(async move {})
+                    // }));
+                    
+
+                    // let (tx, rx) = oneshot::channel();
+                    // let mut tx = Some(tx);
+                    // ice_agent.on_candidate(Box::new(move |c: Option<Arc<dyn Candidate + Send + Sync>>| {
+                    //     if c.is_none() {
+                    //         if let Some(tx) = tx.take() {
+                    //             let _r = tx.send(());
+                    //         }
+                    //     }
+                    //     Box::pin(async move {})
+                    // }));
+
+                    // ice_agent.gather_candidates()?;
+                    // let _r = rx.await;
+
+                    // let local_candidates: Vec<String> = ice_agent
+                    // .get_local_candidates().await?
+                    // .iter()
+                    // .map(|c|c.marshal())
+                    // .collect();
+                    // tracing::debug!("local_candidates: {local_candidates:?}");
+                    
+                    // let (local_ufrag, local_pwd) = ice_agent.get_local_user_credentials().await;
+                    // tracing::debug!("credentials: {local_ufrag:?}, {local_pwd:?}");
+                    // tokio::time::sleep(Duration::MAX).await;
+
+                    let mut peer = IcePeer::with_config(IceConfig {
+                        servers: vec![
+                            "stun:stun1.l.google.com:19302".into(),
+                            "stun:stun2.l.google.com:19302".into(),
+                            "stun:stun.qq.com:3478".into(),
+                        ],
+                    });
+
+                    let local_args = peer.gather_until_done().await?;
+                    tracing::debug!("local args {local_args:?}");
+                    
+                    // let (peer, nat) = PunchPeer::bind_and_detect("0.0.0.0:0").await?;
+
+                    // let local_ufrag = peer.local_ufrag().to_string();
+                
+                    // let nat_type = nat.nat_type();
+                    // if nat_type != Some(NatType::Cone) {
+                    //     tracing::warn!("nat type {nat_type:?}");
+                    // } else {
+                    //     tracing::debug!("nat type {nat_type:?}");
+                    // }
+                    // let mapped = nat.into_mapped().with_context(||"empty mapped address")?;
+
+                    let invoker = session.ctrl_client().clone_invoker();
+                    let rsp = invoker.open_p2p(OpenP2PArgs {
+                        args: Some(local_args.into()).into(),
+                        ..Default::default()
+                    }).await?;
+
+                    let rsp = rsp.open_p2p_rsp.with_context(||"no open_p2p_rsp")?;
+                    match rsp {
+                        Open_p2p_rsp::Args(remote_args) => {
+                            tracing::debug!("remote args {remote_args:?}");
+                            // let mut tun = launch_tun_peer(peer, args.ufrag.into(), args.addr.parse()?, false);
+                            spawn_with_name("peer-client", async move {
+                                let conn = peer.dial(remote_args.into()).await?;
+                                conn.send_data("I'am client".as_bytes()).await?;
+                                let mut buf = vec![0; 1700];
+                                let n = conn.recv_data(&mut buf).await?;
+                                let msg = std::str::from_utf8(&buf[..n])?;
+                                tracing::debug!("recv {msg:?}");
+                                Result::<()>::Ok(())
+                            });
+                        },
+                        Open_p2p_rsp::Status(s) => {
+                            tracing::warn!("open p2p but {s:?}");
+                        },
+                        _ => {
+                            tracing::warn!("unknown Open_p2p_rsp {rsp:?}");
+                        }
+                    }                    
+
+
                     shared.data.lock().ctrl = Some(session.ctrl_client().clone_invoker());
                 }
                 

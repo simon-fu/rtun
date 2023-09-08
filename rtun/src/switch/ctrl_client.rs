@@ -6,9 +6,9 @@ use anyhow::{Result, anyhow, bail, Context};
 use chrono::Local;
 use protobuf::Message;
 
-use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, handle_msg_none, Action}, huid::HUId, channel::{ChId, ChPair}, proto::{OpenChannelResponse, open_channel_response::Open_ch_rsp, OpenShellArgs, C2ARequest, c2arequest::C2a_req_args, OpenSocksArgs, CloseChannelArgs, ResponseStatus, Ping, Pong, KickDownArgs}};
+use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, handle_msg_none, Action}, huid::HUId, channel::{ChId, ChPair}, proto::{OpenChannelResponse, open_channel_response::Open_ch_rsp, OpenShellArgs, C2ARequest, c2arequest::C2a_req_args, OpenSocksArgs, CloseChannelArgs, ResponseStatus, Ping, Pong, KickDownArgs, OpenP2PArgs, OpenP2PResponse}};
 
-use super::{invoker_ctrl::{CloseChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker, OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, OpKickDown, OpKickDownResult}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId, entity_watch::{OpWatch, WatchResult, CtrlGuard, CtrlWatch}};
+use super::{invoker_ctrl::{CloseChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker, OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId, entity_watch::{OpWatch, WatchResult, CtrlGuard, CtrlWatch}};
 
 pub type CtrlClientSession<H> = CtrlClient<Entity<H>>;
 pub type CtrlClientInvoker<H> = CtrlInvoker<Entity<H>>;
@@ -199,6 +199,22 @@ impl<H: SwitchHanlder> AsyncHandler<OpKickDown> for Entity<H> {
     }
 }
 
+#[async_trait::async_trait]
+impl<H: SwitchHanlder> AsyncHandler<OpOpenP2P> for Entity<H> {
+    type Response = OpOpenP2PResult; 
+
+    async fn handle(&mut self, req: OpOpenP2P) -> Self::Response {
+        let r = c2a_open_p2p(&mut self.pair, req.0).await;
+        match r {
+            Ok(args) => {
+                Ok(args)
+            }
+            Err(e) => {
+                Err(e)
+            }
+        }
+    }
+}
 
 impl<H: SwitchHanlder> CtrlHandler for Entity<H> {}
 
@@ -392,4 +408,22 @@ pub async fn c2a_kick_down(pair: &mut ChPair, args: KickDownArgs) -> Result<Resp
     .with_context(||"parse kick down response failed")?;
 
     Ok(status)
+}
+
+pub async fn c2a_open_p2p(pair: &mut ChPair, args: OpenP2PArgs) -> Result<OpenP2PResponse> {
+
+    let data = C2ARequest {
+        c2a_req_args: Some(C2a_req_args::OpenP2p(args)),
+        ..Default::default()
+    }.write_to_bytes()?;
+
+    pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send close ch failed"))?;
+
+    let packet = pair.rx.recv_packet().await
+    .with_context(||"recv ping failed")?;
+
+    let rsp = OpenP2PResponse::parse_from_bytes(&packet.payload)
+    .with_context(||"parse open p2p response failed")?;
+
+    Ok(rsp)
 }

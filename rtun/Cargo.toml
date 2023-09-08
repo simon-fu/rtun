@@ -74,6 +74,16 @@ chrono = "=0.4.26"
 # snafu = "=0.7.5"
 # snafu = { version = "0.5", features = ["futures-01"] }
 
+tokio_kcp = "=0.9.6"
+# kcp = "=0.5.3"
+yamux = "=0.12.0"
+tokio-yamux = "=0.3.8"
+stun_codec = "=0.3.2"
+bytecodec = "=0.4.15"
+rand = "=0.8.5"
+# pin-project-lite = "=0.2.13"
+webrtc-ice = "=0.9.1"
+webrtc-util = "=0.7.0"
 
 [build-dependencies]
 # prost-build = { version = "=0.9.0" }
