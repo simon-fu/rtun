@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, Context};
+use tokio_util::compat::{TokioAsyncWriteCompatExt, TokioAsyncReadCompatExt};
 
-use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, wait_next_none, handle_next_none, handle_msg_none}, huid::HUId, channel::{ChSender, CHANNEL_SIZE, ChReceiver, ChId, ChSenderWeak}, async_rt::spawn_with_name, switch::{invoker_ctrl::{OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, CtrlWeak, OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult}, next_ch_id::NextChId, agent::ch_socks::ChSocks, entity_watch::{CtrlGuard, OpWatch, WatchResult}}, stun::punch::{IcePeer, IceConfig}, proto::{OpenP2PResponse, open_p2presponse::Open_p2p_rsp}};
+use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, wait_next_none, handle_next_none, handle_msg_none}, huid::HUId, channel::{ChSender, CHANNEL_SIZE, ChReceiver, ChId, ChSenderWeak}, async_rt::spawn_with_name, switch::{invoker_ctrl::{OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, CtrlWeak, OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult}, next_ch_id::NextChId, agent::ch_socks::ChSocks, entity_watch::{CtrlGuard, OpWatch, WatchResult}}, ice::{ice_peer::{IcePeer, IceConfig, IceArgs}, throughput::run_throughput}, proto::{OpenP2PResponse, open_p2presponse::Open_p2p_rsp, open_p2pargs::Tun_args}};
 use tokio::sync::mpsc;
 
 use super::super::invoker_ctrl::{CloseChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker};
@@ -211,27 +212,40 @@ impl AsyncHandler<OpOpenP2P> for Entity {
     type Response = OpOpenP2PResult; 
 
     async fn handle(&mut self, mut req: OpOpenP2P) -> Self::Response {
-        let remote_args = req.0.args.take().with_context(||"no remote p2p args")?.into();
+        let remote_args: IceArgs = req.0.args.take().with_context(||"no remote p2p args")?.into();
 
         let mut peer = IcePeer::with_config(IceConfig {
             servers: vec![
-                "stun:stun1.l.google.com:19302".into(),
-                "stun:stun2.l.google.com:19302".into(),
+                // "stun:stun1.l.google.com:19302".into(),
+                // "stun:stun2.l.google.com:19302".into(),
                 "stun:stun.qq.com:3478".into(),
             ],
+            disable_dtls: remote_args.cert_fingerprint.is_none(),
+            ..Default::default()
         });
         
         let local_args = peer.gather_until_done().await?;
         
-        spawn_with_name("p2p-server", async move {
-            let conn = peer.accept(remote_args).await?;
-            conn.send_data("I'am server".as_bytes()).await?;
-            let mut buf = vec![0; 1700];
-            let n = conn.recv_data(&mut buf).await?;
-            let msg = std::str::from_utf8(&buf[..n])?;
-            tracing::debug!("recv {msg:?}");
-            Result::<()>::Ok(())
-        });
+        match req.0.tun_args {
+            Some(Tun_args::Throughput(args)) => {
+                spawn_with_name("p2p-throughput", async move {
+                    tracing::debug!("starting");
+                    
+                    let r = async move {
+                        let conn = peer.accept(remote_args).await?;
+                        let (wr, rd) = conn.accept_bi().await?;
+                        run_throughput(rd.compat(), wr.compat_write(), args).await
+                    }.await;
+                    
+                    tracing::debug!("finished {r:?}");
+                });
+            },
+            _ => {
+
+            }
+        }
+
+        // peer.into_accept_and_chat(remote_args).await?;
         
         let rsp = OpenP2PResponse {
             open_p2p_rsp: Some(Open_p2p_rsp::Args(local_args.into())),

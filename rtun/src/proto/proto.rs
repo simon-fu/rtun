@@ -1,7 +1,7 @@
 
 include!(concat!(env!("OUT_DIR"), "/generated_with_pure/mod.rs"));
 
-use crate::stun::punch::IceArgs;
+use crate::ice::ice_peer::IceArgs;
 
 pub use self::app::*;
 
@@ -71,6 +71,7 @@ impl From<IceArgs> for P2PArgs {
             ufrag: value.ufrag.into(),
             pwd: value.pwd.into(),
             candidates: value.candidates.into_iter().map(|x|x.into()).collect(),
+            cert_fingerprint: value.cert_fingerprint.map(|x|x.into()),
             ..Default::default()
         }
     }
@@ -82,6 +83,7 @@ impl From<P2PArgs> for IceArgs {
             ufrag: value.ufrag.into(),
             pwd: value.pwd.into(),
             candidates: value.candidates.into_iter().map(|x|x.into()).collect(),
+            cert_fingerprint: value.cert_fingerprint.map(|x|x.into()),
         }
     }
 }

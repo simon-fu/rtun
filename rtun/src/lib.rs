@@ -35,4 +35,6 @@ pub mod version;
 
 pub mod stun; 
 
-// pub mod kcp;
+pub mod ice;
+
+pub mod kcp;

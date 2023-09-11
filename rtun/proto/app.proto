@@ -85,11 +85,21 @@ message P2PArgs  {
     // string addr                         = 2;
     string pwd                          = 2;
     repeated string candidates          = 3;
+    optional string cert_fingerprint    = 4;
 }
 
 message OpenP2PArgs  {
     P2PArgs args                        = 1;
+    oneof tun_args {
+        ThroughputArgs throughput       = 2;
+    }
 }
+
+message ThroughputArgs {
+    uint32 send_buf_size                = 1;
+    uint32 recv_buf_size                = 2;
+}
+
 
 message OpenP2PResponse {
     oneof open_p2p_rsp {
