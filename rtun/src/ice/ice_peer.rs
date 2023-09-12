@@ -4,6 +4,7 @@ TODO:
     - 证书验证
     - ufrag, pwd 随机生成
     - 用 pwd 检验 stun 消息完整性
+    - IfWatcher 在 github 上取到空列表
 */
 
 use std::net::SocketAddr;
@@ -468,4 +469,33 @@ async fn test_ice_peer() -> Result<()> {
     r2?;
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_ifnet() {
+    use futures::StreamExt;
+
+    tracing_subscriber::fmt()
+    .with_max_level(tracing::Level::INFO)
+    .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
+    .with_target(false)
+    .init();
+
+    let mut watcher = IfWatcher::new().unwrap();
+    tracing::info!("ifnet list: ==>");
+    for (n, ifnet) in watcher.iter().enumerate() {
+        // let if_addr = ifnet.addr();
+        tracing::info!("No.{} ifnet {ifnet:?}", n+1, );
+    }
+    tracing::info!("ifnet list: <==");
+
+    tracing::info!("poll ifnet event ==>");
+    let r = tokio::time::timeout(Duration::from_secs(5), async move {
+        while let Some(r) = watcher.next().await {
+            let event = r?;
+            tracing::info!("event {event:?}");
+        }
+        Result::<()>::Ok(())
+    }).await;
+    tracing::info!("poll ifnet event <== {r:?}");
 }
