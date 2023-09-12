@@ -1,12 +1,12 @@
 
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
-use anyhow::{Result, Context};
+use anyhow::{Result, Context, bail};
 use tokio_util::compat::{TokioAsyncWriteCompatExt, TokioAsyncReadCompatExt};
 
-use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, wait_next_none, handle_next_none, handle_msg_none}, huid::HUId, channel::{ChSender, CHANNEL_SIZE, ChReceiver, ChId, ChSenderWeak}, async_rt::spawn_with_name, switch::{invoker_ctrl::{OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, CtrlWeak, OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult}, next_ch_id::NextChId, agent::ch_socks::ChSocks, entity_watch::{CtrlGuard, OpWatch, WatchResult}}, ice::{ice_peer::{IcePeer, IceConfig, IceArgs}, throughput::run_throughput}, proto::{OpenP2PResponse, open_p2presponse::Open_p2p_rsp, open_p2pargs::Tun_args}};
-use tokio::sync::mpsc;
+use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, wait_next_none, handle_next_none, handle_msg_none}, huid::HUId, channel::{ChSender, CHANNEL_SIZE, ChReceiver, ChId, ChSenderWeak}, async_rt::spawn_with_name, switch::{invoker_ctrl::{OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, CtrlWeak, OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult}, next_ch_id::NextChId, agent::ch_socks::ChSocks, entity_watch::{CtrlGuard, OpWatch, WatchResult}}, ice::{ice_peer::{IcePeer, IceConfig, IceArgs}, throughput::run_throughput, webrtc_ice_peer::{WebrtcIcePeer, WebrtcIceConfig}}, proto::{OpenP2PResponse, open_p2presponse::Open_p2p_rsp, open_p2pargs::Tun_args}};
+use tokio::{sync::mpsc, time::timeout};
 
 use super::super::invoker_ctrl::{CloseChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker};
 
@@ -211,48 +211,59 @@ impl AsyncHandler<OpKickDown> for Entity {
 impl AsyncHandler<OpOpenP2P> for Entity {
     type Response = OpOpenP2PResult; 
 
-    async fn handle(&mut self, mut req: OpOpenP2P) -> Self::Response {
-        let remote_args: IceArgs = req.0.args.take().with_context(||"no remote p2p args")?.into();
+    async fn handle(&mut self, req: OpOpenP2P) -> Self::Response {
+        let ptype = req.0.ptype;
+        if ptype == 1 {
+            return handle_p2p_myice(req).await
+        } else if ptype == 2 {
+            return handle_p2p_webrtc(req).await
+        } 
+        bail!("unknown p2p type {ptype}", )
 
-        let mut peer = IcePeer::with_config(IceConfig {
-            servers: vec![
-                // "stun:stun1.l.google.com:19302".into(),
-                // "stun:stun2.l.google.com:19302".into(),
-                "stun:stun.qq.com:3478".into(),
-            ],
-            disable_dtls: remote_args.cert_fingerprint.is_none(),
-            ..Default::default()
-        });
+        // let remote_args: IceArgs = req.0.args.take().with_context(||"no remote p2p args")?.into();
+
+        // let mut peer = IcePeer::with_config(IceConfig {
+        //     servers: vec![
+        //         // "stun:stun1.l.google.com:19302".into(),
+        //         // "stun:stun2.l.google.com:19302".into(),
+        //         "stun:stun.qq.com:3478".into(),
+        //     ],
+        //     disable_dtls: remote_args.cert_fingerprint.is_none(),
+        //     ..Default::default()
+        // });
         
-        let local_args = peer.gather_until_done().await?;
+        // let local_args = peer.gather_until_done().await?;
         
-        match req.0.tun_args {
-            Some(Tun_args::Throughput(args)) => {
-                spawn_with_name("p2p-throughput", async move {
-                    tracing::debug!("starting");
+        // match req.0.tun_args {
+        //     Some(Tun_args::Throughput(args)) => {
+        //         spawn_with_name("p2p-throughput", async move {
+        //             tracing::debug!("starting");
+
+        //             let r = async move {
+        //                 let conn = peer.accept(remote_args).await?;
+        //                 let (wr, rd) = conn.accept_bi().await?;
+        //                 run_throughput(rd.compat(), wr.compat_write(), args).await
+        //             }.await;
                     
-                    let r = async move {
-                        let conn = peer.accept(remote_args).await?;
-                        let (wr, rd) = conn.accept_bi().await?;
-                        run_throughput(rd.compat(), wr.compat_write(), args).await
-                    }.await;
-                    
-                    tracing::debug!("finished {r:?}");
-                });
-            },
-            _ => {
+        //             tracing::debug!("finished {r:?}");
+        //         });
+        //     },
+        //     _ => {
 
-            }
-        }
+        //     }
+        // }
 
-        // peer.into_accept_and_chat(remote_args).await?;
+
         
-        let rsp = OpenP2PResponse {
-            open_p2p_rsp: Some(Open_p2p_rsp::Args(local_args.into())),
-            ..Default::default()
-        };
+        // let rsp = OpenP2PResponse {
+        //     open_p2p_rsp: Some(Open_p2p_rsp::Args(local_args.into())),
+        //     ..Default::default()
+        // };
 
-        Ok(rsp)
+        // Ok(rsp)
+
+
+        
 
         // let r = PunchPeer::bind_and_detect("0.0.0.0:0").await;
         // match r {
@@ -287,6 +298,102 @@ impl AsyncHandler<OpOpenP2P> for Entity {
         //     Err(e) => Err(e.into()),
         // }
     }
+}
+
+async fn handle_p2p_myice(mut req: OpOpenP2P) -> Result<OpenP2PResponse> {
+    tracing::debug!("handle_p2p_myice");
+
+    let remote_args: IceArgs = req.0.args.take().with_context(||"no remote p2p args")?.into();
+
+    let mut peer = IcePeer::with_config(IceConfig {
+        servers: vec![
+            "stun:stun1.l.google.com:19302".into(),
+            "stun:stun2.l.google.com:19302".into(),
+            "stun:stun.qq.com:3478".into(),
+        ],
+        disable_dtls: remote_args.cert_fingerprint.is_none(),
+        ..Default::default()
+    });
+    
+    let local_args = peer.gather_until_done().await?;
+    
+    match req.0.tun_args {
+        Some(Tun_args::Throughput(args)) => {
+            spawn_with_name("p2p-throughput", async move {
+                tracing::debug!("starting");
+
+                let r = async move {
+                    let conn = peer.accept(remote_args).await?;
+                    let (wr, rd) = conn.accept_bi().await?;
+                    run_throughput(rd.compat(), wr.compat_write(), args).await
+                }.await;
+                
+                tracing::debug!("finished {r:?}");
+            });
+        },
+        _ => {
+
+        }
+    }
+
+    // peer.into_accept_and_chat(remote_args).await?;
+    
+    let rsp = OpenP2PResponse {
+        open_p2p_rsp: Some(Open_p2p_rsp::Args(local_args.into())),
+        ..Default::default()
+    };
+
+    Ok(rsp)
+}
+
+async fn handle_p2p_webrtc(mut req: OpOpenP2P) -> Result<OpenP2PResponse> {
+    tracing::debug!("handle_p2p_webrtc");
+
+    let remote_args: IceArgs = req.0.args.take().with_context(||"no remote p2p args")?.into();
+
+    let mut peer = WebrtcIcePeer::with_config(WebrtcIceConfig {
+        servers: vec![
+            "stun:stun1.l.google.com:19302".into(),
+            "stun:stun2.l.google.com:19302".into(),
+            "stun:stun.qq.com:3478".into(),
+        ],
+        disable_dtls: remote_args.cert_fingerprint.is_none(),
+        ..Default::default()
+    });
+    
+    let local_args = peer.gather_until_done().await?;
+    
+    match req.0.tun_args {
+        Some(Tun_args::Throughput(args)) => {
+            spawn_with_name("p2p-throughput", async move {
+                tracing::debug!("starting");
+
+                let r = async move {
+                    let conn = peer.kick_and_ugrade_to_kcp(remote_args, false).await?;
+                    let (rd, wr) = conn.split();
+                    // run_throughput(rd, wr, args).await
+                    timeout(
+                        Duration::from_secs(10), 
+                        run_throughput(rd, wr, args)
+                    ).await?
+                }.await;
+                
+                tracing::debug!("finished {r:?}");
+            });
+        },
+        _ => {
+
+        }
+    }
+
+    // peer.into_accept_and_chat(remote_args).await?;
+    
+    let rsp = OpenP2PResponse {
+        open_p2p_rsp: Some(Open_p2p_rsp::Args(local_args.into())),
+        ..Default::default()
+    };
+
+    Ok(rsp)
 }
 
 

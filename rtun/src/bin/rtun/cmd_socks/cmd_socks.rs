@@ -1,10 +1,10 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use anyhow::{Result, Context};
+use anyhow::{Result, Context, bail};
 
 use clap::Parser;
 use parking_lot::Mutex;
-use rtun::{ws::client::ws_connect_to, switch::{invoker_ctrl::{CtrlHandler, CtrlInvoker}, next_ch_id::NextChId, session_stream::{make_stream_session, StreamSession}, switch_sink::PacketSink, switch_source::PacketSource}, channel::{ChId, ChPair, ch_stream::ChStream}, proto::{OpenSocksArgs, OpenP2PArgs, open_p2presponse::Open_p2p_rsp, open_p2pargs::Tun_args, ThroughputArgs}, async_rt::spawn_with_name, ice::{throughput::run_throughput, ice_peer::{IcePeer, IceConfig}}};
+use rtun::{ws::client::ws_connect_to, switch::{invoker_ctrl::{CtrlHandler, CtrlInvoker}, next_ch_id::NextChId, session_stream::{make_stream_session, StreamSession}, switch_sink::PacketSink, switch_source::PacketSource}, channel::{ChId, ChPair, ch_stream::ChStream}, proto::{OpenSocksArgs, OpenP2PArgs, open_p2presponse::Open_p2p_rsp, open_p2pargs::Tun_args, ThroughputArgs}, async_rt::spawn_with_name, ice::{throughput::run_throughput, ice_peer::{IcePeer, IceConfig}, webrtc_ice_peer::{WebrtcIcePeer, WebrtcIceConfig}}};
 use tokio::{net::{TcpListener, TcpStream}, time::timeout};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -43,7 +43,10 @@ pub async fn run(args: CmdArgs) -> Result<()> {
 
                 // let mut session = make_stream_session(stream).await?;
 
-                {
+                if let Some(ptype) = args.p2p {
+                    let invoker = session.ctrl_client().clone_invoker();
+                    kick_p2p(invoker, ptype).await?;
+
                     // let ice_agent = Arc::new(
                     //     IceAgent::new(AgentConfig {
                     //         urls: vec![
@@ -92,82 +95,10 @@ pub async fn run(args: CmdArgs) -> Result<()> {
                     // tracing::debug!("credentials: {local_ufrag:?}, {local_pwd:?}");
                     // tokio::time::sleep(Duration::MAX).await;
 
-                    let ice_servers = vec![
-                        // "stun:stun1.l.google.com:19302".into(),
-                        // "stun:stun2.l.google.com:19302".into(),
-                        "stun:stun.qq.com:3478".into(),
-                    ];
+                                  
+                }
 
-                    let mut peer = IcePeer::with_config(IceConfig {
-                        servers: ice_servers.clone(),
-                        // disable_dtls: true,
-                        ..Default::default()
-                    });
-
-                    tracing::debug!("kick gather candidate");
-                    let local_args = peer.gather_until_done().await?;
-                    tracing::debug!("local args {local_args:?}");
-                    
-                    // let (peer, nat) = PunchPeer::bind_and_detect("0.0.0.0:0").await?;
-
-                    // let local_ufrag = peer.local_ufrag().to_string();
-                
-                    // let nat_type = nat.nat_type();
-                    // if nat_type != Some(NatType::Cone) {
-                    //     tracing::warn!("nat type {nat_type:?}");
-                    // } else {
-                    //     tracing::debug!("nat type {nat_type:?}");
-                    // }
-                    // let mapped = nat.into_mapped().with_context(||"empty mapped address")?;
-
-                    let thrp_args = ThroughputArgs {
-                        send_buf_size: 32*1024,
-                        recv_buf_size: 32*1024,
-                        ..Default::default()
-                    };
-
-                    let invoker = session.ctrl_client().clone_invoker();
-                    let rsp = invoker.open_p2p(OpenP2PArgs {
-                        args: Some(local_args.into()).into(),
-                        tun_args: Some(Tun_args::Throughput(thrp_args.clone())),
-                        ..Default::default()
-                    }).await?;
-
-                    let rsp = rsp.open_p2p_rsp.with_context(||"no open_p2p_rsp")?;
-                    match rsp {
-                        Open_p2p_rsp::Args(remote_args) => {
-                            let remote_args = remote_args.into();
-                            tracing::debug!("remote args {remote_args:?}");
-                            // // let mut tun = launch_tun_peer(peer, args.ufrag.into(), args.addr.parse()?, false);
-                            // peer.into_dial_and_chat(remote_args).await?;
-                            
-                            spawn_with_name("p2p-throughput", async move {
-                                tracing::debug!("starting");
-                                
-                                let r = async move {
-                                    let conn = peer.dial(remote_args).await?;
-                                    let (wr, rd) = conn.open_bi().await?;
-                                    let r = timeout(
-                                        Duration::from_secs(60), 
-                                        run_throughput(rd.compat(), wr.compat_write(), thrp_args)
-                                    ).await;
-                                    conn.close(0_u32.into(), "normal".as_bytes());
-                                    r?
-                                }.await;
-                                
-                                tracing::debug!("finished {r:?}");
-                            });
-
-                        },
-                        Open_p2p_rsp::Status(s) => {
-                            tracing::warn!("open p2p but {s:?}");
-                        },
-                        _ => {
-                            tracing::warn!("unknown Open_p2p_rsp {rsp:?}");
-                        }
-                    }                    
-
-
+                {
                     shared.data.lock().ctrl = Some(session.ctrl_client().clone_invoker());
                 }
                 
@@ -185,6 +116,180 @@ pub async fn run(args: CmdArgs) -> Result<()> {
         }
     }
 
+}
+
+async fn kick_p2p<H: CtrlHandler>(invoker: CtrlInvoker<H>, ptype: u32) -> Result<()> {
+    tracing::debug!("kick p2p type {ptype}");
+    
+    if ptype == 1 {
+        return kick_p2p_myice(invoker, ptype).await;
+    } else if ptype == 2 {
+        return kick_p2p_webrtc(invoker, ptype).await;
+    }
+    bail!("unknown p2p type {ptype}")
+}
+
+async fn kick_p2p_myice<H: CtrlHandler>(invoker: CtrlInvoker<H>, ptype: u32) -> Result<()> {
+    tracing::debug!("kick_p2p_myice");
+    let timeout_duration = Duration::from_secs(10);
+
+    let ice_servers = vec![
+        "stun:stun1.l.google.com:19302".into(),
+        "stun:stun2.l.google.com:19302".into(),
+        "stun:stun.qq.com:3478".into(),
+    ];
+
+    let mut peer = IcePeer::with_config(IceConfig {
+        servers: ice_servers.clone(),
+        // disable_dtls: true,
+        ..Default::default()
+    });
+
+    tracing::debug!("kick gather candidate");
+    let local_args = peer.gather_until_done().await?;
+    tracing::debug!("local args {local_args:?}");
+    
+    // let (peer, nat) = PunchPeer::bind_and_detect("0.0.0.0:0").await?;
+
+    // let local_ufrag = peer.local_ufrag().to_string();
+
+    // let nat_type = nat.nat_type();
+    // if nat_type != Some(NatType::Cone) {
+    //     tracing::warn!("nat type {nat_type:?}");
+    // } else {
+    //     tracing::debug!("nat type {nat_type:?}");
+    // }
+    // let mapped = nat.into_mapped().with_context(||"empty mapped address")?;
+
+    let thrp_args = ThroughputArgs {
+        send_buf_size: 32*1024,
+        recv_buf_size: 32*1024,
+        ..Default::default()
+    };
+
+    // let invoker = session.ctrl_client().clone_invoker();
+    let rsp = invoker.open_p2p(OpenP2PArgs {
+        args: Some(local_args.into()).into(),
+        tun_args: Some(Tun_args::Throughput(thrp_args.clone())),
+        ptype,
+        ..Default::default()
+    }).await?;
+
+    let rsp = rsp.open_p2p_rsp.with_context(||"no open_p2p_rsp")?;
+    match rsp {
+        Open_p2p_rsp::Args(remote_args) => {
+            let remote_args = remote_args.into();
+            tracing::debug!("remote args {remote_args:?}");
+            // // let mut tun = launch_tun_peer(peer, args.ufrag.into(), args.addr.parse()?, false);
+            // peer.into_dial_and_chat(remote_args).await?;
+            
+            spawn_with_name("p2p-throughput", async move {
+                tracing::debug!("starting");
+
+                let r = async move {
+                    let conn = peer.dial(remote_args).await?;
+                    let (wr, rd) = conn.open_bi().await?;
+                    let r = timeout(
+                        timeout_duration, 
+                        run_throughput(rd.compat(), wr.compat_write(), thrp_args)
+                    ).await;
+                    conn.close(0_u32.into(), "normal".as_bytes());
+                    r?
+                }.await;
+                
+                tracing::debug!("finished {r:?}");
+            });
+
+        },
+        Open_p2p_rsp::Status(s) => {
+            tracing::warn!("open p2p but {s:?}");
+        },
+        _ => {
+            tracing::warn!("unknown Open_p2p_rsp {rsp:?}");
+        }
+    }     
+    Ok(())
+}
+
+async fn kick_p2p_webrtc<H: CtrlHandler>(invoker: CtrlInvoker<H>, ptype: u32) -> Result<()> {
+    tracing::debug!("kick_p2p_webrtc");
+    let timeout_duration = Duration::from_secs(10);
+
+    let ice_servers = vec![
+        "stun:stun1.l.google.com:19302".into(),
+        "stun:stun2.l.google.com:19302".into(),
+        "stun:stun.qq.com:3478".into(),
+    ];
+
+    let mut peer = WebrtcIcePeer::with_config(WebrtcIceConfig {
+        servers: ice_servers.clone(),
+        // disable_dtls: true,
+        ..Default::default()
+    });
+
+    tracing::debug!("kick gather candidate");
+    let local_args = peer.gather_until_done().await?;
+    tracing::debug!("local args {local_args:?}");
+    
+    // let (peer, nat) = PunchPeer::bind_and_detect("0.0.0.0:0").await?;
+
+    // let local_ufrag = peer.local_ufrag().to_string();
+
+    // let nat_type = nat.nat_type();
+    // if nat_type != Some(NatType::Cone) {
+    //     tracing::warn!("nat type {nat_type:?}");
+    // } else {
+    //     tracing::debug!("nat type {nat_type:?}");
+    // }
+    // let mapped = nat.into_mapped().with_context(||"empty mapped address")?;
+
+    let thrp_args = ThroughputArgs {
+        send_buf_size: 32*1024,
+        recv_buf_size: 32*1024,
+        ..Default::default()
+    };
+
+    // let invoker = session.ctrl_client().clone_invoker();
+    let rsp = invoker.open_p2p(OpenP2PArgs {
+        args: Some(local_args.into()).into(),
+        tun_args: Some(Tun_args::Throughput(thrp_args.clone())),
+        ptype,
+        ..Default::default()
+    }).await?;
+
+    let rsp = rsp.open_p2p_rsp.with_context(||"no open_p2p_rsp")?;
+    match rsp {
+        Open_p2p_rsp::Args(remote_args) => {
+            let remote_args = remote_args.into();
+            tracing::debug!("remote args {remote_args:?}");
+            // // let mut tun = launch_tun_peer(peer, args.ufrag.into(), args.addr.parse()?, false);
+            // peer.into_dial_and_chat(remote_args).await?;
+            
+            spawn_with_name("p2p-throughput", async move {
+                tracing::debug!("starting");
+
+                let r = async move {
+                    let conn = peer.kick_and_ugrade_to_kcp(remote_args, true).await?;
+                    let (rd, wr) = conn.split();
+                    // run_throughput(rd, wr, thrp_args).await
+                    timeout(
+                        timeout_duration, 
+                        run_throughput(rd, wr, thrp_args)
+                    ).await?
+                }.await;
+                
+                tracing::debug!("finished {r:?}");
+            });
+
+        },
+        Open_p2p_rsp::Status(s) => {
+            tracing::warn!("open p2p but {s:?}");
+        },
+        _ => {
+            tracing::warn!("unknown Open_p2p_rsp {rsp:?}");
+        }
+    }     
+    Ok(())
 }
 
 
@@ -335,5 +440,11 @@ pub struct CmdArgs {
         long_help = "authentication secret",
     )]
     secret: Option<String>,
+
+    #[clap(
+        long = "p2p",
+        long_help = "p2p mode",
+    )]
+    p2p: Option<u32>
 }
 

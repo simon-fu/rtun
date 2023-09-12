@@ -10,24 +10,24 @@ use webrtc_util::Conn;
 
 use crate::ice::{ice_kcp::UpgradeToKcp, ice_mpsc::UpgradeToMpsc};
 
-use super::{ice_kcp::IceKcpConnection, ice_mpsc::IceMpsc};
+use super::{ice_kcp::IceKcpConnection, ice_mpsc::IceMpsc, ice_peer::IceArgs};
 
 #[derive(Debug, Default)]
-pub struct IceConfig {
+pub struct WebrtcIceConfig {
     pub servers: Vec<String>,
     pub disable_dtls: bool,
 }
 
-#[derive(Debug)]
-pub struct IceArgs {
-    pub ufrag: String,
-    pub pwd: String,
-    pub candidates: Vec<String>,
-    pub cert_fingerprint: Option<String>,
-}
+// #[derive(Debug)]
+// pub struct IceArgs {
+//     pub ufrag: String,
+//     pub pwd: String,
+//     pub candidates: Vec<String>,
+//     pub cert_fingerprint: Option<String>,
+// }
 
 pub struct WebrtcIcePeer {
-    config: IceConfig,
+    config: WebrtcIceConfig,
     agent: Option<Arc<IceAgent>>,
     certificate: Option<Certificate>,
     conv: u32,
@@ -35,10 +35,10 @@ pub struct WebrtcIcePeer {
 
 impl WebrtcIcePeer {
     pub fn new() -> Self {
-        Self::with_config(IceConfig::default())
+        Self::with_config(WebrtcIceConfig::default())
     }
 
-    pub fn with_config(config: IceConfig) -> Self {
+    pub fn with_config(config: WebrtcIceConfig) -> Self {
         Self {
             certificate: None,
             agent: None,
@@ -380,7 +380,7 @@ fn test_make_fingerprint() {
 
 #[tokio::test]
 async fn test_ice_peer() -> Result<()> {
-    let mut peer1 = WebrtcIcePeer::with_config(IceConfig {
+    let mut peer1 = WebrtcIcePeer::with_config(WebrtcIceConfig {
         servers: vec![
             "stun:stun1.l.google.com:19302".into(),
             "stun:stun2.l.google.com:19302".into(),
@@ -391,7 +391,7 @@ async fn test_ice_peer() -> Result<()> {
 
     let arg1 = peer1.gather_until_done().await?;
 
-    let mut peer2 = WebrtcIcePeer::with_config(IceConfig {
+    let mut peer2 = WebrtcIcePeer::with_config(WebrtcIceConfig {
         servers: vec![
             "stun:stun1.l.google.com:19302".into(),
             "stun:stun2.l.google.com:19302".into(),

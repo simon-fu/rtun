@@ -93,6 +93,7 @@ message OpenP2PArgs  {
     oneof tun_args {
         ThroughputArgs throughput       = 2;
     }
+    uint32 ptype                        = 3;
 }
 
 message ThroughputArgs {

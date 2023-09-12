@@ -162,7 +162,7 @@ mod test_tokio_kcp {
 
 #[cfg(test)]
 mod test_quinn {
-    use std::net::ToSocketAddrs;
+    // use std::net::ToSocketAddrs;
 
     use tracing::Level;
     use tracing_subscriber::EnvFilter;
@@ -189,8 +189,8 @@ mod test_quinn {
 
 
         let server_connect_addr = "127.0.0.1:11911".parse().unwrap();
-        // let server_listen_addr = "0.0.0.0:11911".parse().unwrap();
-        let server_listen_addr = ":::11911".to_socket_addrs().unwrap().next().unwrap();
+        let server_listen_addr = "0.0.0.0:11911".parse().unwrap();
+        // let server_listen_addr = ":::11911".to_socket_addrs().unwrap().next().unwrap();
         // let server_listen_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 11911));
         let (endpoint, server_cert) = make_server_endpoint(server_listen_addr).unwrap();
 
@@ -201,10 +201,9 @@ mod test_quinn {
             let watcher = IfWatcher::new().unwrap();
             for (n, ifnet) in watcher.iter().enumerate() {
                 let if_addr = ifnet.addr();
-                if (server_addr.is_ipv4() && if_addr.is_ipv4()) 
-                || (server_addr.is_ipv6() && if_addr.is_ipv6()) {
-                    info!("No.{} ifnet {ifnet:?}", n+1, );
-                }
+                let yes = (server_addr.is_ipv4() && if_addr.is_ipv4()) 
+                || (server_addr.is_ipv6() && if_addr.is_ipv6());
+                info!("No.{} ifnet {ifnet:?}, same family {yes}", n+1, );
             }
         }
 
