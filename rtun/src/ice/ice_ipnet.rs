@@ -1,6 +1,10 @@
 
+use std::time::Duration;
+
 use anyhow::Result;
+use futures::StreamExt;
 use if_watch::{tokio::IfWatcher, IpNet, IfEvent};
+use tokio::time::timeout;
 
 use crate::async_rt::dummy;
 
@@ -12,6 +16,28 @@ pub fn ipnet_iter() -> Result<IpNetIter> {
 
 pub struct IpNetIter {
     watcher: IfWatcher,
+}
+
+impl IpNetIter {
+    pub async fn next_net(&mut self) -> Option<Result<IpNet>> {
+
+        loop {
+            let r = timeout(
+                Duration::from_millis(1000), 
+                self.watcher.next(),
+            ).await;
+
+            match r {
+                Ok(Some(Ok(IfEvent::Up(ipnet)))) => {
+                    return Some(Ok(ipnet))
+                },
+                Ok(Some(_r)) => {},
+                Ok(None) => return None,
+                Err(_e) => return None,
+            }
+        }
+
+    }
 }
 
 impl Iterator for IpNetIter {
@@ -57,15 +83,14 @@ async fn test_ipnet() {
 
     tracing::info!("poll ifnet event ==>");
 
-    let fun = ||  {
-        let iter = ipnet_iter()?;
-        for r in iter {
+    let r = async  {
+        let mut iter = ipnet_iter()?;
+        while let Some(r) = iter.next_net().await {
             let ipnet = r?;
             tracing::info!("ipnet {ipnet:?}");
         }
         Result::<()>::Ok(())
-    };
-    let r = fun();
+    }.await;
 
     // let r = tokio::time::timeout(Duration::from_secs(5), async move {
     //     while let Some(r) = watcher.next().await {
