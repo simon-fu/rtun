@@ -8,37 +8,55 @@ use tokio::time::timeout;
 
 use crate::async_rt::dummy;
 
-pub fn ipnet_iter() -> Result<IpNetIter> {
+pub async fn ipnet_iter() -> Result<IpNetIter> {
+    let mut watcher = IfWatcher::new()?;
+
+    let r = timeout(
+        Duration::from_millis(1000), 
+        watcher.next(),
+    ).await;
+
+    let mut first = None;
+    if let Ok(Some(r)) = r {
+        let event = r?;
+        match event {
+            IfEvent::Up(ipnet) => first = Some(ipnet),
+            IfEvent::Down(_r) => {},
+        }
+    }
+
     Ok(IpNetIter{
-        watcher: IfWatcher::new()?,
+        watcher,
+        first,
     })
 }
 
 pub struct IpNetIter {
     watcher: IfWatcher,
+    first: Option<IpNet>,
 }
 
-impl IpNetIter {
-    pub async fn next_net(&mut self) -> Option<Result<IpNet>> {
+// impl IpNetIter {
+//     pub async fn next_net(&mut self) -> Option<Result<IpNet>> {
 
-        loop {
-            let r = timeout(
-                Duration::from_millis(1000), 
-                self.watcher.next(),
-            ).await;
+//         loop {
+//             let r = timeout(
+//                 Duration::from_millis(1000), 
+//                 self.watcher.next(),
+//             ).await;
 
-            match r {
-                Ok(Some(Ok(IfEvent::Up(ipnet)))) => {
-                    return Some(Ok(ipnet))
-                },
-                Ok(Some(_r)) => {},
-                Ok(None) => return None,
-                Err(_e) => return None,
-            }
-        }
+//             match r {
+//                 Ok(Some(Ok(IfEvent::Up(ipnet)))) => {
+//                     return Some(Ok(ipnet))
+//                 },
+//                 Ok(Some(_r)) => {},
+//                 Ok(None) => return None,
+//                 Err(_e) => return None,
+//             }
+//         }
 
-    }
-}
+//     }
+// }
 
 impl Iterator for IpNetIter {
     type Item = Result<IpNet>;
@@ -46,6 +64,11 @@ impl Iterator for IpNetIter {
     fn next(&mut self) -> Option<Self::Item> {
         use std::task::Poll;
         let waker = dummy::waker();
+
+        if let Some(first) = self.first.take() {
+            return Some(Ok(first))
+        }
+
         loop {
             let r = self.watcher.poll_if_event(&mut dummy::context(&waker));
             match r {
@@ -83,14 +106,16 @@ async fn test_ipnet() {
 
     tracing::info!("poll ifnet event ==>");
 
-    let r = async  {
-        let mut iter = ipnet_iter()?;
-        while let Some(r) = iter.next_net().await {
+    let mut iter = ipnet_iter().await.unwrap();
+    let mut fun = ||  {
+        
+        while let Some(r) = iter.next() {
             let ipnet = r?;
             tracing::info!("ipnet {ipnet:?}");
         }
         Result::<()>::Ok(())
-    }.await;
+    };
+    let r = fun();
 
     // let r = tokio::time::timeout(Duration::from_secs(5), async move {
     //     while let Some(r) = watcher.next().await {

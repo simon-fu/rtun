@@ -135,7 +135,7 @@ impl IcePeer {
             //     }
             // }
 
-            for r in ipnet_iter()? {
+            for r in ipnet_iter().await? {
                 let if_addr = r?.addr();
                 if (local_addr.is_ipv4() && if_addr.is_ipv4()) 
                 || (local_addr.is_ipv6() && if_addr.is_ipv6()) {
