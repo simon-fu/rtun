@@ -199,12 +199,14 @@ mod test_quinn {
 
         if server_addr.ip().is_unspecified() {
             let watcher = IfWatcher::new().unwrap();
+            info!("ifnet list: ==>");
             for (n, ifnet) in watcher.iter().enumerate() {
                 let if_addr = ifnet.addr();
                 let yes = (server_addr.is_ipv4() && if_addr.is_ipv4()) 
                 || (server_addr.is_ipv6() && if_addr.is_ipv6());
                 info!("No.{} ifnet {ifnet:?}, same family {yes}", n+1, );
             }
+            info!("ifnet list: <==");
         }
 
         let args1 = args.clone();
