@@ -5,6 +5,8 @@ pub mod ice_peer;
 
 pub mod ice_candidate;
 
+pub mod ice_ipnet;
+
 pub mod ice_kcp;
 
 pub mod ice_mpsc;

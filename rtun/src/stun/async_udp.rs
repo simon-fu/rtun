@@ -5,6 +5,8 @@ use futures::{ready, Future};
 use quinn::udp::{UdpState, RecvMeta, Transmit};
 pub use quinn::AsyncUdpSocket as AsyncUdpSocketOps;
 
+use crate::async_rt::dummy;
+
 // pub trait AsyncUdpSocket: AsyncUdpSocketOps {
 
 // }
@@ -145,17 +147,17 @@ impl AsyncUdpSocket  for DummyUdpSocket {
     }
 }
 
-struct DummyWaker;
-impl task::Wake for DummyWaker {
-    fn wake(self: Arc<Self>) {
+// struct DummyWaker;
+// impl task::Wake for DummyWaker {
+//     fn wake(self: Arc<Self>) {
         
-    }
-    // // Required method
-    // fn wake(self: Arc<Self>);
+//     }
+//     // // Required method
+//     // fn wake(self: Arc<Self>);
 
-    // // Provided method
-    // fn wake_by_ref(self: &Arc<Self>) { ... }
-}
+//     // // Provided method
+//     // fn wake_by_ref(self: &Arc<Self>) { ... }
+// }
 
 #[inline]
 pub fn udp_state() -> &'static Arc<UdpState> {
@@ -192,8 +194,10 @@ impl<'a, U: AsyncUdpSocket + Unpin> UdpSocketWrapper<'a, U> {
 
     pub fn try_send_to(&self, data: Bytes, destination: SocketAddr) -> io::Result<usize> {
         let thiz = Pin::new(self);
-        let waker = Arc::new(DummyWaker).into();
-        let mut cx = task::Context::from_waker(&waker);
+        let waker = dummy::waker();
+        let mut cx = dummy::context(&waker);
+        // let waker = Arc::new(DummyWaker).into();
+        // let mut cx = task::Context::from_waker(&waker);
 
         let transmits = [Transmit {
             destination,

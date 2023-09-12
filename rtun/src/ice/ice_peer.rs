@@ -11,7 +11,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Result, Context, bail};
-use if_watch::tokio::IfWatcher;
 use quinn::{Endpoint, ServerConfig, default_runtime, ClientConfig, Connection, SendStream, RecvStream};
 use sha2::{Sha256, Digest};
 use tracing::debug;
@@ -25,6 +24,7 @@ use crate::stun::stun::{Binding, StunSocket, BindingOutput};
 use crate::{stun::async_udp::BoxUdpSocket, huid::gen_huid::gen_huid};
 
 use super::ice_candidate::{Candidate, server_reflexive};
+use super::ice_ipnet::ipnet_iter;
 
 #[derive(Debug, Default)]
 pub struct IceConfig {
@@ -127,13 +127,22 @@ impl IcePeer {
         }
 
         if local_addr.ip().is_unspecified() {
-            for ifnet in IfWatcher::new()?.iter() {
-                let if_addr = ifnet.addr();
+            // for ifnet in IfWatcher::new()?.iter() {
+            //     let if_addr = ifnet.addr();
+            //     if (local_addr.is_ipv4() && if_addr.is_ipv4()) 
+            //     || (local_addr.is_ipv6() && if_addr.is_ipv6()) {
+            //         candidates.push(Candidate::host(SocketAddr::new(if_addr, local_addr.port()))?);
+            //     }
+            // }
+
+            for r in ipnet_iter()? {
+                let if_addr = r?.addr();
                 if (local_addr.is_ipv4() && if_addr.is_ipv4()) 
                 || (local_addr.is_ipv6() && if_addr.is_ipv6()) {
                     candidates.push(Candidate::host(SocketAddr::new(if_addr, local_addr.port()))?);
                 }
             }
+
         } else {
             candidates.push(Candidate::host(local_addr)?);
         }
@@ -471,31 +480,7 @@ async fn test_ice_peer() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_ifnet() {
-    use futures::StreamExt;
 
-    tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::INFO)
-    .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
-    .with_target(false)
-    .init();
 
-    let mut watcher = IfWatcher::new().unwrap();
-    tracing::info!("ifnet list: ==>");
-    for (n, ifnet) in watcher.iter().enumerate() {
-        // let if_addr = ifnet.addr();
-        tracing::info!("No.{} ifnet {ifnet:?}", n+1, );
-    }
-    tracing::info!("ifnet list: <==");
 
-    tracing::info!("poll ifnet event ==>");
-    let r = tokio::time::timeout(Duration::from_secs(5), async move {
-        while let Some(r) = watcher.next().await {
-            let event = r?;
-            tracing::info!("event {event:?}");
-        }
-        Result::<()>::Ok(())
-    }).await;
-    tracing::info!("poll ifnet event <== {r:?}");
-}
+
