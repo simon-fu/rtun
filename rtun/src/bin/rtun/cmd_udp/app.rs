@@ -79,7 +79,7 @@ impl FooterApp for AppSync {
     fn on_paint(&mut self, term: &Term) -> Result<usize> {
         lazy_static::lazy_static! {
             static ref LONG_DIV: String = {
-                let mut s = String::with_capacity(2048);
+                let mut s = String::with_capacity(32);
                 for _ in 0..s.capacity() {
                     s.push('-')
                 }
@@ -88,7 +88,8 @@ impl FooterApp for AppSync {
         }
         
         let (_h, w) = term.size();
-        let div = &(*LONG_DIV)[..w as usize];
+        let w = (w as usize).min(LONG_DIV.len());
+        let div = &(*LONG_DIV)[..w];
 
         let mut lines = 0;
 
@@ -355,6 +356,9 @@ impl Entity {
                     }
                 }
             },
+            SubCmd::Exit(_args) => {
+                let _r = self.shared.event_tx.send(Event::Exit).await;
+            }
         }
         Ok(())
     }
@@ -409,6 +413,7 @@ enum SubCmd {
     Close(CloseCmdArgs),
     Send(SendCmdArgs),
     Set(SetCmdArgs),
+    Exit(ExitCmdArgs),
 }
 
 
@@ -459,3 +464,7 @@ pub struct SetCmdArgs {
     value: String,
 }
 
+#[derive(Parser, Debug)]
+#[clap(name = "exit")]
+pub struct ExitCmdArgs {
+}
