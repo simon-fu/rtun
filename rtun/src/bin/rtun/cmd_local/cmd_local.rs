@@ -7,9 +7,13 @@ use clap::Parser;
 use rtun::{switch::agent::ch_socks::run_socks_conn, async_rt::spawn_with_name};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::init_log_and_run;
 
+pub fn run(args: CmdArgs) -> Result<()> { 
+    init_log_and_run(do_run(args))?
+}
 
-pub async fn run(args: CmdArgs) -> Result<()> { 
+async fn do_run(args: CmdArgs) -> Result<()> { 
 
     let shared = Arc::new(Shared {
         server: rtun::switch::agent::ch_socks::Server::try_new("127.0.0.1:1080").await?,
@@ -83,7 +87,7 @@ async fn handle_client_directly(
 
 
 #[derive(Parser, Debug)]
-#[clap(name = "client", author, about, version)]
+#[clap(name = "local", author, about, version)]
 pub struct CmdArgs {
     #[clap(
         short = 'l',

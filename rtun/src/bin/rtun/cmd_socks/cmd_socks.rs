@@ -8,9 +8,13 @@ use rtun::{ws::client::ws_connect_to, switch::{invoker_ctrl::{CtrlHandler, CtrlI
 use tokio::{net::{TcpListener, TcpStream}, time::timeout};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::{client_utils::client_select_url, rest_proto::get_agent_from_url};
+use crate::{client_utils::client_select_url, rest_proto::get_agent_from_url, init_log_and_run};
 
-pub async fn run(args: CmdArgs) -> Result<()> { 
+pub fn run(args: CmdArgs) -> Result<()> { 
+    init_log_and_run(do_run(args))?
+}
+
+async fn do_run(args: CmdArgs) -> Result<()> { 
 
     let shared = Arc::new(Shared {
         data: Mutex::new(SharedData {
@@ -414,7 +418,7 @@ async fn handle_client<H: CtrlHandler>(
 
 
 #[derive(Parser, Debug)]
-#[clap(name = "client", author, about, version)]
+#[clap(name = "socks", author, about, version)]
 pub struct CmdArgs {
 
     #[clap(help="eg: http://127.0.0.1:8080")]

@@ -4,10 +4,13 @@ use anyhow::{Result, Context};
 use clap::Parser;
 use rtun::{ws::client::ws_connect_to, switch::{ctrl_client::make_ctrl_client, switch_pair::make_switch_pair}, huid::gen_huid::gen_huid, channel::{ChId, ChPair}, proto::{OpenShellArgs, ProgramArgs}, term::async_input::get_term_size};
 
-use crate::{terminal::run_term, client_utils::client_select_url, rest_proto::get_agent_from_url};
+use crate::{terminal::run_term, client_utils::client_select_url, rest_proto::get_agent_from_url, init_log_and_run};
 
-pub async fn run(args: CmdArgs) -> Result<()> { 
+pub fn run(args: CmdArgs) -> Result<()> { 
+    init_log_and_run(do_run(args))?
+}
 
+async fn do_run(args: CmdArgs) -> Result<()> { 
     let url = client_select_url(&args.url, args.agent.as_deref(), args.secret.as_deref()).await?;
     let url_str = url.as_str();
 
@@ -115,7 +118,7 @@ pub async fn run(args: CmdArgs) -> Result<()> {
 
 
 #[derive(Parser, Debug)]
-#[clap(name = "client", author, about, version)]
+#[clap(name = "shell", author, about, version)]
 pub struct CmdArgs {
 
     #[clap(help="eg: http://127.0.0.1:8080")]

@@ -195,7 +195,7 @@ impl IcePeer {
         .next()
         .with_context(||"negotiate done but empty target")?;
 
-        debug!("negotiate connected to {select_addr}");
+        debug!("setup connection to {select_addr}");
 
         let socket = UdpSocketBridge(StunSocket::new(socket)) ;
 
@@ -245,12 +245,12 @@ impl IcePeer {
             (conn, keepalive)
         };
 
-        debug!("setup connection");
-
         spawn_with_name("keepalive", async move {
             let r = keepalive_task(keepalive, is_client).await;
             debug!("finished {r:?}");
         });
+
+        debug!("upgrade to quic");
 
         Ok(conn)
     }

@@ -26,7 +26,8 @@ Done:
 use anyhow::Result;
 use rtun::{async_rt, version::ver_full};
 use clap::Parser;
-use tracing_subscriber::{EnvFilter, filter::LevelFilter};
+use time::{macros::format_description, UtcOffset};
+use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt::{MakeWriter, time::OffsetTime}};
 
 pub mod cmd_shell;
 
@@ -36,7 +37,7 @@ pub mod cmd_socks;
 
 pub mod cmd_local;
 
-// pub mod cmd_kcp;
+pub mod cmd_udp;
 
 pub mod terminal;
 
@@ -62,31 +63,56 @@ enum SubCmd {
     Socks(cmd_socks::CmdArgs),
     Agent(cmd_agent::CmdArgs),
     Local(cmd_local::CmdArgs),
-    // Kcp(cmd_kcp::CmdArgs),
+    Udp(cmd_udp::CmdArgs),
 }
 
 fn main() -> Result<()> {
-
-    init_log();
-    tracing::info!("rtun {}", ver_full());
     let args = CmdArgs::parse();
+    match args.cmd {
+        SubCmd::Shell(args) => cmd_shell::run(args),
+        SubCmd::Socks(args) => cmd_socks::run(args),
+        SubCmd::Agent(args) => cmd_agent::run(args),
+        SubCmd::Local(args) => cmd_local::run(args),
+        SubCmd::Udp(args) => cmd_udp::run(args),
+    }
 
-    let r = async_rt::run_multi_thread(async move { 
-        return match args.cmd {
-            SubCmd::Shell(args) => cmd_shell::run(args).await,
-            SubCmd::Socks(args) => cmd_socks::run(args).await,
-            SubCmd::Agent(args) => cmd_agent::run(args).await,
-            SubCmd::Local(args) => cmd_local::run(args).await,
-            // SubCmd::Kcp(args) => cmd_kcp::run(args).await,
-        }
-    });
-    tracing::debug!("main finished with {:?}", r);
-    r??;
-    Ok(())
+    // init_log();
+    // tracing::info!("rtun {}", ver_full());
+    // let args = CmdArgs::parse();
+
+    // let r = async_rt::run_multi_thread(async move { 
+    //     return match args.cmd {
+    //         SubCmd::Shell(args) => cmd_shell::run(args).await,
+    //         SubCmd::Socks(args) => cmd_socks::run(args).await,
+    //         SubCmd::Agent(args) => cmd_agent::run(args).await,
+    //         SubCmd::Local(args) => cmd_local::run(args).await,
+    //         SubCmd::Udp(args) => cmd_udp::run(args).await,
+    //     }
+    // });
+    // tracing::debug!("main finished with {:?}", r);
+    // r??;
+    // Ok(())
 }
 
-fn init_log() {
+pub(crate) fn init_log_and_run<F: futures::Future>(future: F) -> Result<F::Output> {
+    init_log();
+    async_rt::run_multi_thread(future)
+}
+pub(crate) fn init_log() {
+    init_log2(||std::io::stdout())
+}
 
+pub(crate) fn init_log2<W2>(w: W2) 
+where
+    W2: for<'writer> MakeWriter<'writer> + 'static + Send + Sync,
+{
+
+    // https://time-rs.github.io/book/api/format-description.html
+    let fmts = format_description!("[hour]:[minute]:[second].[subsecond digits:3]");
+
+    let offset = UtcOffset::current_local_offset().expect("should get local offset!");
+    let timer = OffsetTime::new(offset, fmts);
+    
     let filter = if cfg!(debug_assertions) {
         if let Ok(v) = std::env::var(EnvFilter::DEFAULT_ENV) {
             v.into()
@@ -103,5 +129,8 @@ fn init_log() {
     .with_max_level(tracing::metadata::LevelFilter::DEBUG)
     .with_env_filter(filter)
     // .with_env_filter("rtun=debug,rserver=debug")
+    .with_writer(w)
+    .with_timer(timer)
+    .with_target(false)
     .init();
 }

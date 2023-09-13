@@ -92,6 +92,9 @@ rcgen = "=0.11.1"
 if-watch = { version = "=3.0.1", features = ["tokio"] }
 combine = "=4.6.6"
 
+dialoguer = { version = "=0.10.4", features = ["history", "completion"] }
+console = "=0.15.7"
+
 [build-dependencies]
 # prost-build = { version = "=0.9.0" }
 # protobuf-codegen-pure = "=2"

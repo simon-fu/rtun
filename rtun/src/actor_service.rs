@@ -65,6 +65,10 @@ impl<E: ActorEntity> ActorBuilder<E> {
         WeakInvoker { op_tx: self.op_tx.downgrade() }
     }
 
+    pub fn build_invoker(&self) -> Invoker<E> {
+        Invoker { op_tx: self.op_tx.clone() }
+    }
+
     pub fn build<F0, F1, F2, F3>(
         self,
         name: String,
@@ -218,6 +222,19 @@ impl<E: ActorEntity> Invoker<E> {
         self.op_tx.send(Op::Invoke(AsyncEnvelope::new(req, tx))).await
         .map_err(|_x|anyhow!("send request error"))?;
         let rsp = rx.await.with_context(||"recv response but error")?;
+        Ok(rsp)
+    }
+
+    pub fn blocking_invoke<Request, Response>(&self, req: Request) -> Result<Response> 
+    where
+        Request: Send + 'static,
+        Response: Send + 'static,
+        E: AsyncHandler<Request, Response = Response> + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.op_tx.blocking_send(Op::Invoke(AsyncEnvelope::new(req, tx)))
+        .map_err(|_x|anyhow!("send request error"))?;
+        let rsp = rx.blocking_recv().with_context(||"recv response but error")?;
         Ok(rsp)
     }
 
