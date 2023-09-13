@@ -150,7 +150,7 @@ async fn kick_p2p_myice<H: CtrlHandler>(invoker: CtrlInvoker<H>, ptype: u32) -> 
     });
 
     tracing::debug!("kick gather candidate");
-    let local_args = peer.gather_until_done().await?;
+    let local_args = peer.initiative().await?;
     tracing::debug!("local args {local_args:?}");
     
     // let (peer, nat) = PunchPeer::bind_and_detect("0.0.0.0:0").await?;

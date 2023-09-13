@@ -2,8 +2,9 @@ use std::{sync::Arc, net::SocketAddr, io::{self, IoSliceMut}, task::{Poll, self}
 
 use bytes::Bytes;
 use futures::{ready, Future};
-use quinn::udp::{UdpState, RecvMeta, Transmit};
+use quinn::udp::{UdpState, RecvMeta, Transmit, UdpSocketState};
 pub use quinn::AsyncUdpSocket as AsyncUdpSocketOps;
+use tokio::io::Interest;
 
 use crate::async_rt::dummy;
 
@@ -47,6 +48,9 @@ pub trait AsyncUdpSocket: Send + fmt::Debug + 'static {
     fn may_fragment(&self) -> bool {
         true
     }
+
+    fn set_ttl(&self, ttl: u32) -> io::Result<()>;
+    
 }
 
 impl<T: AsyncUdpSocketOps> AsyncUdpSocket for T 
@@ -58,7 +62,7 @@ impl<T: AsyncUdpSocketOps> AsyncUdpSocket for T
         cx: &mut task::Context,
         transmits: &[Transmit],
     ) -> Poll<Result<usize, io::Error>> {
-        self.poll_send(state, cx, transmits)
+        AsyncUdpSocketOps::poll_send(self, state, cx, transmits)
     }
 
     #[inline]
@@ -68,17 +72,21 @@ impl<T: AsyncUdpSocketOps> AsyncUdpSocket for T
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        self.poll_recv(cx, bufs, meta)
+        AsyncUdpSocketOps::poll_recv(self, cx, bufs, meta)
     }
 
     #[inline]
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.local_addr()
+        AsyncUdpSocketOps::local_addr(self)
     }
 
     #[inline]
     fn may_fragment(&self) -> bool {
-        self.may_fragment()
+        AsyncUdpSocketOps::may_fragment(self)
+    }
+
+    fn set_ttl(&self, _ttl: u32) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
     }
 }
 
@@ -114,6 +122,10 @@ impl AsyncUdpSocket for Box<dyn AsyncUdpSocket> {
     fn may_fragment(&self) -> bool {
         self.as_ref().may_fragment()
     }
+
+    fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        self.as_ref().set_ttl(ttl)
+    }
 }
 
 
@@ -144,6 +156,10 @@ impl AsyncUdpSocket  for DummyUdpSocket {
             Ok(addr) => Ok(addr),
             Err(_e) => Err(io::ErrorKind::InvalidData.into()),
         }
+    }
+
+    fn set_ttl(&self, _ttl: u32) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -304,6 +320,10 @@ impl AsyncUdpSocket for BoxUdpSocket {
     fn may_fragment(&self) -> bool {
         self.0.may_fragment()
     }
+
+    fn set_ttl(&self, _ttl: u32) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 
@@ -351,13 +371,86 @@ impl<U: AsyncUdpSocket> AsyncUdpSocketOps for UdpSocketBridge<U> {
 }
 
 
-pub async fn tokio_socket_bind<A>(addr: A) -> io::Result<BoxUdpSocket> 
+// pub async fn tokio_socket_bind<A>(addr: A) -> io::Result<BoxUdpSocket> 
+// where
+//     A: tokio::net::ToSocketAddrs,
+// {
+//     let socket = tokio::net::UdpSocket::bind(addr).await?;
+//     let socket = quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, socket.into_std()?)?;
+//     Ok(BoxUdpSocket(socket))
+// }
+
+pub async fn tokio_socket_bind<A>(addr: A) -> io::Result<TokioUdpSocket> 
 where
     A: tokio::net::ToSocketAddrs,
 {
     let socket = tokio::net::UdpSocket::bind(addr).await?;
-    let socket = quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, socket.into_std()?)?;
-    Ok(BoxUdpSocket(socket))
+    let socket = socket.into_std()?;
+    UdpSocketState::configure((&socket).into())?;
+    Ok(TokioUdpSocket {
+        io: tokio::net::UdpSocket::from_std(socket)?,
+        inner: UdpSocketState::new(),
+    })
+}
+
+#[derive(Debug)]
+pub struct TokioUdpSocket {
+    io: tokio::net::UdpSocket,
+    inner: UdpSocketState,
+}
+
+// impl TokioUdpSocket {
+//     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+//         self.io.set_ttl(ttl)
+//     }
+// }
+
+impl AsyncUdpSocket for TokioUdpSocket {
+    fn poll_send(
+        &self,
+        state: &UdpState,
+        cx: &mut task::Context,
+        transmits: &[Transmit],
+    ) -> Poll<io::Result<usize>> {
+        let inner = &self.inner;
+        let io = &self.io;
+        loop {
+            ready!(io.poll_send_ready(cx))?;
+            if let Ok(res) = io.try_io(Interest::WRITABLE, || {
+                inner.send(io.into(), state, transmits)
+            }) {
+                return Poll::Ready(Ok(res));
+            }
+        }
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut task::Context,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            ready!(self.io.poll_recv_ready(cx))?;
+            if let Ok(res) = self.io.try_io(Interest::READABLE, || {
+                self.inner.recv((&self.io).into(), bufs, meta)
+            }) {
+                return Poll::Ready(Ok(res));
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.io.local_addr()
+    }
+
+    fn may_fragment(&self) -> bool {
+        quinn::udp::may_fragment()
+    }
+
+    fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        self.io.set_ttl(ttl)
+    }
 }
 
 

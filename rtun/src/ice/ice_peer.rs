@@ -17,11 +17,11 @@ use tracing::debug;
 
 use crate::async_rt::spawn_with_name;
 use crate::ice::ice_candidate::parse_candidate;
-use crate::stun::async_udp::{AsyncUdpSocket, UdpSocketBridge, tokio_socket_bind};
+use crate::stun::async_udp::{AsyncUdpSocket, UdpSocketBridge, tokio_socket_bind, TokioUdpSocket, AsUdpSocket};
 
 
-use crate::stun::stun::{Binding, StunSocket, BindingOutput};
-use crate::{stun::async_udp::BoxUdpSocket, huid::gen_huid::gen_huid};
+use crate::stun::stun::{Binding, StunSocket, BindingOutput, self};
+use crate::huid::gen_huid::gen_huid;
 
 use super::ice_candidate::{Candidate, server_reflexive};
 use super::ice_ipnet::ipnet_iter;
@@ -76,8 +76,10 @@ impl Local {
 
 pub struct IcePeer {
     config: IceConfig,
+    socket: Option<TokioUdpSocket>,
     local: Option<Local>,
-    socket: Option<BoxUdpSocket>,
+    remote: Option<IceArgs>,
+    targets: Vec<SocketAddr>,
 }
 
 impl IcePeer {
@@ -89,6 +91,8 @@ impl IcePeer {
         Self {
             local: None,
             socket: None,
+            remote: None,
+            targets: Default::default(),
             config,
         }
     }
@@ -97,7 +101,49 @@ impl IcePeer {
         self.local.as_ref().map(|x|x.to_args())
     }
 
-    pub async fn gather_until_done(&mut self) -> Result<IceArgs> {
+    pub async fn initiative(&mut self) -> Result<IceArgs> {
+        self.gather_until_done().await
+    }
+
+    pub async fn passive(&mut self, remote: IceArgs) -> Result<IceArgs> {
+        let local_args = self.gather_until_done().await?;
+        
+        self.set_remote(remote)?;
+
+        let config = self.binding_config()?;
+        if let Some(socket) = self.socket.as_mut() {
+            socket.set_ttl(3)?;
+            for target in self.targets.iter() {
+                let data = config.gen_bind_req_bytes()?;
+                socket.as_socket().send_to(data.into(), *target).await?;
+            }
+        }
+
+        Ok(local_args)
+    }
+
+    fn set_remote(&mut self, remote: IceArgs) -> Result<()> {
+        self.targets = Vec::with_capacity(remote.candidates.len());
+        for c in remote.candidates.iter() {
+            self.targets.push(parse_candidate(c)?.addr());
+        }
+        self.remote = Some(remote);
+        Ok(())
+    }
+
+    fn binding_config(&self) -> Result<stun::Config> {
+        let local = self.local.as_ref().with_context(||"no local args")?;
+        let remote = self.remote.as_ref().with_context(||"no remote args")?;
+        let username = format!("{}:{}", local.ufrag, remote.ufrag);
+
+        let mut config = stun::Config::default();
+        config.username = Some(username);
+        config.password = Some(remote.pwd.clone());
+
+        Ok(config)
+    }
+
+    async fn gather_until_done(&mut self) -> Result<IceArgs> {
 
         let mut servers = Vec::with_capacity(self.config.servers.len());
         for s in self.config.servers.iter() {
@@ -164,30 +210,26 @@ impl IcePeer {
     }
 
     pub async fn dial(&mut self, remote: IceArgs) -> Result<IceConn> {
+        self.set_remote(remote)?;
         let socket = self.socket.take().with_context(||"no socket")?;
-        self.negotiate(socket, remote, true).await
+        self.negotiate(socket, true).await
     }
 
-    pub async fn accept(&mut self, remote: IceArgs) -> Result<IceConn> {
+    pub async fn accept(&mut self) -> Result<IceConn> {
         let socket = self.socket.take().with_context(||"no socket")?;
-        self.negotiate(socket, remote, false).await
+        self.negotiate(socket, false).await
     }
 
-    async fn negotiate(&mut self, socket: BoxUdpSocket, remote: IceArgs, is_client: bool) -> Result<IceConn> {
+    async fn negotiate(&mut self, socket: TokioUdpSocket, is_client: bool) -> Result<IceConn> {
 
-        let mut targets = Vec::with_capacity(remote.candidates.len());
-        for c in remote.candidates.iter() {
-            targets.push(parse_candidate(c)?.addr());
-        }
+        let remote = self.remote.as_ref().with_context(||"no remote args")?;
 
         let local = self.local.as_ref().with_context(||"NOT gather yet")?;
 
-        let username = format!("{}:{}", local.ufrag, remote.ufrag);
+        let config = self.binding_config()?;
 
-        let (socket, output) = Binding::with_socket(socket)
-        .username(username)
-        .password(local.pwd.clone())
-        .exec(targets.iter()).await?;
+        let (socket, output) = Binding::with_config(socket, config)
+        .exec(self.targets.iter()).await?;
 
         let select_addr = output.target_iter()
         .next()
@@ -407,8 +449,8 @@ async fn test_ice_peer() -> Result<()> {
     .init();
 
     let servers = vec![
-        "stun:stun1.l.google.com:19302".into(),
-        "stun:stun2.l.google.com:19302".into(),
+        // "stun:stun1.l.google.com:19302".into(),
+        // "stun:stun2.l.google.com:19302".into(),
         // "stun:stun.qq.com:3478".into(),
     ];
 
@@ -417,16 +459,15 @@ async fn test_ice_peer() -> Result<()> {
         ..Default::default()
     });
 
-    let arg1 = peer1.gather_until_done().await?;
+    let arg1 = peer1.initiative().await?;
+    debug!("arg1 {arg1:?}");
 
     let mut peer2 = IcePeer::with_config(IceConfig {
         servers: servers.clone(),
         ..Default::default()
     });
     
-    let arg2 = peer2.gather_until_done().await?;
-
-    debug!("arg1 {arg1:?}");
+    let arg2 = peer2.passive(arg1).await?;
     debug!("arg2 {arg2:?}");
 
 
@@ -450,7 +491,7 @@ async fn test_ice_peer() -> Result<()> {
     });
 
     let task2 = spawn_with_name("server", async move {
-        let conn = peer2.accept(arg1).await?;
+        let conn = peer2.accept().await?;
         let (mut wr, mut rd) = conn.accept_bi().await?;
         wr.write_all("I'am conn2".as_bytes()).await?;
         let mut buf = vec![0; 1700];

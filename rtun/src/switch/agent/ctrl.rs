@@ -315,7 +315,7 @@ async fn handle_p2p_myice(mut req: OpOpenP2P) -> Result<OpenP2PResponse> {
         ..Default::default()
     });
     
-    let local_args = peer.gather_until_done().await?;
+    let local_args = peer.passive(remote_args).await?;
     
     match req.0.tun_args {
         Some(Tun_args::Throughput(args)) => {
@@ -323,7 +323,7 @@ async fn handle_p2p_myice(mut req: OpOpenP2P) -> Result<OpenP2PResponse> {
                 tracing::debug!("starting");
 
                 let r = async move {
-                    let conn = peer.accept(remote_args).await?;
+                    let conn = peer.accept().await?;
                     let (wr, rd) = conn.accept_bi().await?;
                     run_throughput(rd.compat(), wr.compat_write(), args).await
                 }.await;

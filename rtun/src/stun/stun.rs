@@ -7,7 +7,7 @@ use quinn::udp::Transmit;
 
 use crate::stun::async_udp::udp_state;
 
-use super::async_udp::{AsyncUdpSocket, tokio_socket_bind, BoxUdpSocket, AsUdpSocket};
+use super::async_udp::{AsyncUdpSocket, tokio_socket_bind, AsUdpSocket, TokioUdpSocket};
 use rand::Rng;
 use stun_codec::{Message, MessageClass, rfc5389::{methods::BINDING, Attribute, attributes::{Software, XorMappedAddress, MappedAddress, Username}}, TransactionId, MessageEncoder, MessageDecoder, Method};
 use bytecodec::{EncodeExt, DecodeExt};
@@ -18,8 +18,26 @@ pub struct Config {
     detect_all_server: bool,
     min_success_response: Option<usize>,
     use_binding_fut: bool,
-    username: Option<String>,
-    password: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    // ttl: Option<u32>,
+}
+
+impl Config {
+    
+    pub fn gen_bind_req_bytes(&self) -> Result<Vec<u8>> {
+        let msg = self.gen_bind_req()?;
+        encode_message(msg)
+    }
+
+    pub fn gen_bind_req(&self) -> Result<Message<Attribute>> {
+        let mut req = gen_request(BINDING);
+        if let Some(username) = self.username.clone() {
+            let username = Username::new(username)?;
+            req.add_attribute(Attribute::Username(username));
+        }
+        Ok(req)
+    }
 }
 
 pub struct Binding<U> {
@@ -36,8 +54,8 @@ pub struct Binding<U> {
 //     }
 // }
 
-impl Binding<BoxUdpSocket> {
-    pub async fn bind<A>(addr: A) -> Result<Binding<BoxUdpSocket>> 
+impl Binding<TokioUdpSocket> {
+    pub async fn bind<A>(addr: A) -> Result<Binding<TokioUdpSocket>> 
     where
         A: tokio::net::ToSocketAddrs,
     {
@@ -52,6 +70,13 @@ impl<U> Binding<U> {
         Self { 
             socket, 
             config: Default::default(),
+        }
+    }
+
+    pub fn with_config(socket: U, config: Config) -> Binding<U> {
+        Self { 
+            socket, 
+            config,
         }
     }
 
@@ -70,21 +95,29 @@ impl<U> Binding<U> {
     //     }
     // }
 
-    pub fn username(mut self, username: String) -> Binding<U> {
-        self.config.username = Some(username);
-        Binding {
-            config: self.config,
-            socket: self.socket,
-        }
-    }
+    // pub fn username(mut self, username: String) -> Binding<U> {
+    //     self.config.username = Some(username);
+    //     Binding {
+    //         config: self.config,
+    //         socket: self.socket,
+    //     }
+    // }
 
-    pub fn password(mut self, password: String) -> Binding<U> {
-        self.config.password = Some(password);
-        Binding {
-            config: self.config,
-            socket: self.socket,
-        }
-    }
+    // pub fn password(mut self, password: String) -> Binding<U> {
+    //     self.config.password = Some(password);
+    //     Binding {
+    //         config: self.config,
+    //         socket: self.socket,
+    //     }
+    // }
+
+    // pub fn ttl(mut self, ttl: Option<u32>) -> Binding<U> {
+    //     self.config.ttl = ttl;
+    //     Binding {
+    //         config: self.config,
+    //         socket: self.socket,
+    //     }
+    // }
 
     pub async fn exec<I, A>(self, servers: I) -> Result<(U, BindingOutput)> 
     where
@@ -101,7 +134,9 @@ impl<U> Binding<U> {
         I: Iterator<Item = A>,
         A: ToSocketAddrs,
     {
-        
+        // if let Some(ttl) = self.config.ttl {
+        //     self.socket.set_ttl(ttl)?;
+        // }
         let socket = self.socket;
 
         let mut detect = BindingExec::from_socket(socket);
@@ -263,12 +298,14 @@ where
 
                 if self.config.use_binding_fut {
                     for target in iter {
-                        let fut = self.client.binding(target);
+                        let req = self.config.gen_bind_req()?;
+                        let fut = self.client.transaction(req, target);
                         self.binding_futures.push(fut);
                     }
                 } else {
                     for target in iter {
-                        let _r = self.client.req_binding(target);
+                        let req = self.config.gen_bind_req()?;
+                        let _r = self.client.req_transaction(req, target);
                     }
                 }
             },
@@ -466,9 +503,8 @@ impl<U: AsyncUdpSocket + Unpin > StunClient<U> {
         Ok(self)
     }
     
-    pub fn binding(&mut self, target: SocketAddr) -> TransactionFuture {
+    pub fn transaction(&mut self, req: Message<Attribute>, target: SocketAddr) -> TransactionFuture {
         let (tx, rx) = oneshot::channel(); 
-        let req = gen_request(BINDING);
         let r = self.kick_transaction(req, target);
         match r {
             Ok(mut req) => { 
@@ -485,21 +521,30 @@ impl<U: AsyncUdpSocket + Unpin > StunClient<U> {
         }
     }
 
-    pub fn req_binding(&mut self, target: SocketAddr) -> Result<()> {
-        let req = gen_request(BINDING);
+    pub fn req_transaction(&mut self, req: Message<Attribute>, target: SocketAddr) -> Result<()> {
         let req = self.kick_transaction(req, target)?;
         self.transactions.insert(req.request.transaction_id(), Some(req));
         Ok(())
     }
 
-    pub fn req_binding2(&mut self, target: SocketAddr, username: String) -> Result<()> {
-        let username = Username::new(username)?;
-        let mut req: Message<Attribute> = gen_request(BINDING);
-        req.add_attribute(Attribute::Username(username));
-        let req = self.kick_transaction(req, target)?;
-        self.transactions.insert(req.request.transaction_id(), Some(req));
-        Ok(())
-    }
+    // pub fn binding(&mut self, target: SocketAddr) -> TransactionFuture {
+    //     let req = gen_request(BINDING);
+    //     self.transaction(req, target)
+    // }
+
+    // pub fn req_binding(&mut self, target: SocketAddr) -> Result<()> {
+    //     let req = gen_request(BINDING);
+    //     self.req_transaction(req, target)
+    // }
+
+    // pub fn req_binding2(&mut self, target: SocketAddr, username: String) -> Result<()> {
+    //     let username = Username::new(username)?;
+    //     let mut req: Message<Attribute> = gen_request(BINDING);
+    //     req.add_attribute(Attribute::Username(username));
+    //     let req = self.kick_transaction(req, target)?;
+    //     self.transactions.insert(req.request.transaction_id(), Some(req));
+    //     Ok(())
+    // }
 
     fn kick_transaction(&mut self, mut req: Message<Attribute>, target: SocketAddr) -> Result<TransactionReq> {
 
@@ -567,6 +612,7 @@ impl<U: AsyncUdpSocket + Unpin > StunClient<U> {
                             };
     
                             if let Some(data) = try_binding_response_bytes(&msg, &remote_addr) {
+                                let _r = self.socket.set_ttl(64);
                                 let _r = self.socket.as_socket().try_send_to(data.into(), remote_addr);
     
                             } else {
@@ -905,6 +951,10 @@ impl<U: AsyncUdpSocket> AsyncUdpSocket for StunSocket<U> {
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        self.socket.set_ttl(ttl)
     }
 }
 

@@ -350,15 +350,14 @@ mod test_ice_conn {
             ..Default::default()
         });
     
-        let arg1 = peer1.gather_until_done().await?;
-    
+        let arg1 = peer1.initiative().await?;
+        debug!("arg1 {arg1:?}");
+
         let mut peer2 = IcePeer::with_config(IceConfig {
             ..Default::default()
         });
         
-        let arg2 = peer2.gather_until_done().await?;
-    
-        debug!("arg1 {arg1:?}");
+        let arg2 = peer2.passive(arg1).await?;
         debug!("arg2 {arg2:?}");
     
     
@@ -372,7 +371,7 @@ mod test_ice_conn {
     
         let thr_args2 = thr_args.clone();
         let task2 = spawn_with_name("server", async move {
-            let conn = peer2.accept(arg1).await?;
+            let conn = peer2.accept().await?;
             let (wr, rd) = conn.accept_bi().await?;
             run_throughput(rd.compat(), wr.compat_write(), thr_args2).await?;
             Result::<()>::Ok(())
