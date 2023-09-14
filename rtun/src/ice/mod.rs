@@ -16,3 +16,5 @@ pub mod throughput;
 pub mod mpsc_pair;
 
 pub mod bytes_utils;
+
+pub mod ice_quic;

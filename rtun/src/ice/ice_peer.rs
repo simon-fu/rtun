@@ -8,14 +8,11 @@ TODO:
 */
 
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
 use anyhow::{Result, Context, bail};
-use quinn::{Endpoint, ServerConfig, default_runtime, ClientConfig, Connection, SendStream, RecvStream};
 use sha2::{Sha256, Digest};
 use tracing::debug;
 
-use crate::async_rt::spawn_with_name;
+use crate::huid::HUId;
 use crate::ice::ice_candidate::parse_candidate;
 use crate::stun::async_udp::{AsyncUdpSocket, UdpSocketBridge, tokio_socket_bind, TokioUdpSocket, AsUdpSocket};
 
@@ -75,11 +72,13 @@ impl Local {
 }
 
 pub struct IcePeer {
+    uid: HUId,
     config: IceConfig,
     socket: Option<TokioUdpSocket>,
     local: Option<Local>,
     remote: Option<IceArgs>,
     targets: Vec<SocketAddr>,
+    // is_client: bool,
 }
 
 impl IcePeer {
@@ -89,23 +88,36 @@ impl IcePeer {
 
     pub fn with_config(config: IceConfig) -> Self {
         Self {
+            uid: gen_huid(),
             local: None,
             socket: None,
             remote: None,
             targets: Default::default(),
+            // is_client: true,
             config,
         }
+    }
+
+    pub fn uid(&self) -> HUId {
+        self.uid
     }
 
     pub fn local_args(&self) -> Option<IceArgs> {
         self.local.as_ref().map(|x|x.to_args())
     }
 
-    pub async fn initiative(&mut self) -> Result<IceArgs> {
+    // pub fn is_client(&self) -> bool {
+    //     self.is_client
+    // }
+
+    pub async fn client_gather(&mut self) -> Result<IceArgs> {
+        // self.is_client = true;
         self.gather_until_done().await
     }
 
-    pub async fn passive(&mut self, remote: IceArgs) -> Result<IceArgs> {
+    pub async fn server_gather(&mut self, remote: IceArgs) -> Result<IceArgs> {
+        // self.is_client = false;
+        
         let local_args = self.gather_until_done().await?;
         
         self.set_remote(remote)?;
@@ -222,9 +234,9 @@ impl IcePeer {
 
     async fn negotiate(&mut self, socket: TokioUdpSocket, is_client: bool) -> Result<IceConn> {
 
-        let remote = self.remote.as_ref().with_context(||"no remote args")?;
+        // let remote = self.remote.as_ref().with_context(||"no remote args")?;
 
-        let local = self.local.as_ref().with_context(||"NOT gather yet")?;
+        // let local = self.local.as_ref().with_context(||"NOT gather yet")?;
 
         let config = self.binding_config()?;
 
@@ -240,86 +252,115 @@ impl IcePeer {
         debug!("setup connection to {select_addr}");
 
         let socket = UdpSocketBridge(StunSocket::new(socket)) ;
-
-        let server_config = {
-            // let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-            let cert = &local.cert;
-            let cert_der = cert.serialize_der()?;
-            let priv_key = cert.serialize_private_key_der();
-            let priv_key = rustls::PrivateKey(priv_key);
-            let cert_chain = vec![rustls::Certificate(cert_der.clone())];
-        
-            let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key)?;
-            let transport_config = Arc::get_mut(&mut server_config.transport).with_context(||"get transport config failed")?;
-            transport_config.max_concurrent_uni_streams(0_u8.into());
-        
-            server_config
+        let conn = IceConn {
+            uid: self.uid,
+            remote_addr: select_addr,
+            is_client,
+            socket
         };
 
-
-        // let (server_config, server_cert) = configure_server()?;
-
-        let runtime = default_runtime().with_context(||"no async runtime")?;
-
-        let mut endpoint = Endpoint::new_with_abstract_socket(
-            Default::default(), 
-            Some(server_config), 
-            socket, 
-            runtime,
-        )?;
+        // let server_config = {
+        //     // let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+        //     let cert = &local.cert;
+        //     let cert_der = cert.serialize_der()?;
+        //     let priv_key = cert.serialize_private_key_der();
+        //     let priv_key = rustls::PrivateKey(priv_key);
+        //     let cert_chain = vec![rustls::Certificate(cert_der.clone())];
         
-        let (conn, keepalive) = if is_client {
-            let crypto = rustls::ClientConfig::builder()
-            .with_safe_defaults()
-            .with_custom_certificate_verifier(ServerFingerprintVerification::new(remote.cert_fingerprint.clone()))
-            .with_no_client_auth();
+        //     let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key)?;
+        //     let transport_config = Arc::get_mut(&mut server_config.transport).with_context(||"get transport config failed")?;
+        //     transport_config.max_concurrent_uni_streams(0_u8.into());
+        
+        //     server_config
+        // };
+
+
+        // // let (server_config, server_cert) = configure_server()?;
+
+        // let runtime = default_runtime().with_context(||"no quic async runtime")?;
+
+        // let mut endpoint = Endpoint::new_with_abstract_socket(
+        //     Default::default(), 
+        //     Some(server_config), 
+        //     socket, 
+        //     runtime,
+        // )?;
+        
+        // let (conn, keepalive) = if is_client {
+        //     let crypto = rustls::ClientConfig::builder()
+        //     .with_safe_defaults()
+        //     .with_custom_certificate_verifier(ServerFingerprintVerification::new(remote.cert_fingerprint.clone()))
+        //     .with_no_client_auth();
             
-            endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
+        //     endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
 
-            let conn = endpoint.connect(select_addr, "localhost")?.await?;
-            let keepalive = conn.open_bi().await?;
-            (conn, keepalive)
-        } else {
-            let conn = endpoint.accept()
-            .await.with_context(||"accept but enpoint none")?
-            .await?;
-            let keepalive = conn.accept_bi().await?;
-            (conn, keepalive)
-        };
+        //     let conn = endpoint.connect(select_addr, "localhost")?.await?;
+        //     let keepalive = conn.open_bi().await?;
+        //     (conn, keepalive)
+        // } else {
+        //     let conn = endpoint.accept()
+        //     .await.with_context(||"accept but enpoint none")?
+        //     .await?;
+        //     let keepalive = conn.accept_bi().await?;
+        //     (conn, keepalive)
+        // };
 
-        spawn_with_name("keepalive", async move {
-            let r = keepalive_task(keepalive, is_client).await;
-            debug!("finished {r:?}");
-        });
+        // spawn_with_name("keepalive", async move {
+        //     let r = keepalive_task(keepalive, is_client).await;
+        //     debug!("finished {r:?}");
+        // });
 
-        debug!("upgrade to quic");
+        // debug!("upgrade to quic");
 
         Ok(conn)
     }
 
 }
 
-async fn keepalive_task((mut wr, mut rd): (SendStream, RecvStream), _is_client: bool) -> Result<()> {
-    let mut interval = tokio::time::interval(Duration::from_secs(5));
-    let mut buf = vec![0; 2048];
-    loop {
-        tokio::select! {
-            r = rd.read(&mut buf) => {
-                let n = r?.with_context(||"stream closed")?;
-                if n == 0 {
-                    return Ok(())
-                }
-                // let s = std::str::from_utf8(&buf[..n]);
-                // debug!("recv {s:?}");
-            }
-            _r = interval.tick() => {
-                wr.write_all("hello".as_bytes()).await?;
-            }
-        }
-    }
+// async fn keepalive_task((mut wr, mut rd): (SendStream, RecvStream), _is_client: bool) -> Result<()> {
+//     let mut interval = tokio::time::interval(Duration::from_secs(5));
+//     let mut buf = vec![0; 2048];
+//     loop {
+//         tokio::select! {
+//             r = rd.read(&mut buf) => {
+//                 let n = r?.with_context(||"stream closed")?;
+//                 if n == 0 {
+//                     return Ok(())
+//                 }
+//                 // let s = std::str::from_utf8(&buf[..n]);
+//                 // debug!("recv {s:?}");
+//             }
+//             _r = interval.tick() => {
+//                 wr.write_all("hello".as_bytes()).await?;
+//             }
+//         }
+//     }
+// }
+
+pub struct IceConn {
+    uid: HUId,
+    socket: UdpSocketBridge<StunSocket<TokioUdpSocket>>,
+    remote_addr: SocketAddr,
+    is_client: bool,
 }
 
-pub type IceConn = Connection;
+impl IceConn {
+    pub fn uid(&self) -> HUId {
+        self.uid
+    }
+    
+    pub fn is_client(&self) -> bool {
+        self.is_client
+    }
+
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
+    }
+
+    pub fn into_async_udp(self) -> UdpSocketBridge<impl AsyncUdpSocket> {
+        self.socket
+    }
+}
 
 
 
@@ -406,120 +447,120 @@ impl<'a> std::fmt::Display for FingerprintDisplay<'a> {
 //     assert_eq!(s1, "59:94:47:1a:bb:01:11:2a:fc:c1:81:59:f6:cc:74:b4:f5:11:b9:98:06:da:59:b3:ca:f5:a9:c1:73:ca:cf:c5")
 // }
 
-struct ServerFingerprintVerification(Option<String>);
+// struct ServerFingerprintVerification(Option<String>);
 
-impl ServerFingerprintVerification {
-    fn new(fingerprint: Option<String>) -> Arc<Self> {
-        Arc::new(Self(fingerprint))
-    }
-}
+// impl ServerFingerprintVerification {
+//     fn new(fingerprint: Option<String>) -> Arc<Self> {
+//         Arc::new(Self(fingerprint))
+//     }
+// }
 
-impl rustls::client::ServerCertVerifier for ServerFingerprintVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        // if let Some(expect) = self.0.as_ref() {
-        //     let fingerprint = make_fingerprint(SHA256_ALG, &end_entity.0)
-        //     .map_err(|_e|rustls::Error::General("can't get fingerprint".into()))?;
-        //     if fingerprint != *expect {
-        //         debug!("expect fingerprint {expect:?} but {fingerprint:?}");
-        //         return Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYet))
-        //     }
-        // } 
-        Ok(rustls::client::ServerCertVerified::assertion())
+// impl rustls::client::ServerCertVerifier for ServerFingerprintVerification {
+//     fn verify_server_cert(
+//         &self,
+//         _end_entity: &rustls::Certificate,
+//         _intermediates: &[rustls::Certificate],
+//         _server_name: &rustls::ServerName,
+//         _scts: &mut dyn Iterator<Item = &[u8]>,
+//         _ocsp_response: &[u8],
+//         _now: std::time::SystemTime,
+//     ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+//         // if let Some(expect) = self.0.as_ref() {
+//         //     let fingerprint = make_fingerprint(SHA256_ALG, &end_entity.0)
+//         //     .map_err(|_e|rustls::Error::General("can't get fingerprint".into()))?;
+//         //     if fingerprint != *expect {
+//         //         debug!("expect fingerprint {expect:?} but {fingerprint:?}");
+//         //         return Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYet))
+//         //     }
+//         // } 
+//         Ok(rustls::client::ServerCertVerified::assertion())
 
-    }
-}
+//     }
+// }
 
 
-#[tokio::test]
-async fn test_ice_peer() -> Result<()> {
-    use crate::async_rt::spawn_with_name;
+// #[tokio::test]
+// async fn test_ice_peer() -> Result<()> {
+//     use crate::async_rt::spawn_with_name;
 
-    tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::INFO)
-    .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
-    .with_target(false)
-    .init();
+//     tracing_subscriber::fmt()
+//     .with_max_level(tracing::Level::INFO)
+//     .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
+//     .with_target(false)
+//     .init();
 
-    let servers = vec![
-        // "stun:stun1.l.google.com:19302".into(),
-        // "stun:stun2.l.google.com:19302".into(),
-        // "stun:stun.qq.com:3478".into(),
-    ];
+//     let servers = vec![
+//         // "stun:stun1.l.google.com:19302".into(),
+//         // "stun:stun2.l.google.com:19302".into(),
+//         // "stun:stun.qq.com:3478".into(),
+//     ];
 
-    let mut peer1 = IcePeer::with_config(IceConfig {
-        servers: servers.clone(),
-        ..Default::default()
-    });
+//     let mut peer1 = IcePeer::with_config(IceConfig {
+//         servers: servers.clone(),
+//         ..Default::default()
+//     });
 
-    let arg1 = peer1.initiative().await?;
-    debug!("arg1 {arg1:?}");
+//     let arg1 = peer1.client_gather().await?;
+//     debug!("arg1 {arg1:?}");
 
-    let mut peer2 = IcePeer::with_config(IceConfig {
-        servers: servers.clone(),
-        ..Default::default()
-    });
+//     let mut peer2 = IcePeer::with_config(IceConfig {
+//         servers: servers.clone(),
+//         ..Default::default()
+//     });
     
-    let arg2 = peer2.passive(arg1).await?;
-    debug!("arg2 {arg2:?}");
+//     let arg2 = peer2.server_gather(arg1).await?;
+//     debug!("arg2 {arg2:?}");
 
 
-    let task1 = spawn_with_name("client", async move {
-        let conn = peer1.dial(arg2).await?;
-        let (mut wr, mut rd) = conn.open_bi().await?;
-        wr.write_all("I'am conn1".as_bytes()).await?;
-        let mut buf = vec![0; 1700];
-        loop {
-            let n = rd.read(&mut buf).await
-            .with_context(||"read stream failed")?
-            .with_context(||"stream closed")?;
-            if n == 0 {
-                break;
-            }
-            let msg = std::str::from_utf8(&buf[..n])?;
-            debug!("recv {msg:?}");
-        }
+//     let task1 = spawn_with_name("client", async move {
+//         let conn = peer1.dial(arg2).await?;
+//         let (mut wr, mut rd) = conn.open_bi().await?;
+//         wr.write_all("I'am conn1".as_bytes()).await?;
+//         let mut buf = vec![0; 1700];
+//         loop {
+//             let n = rd.read(&mut buf).await
+//             .with_context(||"read stream failed")?
+//             .with_context(||"stream closed")?;
+//             if n == 0 {
+//                 break;
+//             }
+//             let msg = std::str::from_utf8(&buf[..n])?;
+//             debug!("recv {msg:?}");
+//         }
 
-        Result::<()>::Ok(())
-    });
+//         Result::<()>::Ok(())
+//     });
 
-    let task2 = spawn_with_name("server", async move {
-        let conn = peer2.accept().await?;
-        let (mut wr, mut rd) = conn.accept_bi().await?;
-        wr.write_all("I'am conn2".as_bytes()).await?;
-        let mut buf = vec![0; 1700];
+//     let task2 = spawn_with_name("server", async move {
+//         let conn = peer2.accept().await?;
+//         let (mut wr, mut rd) = conn.accept_bi().await?;
+//         wr.write_all("I'am conn2".as_bytes()).await?;
+//         let mut buf = vec![0; 1700];
 
-        loop {
-            let n = rd.read(&mut buf).await
-            .with_context(||"read stream failed")?
-            .with_context(||"stream closed")?;
-            if n == 0 {
-                break;
-            }
-            let msg = std::str::from_utf8(&buf[..n])?;
-            debug!("recv {msg:?}");
-        }
-        Result::<()>::Ok(())
-    });
+//         loop {
+//             let n = rd.read(&mut buf).await
+//             .with_context(||"read stream failed")?
+//             .with_context(||"stream closed")?;
+//             if n == 0 {
+//                 break;
+//             }
+//             let msg = std::str::from_utf8(&buf[..n])?;
+//             debug!("recv {msg:?}");
+//         }
+//         Result::<()>::Ok(())
+//     });
 
-    let r1 = task1.await?;
-    let r2 = task2.await?;
+//     let r1 = task1.await?;
+//     let r2 = task2.await?;
 
-    debug!("task1 finished {r1:?}");
-    debug!("task2 finished {r2:?}");
+//     debug!("task1 finished {r1:?}");
+//     debug!("task2 finished {r2:?}");
 
-    r1?;
-    r2?;
+//     r1?;
+//     r2?;
 
-    Ok(())
-}
+//     Ok(())
+// }
 
 
 

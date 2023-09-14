@@ -1,7 +1,7 @@
 use std::{io::{ErrorKind, self}, time::Duration};
 
 use bytes::{BufMut, Buf};
-use futures::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use anyhow::Result;
 use tokio::time::Instant;
 use crate::proto::ThroughputArgs;
@@ -120,7 +120,7 @@ mod test_tokio_kcp {
     use tracing::Level;
     // use futures::{AsyncBufReadExt, AsyncWriteExt};
     use crate::{async_rt::spawn_with_name, ice::throughput::run_throughput, proto::ThroughputArgs};
-    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+    // use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
     #[tokio::test]
     async fn test_tokio_kcp_throughput() {
@@ -142,7 +142,7 @@ mod test_tokio_kcp {
             let (stream, addr) = listener.accept().await.unwrap();
             println!("accepted from {}", addr);
             let (rd, wr) = tokio::io::split(stream);
-            run_throughput(rd.compat(), wr.compat_write(), args1).await.unwrap();
+            run_throughput(rd, wr, args1).await.unwrap();
         });
 
         let args2 = args;
@@ -151,7 +151,7 @@ mod test_tokio_kcp {
             let stream = KcpStream::connect(&config, remote_addr).await.unwrap();
             println!("connected to {}", remote_addr);
             let (rd, wr) = tokio::io::split(stream);
-            run_throughput(rd.compat(), wr.compat_write(), args2).await.unwrap();
+            run_throughput(rd, wr, args2).await.unwrap();
         });
 
         let _r = task1.await;
@@ -167,7 +167,7 @@ mod test_quinn {
     use tracing::Level;
     use tracing_subscriber::EnvFilter;
     use crate::{async_rt::spawn_with_name, ice::throughput::run_throughput, proto::ThroughputArgs};
-    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+    // use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
     use common::{make_server_endpoint, make_client_endpoint};
     use tracing::info;
     use if_watch::tokio::IfWatcher;
@@ -223,7 +223,7 @@ mod test_quinn {
             info!("accepted stream");
 
             // let (rd, wr) = tokio::io::split(stream);
-            run_throughput(rd.compat(), wr.compat_write(), args1).await.unwrap();
+            run_throughput(rd, wr, args1).await.unwrap();
         });
 
 
@@ -244,7 +244,7 @@ mod test_quinn {
             let (wr, rd) = connection.open_bi().await.unwrap();
             info!("opened stream");
 
-            run_throughput(rd.compat(), wr.compat_write(), args2).await.unwrap();
+            run_throughput(rd, wr, args2).await.unwrap();
         });
 
         let _r = task1.await;
@@ -327,8 +327,8 @@ mod test_ice_conn {
     use anyhow::Result;
     use tracing::Level;
     use tracing_subscriber::EnvFilter;
-    use crate::{async_rt::spawn_with_name, ice::{throughput::run_throughput, ice_peer::{IcePeer, IceConfig}}, proto::ThroughputArgs};
-    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+    use crate::{async_rt::spawn_with_name, ice::{throughput::run_throughput, ice_peer::{IcePeer, IceConfig}, ice_quic::UpgradeToQuic}, proto::ThroughputArgs};
+    // use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
     use tracing::debug;
 
     #[tokio::test]
@@ -350,30 +350,32 @@ mod test_ice_conn {
             ..Default::default()
         });
     
-        let arg1 = peer1.initiative().await?;
+        let arg1 = peer1.client_gather().await?;
         debug!("arg1 {arg1:?}");
 
         let mut peer2 = IcePeer::with_config(IceConfig {
             ..Default::default()
         });
         
-        let arg2 = peer2.passive(arg1).await?;
+        let arg2 = peer2.server_gather(arg1).await?;
         debug!("arg2 {arg2:?}");
     
     
         let thr_args1 = thr_args.clone();
         let task1 = spawn_with_name("client", async move {
-            let conn = peer1.dial(arg2).await?;
+            let conn = peer1.dial(arg2).await?
+            .upgrade_to_quic().await?;
             let (wr, rd) = conn.open_bi().await?;
-            run_throughput(rd.compat(), wr.compat_write(), thr_args1).await?;
+            run_throughput(rd, wr, thr_args1).await?;
             Result::<()>::Ok(())
         });
     
         let thr_args2 = thr_args.clone();
         let task2 = spawn_with_name("server", async move {
-            let conn = peer2.accept().await?;
+            let conn = peer2.accept().await?
+            .upgrade_to_quic().await?;
             let (wr, rd) = conn.accept_bi().await?;
-            run_throughput(rd.compat(), wr.compat_write(), thr_args2).await?;
+            run_throughput(rd, wr, thr_args2).await?;
             Result::<()>::Ok(())
         });
     

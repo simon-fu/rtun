@@ -92,13 +92,18 @@ message OpenP2PArgs  {
     P2PArgs args                        = 1;
     oneof tun_args {
         ThroughputArgs throughput       = 2;
+        P2PSocksArgs socks              = 3;
     }
-    uint32 ptype                        = 3;
+}
+
+message P2PSocksArgs {
+
 }
 
 message ThroughputArgs {
     uint32 send_buf_size                = 1;
     uint32 recv_buf_size                = 2;
+    uint32 peer_type                    = 3;
 }
 
 

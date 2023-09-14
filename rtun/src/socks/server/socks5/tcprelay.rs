@@ -186,13 +186,10 @@ impl Socks5TcpHandler {
         }
     }
 
-
     pub async fn handle_socks5_client<S>(self, mut stream: S, peer_addr: SocketAddr) -> io::Result<()> 
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        // 1. Handshake
-
         let handshake_req = match HandshakeRequest::read_from(&mut stream).await {
             Ok(r) => r,
             Err(Socks5Error::IoError(ref err)) if err.kind() == ErrorKind::UnexpectedEof => {
@@ -204,6 +201,17 @@ impl Socks5TcpHandler {
                 return Err(err.into());
             }
         };
+        
+        self.handle_socks5_req(handshake_req, stream, peer_addr).await
+    }
+
+    pub async fn handle_socks5_req<S>(self, handshake_req: HandshakeRequest, mut stream: S, peer_addr: SocketAddr) -> io::Result<()> 
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        // 1. Handshake
+
+
 
         trace!("socks5 {:?}", handshake_req);
         self.check_auth(&mut stream, &handshake_req).await?;

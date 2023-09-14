@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, io::{self, ErrorKind}};
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Result, Context};
 
@@ -72,14 +72,15 @@ async fn handle_client_directly(
     server: rtun::switch::agent::ch_socks::Server,
 ) -> Result<()> {
 
-    let mut version_buffer = [0u8; 1];
+    // let mut version_buffer = [0u8; 1];
 
-    let n = stream.peek(&mut version_buffer).await?;
-    if n == 0 {
-        return Err(io::Error::from(ErrorKind::UnexpectedEof).into());
-    }
+    // let n = stream.peek(&mut version_buffer).await?;
+    // if n == 0 {
+    //     return Err(io::Error::from(ErrorKind::UnexpectedEof).into());
+    // }
     
-    run_socks_conn(&version_buffer[..], stream, peer_addr, server).await?;
+    // run_socks_conn(&version_buffer[..], stream, peer_addr, server).await?;
+    run_socks_conn(stream, peer_addr, server).await?;
     Ok(())
 }
 

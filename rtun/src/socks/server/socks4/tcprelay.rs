@@ -50,8 +50,6 @@ impl Socks4TcpHandler {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        // 1. Handshake
-
         // NOTE: Wraps it with BufReader for reading NULL terminated information in HandshakeRequest
         let mut s = BufReader::new(stream);
         let handshake_req = match HandshakeRequest::read_from(&mut s).await {
@@ -65,6 +63,14 @@ impl Socks4TcpHandler {
                 return Err(err.into());
             }
         };
+        self.handle_socks4_req(handshake_req, s, peer_addr).await
+    }
+
+    pub async fn handle_socks4_req<S>(self, handshake_req: HandshakeRequest, mut s: BufReader<S>, peer_addr: SocketAddr) -> io::Result<()> 
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        // 1. Handshake
 
         trace!("socks4 {:?} peer: {}", handshake_req, peer_addr);
 

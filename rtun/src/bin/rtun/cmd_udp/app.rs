@@ -1,5 +1,5 @@
 use std::{time::Duration, sync::Arc, net::SocketAddr, fmt::Write};
-
+use clap::Parser;
 use anyhow::{Result, bail, Context};
 use console::Term;
 use parking_lot::Mutex;
@@ -194,12 +194,11 @@ impl  UdpSession {
         Ok(())
     }
 
-    pub async fn wait_for_completed(&mut self) -> Result<Option<SwitchSinkResult>> {
+    pub async fn wait_for_completed(&mut self) -> Result<Option<EntityResult>> {
         self.handle.wait_for_completed().await
     }
 }
 
-pub type SwitchSinkResult = EntityResult;
 
 #[derive(Debug)]
 struct ReqCommand(String);
@@ -394,8 +393,6 @@ impl ActorEntity for Entity {
         ()
     }
 }
-
-use clap::Parser;
 
 
 
