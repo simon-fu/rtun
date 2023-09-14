@@ -141,15 +141,15 @@ impl QuicConn {
         };
 
         let elapsed_ms = Local::now().timestamp_millis() - update_ts;
-        Duration::from_millis(elapsed_ms as u64) >= ping_timeout()
+        Duration::from_millis(elapsed_ms as u64) >= (ping_interval() * 5/2)
     }
 
-    pub fn ping_timeout(&self) -> Duration {
-        ping_timeout()
+    pub fn ping_interval(&self) -> Duration {
+        ping_interval()
     }
 }
 
-fn ping_timeout() -> Duration {
+fn ping_interval() -> Duration {
     const ALIVE_INTERVAL_MILLI: u64 = 5000;
     Duration::from_millis(ALIVE_INTERVAL_MILLI)
 }
@@ -170,13 +170,14 @@ pub struct Stats {
 
 
 async fn keepalive_task(mut ctx: AliveContext) -> Result<()> {
-    let mut interval = tokio::time::interval(ping_timeout());
+    let mut interval = tokio::time::interval(ping_interval());
 
     loop {
         tokio::select! {
             r = ctx.rd.read_buf(&mut ctx.recv_buf) => {
                 let n = r.with_context(||"stream closed")?;
                 if n == 0 {
+                    debug!("read zero");
                     return Ok(())
                 }
                 ctx.process_packet().await?;
@@ -184,13 +185,15 @@ async fn keepalive_task(mut ctx: AliveContext) -> Result<()> {
             _r = interval.tick(), if !ctx.sending_ping => {
                 ctx.send_buf.clear();
 
-                let len = Ping::new()
-                .write_to_buf(&mut ctx.send_buf)?;
+                let ping = Ping::new();
+                let len = ping.write_to_buf(&mut ctx.send_buf)?;
 
                 ctx.wr.write_all(&ctx.send_buf[..len]).await?;
                 ctx.sending_ping = true;
+                // debug!("sent ping {ping:?}, buf.len {}", ctx.send_buf.len());
             }
             _r = ctx.guard_rx.recv() => {
+                debug!("read guard {_r:?}");
                 return Ok(())
             }
         }
@@ -212,30 +215,39 @@ struct AliveContext {
 impl AliveContext {
 
     async fn process_packet(&mut self) -> Result<()> {
-        let data = &self.recv_buf[..];
+        // let data = &self.recv_buf[..];
         
-        let packet = {
-            match Packet::parse_from(data)? {
-                Some(v) => v,
-                None => return Ok(()),
-            }
-        };
+        while !self.recv_buf.is_empty() {
+            
+            let packet = {
+                match Packet::parse_from(&mut self.recv_buf)? {
+                    Some(v) => v,
+                    None => break,
+                }
+            };
+            
+            match packet {
+                Packet::Ping(ping) => {
+                    self.send_buf.clear();
+                    let pong = Pong::new(ping.req_ts);
+                    let len = pong.write_to_buf(&mut self.send_buf)?;
+                    self.wr.write_all(&self.send_buf[..len]).await?;
+                    // debug!("recv {ping:?}, sent {pong:?}, buf.len {}", self.send_buf.len());
     
-        match packet {
-            Packet::Ping(ping) => {
-                self.send_buf.clear();
-                let len = Pong::new(ping.req_ts).write_to_buf(&mut self.send_buf)?;
-                self.wr.write_all(&self.send_buf[..len]).await?;
-
-            },
-            Packet::Pong(pong) => {
-                let now = Local::now().timestamp_millis();
-                self.sending_ping = false;
-                let mut stats = self.shared.stats.lock();
-                stats.latency = now - pong.req_ts;
-                stats.update_ts = now;
-            },
+                },
+                Packet::Pong(pong) => {
+                    let now = Local::now().timestamp_millis();
+                    let latency = now - pong.req_ts;
+                    self.sending_ping = false;
+                    debug!("latency {latency} ms");
+                    // debug!("recv {pong:?}, now {now}, latency {latency} ms");
+                    let mut stats = self.shared.stats.lock();
+                    stats.latency = latency;
+                    stats.update_ts = now;
+                },
+            }
         }
+        
         
     
         Ok(())
@@ -250,14 +262,15 @@ enum Packet {
 }
 
 impl Packet {
-    fn parse_from(data: &[u8]) -> Result<Option<Self>> {
-        let first = data[0];
+    // fn parse_from(data: &[u8]) -> Result<Option<Self>> {
+    fn parse_from<B: Buf>(buf: B) -> Result<Option<Self>> {
+        let first = buf.chunk()[0];
         match first {
             Ping::START_BYTE => {
-                Ok(Ping::parse_from(data)?.map(|x|Self::Ping(x)))
+                Ok(Ping::parse_from(buf)?.map(|x|Self::Ping(x)))
             },
             Pong::START_BYTE => {
-                Ok(Pong::parse_from(data)?.map(|x|Self::Pong(x)))
+                Ok(Pong::parse_from(buf)?.map(|x|Self::Pong(x)))
             },
             _ => {
                 bail!("unknown start byte")
@@ -267,6 +280,7 @@ impl Packet {
     }
 }
 
+#[derive(Debug)]
 struct Ping {
     req_ts: i64,
 }
@@ -289,17 +303,17 @@ impl Ping {
         Ok(Self::MIN_LEN)
     }
 
-    fn parse_from(mut data: &[u8]) -> Result<Option<Self>> {
-        if data.len() < Self::MIN_LEN {
+    fn parse_from<B: Buf>(mut buf: B) -> Result<Option<Self>> {
+        if buf.remaining() < Self::MIN_LEN {
             return Ok(None)
         }
         
-        let first = data.get_u8();
+        let first = buf.get_u8();
         if first != Self::START_BYTE {
             bail!("invalid start byte")
         }
 
-        let req_ts = data.get_i64();
+        let req_ts = buf.get_i64();
         Ok(Some(Self { req_ts }))
     }
 
@@ -307,6 +321,7 @@ impl Ping {
     const START_BYTE: u8 = 0x79;
 }
 
+#[derive(Debug)]
 struct Pong {
     req_ts: i64,
     rsp_ts: i64,
@@ -332,18 +347,18 @@ impl Pong {
         Ok(Self::MIN_LEN)
     }
 
-    fn parse_from(mut data: &[u8]) -> Result<Option<Self>> {
-        if data.len() < Self::MIN_LEN {
+    fn parse_from<B: Buf>(mut buf: B) -> Result<Option<Self>> {
+        if buf.remaining() < Self::MIN_LEN {
             return Ok(None)
         }
         
-        let first = data.get_u8();
+        let first = buf.get_u8();
         if first != Self::START_BYTE {
             bail!("invalid start byte")
         }
 
-        let req_ts = data.get_i64();
-        let rsp_ts = data.get_i64();
+        let req_ts = buf.get_i64();
+        let rsp_ts = buf.get_i64();
         Ok(Some(Self { req_ts, rsp_ts }))
     }
 

@@ -244,11 +244,12 @@ async fn handle_p2p_socks(socks_server: super::ch_socks::Server, remote_args: P2
         ..Default::default()
     });
     
-    let local_args = peer.server_gather(remote_args).await?;
-    
-    let uid = gen_huid();
+    let local_args = peer.server_gather(remote_args.clone()).await?;
+    let uid = peer.uid();
+    tracing::debug!("{uid} starting, local {local_args:?}, remote {remote_args:?}");
+
     spawn_with_name(format!("p2p-socks-{uid}"), async move {
-        tracing::debug!("starting");
+        // tracing::debug!("starting, local {local_args:?}, remote {remote_args:?}");
 
         let r = conn_task(peer, socks_server).await;
         
@@ -273,7 +274,8 @@ async fn conn_task(mut peer: IcePeer, socks_server: super::ch_socks::Server,) ->
     let conn = conn.upgrade_to_quic().await?;
 
     loop {
-        let pair = conn.accept_bi().await?;
+        let pair = conn.accept_bi().await
+        .with_context(||"accpet bi failed")?;
         let stream = QuicStream::new(pair);
 
         let uid = gen_huid();

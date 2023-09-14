@@ -30,7 +30,7 @@ pub struct IceConfig {
     pub compnent_id: Option<u16>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IceArgs {
     pub ufrag: String,
     pub pwd: String,
@@ -348,7 +348,7 @@ impl IceConn {
     pub fn uid(&self) -> HUId {
         self.uid
     }
-    
+
     pub fn is_client(&self) -> bool {
         self.is_client
     }

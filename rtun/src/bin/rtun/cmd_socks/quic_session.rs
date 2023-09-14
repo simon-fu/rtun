@@ -2,7 +2,7 @@ use std::time::Duration;
 use anyhow::{Result, bail, Context, anyhow};
 use quinn::{SendStream, RecvStream};
 use tokio::{sync::{mpsc, oneshot}, task::JoinHandle, time::Instant};
-use tracing::debug;
+use tracing::{debug, info};
 use rtun::{actor_service::{ActorEntity, handle_first_none, Action, AsyncHandler, ActorHandle, handle_msg_none, start_actor}, huid::HUId, switch::invoker_ctrl::{CtrlInvoker, CtrlHandler}, ice::{ice_quic::{QuicConn, UpgradeToQuic}, ice_peer::{IcePeer, IceConfig}}, async_rt::spawn_with_inherit, proto::{OpenP2PArgs, open_p2pargs::Tun_args, P2PSocksArgs, open_p2presponse::Open_p2p_rsp}};
 
 
@@ -129,9 +129,9 @@ impl <H: CtrlHandler> Entity<H> {
                 };
             },
             State::Working(work) => {
-                tokio::time::sleep(work.conn.ping_timeout()).await;
+                tokio::time::sleep(work.conn.ping_interval()).await;
                 if work.conn.is_ping_timeout() {
-                    debug!("ping timeout, try punch again");
+                    info!("ping timeout, try punch again");
                     let punch = kick_punch(self.ctrl.clone())?;
                     self.state = State::Punching(punch);
                 }
