@@ -49,7 +49,7 @@ async fn run_socks_server( shared: Arc<Shared>, listener: TcpListener ) -> Resul
     loop {
         let (stream, peer_addr)  = listener.accept().await.with_context(||"accept tcp failed")?;
         
-        tracing::debug!("[{peer_addr}] client connected");
+        tracing::trace!("[{peer_addr}] client connected");
 
         let server = shared.server.clone();
 
@@ -60,7 +60,7 @@ async fn run_socks_server( shared: Arc<Shared>, listener: TcpListener ) -> Resul
                 peer_addr,
                 server,
             ).await;
-            tracing::debug!("[{peer_addr}] client finished with {r:?}");
+            tracing::trace!("[{peer_addr}] client finished with {r:?}");
             r
         });
     }

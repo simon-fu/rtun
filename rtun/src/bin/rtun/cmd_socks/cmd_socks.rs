@@ -26,24 +26,40 @@ async fn do_run(args: CmdArgs) -> Result<()> {
     let agent_pool = AgentPool::new();
 
     {
-        let listener = TcpListener::bind(&args.listen).await
-        .with_context(||format!("fail to bind address [{}]", args.listen))?;
-        tracing::info!("socks5 listen on [{}]", args.listen);
+        let listen_addr = &args.listen;
+        let listen_addr: SocketAddr = listen_addr.parse().with_context(|| format!("invalid addr {listen_addr:?}"))?;
 
-        if args.relay {
-            let shared = shared.clone();
-            spawn_with_name("local_sock", async move {
-                let r = run_socks_server_ctrl(shared, listener).await;
-                r
-            });
-        } else {
+        for n in 0..3 {
+            let listen_addr = SocketAddr::new(listen_addr.ip(), listen_addr.port()+n);
+            let listener = TcpListener::bind(listen_addr).await
+            .with_context(||format!("fail to bind address [{listen_addr}]"))?;
+            tracing::info!("socks5 via quic listen on [{listen_addr}]");
+    
             let pool = agent_pool.clone();
-
+    
             spawn_with_name("local_sock", async move {
-                let r = run_socks_server_quic(pool, listener).await;
+                let r = run_socks_via_quic(pool, listener).await;
                 r
             });
         }
+
+    }
+
+    if let Some(socks_ws) = &args.socks_ws {
+        let listen_addr = if socks_ws == "0" || socks_ws == "1" || socks_ws == "true" {
+            "0.0.0.0:13080"
+        } else {
+            socks_ws
+        };
+        let listener = TcpListener::bind(listen_addr).await
+        .with_context(||format!("fail to bind address [{listen_addr}]"))?;
+        tracing::info!("socks5 via ctrl listen on [{listen_addr}]");
+
+        let shared = shared.clone();
+        spawn_with_name("local_sock", async move {
+            let r = run_socks_via_ctrl(shared, listener).await;
+            r
+        });
     }
 
     let mut last_success = true;
@@ -127,12 +143,12 @@ async fn try_connect(args: &CmdArgs) -> Result<StreamSession<impl PacketSink, im
     Ok(session)
 }
 
-async fn run_socks_server_quic<H: CtrlHandler>( pool: AgentPool<H>, listener: TcpListener ) -> Result<()> {
+async fn run_socks_via_quic<H: CtrlHandler>( pool: AgentPool<H>, listener: TcpListener ) -> Result<()> {
 
     loop {
         let (mut stream, peer_addr)  = listener.accept().await.with_context(||"accept tcp failed")?;
         
-        tracing::debug!("[{peer_addr}] client connected");
+        tracing::trace!("[{peer_addr}] client connected");
 
         let pool = pool.clone();
         tokio::spawn(async move {
@@ -145,7 +161,7 @@ async fn run_socks_server_quic<H: CtrlHandler>( pool: AgentPool<H>, listener: Tc
                 }
                 Result::<()>::Ok(())
             }.await;
-            tracing::debug!("[{peer_addr}] client finished with {r:?}");
+            tracing::trace!("[{peer_addr}] client finished with {r:?}");
             r
         });
 
@@ -155,12 +171,12 @@ async fn run_socks_server_quic<H: CtrlHandler>( pool: AgentPool<H>, listener: Tc
 }
 
 
-async fn run_socks_server_ctrl<H: CtrlHandler>( shared: Arc<Shared<H>>, listener: TcpListener ) -> Result<()> {
+async fn run_socks_via_ctrl<H: CtrlHandler>( shared: Arc<Shared<H>>, listener: TcpListener ) -> Result<()> {
     let mut next_ch_id = NextChId::default();
     loop {
         let (stream, peer_addr)  = listener.accept().await.with_context(||"accept tcp failed")?;
         
-        tracing::debug!("[{peer_addr}] client connected");
+        tracing::trace!("[{peer_addr}] client connected");
 
         let r = {
             shared.data.lock().ctrl.clone()
@@ -178,7 +194,7 @@ async fn run_socks_server_ctrl<H: CtrlHandler>( shared: Arc<Shared<H>>, listener
                         stream, 
                         peer_addr,
                     ).await;
-                    tracing::debug!("[{peer_addr}] client finished with {r:?}");
+                    tracing::trace!("[{peer_addr}] client finished with {r:?}");
                     r
                 });
             },
@@ -284,9 +300,9 @@ pub struct CmdArgs {
     mode: Option<u32>,
 
     #[clap(
-        long = "relay",
-        long_help = "relay mode",
+        long = "socks-ws",
+        long_help = "listen addr for socks via ws",
     )]
-    relay: bool,
+    socks_ws: Option<String>,
 }
 

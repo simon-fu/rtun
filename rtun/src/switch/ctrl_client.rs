@@ -269,7 +269,7 @@ async fn handle_next<H: SwitchHanlder>(entity: &mut Entity<H>, next: Next) -> Re
                 Ok(r) => {
                     let pong = r?;
                     let elapsed = Local::now().timestamp_millis() - pong.timestamp;
-                    tracing::debug!("ping/pong elapsed {elapsed} ms\r");
+                    tracing::debug!("ping/pong latency {elapsed} ms\r");
                 },
                 Err(_elapsed) => {
                     tracing::warn!("ping/pong timeout {timeout:?}, shutdown switch\r");

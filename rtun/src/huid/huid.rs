@@ -1,5 +1,5 @@
 
-use std::{convert::TryFrom, sync::{Arc, atomic::AtomicU64}, time::{SystemTime, UNIX_EPOCH}};
+use std::{convert::TryFrom, sync::{Arc, atomic::AtomicU64}};
 
 use anyhow::bail;
 
@@ -192,8 +192,11 @@ impl std::fmt::Debug for HUId {
 }
 
 fn random_id() -> u64 {
-    SystemTime::now()
-    .duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    // use std::time::{SystemTime, UNIX_EPOCH}
+    // SystemTime::now()
+    // .duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    use rand::Rng;
+    rand::thread_rng().gen::<u64>()
 }
 
 pub trait NextId {

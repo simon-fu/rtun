@@ -218,7 +218,7 @@ impl AliveContext {
         // let data = &self.recv_buf[..];
         
         while !self.recv_buf.is_empty() {
-            
+
             let packet = {
                 match Packet::parse_from(&mut self.recv_buf)? {
                     Some(v) => v,

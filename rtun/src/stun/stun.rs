@@ -961,9 +961,13 @@ impl<U: AsyncUdpSocket> AsyncUdpSocket for StunSocket<U> {
 
 #[cfg(test)]
 mod test {
-    use super::NatType;
+    use stun_codec::rfc5389::attributes::MessageIntegrity;
 
-    use super::{BindingOutput, ReflexiveAddr};
+    use super::*;
+
+    // use super::NatType;
+
+    // use super::{BindingOutput, ReflexiveAddr};
 
     #[test]
     fn test_nat_detect_output_cone() {
@@ -1054,6 +1058,56 @@ mod test {
         assert!(!obj.is_empty(), "{obj:?}") ;
         assert!(obj.is_nat_detect_done(), "{obj:?}") ;
         assert_eq!(obj.nat_type(), Some(NatType::Symmetric), "{obj:?}") ;
+
+    }
+
+    #[test]
+    fn test_integrity() {
+        use super::Config;
+        let pwd = "a123".to_string();
+        let config = Config {
+            username: Some("mike".into()),
+            password: Some(pwd.clone()),
+            ..Default::default()
+        };
+
+        let right_data = {
+            let password = &pwd;
+            let mut msg = config.gen_bind_req().unwrap();
+            let integrity = MessageIntegrity::new_short_term_credential(&msg, password).unwrap();
+            msg.add_attribute(integrity.into());
+            encode_message(msg).unwrap()
+        };
+
+        let wrong_data = {
+            let password = "wrong password";
+            let mut msg = config.gen_bind_req().unwrap();
+            let integrity = MessageIntegrity::new_short_term_credential(&msg, password).unwrap();
+            msg.add_attribute(integrity.into());
+            encode_message(msg).unwrap()
+        };
+
+
+        {
+            let data = &right_data[..];
+            let decoded_msg = decode_message(data).unwrap();
+            let decode_integrity = decoded_msg.get_attribute::<MessageIntegrity>().unwrap();
+            let r = decode_integrity.check_short_term_credential(&pwd);
+            assert!(r.is_ok(), "{r:?}");
+        }
+
+        {
+            let data = &wrong_data[..];
+            let decoded_msg = decode_message(data).unwrap();
+            let decode_integrity = decoded_msg.get_attribute::<MessageIntegrity>().unwrap();
+            let r = decode_integrity.check_short_term_credential(&pwd);
+            assert!(r.is_err(), "{r:?}");
+        }
+
+    }
+
+    #[test]
+    fn test_with_webrtc() {
 
     }
 

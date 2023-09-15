@@ -2,9 +2,9 @@
 TODO:
     - ice nego 要有超时
     - 证书验证
-    - ufrag, pwd 随机生成
+    - ok ufrag, pwd 随机生成
     - 用 pwd 检验 stun 消息完整性
-    - IfWatcher 在 github 上取到空列表
+    - ok IfWatcher 在 github 上取到空列表
 */
 
 use std::net::SocketAddr;
@@ -207,8 +207,8 @@ impl IcePeer {
 
 
         let local = Local {
-            ufrag: gen_huid().to_string(),
-            pwd: gen_huid().to_string(),
+            ufrag: HUId::random().to_string(),
+            pwd: HUId::random().to_string(),
             candidates,
             cert: rcgen::generate_simple_self_signed(vec!["localhost".into()])?,
         };
