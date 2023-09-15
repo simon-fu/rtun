@@ -12,6 +12,12 @@ use crate::ice::{ice_kcp::UpgradeToKcp, ice_mpsc::UpgradeToMpsc};
 
 use super::{ice_kcp::IceKcpConnection, ice_mpsc::IceMpsc, ice_peer::IceArgs};
 
+#[derive(Debug, Clone)]
+pub struct DtlsIceArgs {
+    pub ice: IceArgs,
+    pub cert_fingerprint: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct WebrtcIceConfig {
     pub servers: Vec<String>,
@@ -47,7 +53,7 @@ impl WebrtcIcePeer {
         }
     }
 
-    pub async fn gather_until_done(&mut self) -> Result<IceArgs> {
+    pub async fn gather_until_done(&mut self) -> Result<DtlsIceArgs> {
 
         self.certificate = if !self.config.disable_dtls {
             Some(Certificate::generate_self_signed(vec!["localhost".to_owned()])?)
@@ -107,10 +113,12 @@ impl WebrtcIcePeer {
         self.agent = Some(ice_agent);
         self.conv = crc32c::crc32c(local_ufrag.as_bytes());
 
-        Ok(IceArgs {
-            ufrag: local_ufrag,
-            pwd: local_pwd,
-            candidates: local_candidates,
+        Ok(DtlsIceArgs {
+            ice: IceArgs {
+                ufrag: local_ufrag,
+                pwd: local_pwd,
+                candidates: local_candidates,
+            },
             cert_fingerprint: match &self.certificate {
                 Some(certificate) => Some(make_fingerprint(SHA256_ALG, &certificate.certificate[0].0)?),
                 None => None,
@@ -118,23 +126,23 @@ impl WebrtcIcePeer {
         })
     }
 
-    pub async fn dial(&mut self, remote: IceArgs) -> Result<IceConn> {
-        self.conv = crc32c::crc32c(remote.ufrag.as_bytes());
+    pub async fn dial(&mut self, remote: DtlsIceArgs) -> Result<IceConn> {
+        self.conv = crc32c::crc32c(remote.ice.ufrag.as_bytes());
 
-        let agent = self.add_remote_candidates(&remote)?;
+        let agent = self.add_remote_candidates(&remote.ice)?;
 
         let (_cancel_tx, cancel_rx) = mpsc::channel(1);
-        let conn = agent.dial(cancel_rx, remote.ufrag, remote.pwd).await?;
+        let conn = agent.dial(cancel_rx, remote.ice.ufrag, remote.ice.pwd).await?;
         tracing::debug!("ice dial connected");
 
         self.make_conn(conn, true, remote.cert_fingerprint.as_deref()).await
     }
 
-    pub async fn accept(&mut self, remote: IceArgs) -> Result<IceConn> {
-        let agent = self.add_remote_candidates(&remote)?;
+    pub async fn accept(&mut self, remote: DtlsIceArgs) -> Result<IceConn> {
+        let agent = self.add_remote_candidates(&remote.ice)?;
         
         let (_cancel_tx, cancel_rx) = mpsc::channel(1);
-        let conn = agent.accept(cancel_rx, remote.ufrag, remote.pwd).await?;
+        let conn = agent.accept(cancel_rx, remote.ice.ufrag, remote.ice.pwd).await?;
         
         tracing::debug!("ice accept connected");
 
@@ -228,7 +236,7 @@ impl WebrtcIcePeer {
     //     Ok(())
     // }
 
-    pub async fn kick_and_ugrade_to_kcp(self, remote: IceArgs, is_client: bool) -> Result<IceKcpConnection> {
+    pub async fn kick_and_ugrade_to_kcp(self, remote: DtlsIceArgs, is_client: bool) -> Result<IceKcpConnection> {
         let mut peer = self;
         let conn = if is_client {
             peer.dial(remote).await?
@@ -242,7 +250,7 @@ impl WebrtcIcePeer {
         Ok(conn)
     }
 
-    pub async fn kick_and_ugrade_to_mpsc(self, remote: IceArgs, is_client: bool) -> Result<IceMpsc> {
+    pub async fn kick_and_ugrade_to_mpsc(self, remote: DtlsIceArgs, is_client: bool) -> Result<IceMpsc> {
         let mut peer = self;
         let conn = if is_client {
             peer.dial(remote).await?

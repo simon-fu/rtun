@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{Result, Context};
-use rtun::{switch::invoker_ctrl::{CtrlHandler, CtrlInvoker}, ice::{ice_peer::{IcePeer, IceConfig}, ice_quic::UpgradeToQuic, throughput::run_throughput, webrtc_ice_peer::{WebrtcIcePeer, WebrtcIceConfig}}, proto::{OpenP2PArgs, ThroughputArgs, open_p2pargs::Tun_args, open_p2presponse::Open_p2p_rsp}, async_rt::spawn_with_name};
+use rtun::{switch::invoker_ctrl::{CtrlHandler, CtrlInvoker}, ice::{ice_peer::{IcePeer, IceConfig}, ice_quic::{UpgradeToQuic, QuicIceCert}, throughput::run_throughput, webrtc_ice_peer::{WebrtcIcePeer, WebrtcIceConfig, DtlsIceArgs}}, proto::{ThroughputArgs,  open_p2presponse::Open_p2p_rsp, P2PArgs, p2pargs::P2p_args, QuicThroughputArgs, P2PQuicArgs, WebrtcThroughputArgs, P2PDtlsArgs}, async_rt::spawn_with_name};
 use tokio::time::timeout;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
@@ -9,7 +9,7 @@ pub async fn kick_p2p<H: CtrlHandler>(invoker: CtrlInvoker<H>, ptype: u32) -> Re
     tracing::debug!("kick p2p type {ptype}");
     
     if ptype == 11 {
-        return kick_p2p_myice(invoker, ptype).await;
+        return kick_quic_throughput(invoker, ptype).await;
     } else if ptype == 12 {
         return kick_p2p_webrtc(invoker, ptype).await;
     } else {
@@ -18,8 +18,8 @@ pub async fn kick_p2p<H: CtrlHandler>(invoker: CtrlInvoker<H>, ptype: u32) -> Re
     }
 }
 
-async fn kick_p2p_myice<H: CtrlHandler>(invoker: CtrlInvoker<H>, peer_type: u32) -> Result<()> {
-    tracing::debug!("kick_p2p_myice");
+async fn kick_quic_throughput<H: CtrlHandler>(invoker: CtrlInvoker<H>, peer_type: u32) -> Result<()> {
+    tracing::debug!("kick_quic_throughput");
     let timeout_duration = Duration::from_secs(10);
 
     let ice_servers = vec![
@@ -38,6 +38,7 @@ async fn kick_p2p_myice<H: CtrlHandler>(invoker: CtrlInvoker<H>, peer_type: u32)
     let local_args = peer.client_gather().await?;
     tracing::debug!("local args {local_args:?}");
     
+    let cert = QuicIceCert::try_new()?;
     // let (peer, nat) = PunchPeer::bind_and_detect("0.0.0.0:0").await?;
 
     // let local_ufrag = peer.local_ufrag().to_string();
@@ -58,16 +59,32 @@ async fn kick_p2p_myice<H: CtrlHandler>(invoker: CtrlInvoker<H>, peer_type: u32)
     };
 
     // let invoker = session.ctrl_client().clone_invoker();
-    let rsp = invoker.open_p2p(OpenP2PArgs {
-        args: Some(local_args.into()).into(),
-        tun_args: Some(Tun_args::Throughput(thrp_args.clone())),
+    let rsp = invoker.open_p2p(P2PArgs {
+        p2p_args: Some(P2p_args::QuicThrput(QuicThroughputArgs {
+            base: Some(P2PQuicArgs {
+                ice: Some(local_args.into()).into(),
+                cert_der: cert.to_bytes()?.into(),
+                ..Default::default()
+            }.into()).into(),
+            throughput: Some(thrp_args.clone()).into(),
+            ..Default::default()
+        })),
+        // args: Some(local_args.into()).into(),
+        // tun_args: Some(Tun_args::Throughput(thrp_args.clone())),
         ..Default::default()
     }).await?;
 
     let rsp = rsp.open_p2p_rsp.with_context(||"no open_p2p_rsp")?;
     match rsp {
-        Open_p2p_rsp::Args(remote_args) => {
-            let remote_args = remote_args.into();
+        Open_p2p_rsp::Args(mut remote_args) => {
+            // tracing::debug!("raw args {remote_args}");
+            let mut remote_args = remote_args.take_quic_thrput();
+            let mut base = remote_args.take_base();
+            let remote_args = base.take_ice().into();
+
+            let local_cert = QuicIceCert::try_new()?;
+            let remote_cert = base.take_cert_der();
+
             tracing::debug!("remote args {remote_args:?}");
             // // let mut tun = launch_tun_peer(peer, args.ufrag.into(), args.addr.parse()?, false);
             // peer.into_dial_and_chat(remote_args).await?;
@@ -77,7 +94,7 @@ async fn kick_p2p_myice<H: CtrlHandler>(invoker: CtrlInvoker<H>, peer_type: u32)
 
                 let r = async move {
                     let conn = peer.dial(remote_args).await?
-                    .upgrade_to_quic().await?;
+                    .upgrade_to_quic2(&local_cert, Some(remote_cert)).await?;
                     let (wr, rd) = conn.open_bi().await?;
                     let r = timeout(
                         timeout_duration, 
@@ -140,17 +157,39 @@ async fn kick_p2p_webrtc<H: CtrlHandler>(invoker: CtrlInvoker<H>, peer_type: u32
         ..Default::default()
     };
 
-    // let invoker = session.ctrl_client().clone_invoker();
-    let rsp = invoker.open_p2p(OpenP2PArgs {
-        args: Some(local_args.into()).into(),
-        tun_args: Some(Tun_args::Throughput(thrp_args.clone())),
+    let rsp = invoker.open_p2p(P2PArgs {
+        p2p_args: Some(P2p_args::WebrtcThrput(WebrtcThroughputArgs {
+            base: Some(P2PDtlsArgs {
+                ice: Some(local_args.ice.into()).into(),
+                cert_fingerprint: local_args.cert_fingerprint.map(|x|x.into()),
+                ..Default::default()
+            }.into()).into(),
+            throughput: Some(thrp_args.clone()).into(),
+            ..Default::default()
+        })),
+        // args: Some(local_args.into()).into(),
+        // tun_args: Some(Tun_args::Throughput(thrp_args.clone())),
         ..Default::default()
     }).await?;
 
+    // // let invoker = session.ctrl_client().clone_invoker();
+    // let rsp = invoker.open_p2p(OpenP2PArgs {
+    //     args: Some(local_args.into()).into(),
+    //     tun_args: Some(Tun_args::Throughput(thrp_args.clone())),
+    //     ..Default::default()
+    // }).await?;
+
     let rsp = rsp.open_p2p_rsp.with_context(||"no open_p2p_rsp")?;
     match rsp {
-        Open_p2p_rsp::Args(remote_args) => {
-            let remote_args = remote_args.into();
+        Open_p2p_rsp::Args(mut remote_args) => {
+            let mut remote_args = remote_args.take_webrtc_thrput();
+            let mut dtls = remote_args.take_base();
+            // let thrput = remote_args.take_throughput();
+            let remote_args = DtlsIceArgs {
+                ice: dtls.take_ice().into(),
+                cert_fingerprint: Some(dtls.cert_fingerprint().into()),
+            };
+
             tracing::debug!("remote args {remote_args:?}");
             // // let mut tun = launch_tun_peer(peer, args.ufrag.into(), args.addr.parse()?, false);
             // peer.into_dial_and_chat(remote_args).await?;

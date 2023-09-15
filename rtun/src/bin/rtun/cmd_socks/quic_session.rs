@@ -3,7 +3,7 @@ use anyhow::{Result, bail, Context, anyhow};
 use quinn::{SendStream, RecvStream};
 use tokio::{sync::{mpsc, oneshot}, task::JoinHandle, time::Instant};
 use tracing::{debug, info};
-use rtun::{actor_service::{ActorEntity, handle_first_none, Action, AsyncHandler, ActorHandle, handle_msg_none, start_actor}, huid::HUId, switch::invoker_ctrl::{CtrlInvoker, CtrlHandler}, ice::{ice_quic::{QuicConn, UpgradeToQuic}, ice_peer::{IcePeer, IceConfig}}, async_rt::spawn_with_inherit, proto::{OpenP2PArgs, open_p2pargs::Tun_args, P2PSocksArgs, open_p2presponse::Open_p2p_rsp}};
+use rtun::{actor_service::{ActorEntity, handle_first_none, Action, AsyncHandler, ActorHandle, handle_msg_none, start_actor}, huid::HUId, switch::invoker_ctrl::{CtrlInvoker, CtrlHandler}, ice::{ice_quic::{QuicConn, UpgradeToQuic, QuicIceCert}, ice_peer::{IcePeer, IceConfig, IceArgs}}, async_rt::spawn_with_inherit, proto::{open_p2presponse::Open_p2p_rsp, P2PArgs, p2pargs::P2p_args, QuicSocksArgs, P2PQuicArgs}};
 
 
 
@@ -70,7 +70,7 @@ impl<H: CtrlHandler> AsyncHandler<ReqCh> for Entity<H> {
                 match r {
                     Ok(r) => return Ok(r),
                     Err(e) => {
-                        debug!("open ch failed {e:?}");
+                        info!("disconnected by [opening ch failed {e:?}]");
                         self.state = State::Disconnected(next_retry());
                     }
                 }
@@ -122,9 +122,12 @@ impl <H: CtrlHandler> Entity<H> {
             State::Punching(punch) => {
                 let r = punch.rx.recv().await;
                 self.state = match r {
-                    Some(conn) => State::Working(Work {
-                        conn,
-                    }),
+                    Some(conn) => {
+                        info!("tunnel connected");
+                        State::Working(Work {
+                            conn,
+                        })
+                    },
                     None => State::Disconnected(next_retry()),
                 };
             },
@@ -187,20 +190,45 @@ async fn punch_task<H: CtrlHandler>(ctrl: CtrlInvoker<H>, tx: mpsc::Sender<QuicC
     tracing::debug!("kick gather candidate");
     let local_args = peer.client_gather().await?;
     tracing::debug!("local args {local_args:?}");
+
+    let ice_cert = QuicIceCert::try_new()?;
+    let cert_der = ice_cert.to_bytes()?.into();
     
-    let rsp = ctrl.open_p2p(OpenP2PArgs {
-        args: Some(local_args.into()).into(),
-        tun_args: Some(Tun_args::Socks(P2PSocksArgs::default())),
+    let rsp = ctrl.open_p2p(P2PArgs {
+        p2p_args: Some(P2p_args::QuicSocks(QuicSocksArgs {
+            base: Some(P2PQuicArgs {
+                ice: Some(local_args.into()).into(),
+                cert_der,
+                ..Default::default()
+            }).into(),
+            ..Default::default()
+        })),
         ..Default::default()
     }).await?;
 
+    // let rsp = ctrl.open_p2p(P2PArgs {
+    //     args: Some(local_args.into()).into(),
+    //     tun_args: Some(Tun_args::Socks(P2PSocksArgs::default())),
+    //     ..Default::default()
+    // }).await?;
+
     let rsp = rsp.open_p2p_rsp.with_context(||"no open_p2p_rsp")?;
     match rsp {
-        Open_p2p_rsp::Args(remote_args) => {
-            let remote_args = remote_args.into();
+        Open_p2p_rsp::Args(mut remote_args) => {
+            if !remote_args.has_quic_socks() {
+                bail!("no quic socks")
+            }
+
+            let mut args = remote_args.take_quic_socks()
+            .base.0.with_context(||"no base in quic socks")?;
+            let remote_args: IceArgs = args.ice.take().with_context(||"no ice in quic args")?.into();
+            
+            let local_cert = QuicIceCert::try_new()?;
+            let server_cert_der = args.cert_der;
+
             tracing::debug!("remote args {remote_args:?}");
             let conn = peer.dial(remote_args).await?
-            .upgrade_to_quic().await?;
+            .upgrade_to_quic2(&local_cert, Some(server_cert_der)).await?;
             let _r = tx.send(conn).await;
             
             return Ok(())

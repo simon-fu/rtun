@@ -33,7 +33,7 @@ async fn do_run(args: CmdArgs) -> Result<()> {
             let listen_addr = SocketAddr::new(listen_addr.ip(), listen_addr.port()+n);
             let listener = TcpListener::bind(listen_addr).await
             .with_context(||format!("fail to bind address [{listen_addr}]"))?;
-            tracing::info!("socks5 via quic listen on [{listen_addr}]");
+            tracing::info!("socks5(quic) listen on [{listen_addr}]");
     
             let pool = agent_pool.clone();
     
@@ -53,7 +53,7 @@ async fn do_run(args: CmdArgs) -> Result<()> {
         };
         let listener = TcpListener::bind(listen_addr).await
         .with_context(||format!("fail to bind address [{listen_addr}]"))?;
-        tracing::info!("socks5 via ctrl listen on [{listen_addr}]");
+        tracing::info!("socks5(ws) listen on [{listen_addr}]");
 
         let shared = shared.clone();
         spawn_with_name("local_sock", async move {
@@ -69,7 +69,6 @@ async fn do_run(args: CmdArgs) -> Result<()> {
         let r = try_connect(&args).await;
         match r {
             Ok(mut session) => {
-                tracing::info!("session connected");
                 last_success = true;
 
                 // let mut session = make_stream_session(stream).await?;
@@ -94,9 +93,10 @@ async fn do_run(args: CmdArgs) -> Result<()> {
                     tracing::warn!("connect failed [{e:?}]");
                     tracing::info!("try reconnecting...");
                 }
-                tokio::time::sleep(Duration::from_millis(1000)).await;
             },
         }
+
+        tokio::time::sleep(Duration::from_millis(1000)).await;
     }
 
 }
@@ -132,9 +132,10 @@ async fn try_connect(args: &CmdArgs) -> Result<StreamSession<impl PacketSink, im
     let url_str = url.as_str();
 
     let (stream, _r) = ws_connect_to(url_str).await
-    .with_context(||format!("fail to connect to [{}]", url_str))?;
+    .with_context(||format!("connect to agent failed"))?;
 
-    tracing::info!("select agent {:?}", get_agent_from_url(&url));
+    let agent_name = get_agent_from_url(&url);
+    tracing::info!("connected to agent {agent_name:?}");
 
     // let uid = gen_huid();
     // let mut switch = make_switch_pair(uid, stream.split()).await?;

@@ -39,7 +39,7 @@ message C2ARequest {
         CloseChannelArgs close_channel  = 3;
         Ping ping                       = 4;
         KickDownArgs kick_down          = 5;
-        OpenP2PArgs open_p2p            = 6;
+        P2PArgs open_p2p                = 6;
     }
 }
 
@@ -80,24 +80,51 @@ message CloseChannelArgs  {
     uint64 ch_id                        = 1;
 }
 
-message P2PArgs  {
+message P2PIceArgs  {
     string ufrag                        = 1;
-    // string addr                         = 2;
     string pwd                          = 2;
     repeated string candidates          = 3;
-    optional string cert_fingerprint    = 4;
 }
 
-message OpenP2PArgs  {
-    P2PArgs args                        = 1;
-    oneof tun_args {
-        ThroughputArgs throughput       = 2;
-        P2PSocksArgs socks              = 3;
+// message P2PArgs  {
+//     // optional bytes cert_der             = 4;
+//     oneof p2p_type {
+//         P2PQuicArgs quic                = 4;
+//         P2PDtlsArgs dtls                = 5;
+//     }
+// }
+
+
+message P2PArgs  {
+    oneof p2p_args {
+        QuicSocksArgs quic_socks        = 1;
+        QuicThroughputArgs quic_thrput  = 2;
+        WebrtcThroughputArgs webrtc_thrput = 3;
     }
 }
 
-message P2PSocksArgs {
+message P2PQuicArgs {
+    P2PIceArgs ice                      = 1;
+    bytes cert_der                      = 2;
+}
 
+message QuicSocksArgs {
+    P2PQuicArgs base                    = 1;
+}
+
+message P2PDtlsArgs {
+    P2PIceArgs ice                      = 1;
+    optional string cert_fingerprint             = 2;
+}
+
+message QuicThroughputArgs {
+    P2PQuicArgs base                    = 1;
+    ThroughputArgs throughput           = 2;
+}
+
+message WebrtcThroughputArgs {
+    P2PDtlsArgs base                    = 1;
+    ThroughputArgs throughput           = 2;
 }
 
 message ThroughputArgs {

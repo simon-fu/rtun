@@ -1,15 +1,14 @@
 /* 
 TODO:
     - ice nego 要有超时
-    - 证书验证
+    - ok (实现了校验服务端证书） quic 证书验证
     - ok ufrag, pwd 随机生成
     - 用 pwd 检验 stun 消息完整性
     - ok IfWatcher 在 github 上取到空列表
 */
 
 use std::net::SocketAddr;
-use anyhow::{Result, Context, bail};
-use sha2::{Sha256, Digest};
+use anyhow::{Result, Context};
 use tracing::debug;
 
 use crate::huid::HUId;
@@ -26,7 +25,7 @@ use super::ice_ipnet::ipnet_iter;
 #[derive(Debug, Default)]
 pub struct IceConfig {
     pub servers: Vec<String>,
-    pub disable_dtls: bool,
+    // pub disable_dtls: bool,
     pub compnent_id: Option<u16>,
 }
 
@@ -35,14 +34,14 @@ pub struct IceArgs {
     pub ufrag: String,
     pub pwd: String,
     pub candidates: Vec<String>,
-    pub cert_fingerprint: Option<String>,
+    // pub cert_der: Option<Bytes>,
 }
 
 struct Local {
     pub ufrag: String,
     pub pwd: String,
     pub candidates: Vec<Candidate>,
-    pub cert: rcgen::Certificate,
+    // pub cert: rcgen::Certificate,
 }
 
 impl Local {
@@ -56,19 +55,19 @@ impl Local {
             ufrag: self.ufrag.clone(),
             pwd: self.pwd.clone(),
             candidates,
-            cert_fingerprint: self.cert_fingerprint(),
+            // cert_der: None,
         }
     }
 
-    fn cert_fingerprint(&self, ) -> Option<String> {
-        let data = self.cert.get_key_pair().public_key_der();
-        return make_fingerprint(SHA256_ALG, &data).ok()
+    // fn cert_fingerprint(&self, ) -> Option<String> {
+    //     let data = self.cert.get_key_pair().public_key_der();
+    //     return make_fingerprint(SHA256_ALG, &data).ok()
 
-        // if let Ok(data) = self.cert.serialize_der() {
-        //     return make_fingerprint(SHA256_ALG, &data).ok()
-        // }
-        // None
-    }
+    //     // if let Ok(data) = self.cert.serialize_der() {
+    //     //     return make_fingerprint(SHA256_ALG, &data).ok()
+    //     // }
+    //     // None
+    // }
 }
 
 pub struct IcePeer {
@@ -210,7 +209,7 @@ impl IcePeer {
             ufrag: HUId::random().to_string(),
             pwd: HUId::random().to_string(),
             candidates,
-            cert: rcgen::generate_simple_self_signed(vec!["localhost".into()])?,
+            // cert: rcgen::generate_simple_self_signed(vec!["localhost".into()])?,
         };
 
         let args = local.to_args();
@@ -408,37 +407,37 @@ impl IceConn {
 // }
 
 
-const SHA256_ALG: &str = "sha-256";
+// const SHA256_ALG: &str = "sha-256";
 
-fn make_fingerprint(algorithm: &str, cert_data: &[u8]) -> Result<String> {
-    if algorithm != SHA256_ALG {
-        bail!("unsupported fingerprint algorithm [{algorithm}]")
-    }
+// fn make_fingerprint(algorithm: &str, cert_data: &[u8]) -> Result<String> {
+//     if algorithm != SHA256_ALG {
+//         bail!("unsupported fingerprint algorithm [{algorithm}]")
+//     }
 
-    let mut h = Sha256::new();
-    h.update(cert_data);
-    let hashed = h.finalize();
+//     let mut h = Sha256::new();
+//     h.update(cert_data);
+//     let hashed = h.finalize();
     
-    Ok(FingerprintDisplay(&hashed[..]).to_string())
-}
+//     Ok(FingerprintDisplay(&hashed[..]).to_string())
+// }
 
-struct FingerprintDisplay<'a>(&'a [u8]);
-impl<'a> std::fmt::Display for FingerprintDisplay<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let len = self.0.len();
+// struct FingerprintDisplay<'a>(&'a [u8]);
+// impl<'a> std::fmt::Display for FingerprintDisplay<'a> {
+//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+//         let len = self.0.len();
 
-        if len > 0 {
-            for b in &self.0[..len-1] {
-                let x = *b;
-                write!(f, "{x:02x}:")?;
-            }
-            let x = self.0[len-1];
-            write!(f, "{x:02x}")?;
-        }
+//         if len > 0 {
+//             for b in &self.0[..len-1] {
+//                 let x = *b;
+//                 write!(f, "{x:02x}:")?;
+//             }
+//             let x = self.0[len-1];
+//             write!(f, "{x:02x}")?;
+//         }
 
-        Ok(())
-    }
-}
+//         Ok(())
+//     }
+// }
 
 // #[test]
 // fn test_make_fingerprint() {

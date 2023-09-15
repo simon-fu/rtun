@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow, bail, Context};
 use chrono::Local;
 use protobuf::Message;
 
-use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, handle_msg_none, Action}, huid::HUId, channel::{ChId, ChPair}, proto::{OpenChannelResponse, open_channel_response::Open_ch_rsp, OpenShellArgs, C2ARequest, c2arequest::C2a_req_args, OpenSocksArgs, CloseChannelArgs, ResponseStatus, Ping, Pong, KickDownArgs, OpenP2PArgs, OpenP2PResponse}};
+use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, handle_msg_none, Action}, huid::HUId, channel::{ChId, ChPair}, proto::{OpenChannelResponse, open_channel_response::Open_ch_rsp, OpenShellArgs, C2ARequest, c2arequest::C2a_req_args, OpenSocksArgs, CloseChannelArgs, ResponseStatus, Ping, Pong, KickDownArgs, OpenP2PResponse, P2PArgs}};
 
 use super::{invoker_ctrl::{CloseChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker, OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId, entity_watch::{OpWatch, WatchResult, CtrlGuard, CtrlWatch}};
 
@@ -410,7 +410,7 @@ pub async fn c2a_kick_down(pair: &mut ChPair, args: KickDownArgs) -> Result<Resp
     Ok(status)
 }
 
-pub async fn c2a_open_p2p(pair: &mut ChPair, args: OpenP2PArgs) -> Result<OpenP2PResponse> {
+pub async fn c2a_open_p2p(pair: &mut ChPair, args: P2PArgs) -> Result<OpenP2PResponse> {
 
     let data = C2ARequest {
         c2a_req_args: Some(C2a_req_args::OpenP2p(args)),

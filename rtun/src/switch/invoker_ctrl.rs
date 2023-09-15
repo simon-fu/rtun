@@ -2,7 +2,7 @@
 
 
 use anyhow::Result;
-use crate::{channel::{ChId, ChSender}, actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker}, proto::{OpenShellArgs, OpenSocksArgs, KickDownArgs, OpenP2PArgs, OpenP2PResponse}};
+use crate::{channel::{ChId, ChSender}, actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker}, proto::{OpenShellArgs, OpenSocksArgs, KickDownArgs, OpenP2PResponse, P2PArgs}};
 
 use super::entity_watch::{OpWatch, WatchResult};
 
@@ -77,7 +77,7 @@ where
         self.invoker.invoke(OpKickDown(args)).await?
     }
 
-    pub async fn open_p2p(&self, args: OpenP2PArgs) -> OpOpenP2PResult {
+    pub async fn open_p2p(&self, args: P2PArgs) -> OpOpenP2PResult {
         self.invoker.invoke(OpOpenP2P(args)).await?
     }
 }
@@ -129,6 +129,6 @@ pub type OpKickDownResult = Result<()>;
 
 
 #[derive(Debug)]
-pub struct OpOpenP2P(pub OpenP2PArgs);
+pub struct OpOpenP2P(pub P2PArgs);
 
 pub type OpOpenP2PResult = Result<OpenP2PResponse>;
