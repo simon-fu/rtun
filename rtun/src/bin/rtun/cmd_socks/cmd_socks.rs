@@ -218,7 +218,17 @@ async fn handle_client<H: CtrlHandler>(
         ..Default::default()
     };
 
-    let ch_tx = ctrl.open_socks(ch_tx, open_args).await?;
+    let ch_tx = {
+        let r = ctrl.open_socks(ch_tx, open_args).await
+        .with_context(||"open socks ch failed");
+        match r {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("{e:?}");
+                return Err(e)
+            }
+        }
+    };
     tracing::debug!("opened socks {} -> {:?}", peer_addr, ch_tx.ch_id());
 
     // let mut ch_rx = ch_rx;

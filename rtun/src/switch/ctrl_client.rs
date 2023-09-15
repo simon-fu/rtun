@@ -346,7 +346,7 @@ pub async fn c2a_open_socks(pair: &mut ChPair, args: OpenSocksArgs) -> Result<Ch
 
     let opened_ch_id = match rsp {
         Open_ch_rsp::ChId(v) => ChId(v),
-        Open_ch_rsp::Status(status) => bail!("open socks response status {:?}", status),
+        Open_ch_rsp::Status(status) => bail!("open socks response status {status}"),
         // _ => bail!("unknown"),
     };
 

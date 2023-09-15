@@ -29,7 +29,7 @@ pub async fn run(args0: CmdArgs) -> Result<()> {
         _r = tokio::time::sleep(expire_in) => {
             tracing::info!("running expired")
         }
-        _r = run_loop(&url, expire_in) => {
+        _r = run_loop(&url, expire_in, args0.no_socks_ws) => {
 
         }
     }
@@ -79,7 +79,7 @@ pub async fn run(args0: CmdArgs) -> Result<()> {
 
 }
 
-async fn run_loop(url: &url::Url, expire_in: Duration) {
+async fn run_loop(url: &url::Url, expire_in: Duration, no_socks_ws: bool) {
     let expire_at = Instant::now() + expire_in;
 
     let mut last_success = true;
@@ -101,6 +101,12 @@ async fn run_loop(url: &url::Url, expire_in: Duration) {
             Ok((name, mut session)) => {
                 tracing::info!("session connected, agent [{name}]");
                 last_success = true;
+
+                let r = session.ctrl_client().set_no_socks(no_socks_ws).await;
+                if let Err(e) = r {
+                    tracing::error!("set no socks failed {e:?}");
+                }
+                
                 // let r = stream.next().await;
                 // let mut session = make_agent_session(stream).await?;
                 let r = session.wait_for_completed().await;
@@ -200,11 +206,9 @@ pub struct CmdArgs {
     )]
     expire_in: Option<i64>,
 
-    // #[clap(
-    //     short = 'r',
-    //     long = "reverse",
-    //     long_help = "connect to url as reverse agent",
-    //     // multiple_occurrences = true
-    // )]
-    // reverse: Option<bool>,
+    #[clap(
+        long = "no-socks-ws",
+        long_help = "disable socks via ws service",
+    )]
+    no_socks_ws: bool,
 }
