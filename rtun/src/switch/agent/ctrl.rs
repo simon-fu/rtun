@@ -34,8 +34,8 @@ impl  AgentCtrl {
         Ok(())
     }
 
-    pub async fn set_no_socks(&self, v: bool) -> Result<()> {
-        let r = self.handle.invoker().invoke(SetNoSocks(v)).await??;
+    pub async fn disable_shell(&self, v: bool) -> Result<()> {
+        let r = self.handle.invoker().invoke(DisableShell(v)).await??;
         Ok(r)
     }
 }
@@ -50,7 +50,7 @@ pub async fn make_agent_ctrl(uid: HUId) -> Result<AgentCtrl> {
         channels: Default::default(),
         weak: None,
         guard: CtrlGuard::new(),
-        no_socks: false,
+        disable_shell: false,
     };
 
     let handle = start_actor(
@@ -121,6 +121,9 @@ impl AsyncHandler<OpOpenShell> for Entity {
     type Response = OpOpenShellResult; 
 
     async fn handle(&mut self, req: OpOpenShell) -> Self::Response {
+        if self.disable_shell {
+            bail!("shell disabled")
+        }
 
         let exec = open_shell(req.1).await?;
 
@@ -162,9 +165,6 @@ impl AsyncHandler<OpOpenSocks> for Entity {
     type Response = OpOpenSocksResult; 
 
     async fn handle(&mut self, req: OpOpenSocks) -> Self::Response {
-        if self.no_socks {
-            bail!("socks disable")
-        }
 
         let exec = ChSocks::try_new(req.1)?;
 
@@ -253,14 +253,14 @@ impl AsyncHandler<OpOpenP2P> for Entity {
     }
 }
 
-struct SetNoSocks(bool);
+struct DisableShell(bool);
 
 #[async_trait::async_trait]
-impl AsyncHandler<SetNoSocks> for Entity {
+impl AsyncHandler<DisableShell> for Entity {
     type Response = Result<()>; 
 
-    async fn handle(&mut self, req: SetNoSocks) -> Self::Response {
-        self.no_socks = req.0;
+    async fn handle(&mut self, req: DisableShell) -> Self::Response {
+        self.disable_shell = req.0;
         Ok(())
     }
 }
@@ -489,7 +489,7 @@ pub struct Entity {
     channels: HashMap<ChId, ChItem>,
     weak: Option<CtrlWeak<Self>>,
     guard: CtrlGuard,
-    no_socks: bool,
+    disable_shell: bool,
 }
 
 impl Entity {

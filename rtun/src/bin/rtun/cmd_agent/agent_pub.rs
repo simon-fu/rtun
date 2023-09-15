@@ -29,7 +29,7 @@ pub async fn run(args0: CmdArgs) -> Result<()> {
         _r = tokio::time::sleep(expire_in) => {
             tracing::info!("running expired")
         }
-        _r = run_loop(&url, expire_in, args0.no_socks_ws) => {
+        _r = run_loop(&url, expire_in, args0.disable_shell) => {
 
         }
     }
@@ -79,7 +79,7 @@ pub async fn run(args0: CmdArgs) -> Result<()> {
 
 }
 
-async fn run_loop(url: &url::Url, expire_in: Duration, no_socks_ws: bool) {
+async fn run_loop(url: &url::Url, expire_in: Duration, disable_shell: bool) {
     let expire_at = Instant::now() + expire_in;
 
     let mut last_success = true;
@@ -102,7 +102,7 @@ async fn run_loop(url: &url::Url, expire_in: Duration, no_socks_ws: bool) {
                 tracing::info!("session connected, agent [{name}]");
                 last_success = true;
 
-                let r = session.ctrl_client().set_no_socks(no_socks_ws).await;
+                let r = session.ctrl_client().disable_shell(disable_shell).await;
                 if let Err(e) = r {
                     tracing::error!("set no socks failed {e:?}");
                 }
@@ -207,8 +207,8 @@ pub struct CmdArgs {
     expire_in: Option<i64>,
 
     #[clap(
-        long = "no-socks-ws",
-        long_help = "disable socks via ws service",
+        long = "disable-shell",
+        long_help = "disable shell service",
     )]
-    no_socks_ws: bool,
+    disable_shell: bool,
 }

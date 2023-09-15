@@ -41,7 +41,7 @@ impl<H: SwitchHanlder>  CtrlClient<H> {
 }
 
 
-pub async fn make_ctrl_client<H: SwitchHanlder>(uid: HUId, pair: ChPair, switch: SwitchInvoker<H>) -> Result<CtrlClient<H>> {
+pub async fn make_ctrl_client<H: SwitchHanlder>(uid: HUId, pair: ChPair, switch: SwitchInvoker<H>, disable_bridge_ch: bool) -> Result<CtrlClient<H>> {
 
     // let mux_tx = switch.get_mux_tx().await?;
     let switch_watch = switch.watch().await?;
@@ -55,6 +55,7 @@ pub async fn make_ctrl_client<H: SwitchHanlder>(uid: HUId, pair: ChPair, switch:
         next_ch_id: Default::default(),
         guard: CtrlGuard::new(),
         switch_watch,
+        disable_bridge_ch,
     };
 
     let handle = start_actor(
@@ -107,6 +108,9 @@ impl<H: SwitchHanlder> AsyncHandler<OpCloseChannel> for Entity<H> {
     type Response = CloseChannelResult; 
 
     async fn handle(&mut self, req: OpCloseChannel) -> Self::Response { 
+        if self.disable_bridge_ch {
+            bail!("bridge ch disabled")
+        }
 
         let r = c2a_close_channel(&mut self.pair, CloseChannelArgs {
             ch_id: req.0.0,
@@ -128,6 +132,10 @@ impl<H: SwitchHanlder> AsyncHandler<OpOpenShell> for Entity<H> {
     type Response = OpOpenShellResult; 
 
     async fn handle(&mut self, mut req: OpOpenShell) -> Self::Response {
+
+        if self.disable_bridge_ch {
+            bail!("bridge ch disabled")
+        }
 
         let req_ch_id = self.next_ch_id.next_ch_id();
         req.1.ch_id = Some(req_ch_id.0);
@@ -153,6 +161,9 @@ impl<H: SwitchHanlder> AsyncHandler<OpOpenSocks> for Entity<H> {
     type Response = OpOpenSocksResult; 
 
     async fn handle(&mut self, mut req: OpOpenSocks) -> Self::Response {
+        if self.disable_bridge_ch {
+            bail!("bridge ch disabled")
+        }
 
         let req_ch_id = self.next_ch_id.next_ch_id();
         req.1.ch_id = Some(req_ch_id.0);
@@ -216,6 +227,18 @@ impl<H: SwitchHanlder> AsyncHandler<OpOpenP2P> for Entity<H> {
     }
 }
 
+struct SetNoSocks(bool);
+
+#[async_trait::async_trait]
+impl<H: SwitchHanlder> AsyncHandler<SetNoSocks> for Entity<H> {
+    type Response = Result<()>; 
+
+    async fn handle(&mut self, req: SetNoSocks) -> Self::Response {
+        self.disable_bridge_ch = req.0;
+        Ok(())
+    }
+}
+
 impl<H: SwitchHanlder> CtrlHandler for Entity<H> {}
 
 
@@ -229,6 +252,7 @@ pub struct Entity<H: SwitchHanlder> {
     next_ch_id: NextChId,
     guard: CtrlGuard,
     switch_watch: CtrlWatch,
+    disable_bridge_ch: bool,
 }
 
 // impl<H: SwitchHanlder> Entity<H> {

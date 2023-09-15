@@ -139,7 +139,7 @@ async fn try_connect(args: &CmdArgs) -> Result<StreamSession<impl PacketSink, im
 
     // let uid = gen_huid();
     // let mut switch = make_switch_pair(uid, stream.split()).await?;
-    let session = make_stream_session(stream.split()).await?;
+    let session = make_stream_session(stream.split(), false).await?;
     
     Ok(session)
 }

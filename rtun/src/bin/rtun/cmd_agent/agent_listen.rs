@@ -45,6 +45,7 @@ pub async fn run(args: CmdArgs) -> Result<()> {
         local: local_agent.as_ref().map(|x|x.clone_ctrl()),
         secret: args.secret.clone(),
         data: Default::default(),
+        disable_bridge_ch: args.disable_bridge_ch,
     });
 
     let app = Router::new()
@@ -218,7 +219,7 @@ async fn handle_ws_pub(
 
 async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr: SocketAddr, params: PubParams) -> Result<()> {
 
-    let mut session = make_stream_session(WsStreamAxum::new(socket.split()).split()).await?;
+    let mut session = make_stream_session(WsStreamAxum::new(socket.split()).split(), shared.disable_bridge_ch).await?;
 
     // let mut session = make_stream_switch(uid, WsStreamAxum::new(socket)).await?;
     // let switch = session.clone_invoker();
@@ -421,6 +422,7 @@ struct Shared {
     secret: Option<String>,
     local: Option<AgentCtrlInvoker>,
     data: Mutex<SharedData>,
+    disable_bridge_ch: bool,
 }
 
 #[derive(Default)]
@@ -478,5 +480,11 @@ pub struct CmdArgs {
         long_help = "authentication secret",
     )]
     secret: Option<String>,
+
+    #[clap(
+        long = "disable-bridge-ch",
+        long_help = "disable bridge channel",
+    )]
+    disable_bridge_ch: bool,
 }
 

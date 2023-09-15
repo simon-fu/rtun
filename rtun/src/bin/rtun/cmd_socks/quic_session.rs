@@ -9,10 +9,8 @@ use rtun::{actor_service::{ActorEntity, handle_first_none, Action, AsyncHandler,
 
 pub fn make_quic_session<H: CtrlHandler>(uid: HUId, ctrl: CtrlInvoker<H>, agent: &str) -> Result<QuicSession<H>> {
 
-    let punch = kick_punch(ctrl.clone())?;
-
     let entity = Entity {
-        state: State::Punching(punch),
+        state: State::Disconnected(Instant::now()), 
         ctrl,
     };
     
@@ -205,12 +203,6 @@ async fn punch_task<H: CtrlHandler>(ctrl: CtrlInvoker<H>, tx: mpsc::Sender<QuicC
         })),
         ..Default::default()
     }).await?;
-
-    // let rsp = ctrl.open_p2p(P2PArgs {
-    //     args: Some(local_args.into()).into(),
-    //     tun_args: Some(Tun_args::Socks(P2PSocksArgs::default())),
-    //     ..Default::default()
-    // }).await?;
 
     let rsp = rsp.open_p2p_rsp.with_context(||"no open_p2p_rsp")?;
     match rsp {

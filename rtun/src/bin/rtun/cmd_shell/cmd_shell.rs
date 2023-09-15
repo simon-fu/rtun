@@ -33,7 +33,7 @@ async fn do_run(args: CmdArgs) -> Result<()> {
     let pair = ChPair { tx: ctrl_tx, rx: ctrl_rx };
 
     // let mut ctrl = ClientChannelCtrl::new(pair, invoker);
-    let mut ctrl_session = make_ctrl_client(uid, pair, switch).await?;
+    let mut ctrl_session = make_ctrl_client(uid, pair, switch, false).await?;
     let ctrl = ctrl_session.clone_invoker();
 
     // let ch_id = ChId(1);

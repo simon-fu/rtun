@@ -6,7 +6,7 @@ use crate::{huid::gen_huid::gen_huid, channel::{ChId, ChPair}};
 use super::{ctrl_client::make_ctrl_client, switch_pair::{SwitchPair, make_switch_pair, SwitchPairCtrlClient}, switch_sink::PacketSink, switch_source::PacketSource};
 
 
-pub async fn make_stream_session<S1, S2>(stream: (S1, S2)) -> Result<StreamSession<S1, S2>> 
+pub async fn make_stream_session<S1, S2>(stream: (S1, S2), disable_bridge_ch: bool) -> Result<StreamSession<S1, S2>> 
 where
     S1: PacketSink,
     S2: PacketSource,
@@ -23,7 +23,7 @@ where
     
     let pair = ChPair { tx: ctrl_tx, rx: ctrl_rx };
 
-    let ctrl_session = make_ctrl_client(uid, pair, switch).await?;
+    let ctrl_session = make_ctrl_client(uid, pair, switch, disable_bridge_ch).await?;
 
     Ok(StreamSession{switch_session, ctrl_session})
 }
