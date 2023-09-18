@@ -255,22 +255,33 @@ impl UdpOps for StunResolver {
 
     fn process_tick(&mut self, now: Instant) -> Result<()>  {
         let r = self.inflight.process_tick(now, &mut self.tx_que, &mut self.timeouts);
+        if let Err(e) = r {
+            tracing::warn!("process_tick failed [{e:?}]");
+        }
         self.timeouts.clear();
-        r
+        Ok(())
     }
 
     fn input_data(&mut self, data: &[u8], from_addr: SocketAddr, now: Instant) -> Result<()>  {
-        let msg = decode_message(data)?;
+        let mut func = move || -> Result<()> {
+            let msg = decode_message(data)?;
 
-        match (msg.class(), msg.method()) {
-            (MessageClass::SuccessResponse, BINDING) => {
-                // tracing::debug!("is binding success response");
-                self.process_success_rsp(msg, from_addr, now)?;
-
-            },
-            r => {
-                tracing::debug!("unknown recv msg {r:?}");
+            match (msg.class(), msg.method()) {
+                (MessageClass::SuccessResponse, BINDING) => {
+                    // tracing::debug!("is binding success response");
+                    self.process_success_rsp(msg, from_addr, now)?;
+    
+                },
+                r => {
+                    tracing::debug!("unknown recv msg {r:?}");
+                }
             }
+            Ok(())
+        };
+
+        let r = func();
+        if let Err(e) = r {
+            tracing::warn!("input_data failed [{e:?}]");
         }
 
         Ok(())
