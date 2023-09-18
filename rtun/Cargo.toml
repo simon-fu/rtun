@@ -92,6 +92,7 @@ quinn = "=0.10.2"
 rcgen = "=0.11.1"
 if-watch = { version = "=3.0.1", features = ["tokio"] }
 combine = "=4.6.6"
+# webpki = "=0.22.1"
 
 dialoguer = { version = "=0.10.4", features = ["history", "completion"] }
 console = "=0.15.7"

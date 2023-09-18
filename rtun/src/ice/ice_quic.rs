@@ -35,42 +35,42 @@ impl QuicIceArgs {
 
 pub struct QuicIceCert {
     pub cert: Certificate,
-    // pub cert_der: Bytes,
+    pub cert_der: Vec<u8>,
 }
 
 impl QuicIceCert {
     pub fn try_new() -> Result<Self> {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-        // let cert_der = cert.serialize_der()?.into();
-        Ok(Self { cert })
+        let cert_der = cert.serialize_der()?.into();
+        Ok(Self { cert, cert_der })
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        Ok(self.cert.serialize_der()?)
+        Ok(self.cert_der.clone())
     }
 }
 
 
 #[async_trait]
 pub trait UpgradeToQuic {
-    async fn upgrade_to_quic(self) -> Result<QuicConn>;
-    async fn upgrade_to_quic2(self, local_cert: &QuicIceCert, remote_cert: Option<Bytes>) -> Result<QuicConn>;
+    // async fn upgrade_to_quic(self) -> Result<QuicConn>;
+    async fn upgrade_to_quic(self, local_cert: &QuicIceCert, remote_cert: Bytes) -> Result<QuicConn>;
 }
 
 
 
 #[async_trait]
 impl UpgradeToQuic for IceConn {
-    async fn upgrade_to_quic(self) -> Result<QuicConn> {
-        let local_cert = QuicIceCert::try_new()?;
-        self.upgrade_to_quic2(&local_cert, None).await
-    }
+    // async fn upgrade_to_quic(self) -> Result<QuicConn> {
+    //     let local_cert = QuicIceCert::try_new()?;
+    //     self.upgrade_to_quic2(&local_cert, None).await
+    // }
 
-    async fn upgrade_to_quic2(self, local_cert: &QuicIceCert, remote_cert: Option<Bytes>) -> Result<QuicConn> {
+    async fn upgrade_to_quic(self, local_cert: &QuicIceCert, remote_cert: Bytes) -> Result<QuicConn> {
 
         let uid = self.uid();
         let is_client = self.is_client();
-        let remote_fingerprint = None;
+        // let remote_fingerprint = None;
 
         let remote_addr = self.remote_addr();
         let socket = self.into_async_udp();
@@ -108,32 +108,46 @@ impl UpgradeToQuic for IceConn {
             // .with_custom_certificate_verifier(ServerFingerprintVerification::new(remote_fingerprint))
             // .with_no_client_auth();
 
-            let client_config = match remote_cert {
-                Some(remote_cert) => {
-                    debug!("use remote cert len {}", remote_cert.len());
-                    let mut certs = rustls::RootCertStore::empty();
-                    certs.add(&rustls::Certificate(remote_cert.to_vec()))?;
-                    ClientConfig::with_root_certificates(certs)
-                },
-                None => {
-                    let crypto = rustls::ClientConfig::builder()
-                    .with_safe_defaults()
-                    .with_custom_certificate_verifier(ServerFingerprintVerification::new(remote_fingerprint))
-                    .with_no_client_auth();
-                    ClientConfig::new(Arc::new(crypto))
-                }
-            };
+            debug!("use remote cert len {}", remote_cert.len());
+            let mut certs = rustls::RootCertStore::empty();
+            certs.add(&rustls::Certificate(remote_cert.to_vec()))?;
+            let client_config = ClientConfig::with_root_certificates(certs);
+
+            // let client_config = match remote_cert {
+            //     Some(remote_cert) => {
+            //         debug!("use remote cert len {}", remote_cert.len());
+            //         let mut certs = rustls::RootCertStore::empty();
+            //         certs.add(&rustls::Certificate(remote_cert.to_vec()))?;
+            //         ClientConfig::with_root_certificates(certs)
+            //     },
+            //     None => {
+            //         let crypto = rustls::ClientConfig::builder()
+            //         .with_safe_defaults()
+            //         .with_custom_certificate_verifier(ServerFingerprintVerification::new(remote_fingerprint))
+            //         .with_no_client_auth();
+            //         ClientConfig::new(Arc::new(crypto))
+            //     }
+            // };
             
             endpoint.set_default_client_config(client_config);
 
             let conn = endpoint.connect(remote_addr, "localhost")?.await?;
-            let keepalive = conn.open_bi().await?;
+            let mut keepalive = conn.open_bi().await?;
+
+            {
+                let cert = local_cert.to_bytes()?;
+                send_token(&mut keepalive.0, &cert[..]).await?;
+            }
+            
             (conn, keepalive)
         } else {
             let conn = endpoint.accept()
             .await.with_context(||"accept but enpoint none")?
             .await?;
-            let keepalive = conn.accept_bi().await?;
+            let mut keepalive = conn.accept_bi().await?;
+
+            recv_token(&mut keepalive.1, &remote_cert[..]).await?;
+
             (conn, keepalive)
         };
 
@@ -165,6 +179,51 @@ impl UpgradeToQuic for IceConn {
         let conn = QuicConn { conn, shared, _guard_tx };
         Ok(conn)
     }
+}
+
+const TOKEN_FIRST: u8 = 0x58;
+
+async fn send_token(stream: &mut SendStream, cert: &[u8]) -> Result<()> {
+
+    let token = make_fingerprint(cert)?;
+    let payload = token.as_bytes();
+
+    let mut buf = BytesMut::with_capacity(3 + payload.len());
+
+    buf.put_u8(TOKEN_FIRST);
+    buf.put_u16(payload.len() as u16);
+    buf.put_slice(payload);
+
+    stream.write_all(&buf[..]).await?;
+
+    Ok(())
+}
+
+async fn recv_token(stream: &mut RecvStream, cert: &[u8]) -> Result<()> {
+
+    let mut header = [0_u8; 3];
+    stream.read_exact(&mut header).await?;
+
+    let mut header = &header[..];
+    let first = header.get_u8();
+    let payload_len = header.get_u16() as usize;
+
+    if first != TOKEN_FIRST {
+        bail!("expect first [{TOKEN_FIRST}] but [{first}]")
+    }
+
+    let mut buf = vec![0; payload_len];
+    stream.read_exact(&mut buf).await?;
+
+    let token = String::from_utf8(buf)?;
+
+    let expect = make_fingerprint(cert)?;
+
+    if token != expect {
+        bail!("expect token [{expect}] but [{token}]")
+    }
+
+    Ok(())
 }
 
 pub struct QuicConn {
@@ -335,7 +394,7 @@ impl Packet {
                 Ok(Pong::parse_from(buf)?.map(|x|Self::Pong(x)))
             },
             _ => {
-                bail!("unknown start byte")
+                bail!("unknown start byte {first:02x}")
             }
         }
 
@@ -429,47 +488,47 @@ impl Pong {
 }
 
 
-struct ServerFingerprintVerification(Option<String>);
+// struct ServerFingerprintVerification(Option<String>);
 
-impl ServerFingerprintVerification {
-    fn new(fingerprint: Option<String>) -> Arc<Self> {
-        Arc::new(Self(fingerprint))
-    }
-}
+// impl ServerFingerprintVerification {
+//     fn new(fingerprint: Option<String>) -> Arc<Self> {
+//         Arc::new(Self(fingerprint))
+//     }
+// }
 
-impl rustls::client::ServerCertVerifier for ServerFingerprintVerification {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+// impl rustls::client::ServerCertVerifier for ServerFingerprintVerification {
+//     fn verify_server_cert(
+//         &self,
+//         _end_entity: &rustls::Certificate,
+//         _intermediates: &[rustls::Certificate],
+//         _server_name: &rustls::ServerName,
+//         _scts: &mut dyn Iterator<Item = &[u8]>,
+//         _ocsp_response: &[u8],
+//         _now: std::time::SystemTime,
+//     ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
 
-        let fingerprint = make_fingerprint(&end_entity.0)
-            .map_err(|_e|rustls::Error::General("can't make fingerprint".into()))?;
-        debug!("got cert len {}, fingerprint {fingerprint:?}", end_entity.0.len());
+//         // let fingerprint = make_fingerprint(&end_entity.0)
+//         //     .map_err(|_e|rustls::Error::General("can't make fingerprint".into()))?;
+//         // debug!("got cert len {}, fingerprint {fingerprint:?}", end_entity.0.len());
 
-        debug!("intermediates num {}", _intermediates.len());
-        for (n, c) in _intermediates.iter().enumerate() {
-            let v = make_fingerprint(&c.0)
-            .map_err(|_e|rustls::Error::General("can't make intermediate fingerprint".into()))?;
-            debug!("intermediates[{n}]: len {}, fingerprint {v:?}", c.0.len());
-        }
+//         // debug!("intermediates num {}", _intermediates.len());
+//         // for (n, c) in _intermediates.iter().enumerate() {
+//         //     let v = make_fingerprint(&c.0)
+//         //     .map_err(|_e|rustls::Error::General("can't make intermediate fingerprint".into()))?;
+//         //     debug!("intermediates[{n}]: len {}, fingerprint {v:?}", c.0.len());
+//         // }
 
-        if let Some(expect) = self.0.as_ref() {
-            if fingerprint != *expect {
-                debug!("expect fingerprint {expect:?} but {fingerprint:?}");
-                return Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYet))
-            }
-        } 
+//         // if let Some(expect) = self.0.as_ref() {
+//         //     if fingerprint != *expect {
+//         //         debug!("expect fingerprint {expect:?} but {fingerprint:?}");
+//         //         return Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYet))
+//         //     }
+//         // } 
 
-        Ok(rustls::client::ServerCertVerified::assertion())
+//         Ok(rustls::client::ServerCertVerified::assertion())
 
-    }
-}
+//     }
+// }
 
 const SHA256_ALG: &str = "sha-256";
 
@@ -583,6 +642,12 @@ async fn manual_test_ice_quic_drop() -> Result<()> {
     .init();
 
     let servers = vec![ ];
+    
+    let cert1 = QuicIceCert::try_new()?;
+    let cert2 = QuicIceCert::try_new()?;
+
+    let cert_der1 = cert1.to_bytes()?;
+    let cert_der2 = cert2.to_bytes()?;
 
     let mut peer1 = IcePeer::with_config(IceConfig {
         servers: servers.clone(),
@@ -603,7 +668,7 @@ async fn manual_test_ice_quic_drop() -> Result<()> {
 
     let task1 = spawn_with_name(format!("client-{}", peer1.uid()), async move {
         let conn = peer1.dial(arg2).await?;
-        let conn = conn.upgrade_to_quic().await?;
+        let conn = conn.upgrade_to_quic(&cert1, cert_der2.into()).await?;
         let (mut wr, mut rd) = conn.open_bi().await?;
         wr.write_all("I'am conn1".as_bytes()).await?;
         let mut buf = vec![0; 1700];
@@ -624,7 +689,7 @@ async fn manual_test_ice_quic_drop() -> Result<()> {
 
     let task2 = spawn_with_name(format!("server-{}", peer2.uid()), async move {
         let conn = peer2.accept().await?;
-        let conn = conn.upgrade_to_quic().await?;
+        let conn = conn.upgrade_to_quic(&cert2, cert_der1.into()).await?;
         let (mut wr, mut _rd) = conn.accept_bi().await?;
         wr.write_all("I'am conn2".as_bytes()).await?;
 
@@ -661,6 +726,12 @@ async fn manual_test_ice_quic() -> Result<()> {
         // "stun:stun.qq.com:3478".into(),
     ];
 
+    let cert1 = QuicIceCert::try_new()?;
+    let cert2 = QuicIceCert::try_new()?;
+
+    let cert_der1 = cert1.to_bytes()?;
+    let cert_der2 = cert2.to_bytes()?;
+
     let mut peer1 = IcePeer::with_config(IceConfig {
         servers: servers.clone(),
         ..Default::default()
@@ -680,7 +751,7 @@ async fn manual_test_ice_quic() -> Result<()> {
 
     let task1 = spawn_with_name("client", async move {
         let conn = peer1.dial(arg2).await?;
-        let conn = conn.upgrade_to_quic().await?;
+        let conn = conn.upgrade_to_quic(&cert1, cert_der2.into()).await?;
         let (mut wr, mut rd) = conn.open_bi().await?;
         wr.write_all("I'am conn1".as_bytes()).await?;
         let mut buf = vec![0; 1700];
@@ -700,7 +771,7 @@ async fn manual_test_ice_quic() -> Result<()> {
 
     let task2 = spawn_with_name("server", async move {
         let conn = peer2.accept().await?;
-        let conn = conn.upgrade_to_quic().await?;
+        let conn = conn.upgrade_to_quic(&cert2, cert_der1.into()).await?;
         let (mut wr, mut rd) = conn.accept_bi().await?;
         wr.write_all("I'am conn2".as_bytes()).await?;
         let mut buf = vec![0; 1700];
@@ -728,5 +799,18 @@ async fn manual_test_ice_quic() -> Result<()> {
     r2?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test_cert {
+    use super::QuicIceCert;
+
+    #[test]
+    fn test_cert() {
+        let cert = QuicIceCert::try_new().unwrap();
+        let data1 = cert.to_bytes().unwrap();
+        let data2 = cert.to_bytes().unwrap();
+        assert_eq!(data1, data2);
+    }
 }
 

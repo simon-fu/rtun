@@ -1,9 +1,9 @@
 /* 
 TODO:
-    - ice nego 要有超时
+    - ok ice nego 要有超时
     - ok (实现了校验服务端证书） quic 证书验证
     - ok ufrag, pwd 随机生成
-    - 用 pwd 检验 stun 消息完整性
+    - ok 用 pwd 检验 stun 消息完整性
     - ok IfWatcher 在 github 上取到空列表
 */
 

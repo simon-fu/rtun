@@ -3,6 +3,7 @@
 use std::{collections::HashMap, time::Duration};
 
 use anyhow::{Result, Context, bail};
+use bytes::Bytes;
 use protobuf::MessageField;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
@@ -267,6 +268,7 @@ impl AsyncHandler<DisableShell> for Entity {
 
 async fn handle_quic_socks(socks_server: super::ch_socks::Server, mut remote_args: P2PQuicArgs) -> Result<OpenP2PResponse> {
     let remote_ice: IceArgs = remote_args.ice.take().with_context(||"no ice in P2PQuicArgs")?.into();
+    let remote_cert_der = remote_args.cert_der;
 
 
     let mut peer = IcePeer::with_config(IceConfig {
@@ -290,7 +292,7 @@ async fn handle_quic_socks(socks_server: super::ch_socks::Server, mut remote_arg
     spawn_with_name(format!("quic-socks-{uid}"), async move {
         // tracing::debug!("starting, local {local_args:?}, remote {remote_args:?}");
 
-        let r = quic_tunnel_task(peer, local_cert, socks_server).await;
+        let r = quic_tunnel_task(peer, local_cert, remote_cert_der, socks_server).await;
         
         tracing::debug!("finished {r:?}");
     });
@@ -315,12 +317,12 @@ async fn handle_quic_socks(socks_server: super::ch_socks::Server, mut remote_arg
     Ok(rsp)
 }
 
-async fn quic_tunnel_task(mut peer: IcePeer, local_cert: QuicIceCert, socks_server: super::ch_socks::Server,) -> Result<()> {
+async fn quic_tunnel_task(mut peer: IcePeer, local_cert: QuicIceCert, remote_cert_der: Bytes, socks_server: super::ch_socks::Server,) -> Result<()> {
 
     
     let conn = peer.accept().await?;
     let peer_addr = conn.remote_addr();
-    let conn = conn.upgrade_to_quic2(&local_cert, None).await?;
+    let conn = conn.upgrade_to_quic(&local_cert, remote_cert_der).await?;
 
     loop {
         let pair = conn.accept_bi().await
@@ -387,7 +389,7 @@ async fn handle_quic_throughput(mut remote_args: QuicThroughputArgs) -> Result<O
 
         let r = async move {
             let conn = peer.accept().await?
-            .upgrade_to_quic2(&local_cert, Some(remote_cert)).await?;
+            .upgrade_to_quic(&local_cert, remote_cert).await?;
             let (wr, rd) = conn.accept_bi().await?;
             run_throughput(rd, wr, thr_args).await
         }.await;

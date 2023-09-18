@@ -220,7 +220,7 @@ async fn punch_task<H: CtrlHandler>(ctrl: CtrlInvoker<H>, tx: mpsc::Sender<QuicC
 
             tracing::debug!("remote args {remote_args:?}");
             let conn = peer.dial(remote_args).await?
-            .upgrade_to_quic2(&local_cert, Some(server_cert_der)).await?;
+            .upgrade_to_quic(&local_cert, Some(server_cert_der)).await?;
             let _r = tx.send(conn).await;
             
             return Ok(())

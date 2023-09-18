@@ -94,7 +94,7 @@ async fn kick_quic_throughput<H: CtrlHandler>(invoker: CtrlInvoker<H>, peer_type
 
                 let r = async move {
                     let conn = peer.dial(remote_args).await?
-                    .upgrade_to_quic2(&local_cert, Some(remote_cert)).await?;
+                    .upgrade_to_quic(&local_cert, Some(remote_cert)).await?;
                     let (wr, rd) = conn.open_bi().await?;
                     let r = timeout(
                         timeout_duration, 

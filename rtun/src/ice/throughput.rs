@@ -327,7 +327,7 @@ mod test_ice_conn {
     use anyhow::Result;
     use tracing::Level;
     use tracing_subscriber::EnvFilter;
-    use crate::{async_rt::spawn_with_name, ice::{throughput::run_throughput, ice_peer::{IcePeer, IceConfig}, ice_quic::UpgradeToQuic}, proto::ThroughputArgs};
+    use crate::{async_rt::spawn_with_name, ice::{throughput::run_throughput, ice_peer::{IcePeer, IceConfig}, ice_quic::{UpgradeToQuic, QuicIceCert}}, proto::ThroughputArgs};
     // use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
     use tracing::debug;
 
@@ -360,11 +360,16 @@ mod test_ice_conn {
         let arg2 = peer2.server_gather(arg1).await?;
         debug!("arg2 {arg2:?}");
     
-    
+        let cert1 = QuicIceCert::try_new()?;
+        let cert2 = QuicIceCert::try_new()?;
+
+        let cert_der1 = cert1.to_bytes()?;
+        let cert_der2 = cert2.to_bytes()?;
+
         let thr_args1 = thr_args.clone();
         let task1 = spawn_with_name("client", async move {
             let conn = peer1.dial(arg2).await?
-            .upgrade_to_quic().await?;
+            .upgrade_to_quic(&cert1, cert_der2.into()).await?;
             let (wr, rd) = conn.open_bi().await?;
             run_throughput(rd, wr, thr_args1).await?;
             Result::<()>::Ok(())
@@ -373,7 +378,7 @@ mod test_ice_conn {
         let thr_args2 = thr_args.clone();
         let task2 = spawn_with_name("server", async move {
             let conn = peer2.accept().await?
-            .upgrade_to_quic().await?;
+            .upgrade_to_quic(&cert2, cert_der1.into()).await?;
             let (wr, rd) = conn.accept_bi().await?;
             run_throughput(rd, wr, thr_args2).await?;
             Result::<()>::Ok(())
