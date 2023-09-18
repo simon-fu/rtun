@@ -256,7 +256,7 @@ impl UdpOps for StunResolver {
     fn process_tick(&mut self, now: Instant) -> Result<()>  {
         let r = self.inflight.process_tick(now, &mut self.tx_que, &mut self.timeouts);
         if let Err(e) = r {
-            tracing::warn!("process_tick failed [{e:?}]");
+            tracing::debug!("process_tick failed [{e:?}]");
         }
         self.timeouts.clear();
         Ok(())
@@ -264,7 +264,7 @@ impl UdpOps for StunResolver {
 
     fn input_data(&mut self, data: &[u8], from_addr: SocketAddr, now: Instant) -> Result<()>  {
         let mut func = move || -> Result<()> {
-            let msg = decode_message(data)?;
+            let msg = decode_message(data).with_context(||"decode stun msg failed")?;
 
             match (msg.class(), msg.method()) {
                 (MessageClass::SuccessResponse, BINDING) => {
@@ -281,7 +281,7 @@ impl UdpOps for StunResolver {
 
         let r = func();
         if let Err(e) = r {
-            tracing::warn!("input_data failed [{e:?}]");
+            tracing::trace!("input_data failed [{e:?}]");
         }
 
         Ok(())
@@ -624,7 +624,9 @@ impl UdpOps for IceChecker {
     fn input_data(&mut self, data: &[u8], from_addr: SocketAddr, now: Instant) -> Result<()>  {
         let r = self.do_input_data(data, from_addr, now);
         if let Err(e) = r {
-            tracing::warn!("input_data faild [{e:?}]");
+            // some remains messages from stun server
+            use crate::hex::BinStrLine;
+            tracing::trace!("input_data faild [{e:?}], {}", data.dump_bin());
         }
         Ok(())
     }
@@ -680,7 +682,7 @@ impl IceChecker {
     }
 
     fn do_input_data(&mut self, data: &[u8], from_addr: SocketAddr, now: Instant) -> Result<()> {
-        let msg = decode_message(data)?;
+        let msg = decode_message(data).with_context(||"decode ice packet failed")?;
 
         match (msg.class(), msg.method()) {
             (MessageClass::Request, BINDING) => {
