@@ -189,8 +189,8 @@ async fn punch_task<H: CtrlHandler>(ctrl: CtrlInvoker<H>, tx: mpsc::Sender<QuicC
     let local_args = peer.client_gather().await?;
     tracing::debug!("local args {local_args:?}");
 
-    let ice_cert = QuicIceCert::try_new()?;
-    let cert_der = ice_cert.to_bytes()?.into();
+    let local_cert = QuicIceCert::try_new()?;
+    let cert_der = local_cert.to_bytes()?.into();
     
     let rsp = ctrl.open_p2p(P2PArgs {
         p2p_args: Some(P2p_args::QuicSocks(QuicSocksArgs {
@@ -215,12 +215,12 @@ async fn punch_task<H: CtrlHandler>(ctrl: CtrlInvoker<H>, tx: mpsc::Sender<QuicC
             .base.0.with_context(||"no base in quic socks")?;
             let remote_args: IceArgs = args.ice.take().with_context(||"no ice in quic args")?.into();
             
-            let local_cert = QuicIceCert::try_new()?;
+            // let local_cert = QuicIceCert::try_new()?;
             let server_cert_der = args.cert_der;
 
             tracing::debug!("remote args {remote_args:?}");
             let conn = peer.dial(remote_args).await?
-            .upgrade_to_quic(&local_cert, Some(server_cert_der)).await?;
+            .upgrade_to_quic(&local_cert, server_cert_der).await?;
             let _r = tx.send(conn).await;
             
             return Ok(())
