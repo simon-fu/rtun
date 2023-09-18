@@ -37,14 +37,14 @@ where
     U: AsyncUdpSocket + Unpin,
     O: UdpOps,
 {
-    tracing::debug!("try udp_flush, tx_que {}", ops.tx_que().len());
+    // tracing::debug!("try udp_flush, tx_que {}", ops.tx_que().len());
     udp_flush(socket, ops).await?;
 
     let socket = socket.as_socket();
     let next = ops.next_tick_time(Instant::now());
     tokio::select! {
         r = socket.recv_from(buf) => {
-            tracing::debug!("recv from {r:?}");
+            // tracing::debug!("recv from {r:?}");
             let (len, from_addr) = r?;
             ops.input_data(&buf[..len], from_addr, Instant::now())?;
         }
@@ -64,11 +64,11 @@ where
         let tx = tx.clone();
         match tx {
             UdpTx::Tx(packet) => {
-                tracing::debug!("send to {} bytes {}", packet.addr, packet.data.len());
+                // tracing::debug!("send to {} bytes {}", packet.addr, packet.data.len());
                 socket.as_socket().send_to(packet.data, packet.addr).await?;
             },
             UdpTx::SetTtl(ttl) => {
-                tracing::debug!("set ttl {ttl}");
+                // tracing::debug!("set ttl {ttl}");
                 socket.set_ttl(ttl)?;
             },
         };
@@ -157,7 +157,7 @@ impl StunResolver {
         
         self.tx_que.push_back(UdpTx::Tx(tsx.packet.clone()));
         self.inflight.insert(tsx_id, tsx);
-        tracing::debug!("kick resolve target {target}, tx_que {}", self.tx_que.len());
+        // tracing::debug!("kick resolve target {target}, tx_que {}", self.tx_que.len());
 
         Ok(())
     }
@@ -223,7 +223,7 @@ impl StunResolver {
                 break;
             }
 
-            tracing::debug!("run once: lookup empty {}, resolver empty {}, tx_que {}", lookup_futures.is_empty(), resolver.is_empty(), resolver.tx_que.len());
+            // tracing::debug!("run once: lookup empty {}, resolver empty {}, tx_que {}", lookup_futures.is_empty(), resolver.is_empty(), resolver.tx_que.len());
 
             tokio::select! {
                 r = udp_run_one(socket, resolver, &mut buf), if !resolver.is_empty() => {
@@ -264,7 +264,7 @@ impl UdpOps for StunResolver {
 
         match (msg.class(), msg.method()) {
             (MessageClass::SuccessResponse, BINDING) => {
-                tracing::debug!("is binding success response");
+                // tracing::debug!("is binding success response");
                 self.process_success_rsp(msg, from_addr, now)?;
 
             },
@@ -424,7 +424,7 @@ impl CheckerConfig {
         }
 
         let creds = &self.local_creds;
-        tracing::debug!("make req, {:?}, {creds:?}, target {:?}, use_cand {use_cand}", req.transaction_id(), cand.addr());
+        // tracing::debug!("make req, {:?}, {creds:?}, target {:?}, use_cand {use_cand}", req.transaction_id(), cand.addr());
         
 
         if let Some(creds) = creds {
@@ -464,7 +464,7 @@ impl CheckerConfig {
         let creds = &self.remote_creds;
 
         let mut rsp = Message::new(MessageClass::SuccessResponse, BINDING, req.transaction_id());
-        tracing::debug!("make rsp, {:?}, {creds:?}, {:?}", rsp.transaction_id(), from_addr);
+        // tracing::debug!("make rsp, {:?}, {creds:?}, {:?}", rsp.transaction_id(), from_addr);
         
         rsp.add_attribute(Attribute::XorMappedAddress(XorMappedAddress::new(from_addr)));
 
@@ -494,7 +494,7 @@ impl CheckerConfig {
 
     fn make_role_conflict_rsp(&self, req: &Message<Attribute>, from_addr: SocketAddr) -> Result<Message<Attribute>> {
         let creds = &self.local_creds;
-        tracing::debug!("make role conflict with creds {creds:?}");
+        // tracing::debug!("make role conflict with creds {creds:?}");
 
         let mut rsp = Message::new(MessageClass::ErrorResponse, BINDING, req.transaction_id());
         
@@ -673,13 +673,13 @@ impl IceChecker {
 
         match (msg.class(), msg.method()) {
             (MessageClass::Request, BINDING) => {
-                tracing::debug!("is binding request");
+                // tracing::debug!("is binding request");
                 self.config.check_req_integrity(&msg)?;
                 self.process_req(msg, from_addr, now)?;
 
             },
             (MessageClass::SuccessResponse, BINDING) => {
-                tracing::debug!("is binding success response");
+                // tracing::debug!("is binding success response");
                 self.config.check_rsp_integrity(&msg)?;
                 self.process_success_rsp(msg, from_addr, now)?;
 
@@ -787,7 +787,7 @@ impl IceChecker {
                     // ignore nominated until recv response
                     return Ok(())
                 } else {
-                    tracing::debug!("got use_cand, selected {from_addr}");
+                    // tracing::debug!("got use_cand, selected {from_addr}");
                     self.result = Some(CheckResult::Selected(from_addr));
                 }
             }
@@ -841,13 +841,13 @@ impl IceChecker {
                 match &self.nominated_tsx_id {
                     Some(nominated_tsx_id) => {
                         if tsx_id == *nominated_tsx_id {
-                            tracing::debug!("recv nominate reponse, addr {from_addr}, {tsx_id:?}");
+                            // tracing::debug!("recv nominate reponse, addr {from_addr}, {tsx_id:?}");
                             self.result = Some(CheckResult::Selected(from_addr));
                         }
                     },
                     None => {
                         let (tsx_id, tsx) = self.config.make_req_tsx(cand, true, now)?;
-                        tracing::debug!("nominate addr {from_addr}, {tsx_id:?}");
+                        // tracing::debug!("nominate addr {from_addr}, {tsx_id:?}");
                         self.nominated_tsx_id = Some(tsx_id);
         
                         self.tx_que.push_back(UdpTx::Tx(tsx.packet.clone()));
@@ -928,7 +928,7 @@ impl<U: AsyncUdpSocket> AsyncUdpSocket for IceSocket<U> {
                                     segment_size: None,
                                     src_ip: None,
                                 }];
-                                tracing::debug!("got binding req, response it");
+                                // tracing::debug!("got binding req, response it");
                                 let r = self.poll_send(udp_state(), cx, &transmits);
                                 let _r = ready!(r);
                             }
@@ -1066,7 +1066,7 @@ pub struct UdpPacket {
 
 
 fn check_integrity(msg: &Message<Attribute>, username: Option<&str>, password: Option<&str>) -> Result<()> {
-    tracing::debug!("check_integrity: {:?}, user {username:?}, pass {password:?}", msg.transaction_id());
+    // tracing::debug!("check_integrity: {:?}, user {username:?}, pass {password:?}", msg.transaction_id());
     if let Some(username) = username {
         if let Some(attr) = msg.get_attribute::<Username>() {
             if attr.name() != username {

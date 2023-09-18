@@ -135,7 +135,7 @@ impl IcePeer {
         //     let rrr = 0;
         // }
 
-        tracing::debug!("prepare checking..");
+        // tracing::debug!("prepare checking..");
         let mut checker = self.make_checker(false)?;
         if let Some(socket) = self.socket.as_mut() {
             checker.prepare_checking()?;
@@ -144,7 +144,7 @@ impl IcePeer {
         // wait for udp packet on wire
         tokio::time::sleep(Duration::from_millis(100)).await; 
 
-        tracing::debug!("prepare checking done");
+        // tracing::debug!("prepare checking done");
 
         Ok(local_args)
     }
@@ -316,7 +316,7 @@ impl IcePeer {
         // let select_addr = output.addr();
 
         let mut checker = self.make_checker(is_client)?;
-        tracing::debug!("start checking... (is_client {is_client}), {:?}", checker.config());
+        debug!("start checking... (is_client {is_client}), {:?}", checker.config());
 
         checker.kick_checking(Instant::now())?;
         udp_run_until_done(&socket, &mut checker).await?;
