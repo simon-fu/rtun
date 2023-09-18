@@ -232,11 +232,20 @@ impl<'a, U: AsyncUdpSocket + Unpin> UdpSocketWrapper<'a, U> {
     }
 
     pub async fn send_to(&self, data: Bytes, destination: SocketAddr) -> io::Result<usize> {
-        SendFut {
+        SendToFut {
             socket: self.0,
             state: udp_state(),
             data,
             destination,
+        }.await
+    }
+
+
+    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        // tokio::net::UdpSocket::recv_from(&self, buf);
+        RecvFromFut {
+            socket: self.0,
+            buf,
         }.await
     }
 
@@ -260,14 +269,45 @@ impl<'a, U: AsyncUdpSocket + Unpin> UdpSocketWrapper<'a, U> {
     }
 }
 
-struct SendFut<'a, U> {
+struct RecvFromFut<'a, U> {
+    socket: &'a U,
+    buf: &'a mut [u8],
+}
+
+impl<'a, U: AsyncUdpSocket> Future for RecvFromFut<'a, U> {
+    type Output = io::Result<(usize, SocketAddr)>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        let self0 = self.get_mut();
+        let mut bufs = [IoSliceMut::new(self0.buf)];
+        let mut meta = [RecvMeta::default()];
+
+        let r = self0.socket.poll_recv(
+            cx, 
+            &mut bufs, 
+            &mut meta,
+        );
+
+        let r = ready!(r);
+        match r {
+            Ok(_n) => {
+                let len = meta[0].len;
+                Poll::Ready(Ok((len, meta[0].addr)))
+            },
+            Err(e) => Poll::Ready(Err(e)),
+        }
+        
+    }
+}
+
+struct SendToFut<'a, U> {
     socket: &'a U,
     state: &'a UdpState,
     data: Bytes,
     destination: SocketAddr
 }
 
-impl<'a, U: AsyncUdpSocket> Future for SendFut<'a, U> {
+impl<'a, U: AsyncUdpSocket> Future for SendToFut<'a, U> {
     type Output = io::Result<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {

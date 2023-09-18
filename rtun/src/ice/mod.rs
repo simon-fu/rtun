@@ -2,6 +2,9 @@
 pub mod webrtc_ice_peer;
 
 pub mod ice_peer;
+pub mod ice_socket;
+pub mod ice_attribute;
+
 
 pub mod ice_candidate;
 

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use anyhow::{Result, Context, bail};
 
+use bytes::Buf;
 use futures::channel::oneshot;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -311,7 +312,18 @@ pub struct IceConn {
 
 impl IceConn {
     pub async fn write_data(&mut self, data: &[u8]) -> Result<usize> {
+        // let remote_addr = self.conn.remote_addr().with_context(||"no remote addr")?;
+        // self.conn.send_to(data, remote_addr).await.map_err(|e|e.into())
         self.conn.send(data).await.map_err(|e|e.into())
+    }
+
+    pub async fn write_data_all(&mut self, mut data: &[u8]) -> Result<()> {
+        while data.len() > 0 {
+            let n = self.write_data(data).await.map_err(|e|anyhow::Error::from(e))?;
+            data.advance(n);
+            println!("sent bytes {n}, remains {}", data.len());
+        }
+        Ok(())
     }
 
     pub async fn read_data(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -387,46 +399,66 @@ fn test_make_fingerprint() {
 
 
 #[tokio::test]
-async fn test_ice_peer() -> Result<()> {
+async fn test_webrtc_ice_peer() -> Result<()> {
+    tracing_subscriber::fmt()
+    .with_max_level(tracing::Level::INFO)
+    .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
+    .with_target(false)
+    .init();
+
+    let servers: Vec<String> = vec![
+        // "stun:stun1.l.google.com:19302".into(),
+        // "stun:stun2.l.google.com:19302".into(),
+        // "stun:stun.qq.com:3478".into(),
+    ];
+
+    let disable_dtls = true;
+
     let mut peer1 = WebrtcIcePeer::with_config(WebrtcIceConfig {
-        servers: vec![
-            "stun:stun1.l.google.com:19302".into(),
-            "stun:stun2.l.google.com:19302".into(),
-            "stun:stun.qq.com:3478".into(),
-        ],
+        servers: servers.clone(),
+        disable_dtls,
         ..Default::default()
     });
 
     let arg1 = peer1.gather_until_done().await?;
+    tracing::debug!("arg1 {arg1:?}");
 
     let mut peer2 = WebrtcIcePeer::with_config(WebrtcIceConfig {
-        servers: vec![
-            "stun:stun1.l.google.com:19302".into(),
-            "stun:stun2.l.google.com:19302".into(),
-            "stun:stun.qq.com:3478".into(),
-        ],
+        servers: servers.clone(),
+        disable_dtls,
         ..Default::default()
     });
     
     let arg2 = peer2.gather_until_done().await?;
+    tracing::debug!("arg1 {arg2:?}");
 
     let task1 = tokio::spawn(async move {
         let mut conn = peer1.dial(arg2).await?;
-        conn.write_data("I'am conn1".as_bytes()).await?;
+        // tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+        let msg = "I'am conn1";
+        conn.write_data(msg.as_bytes()).await?;
+        tracing::debug!("sent {msg:?}");
+
         let mut buf = vec![0; 1700];
         let n = conn.read_data(&mut buf).await?;
         let msg = std::str::from_utf8(&buf[..n])?;
-        println!("recv {msg:?}");
+        tracing::debug!("recv {msg:?}");
         Result::<()>::Ok(())
     });
 
     let task2 = tokio::spawn(async move {
         let mut conn = peer2.accept(arg1).await?;
-        conn.write_data("I'am conn2".as_bytes()).await?;
+        // tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+        let msg = "I'am conn2";
+        conn.write_data(msg.as_bytes()).await?;
+        tracing::debug!("sent {msg:?}");
+
         let mut buf = vec![0; 1700];
         let n = conn.read_data(&mut buf).await?;
         let msg = std::str::from_utf8(&buf[..n])?;
-        println!("recv {msg:?}");
+        tracing::debug!("recv {msg:?}");
         Result::<()>::Ok(())
     });
 

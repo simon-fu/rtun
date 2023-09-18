@@ -8,17 +8,17 @@ TODO:
 */
 
 use std::net::SocketAddr;
+use std::time::Duration;
 use anyhow::{Result, Context};
+use tokio::time::Instant;
 use tracing::debug;
 
 use crate::huid::HUId;
-use crate::ice::ice_candidate::parse_candidate;
-use crate::stun::async_udp::{AsyncUdpSocket, UdpSocketBridge, tokio_socket_bind, TokioUdpSocket, AsUdpSocket};
-
-
-use crate::stun::stun::{Binding, StunSocket, BindingOutput, self};
 use crate::huid::gen_huid::gen_huid;
+use crate::ice::ice_candidate::parse_candidate;
+use crate::stun::async_udp::{AsyncUdpSocket, UdpSocketBridge, tokio_socket_bind, TokioUdpSocket};
 
+use super::ice_socket::{IceChecker, IceCreds, udp_run_until_done, StunResolver, CheckerConfig, udp_flush, IceSocket};
 use super::ice_candidate::{Candidate, server_reflexive};
 use super::ice_ipnet::ipnet_iter;
 
@@ -76,7 +76,7 @@ pub struct IcePeer {
     socket: Option<TokioUdpSocket>,
     local: Option<Local>,
     remote: Option<IceArgs>,
-    targets: Vec<SocketAddr>,
+    targets: Vec<Candidate>,
     // is_client: bool,
 }
 
@@ -121,14 +121,30 @@ impl IcePeer {
         
         self.set_remote(remote)?;
 
-        let config = self.binding_config()?;
+        // let config = self.binding_config(false)?;
+        // tracing::debug!("{} aaa server gather config {config:?}", self.uid);
+
+        // if let Some(socket) = self.socket.as_mut() {
+        //     socket.set_ttl(3)?;
+        //     for target in self.targets.iter() {
+        //         tracing::debug!("aaa server gather send to {target:?}");
+        //         let data = config.make_req_bytes(target, false)?;
+        //         socket.as_socket().send_to(data.into(), target.addr()).await?;
+        //     }
+        //     // tokio::time::sleep(std::time::Duration::MAX/2).await; // aaa
+        //     let rrr = 0;
+        // }
+
+        tracing::debug!("prepare checking..");
+        let mut checker = self.make_checker(false)?;
         if let Some(socket) = self.socket.as_mut() {
-            socket.set_ttl(3)?;
-            for target in self.targets.iter() {
-                let data = config.gen_bind_req_bytes()?;
-                socket.as_socket().send_to(data.into(), *target).await?;
-            }
+            checker.prepare_checking()?;
+            udp_flush(socket, &mut checker).await?;
         }
+        // wait for udp packet on wire
+        tokio::time::sleep(Duration::from_millis(100)).await; 
+
+        tracing::debug!("prepare checking done");
 
         Ok(local_args)
     }
@@ -136,22 +152,71 @@ impl IcePeer {
     fn set_remote(&mut self, remote: IceArgs) -> Result<()> {
         self.targets = Vec::with_capacity(remote.candidates.len());
         for c in remote.candidates.iter() {
-            self.targets.push(parse_candidate(c)?.addr());
+            let cand = parse_candidate(c)?;
+            self.targets.push(cand);
+            // self.targets.push(BindingCandidate {
+            //     addr: cand.addr(),
+            //     use_cand: false,
+            //     prio: Some(cand.prio()),
+            // });
         }
         self.remote = Some(remote);
         Ok(())
     }
 
-    fn binding_config(&self) -> Result<stun::Config> {
+    // // fn binding_config(&self) -> Result<stun::Config> {
+    // //     let local = self.local.as_ref().with_context(||"no local args")?;
+    // //     let remote = self.remote.as_ref().with_context(||"no remote args")?;
+    // //     let username = format!("{}:{}", local.ufrag, remote.ufrag);
+
+    // //     let config = stun::Config::default()
+    // //     .with_username(username)
+    // //     .with_password(remote.pwd.clone());
+
+    // //     Ok(config)
+    // // }
+
+    // fn binding_config(&self, is_client: bool) -> Result<BindingConfig> {
+    //     let local = self.local.as_ref().with_context(||"no local args")?;
+    //     let remote = self.remote.as_ref().with_context(||"no remote args")?;
+
+    //     let config = BindingConfig::default()
+    //     .with_software("rtun".into())
+    //     .with_ice_controlling(is_client)
+    //     .with_local_creds(
+    //         format!("{}:{}", remote.ufrag, local.ufrag), 
+    //         remote.pwd.to_string(),
+    //     )
+    //     .with_remote_creds(
+    //         format!("{}:{}", local.ufrag, remote.ufrag), 
+    //         local.pwd.to_string(),
+    //     );
+
+    //     Ok(config)
+    // }
+
+    fn make_checker(&self, is_client: bool) -> Result<IceChecker> {
         let local = self.local.as_ref().with_context(||"no local args")?;
         let remote = self.remote.as_ref().with_context(||"no remote args")?;
-        let username = format!("{}:{}", local.ufrag, remote.ufrag);
 
-        let mut config = stun::Config::default();
-        config.username = Some(username);
-        config.password = Some(remote.pwd.clone());
+        let mut binding = CheckerConfig::default()
+        .with_software("rtun".into())
+        .with_controlling(is_client)
+        .with_local_creds(IceCreds {
+            username: format!("{}:{}", remote.ufrag, local.ufrag),
+            password: remote.pwd.to_string(),
+        })
+        .with_remote_creds(IceCreds {
+            username: format!("{}:{}", local.ufrag, remote.ufrag), 
+            password: local.pwd.to_string(),
+        })
+        .into_exec();
 
-        Ok(config)
+        for cand in self.targets.iter() {
+            binding.add_remote_candidate(cand.clone());
+        }
+
+        Ok(binding)
     }
 
     async fn gather_until_done(&mut self) -> Result<IceArgs> {
@@ -167,19 +232,27 @@ impl IcePeer {
         }
 
 
-        let (socket, output) = if servers.is_empty() {
-            (tokio_socket_bind("0.0.0.0:0").await?, BindingOutput::default())
-        } else {
-            Binding::bind("0.0.0.0:0").await?
-            .exec(servers.into_iter()).await?
-        };
+        // // let (socket, output) = if servers.is_empty() {
+        // //     (tokio_socket_bind("0.0.0.0:0").await?, BindingOutput::default())
+        // // } else {
+        // //     Binding::bind("0.0.0.0:0").await?
+        // //     .exec(servers.into_iter()).await?
+        // // };
+
+        // // debug!("ice servers {servers:?}");
+        // let (socket, output) = BindingConfig::default()
+        // .resolve_mapped_addr(servers.into_iter()).await?;
+
+        let socket = tokio_socket_bind("0.0.0.0:0").await?;
+        let mut resolver = StunResolver::default();
+        resolver.resolve(&socket, servers.into_iter()).await?;
         
 
         let local_addr = socket.local_addr()?;
 
         let mut candidates = Vec::new();
 
-        for addr in output.mapped_iter() {
+        for addr in resolver.mapped_addrs().mapped_iter() {
             candidates.push(server_reflexive(addr, local_addr, self.config.compnent_id));
         }
 
@@ -233,24 +306,27 @@ impl IcePeer {
 
     async fn negotiate(&mut self, socket: TokioUdpSocket, is_client: bool) -> Result<IceConn> {
 
-        // let remote = self.remote.as_ref().with_context(||"no remote args")?;
 
-        // let local = self.local.as_ref().with_context(||"NOT gather yet")?;
 
-        let config = self.binding_config()?;
+        // let config = self.binding_config(is_client)?;
+        // tracing::debug!("{} aaa negotiate config {config:?}", self.uid);
 
-        let (socket, output) = Binding::with_config(socket, config)
-        .exec(self.targets.iter()).await?;
+        // let (socket, output) = config
+        // .resolve_ice(socket, self.targets.iter().map(|x|x.clone())).await?;
+        // let select_addr = output.addr();
 
-        let select_addr = output.target_iter()
-        .next()
-        .with_context(||"negotiate done but empty output")?
-        .next()
-        .with_context(||"negotiate done but empty target")?;
+        let mut checker = self.make_checker(is_client)?;
+        tracing::debug!("start checking... (is_client {is_client}), {:?}", checker.config());
+
+        checker.kick_checking(Instant::now())?;
+        udp_run_until_done(&socket, &mut checker).await?;
+        let select_addr = checker.selected_addr().with_context(||"checking done but no selected addr")?;
 
         debug!("setup connection to {select_addr}");
 
-        let socket = UdpSocketBridge(StunSocket::new(socket)) ;
+        // let socket = UdpSocketBridge(StunSocket::new(socket)) ;
+        let socket = UdpSocketBridge(checker.into_socket(socket)) ;
+
         let conn = IceConn {
             uid: self.uid,
             remote_addr: select_addr,
@@ -258,87 +334,17 @@ impl IcePeer {
             socket
         };
 
-        // let server_config = {
-        //     // let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-        //     let cert = &local.cert;
-        //     let cert_der = cert.serialize_der()?;
-        //     let priv_key = cert.serialize_private_key_der();
-        //     let priv_key = rustls::PrivateKey(priv_key);
-        //     let cert_chain = vec![rustls::Certificate(cert_der.clone())];
-        
-        //     let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key)?;
-        //     let transport_config = Arc::get_mut(&mut server_config.transport).with_context(||"get transport config failed")?;
-        //     transport_config.max_concurrent_uni_streams(0_u8.into());
-        
-        //     server_config
-        // };
-
-
-        // // let (server_config, server_cert) = configure_server()?;
-
-        // let runtime = default_runtime().with_context(||"no quic async runtime")?;
-
-        // let mut endpoint = Endpoint::new_with_abstract_socket(
-        //     Default::default(), 
-        //     Some(server_config), 
-        //     socket, 
-        //     runtime,
-        // )?;
-        
-        // let (conn, keepalive) = if is_client {
-        //     let crypto = rustls::ClientConfig::builder()
-        //     .with_safe_defaults()
-        //     .with_custom_certificate_verifier(ServerFingerprintVerification::new(remote.cert_fingerprint.clone()))
-        //     .with_no_client_auth();
-            
-        //     endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
-
-        //     let conn = endpoint.connect(select_addr, "localhost")?.await?;
-        //     let keepalive = conn.open_bi().await?;
-        //     (conn, keepalive)
-        // } else {
-        //     let conn = endpoint.accept()
-        //     .await.with_context(||"accept but enpoint none")?
-        //     .await?;
-        //     let keepalive = conn.accept_bi().await?;
-        //     (conn, keepalive)
-        // };
-
-        // spawn_with_name("keepalive", async move {
-        //     let r = keepalive_task(keepalive, is_client).await;
-        //     debug!("finished {r:?}");
-        // });
-
-        // debug!("upgrade to quic");
 
         Ok(conn)
     }
 
 }
 
-// async fn keepalive_task((mut wr, mut rd): (SendStream, RecvStream), _is_client: bool) -> Result<()> {
-//     let mut interval = tokio::time::interval(Duration::from_secs(5));
-//     let mut buf = vec![0; 2048];
-//     loop {
-//         tokio::select! {
-//             r = rd.read(&mut buf) => {
-//                 let n = r?.with_context(||"stream closed")?;
-//                 if n == 0 {
-//                     return Ok(())
-//                 }
-//                 // let s = std::str::from_utf8(&buf[..n]);
-//                 // debug!("recv {s:?}");
-//             }
-//             _r = interval.tick() => {
-//                 wr.write_all("hello".as_bytes()).await?;
-//             }
-//         }
-//     }
-// }
+
 
 pub struct IceConn {
     uid: HUId,
-    socket: UdpSocketBridge<StunSocket<TokioUdpSocket>>,
+    socket: UdpSocketBridge<IceSocket<TokioUdpSocket>>,
     remote_addr: SocketAddr,
     is_client: bool,
 }
@@ -364,204 +370,288 @@ impl IceConn {
 
 
 
-// // #[derive(Clone)]
-// pub struct IceConn {
-//     pub(crate) conn: AConn,
-// }
-
-// impl IceConn {
-//     pub async fn write_data(&mut self, data: &[u8]) -> Result<usize> {
-//         self.conn.send(data).await.map_err(|e|e.into())
-//     }
-
-//     pub async fn read_data(&mut self, buf: &mut [u8]) -> Result<usize> {
-//         self.conn.recv(buf).await.map_err(|e|e.into())
-//     }
-
-//     pub fn split(self) -> (IceReadHalf, IceWriteHalf) {
-//         (
-//             IceReadHalf{ conn: self.conn.clone() },
-//             IceWriteHalf{ conn: self.conn },
-//         )
-//     }
-// }
-
-// pub struct IceReadHalf {
-//     conn: AConn,
-// }
-
-// impl IceReadHalf {
-//     pub async fn read_data(&mut self, buf: &mut [u8]) -> Result<usize> {
-//         self.conn.recv(buf).await.map_err(|e|e.into())
-//     }
-// }
-
-// pub struct IceWriteHalf {
-//     conn: AConn,
-// }
-
-// impl IceWriteHalf {
-//     pub async fn write_data(&mut self, data: &[u8]) -> Result<usize> {
-//         self.conn.send(data).await.map_err(|e|e.into())
-//     }
-// }
 
 
-// const SHA256_ALG: &str = "sha-256";
+#[cfg(test)]
+mod test {
+    use crate::stun::async_udp::AsUdpSocket;
 
-// fn make_fingerprint(algorithm: &str, cert_data: &[u8]) -> Result<String> {
-//     if algorithm != SHA256_ALG {
-//         bail!("unsupported fingerprint algorithm [{algorithm}]")
-//     }
+    use super::*;
+    use futures::{stream::FuturesUnordered, StreamExt};
+    use tracing::debug;
+    use anyhow::Result;
 
-//     let mut h = Sha256::new();
-//     h.update(cert_data);
-//     let hashed = h.finalize();
+    #[tokio::test]
+    async fn test_ice_peer_basic() -> Result<()> {
+        use crate::async_rt::spawn_with_name;
     
-//     Ok(FingerprintDisplay(&hashed[..]).to_string())
-// }
-
-// struct FingerprintDisplay<'a>(&'a [u8]);
-// impl<'a> std::fmt::Display for FingerprintDisplay<'a> {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         let len = self.0.len();
-
-//         if len > 0 {
-//             for b in &self.0[..len-1] {
-//                 let x = *b;
-//                 write!(f, "{x:02x}:")?;
-//             }
-//             let x = self.0[len-1];
-//             write!(f, "{x:02x}")?;
-//         }
-
-//         Ok(())
-//     }
-// }
-
-// #[test]
-// fn test_make_fingerprint() {
-//     let cert_bytes = "12345".as_bytes();
-//     let s1 = make_fingerprint(SHA256_ALG, cert_bytes).unwrap();
-//     assert_eq!(s1, "59:94:47:1a:bb:01:11:2a:fc:c1:81:59:f6:cc:74:b4:f5:11:b9:98:06:da:59:b3:ca:f5:a9:c1:73:ca:cf:c5")
-// }
-
-// struct ServerFingerprintVerification(Option<String>);
-
-// impl ServerFingerprintVerification {
-//     fn new(fingerprint: Option<String>) -> Arc<Self> {
-//         Arc::new(Self(fingerprint))
-//     }
-// }
-
-// impl rustls::client::ServerCertVerifier for ServerFingerprintVerification {
-//     fn verify_server_cert(
-//         &self,
-//         _end_entity: &rustls::Certificate,
-//         _intermediates: &[rustls::Certificate],
-//         _server_name: &rustls::ServerName,
-//         _scts: &mut dyn Iterator<Item = &[u8]>,
-//         _ocsp_response: &[u8],
-//         _now: std::time::SystemTime,
-//     ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-//         // if let Some(expect) = self.0.as_ref() {
-//         //     let fingerprint = make_fingerprint(SHA256_ALG, &end_entity.0)
-//         //     .map_err(|_e|rustls::Error::General("can't get fingerprint".into()))?;
-//         //     if fingerprint != *expect {
-//         //         debug!("expect fingerprint {expect:?} but {fingerprint:?}");
-//         //         return Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYet))
-//         //     }
-//         // } 
-//         Ok(rustls::client::ServerCertVerified::assertion())
-
-//     }
-// }
-
-
-// #[tokio::test]
-// async fn test_ice_peer() -> Result<()> {
-//     use crate::async_rt::spawn_with_name;
-
-//     tracing_subscriber::fmt()
-//     .with_max_level(tracing::Level::INFO)
-//     .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
-//     .with_target(false)
-//     .init();
-
-//     let servers = vec![
-//         // "stun:stun1.l.google.com:19302".into(),
-//         // "stun:stun2.l.google.com:19302".into(),
-//         // "stun:stun.qq.com:3478".into(),
-//     ];
-
-//     let mut peer1 = IcePeer::with_config(IceConfig {
-//         servers: servers.clone(),
-//         ..Default::default()
-//     });
-
-//     let arg1 = peer1.client_gather().await?;
-//     debug!("arg1 {arg1:?}");
-
-//     let mut peer2 = IcePeer::with_config(IceConfig {
-//         servers: servers.clone(),
-//         ..Default::default()
-//     });
+        init_log();
     
-//     let arg2 = peer2.server_gather(arg1).await?;
-//     debug!("arg2 {arg2:?}");
+        let servers = vec![
+            // "stun:stun1.l.google.com:19302".into(),
+            // "stun:stun2.l.google.com:19302".into(),
+            // "stun:stun.qq.com:3478".into(),
+        ];
+    
+        let mut peer1 = IcePeer::with_config(IceConfig {
+            servers: servers.clone(),
+            ..Default::default()
+        });
+    
+        let arg1 = peer1.client_gather().await?;
+        debug!("arg1 {arg1:?}");
+    
+        let mut peer2 = IcePeer::with_config(IceConfig {
+            servers: servers.clone(),
+            ..Default::default()
+        });
+        
+        let arg2 = peer2.server_gather(arg1).await?;
+        debug!("arg2 {arg2:?}");
+    
+        let msg1 = "I'am conn1";
+        let msg2 = "I'am conn2";
+    
+        let task1 = spawn_with_name("client", async move {
+            let conn = peer1.dial(arg2).await?;
+            let remote_addr = conn.remote_addr();
+            let socket = conn.into_async_udp();
+            socket.as_socket().send_to(msg1.as_bytes().to_vec().into(), remote_addr).await?;
+    
+            let mut buf = vec![0; 1700];
+            let (n, _addr) = socket.as_socket().recv_from(&mut buf).await
+            .with_context(||"read stream failed")?;
+            let msg = std::str::from_utf8(&buf[..n])?;
+            debug!("recv {msg:?}");
+            assert_eq!(msg, msg2);
+            Result::<()>::Ok(())
+        });
+    
+        let task2 = spawn_with_name("server", async move {
+            let conn = peer2.accept().await?;
+            let remote_addr = conn.remote_addr();
+            let socket = conn.into_async_udp();
+            socket.as_socket().send_to(msg2.as_bytes().to_vec().into(), remote_addr).await?;
+    
+            let mut buf = vec![0; 1700];
+            let (n, _addr) = socket.as_socket().recv_from(&mut buf).await
+            .with_context(||"read stream failed")?;
+            let msg = std::str::from_utf8(&buf[..n])?;
+            debug!("recv {msg:?}");
+            assert_eq!(msg, msg1);
+            Result::<()>::Ok(())
+        });
+    
+        let r1 = task1.await?;
+        let r2 = task2.await?;
+    
+        debug!("task1 finished {r1:?}");
+        debug!("task2 finished {r2:?}");
+    
+        r1?;
+        r2?;
+    
+        Ok(())
+    }
+    
+    
+    #[tokio::test]
+    async fn test_ice_peer_with_webrtc_as_client() -> Result<()> {
+        use crate::async_rt::spawn_with_name;
+        use crate::ice::webrtc_ice_peer::{WebrtcIcePeer, WebrtcIceConfig, DtlsIceArgs};
+    
+        init_log();
+    
+        let servers = vec![
+            // "stun:stun1.l.google.com:19302".into(),
+            // "stun:stun2.l.google.com:19302".into(),
+            // "stun:stun.qq.com:3478".into(),
+        ];
+    
+        let mut peer1 = IcePeer::with_config(IceConfig {
+            servers: servers.clone(),
+            ..Default::default()
+        });
+    
+        let arg1 = peer1.client_gather().await?;
+        debug!("arg1 {arg1:?}");
+    
+        let mut peer2 = WebrtcIcePeer::with_config(WebrtcIceConfig {
+            servers: servers.clone(),
+            disable_dtls: true,
+            ..Default::default()
+        });
+        
+        let arg2 = peer2.gather_until_done().await?;
+        debug!("arg2 {arg2:?}");
+    
+        let msg1 = "I'am conn1";
+        let msg2 = "I'am conn2";
+    
+        let task1 = spawn_with_name("client", async move {
+            let arg2 = arg2.ice;
 
+            let conn = peer1.dial(arg2).await?;
+            let remote_addr = conn.remote_addr();
+            let socket = conn.into_async_udp();
+            socket.as_socket().send_to(msg1.as_bytes().to_vec().into(), remote_addr).await?;
+            debug!("sent msg");
+    
+            let mut buf = vec![0; 1700];
+            let (n, _addr) = socket.as_socket().recv_from(&mut buf).await
+            .with_context(||"read stream failed")?;
+            let msg = std::str::from_utf8(&buf[..n])?;
+            debug!("recv {msg:?}");
+            assert_eq!(msg, msg2);
+            Result::<()>::Ok(())
+        });
+    
+        let task2 = spawn_with_name("server", async move {
+            let arg1 = DtlsIceArgs {
+                ice: arg1,
+                cert_fingerprint: None,
+            };
 
-//     let task1 = spawn_with_name("client", async move {
-//         let conn = peer1.dial(arg2).await?;
-//         let (mut wr, mut rd) = conn.open_bi().await?;
-//         wr.write_all("I'am conn1".as_bytes()).await?;
-//         let mut buf = vec![0; 1700];
-//         loop {
-//             let n = rd.read(&mut buf).await
-//             .with_context(||"read stream failed")?
-//             .with_context(||"stream closed")?;
-//             if n == 0 {
-//                 break;
-//             }
-//             let msg = std::str::from_utf8(&buf[..n])?;
-//             debug!("recv {msg:?}");
-//         }
+            let mut conn = peer2.accept(arg1).await?;
 
-//         Result::<()>::Ok(())
-//     });
+            conn.write_data_all(msg2.as_bytes()).await?;
+            debug!("sent msg");
+    
+            let mut buf = vec![0; 1700];
+            let n = conn.read_data(&mut buf).await
+            .with_context(||"read stream failed")?;
+            let msg = std::str::from_utf8(&buf[..n])?;
+            debug!("recv {msg:?}");
+            assert_eq!(msg, msg1);
+            Result::<()>::Ok(())
+        });
+        
 
-//     let task2 = spawn_with_name("server", async move {
-//         let conn = peer2.accept().await?;
-//         let (mut wr, mut rd) = conn.accept_bi().await?;
-//         wr.write_all("I'am conn2".as_bytes()).await?;
-//         let mut buf = vec![0; 1700];
+        let mut futs = FuturesUnordered::new();
+        futs.push(task1);
+        futs.push(task2);
+        
+        while let Some(r) = futs.next().await {
+            debug!("task finished {r:?}");
+            r??;
+        }
 
-//         loop {
-//             let n = rd.read(&mut buf).await
-//             .with_context(||"read stream failed")?
-//             .with_context(||"stream closed")?;
-//             if n == 0 {
-//                 break;
-//             }
-//             let msg = std::str::from_utf8(&buf[..n])?;
-//             debug!("recv {msg:?}");
-//         }
-//         Result::<()>::Ok(())
-//     });
+    
+        // let r1 = task1.await?;
+        // let r2 = task2.await?;
+    
+        // debug!("task1 finished {r1:?}");
+        // debug!("task2 finished {r2:?}");
+    
+        // r1?;
+        // r2?;
+    
+        Ok(())
+    }
 
-//     let r1 = task1.await?;
-//     let r2 = task2.await?;
+    #[tokio::test]
+    async fn test_ice_peer_with_webrtc_as_server() -> Result<()> {
+        use crate::async_rt::spawn_with_name;
+        use crate::ice::webrtc_ice_peer::{WebrtcIcePeer, WebrtcIceConfig, DtlsIceArgs};
+    
+        init_log();
+    
+        let servers = vec![
+            // "stun:stun1.l.google.com:19302".into(),
+            // "stun:stun2.l.google.com:19302".into(),
+            // "stun:stun.qq.com:3478".into(),
+        ];
+    
 
-//     debug!("task1 finished {r1:?}");
-//     debug!("task2 finished {r2:?}");
+        let mut peer1 = WebrtcIcePeer::with_config(WebrtcIceConfig {
+            servers: servers.clone(),
+            disable_dtls: true,
+            ..Default::default()
+        });
 
-//     r1?;
-//     r2?;
+        let arg1 = peer1.gather_until_done().await?;
+        debug!("arg1 {arg1:?}");
+    
+        let mut peer2 = IcePeer::with_config(IceConfig {
+            servers: servers.clone(),
+            ..Default::default()
+        });
+        
+        let arg2 = peer2.server_gather(arg1.ice).await?;
+        debug!("arg2 {arg2:?}");
+    
+        let msg1 = "I'am conn1";
+        let msg2 = "I'am conn2";
+    
+        let task1 = spawn_with_name("client", async move {
+            let arg2 = DtlsIceArgs {
+                ice: arg2,
+                cert_fingerprint: None,
+            };
 
-//     Ok(())
-// }
+            let mut conn = peer1.dial(arg2).await?;
 
+            conn.write_data_all(msg1.as_bytes()).await?;
+            debug!("sent msg");
+    
+            let mut buf = vec![0; 1700];
+            let n = conn.read_data(&mut buf).await
+            .with_context(||"read stream failed")?;
+            let msg = std::str::from_utf8(&buf[..n])?;
+            debug!("recv {msg:?}");
+            assert_eq!(msg, msg2);
+            Result::<()>::Ok(())
+        });
 
+        let task2 = spawn_with_name("server", async move {
+            // let arg1 = arg1.ice;
 
+            let conn = peer2.accept().await?;
+            let remote_addr = conn.remote_addr();
+            let socket = conn.into_async_udp();
+            socket.as_socket().send_to(msg2.as_bytes().to_vec().into(), remote_addr).await?;
+            debug!("sent msg");
+    
+            let mut buf = vec![0; 1700];
+            let (n, _addr) = socket.as_socket().recv_from(&mut buf).await
+            .with_context(||"read stream failed")?;
+            let msg = std::str::from_utf8(&buf[..n])?;
+            debug!("recv {msg:?}");
+            assert_eq!(msg, msg1);
+            Result::<()>::Ok(())
+        });
+            
+
+        let mut futs = FuturesUnordered::new();
+        futs.push(task1);
+        futs.push(task2);
+        
+        while let Some(r) = futs.next().await {
+            debug!("task finished {r:?}");
+            r??;
+        }
+    
+        Ok(())
+    }
+
+    fn init_log() {
+        let _r = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
+        .with_target(false)
+        .try_init();
+
+        // lazy_static::lazy_static! {
+        //     static ref DUMMY: () = {
+        //         tracing_subscriber::fmt()
+        //         .with_max_level(tracing::Level::INFO)
+        //         .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
+        //         .with_target(false)
+        //         .init();
+        //         ()
+        //     };
+        // }
+    }
+}
 
 

@@ -186,7 +186,7 @@ impl Candidate {
         base: SocketAddr,
         prio: u32,
         found: Option<String>,
-        ufrag: String,
+        ufrag: Option<String>,
     ) -> Self {
         Candidate::new(
             found,
@@ -197,7 +197,7 @@ impl Candidate {
             Some(base),
             CandidateKind::PeerReflexive,
             None,
-            Some(ufrag),
+            ufrag,
         )
     }
 

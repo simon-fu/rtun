@@ -18,13 +18,26 @@ pub struct Config {
     detect_all_server: bool,
     min_success_response: Option<usize>,
     use_binding_fut: bool,
-    pub username: Option<String>,
-    pub password: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
     // ttl: Option<u32>,
 }
 
 impl Config {
-    
+    pub fn with_username(self, username: String) -> Self {
+        Self {
+            username: Some(username),
+            ..self
+        }
+    }
+
+    pub fn with_password(self, password: String) -> Self {
+        Self {
+            password: Some(password),
+            ..self
+        }
+    }
+
     pub fn gen_bind_req_bytes(&self) -> Result<Vec<u8>> {
         let msg = self.gen_bind_req()?;
         encode_message(msg)
@@ -1106,10 +1119,6 @@ mod test {
 
     }
 
-    #[test]
-    fn test_with_webrtc() {
-        
-    }
 
 }
 
