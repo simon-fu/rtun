@@ -334,7 +334,7 @@ async fn quic_tunnel_task(mut peer: IcePeer, local_cert: QuicIceCert, remote_cer
         let server = socks_server.clone();
         spawn_with_inherit(name, async move {
             let r = run_socks_conn(stream, peer_addr, server).await;
-            tracing::debug!("finished {r:?}");
+            tracing::trace!("finished {r:?}");
             r
         });
     }
