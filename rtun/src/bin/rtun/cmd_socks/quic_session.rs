@@ -1,18 +1,21 @@
 use std::time::Duration;
 use anyhow::{Result, bail, Context, anyhow};
+use indicatif::ProgressBar;
 use quinn::{SendStream, RecvStream};
 use tokio::{sync::{mpsc, oneshot}, task::JoinHandle, time::Instant};
 use tracing::{debug, info};
-use rtun::{actor_service::{ActorEntity, handle_first_none, Action, AsyncHandler, ActorHandle, handle_msg_none, start_actor}, huid::HUId, switch::invoker_ctrl::{CtrlInvoker, CtrlHandler}, ice::{ice_quic::{QuicConn, UpgradeToQuic, QuicIceCert}, ice_peer::{IcePeer, IceConfig, IceArgs}}, async_rt::spawn_with_inherit, proto::{open_p2presponse::Open_p2p_rsp, P2PArgs, p2pargs::P2p_args, QuicSocksArgs, P2PQuicArgs}};
+use rtun::{actor_service::{ActorEntity, handle_first_none, Action, AsyncHandler, ActorHandle, handle_msg_none, start_actor}, huid::HUId, switch::invoker_ctrl::{CtrlInvoker, CtrlHandler}, ice::{ice_quic::{QuicConn, UpgradeToQuic, QuicIceCert}, ice_peer::{IcePeer, IceConfig, IceArgs}}, async_rt::spawn_with_inherit, proto::{open_p2presponse::Open_p2p_rsp, P2PArgs, p2pargs::P2p_args, QuicSocksArgs, P2PQuicArgs, QuicStats}};
 
 
 
-pub fn make_quic_session<H: CtrlHandler>(uid: HUId, ctrl: CtrlInvoker<H>, agent: &str) -> Result<QuicSession<H>> {
+pub fn make_quic_session<H: CtrlHandler>(uid: HUId, ctrl: CtrlInvoker<H>, agent: &str, bar: ProgressBar) -> Result<QuicSession<H>> {
 
-    let entity = Entity {
+    let mut entity = Entity {
         state: State::Disconnected(Instant::now()), 
         ctrl,
+        bar,
     };
+    update_bar(&mut entity.state, &entity.bar);
     
     let handle = start_actor (
         format!("quic-{agent}-{uid}", ),
@@ -45,7 +48,9 @@ impl<H: CtrlHandler> AsyncHandler<SetCtrl<H>> for Entity<H> {
             State::Punching(_) => {}
             State::Disconnected(_) => {
                 let punch = kick_punch(self.ctrl.clone())?;
-                self.state = State::Punching(punch);
+                // self.state = State::Punching(punch);
+                // self.update_bar();
+                update_state(&mut self.state, State::Punching(punch), &self.bar);
             }
         }
         Ok(())
@@ -69,7 +74,8 @@ impl<H: CtrlHandler> AsyncHandler<ReqCh> for Entity<H> {
                     Ok(r) => return Ok(r),
                     Err(e) => {
                         info!("disconnected by [opening ch failed {e:?}]");
-                        self.state = State::Disconnected(next_retry());
+                        // self.state = State::Disconnected(next_retry());
+                        update_state(&mut self.state, State::Disconnected(next_retry()), &self.bar);
                     }
                 }
             }
@@ -107,11 +113,13 @@ enum State {
 
 struct Work {
     conn: QuicConn,
+    remote_state: QuicStats,
 }
 
 pub struct Entity<H: CtrlHandler> {
     ctrl: CtrlInvoker<H>,
     state: State,
+    bar: ProgressBar,
 }
 
 impl <H: CtrlHandler> Entity<H> {
@@ -119,28 +127,36 @@ impl <H: CtrlHandler> Entity<H> {
         match &mut self.state {
             State::Punching(punch) => {
                 let r = punch.rx.recv().await;
-                self.state = match r {
+                let new_state = match r {
                     Some(conn) => {
                         info!("tunnel connected");
                         State::Working(Work {
                             conn,
+                            remote_state: Default::default(),
                         })
                     },
                     None => State::Disconnected(next_retry()),
                 };
+                update_state(&mut self.state, new_state, &self.bar);
             },
             State::Working(work) => {
                 tokio::time::sleep(work.conn.ping_interval()).await;
+                // let stats = work.conn.stats();
+                // debug!("stats {:?}", stats.path);
                 if work.conn.is_ping_timeout() {
                     info!("ping timeout, try punch again");
                     let punch = kick_punch(self.ctrl.clone())?;
-                    self.state = State::Punching(punch);
+                    // self.state = State::Punching(punch);
+                    update_state(&mut self.state, State::Punching(punch), &self.bar);
+                } else {
+                    update_bar(&mut self.state, &self.bar);
                 }
             },
             State::Disconnected(deadline) => {
                 tokio::time::sleep_until(*deadline).await;
                 let punch = kick_punch(self.ctrl.clone())?;
-                self.state = State::Punching(punch);
+                // self.state = State::Punching(punch);
+                update_state(&mut self.state, State::Punching(punch), &self.bar);
             },
         }
         Ok(())
@@ -163,6 +179,59 @@ fn kick_punch<H: CtrlHandler>(ctrl: CtrlInvoker<H>) -> Result<PunchSession> {
         _guard: guard_tx,
         _task: task,
     })
+}
+
+fn update_state(state: &mut State, next: State, bar: &ProgressBar) {
+    *state = next;
+    update_bar(state, bar);
+}
+
+fn update_bar(state: &mut State, bar: &ProgressBar) {
+    match state {
+        State::Punching(_v) => {
+            bar.set_message("Punching: ...");
+        },
+        State::Working(work) => {
+            if let Some(s) = work.conn.try_remote_stats() {
+                work.remote_state = s;
+            }
+            let remote_rtt = work.remote_state.path().rtt();
+            let remote_cwnd = work.remote_state.path().cwnd();
+
+            let stats = work.conn.stats();
+            let path = &stats.path;
+            bar.set_message(format!(
+                "rtt {}/{remote_rtt}, cwnd {}/{remote_cwnd}, ev {}, lost {}/{}, sent {}, pl {}/{}, black {}", 
+                path.rtt.as_millis(),
+                path.cwnd,
+                // Congestion events on the connection
+                path.congestion_events,
+                // The amount of packets lost on this path
+                path.lost_packets,
+                // The amount of bytes lost on this path
+                path.lost_bytes,
+                // The amount of packets sent on this path
+                path.sent_packets,
+                // The amount of PLPMTUD probe packets sent on this path (also counted by `sent_packets`)
+                path.sent_plpmtud_probes,
+                // The amount of PLPMTUD probe packets lost on this path (ignored by `lost_packets` and
+                // `lost_bytes`)
+                path.lost_plpmtud_probes,
+                // The number of times a black hole was detected in the path
+                path.black_holes_detected,
+            ));
+        },
+        State::Disconnected(v) => {
+            let now = Instant::now();
+            let milli = if *v > now {
+                (*v-now).as_millis() as u64
+            } else {
+                0
+            };
+
+            bar.set_message(format!("Disconnected: retry in {milli} ms"));
+        },
+    }
 }
 
 struct PunchSession {

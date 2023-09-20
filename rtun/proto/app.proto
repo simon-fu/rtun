@@ -190,45 +190,18 @@ message ShutdownArgs {
     int32 code                          = 1;
 }
 
-// message ShellArgs {
+message QuicStats {
+    optional QuicPathStats path                 = 1;
+}
 
-// }
-
-// message AgentServerInPacket {
-//     oneof agent_server_in {
-//         OpenChannel open_channel        = 1;
-//         ChannelData ch_data             = 2;
-//     }
-// }
-
-// message OpenChannel {
-//     uint64  ch_id                       = 1;
-//     oneof channel_arg {
-//         ShellArgs sell_args             = 2;
-//     }
-// }
-
-
-
-// message AgentClientOutPacket {
-//     oneof agent_client_out {
-//         ChannelData ch_data = 1;
-//     }
-// }
-
-// message ChannelData {
-//     uint64  ch_id               = 1;
-//     bytes payload               = 2;
-// }
-
-
-
-
-
-
-
-// message RequestHanshake {
-//     Version version = 1;
-//     DeviceType device_type = 2;
-// }
-
+message QuicPathStats {
+    optional uint32 rtt                         = 1;
+    optional uint64 cwnd                        = 2;
+    optional uint64 congestion_events           = 3;
+    optional uint64 lost_packets                = 4;
+    optional uint64 lost_bytes                  = 5;
+    optional uint64 sent_packets                = 6;
+    optional uint64 sent_plpmtud_probes         = 7;
+    optional uint64 lost_plpmtud_probes         = 8;
+    optional uint64 black_holes_detected        = 9;
+}

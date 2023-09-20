@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 use anyhow::{Result, Context};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use parking_lot::Mutex;
 use rtun::{switch::invoker_ctrl::{CtrlHandler, CtrlInvoker}, huid::gen_huid::gen_huid};
 
@@ -9,18 +10,26 @@ use super::quic_session::{QuicSession, make_quic_session, SetCtrl, StreamPair, R
 
 pub struct AgentPool<H: CtrlHandler> {
     shared: Arc<Mutex<Work<H>>>,
+    multi: MultiProgress,
+    prefix: String,
 }
 
 impl<H: CtrlHandler> Clone for AgentPool<H> {
     fn clone(&self) -> Self {
-        Self { shared: self.shared.clone() }
+        Self { 
+            shared: self.shared.clone(), 
+            multi: self.multi.clone(),
+            prefix: self.prefix.clone(),
+        }
     }
 }
 
 impl<H: CtrlHandler> AgentPool<H> {
-    pub fn new() -> Self {
+    pub fn new(multi: MultiProgress, prefix: String) -> Self {
         Self {
             shared: Default::default(),
+            multi,
+            prefix,
         }
     }
 
@@ -34,8 +43,14 @@ impl<H: CtrlHandler> AgentPool<H> {
             }
         }
 
+        let bar = self.multi.add(ProgressBar::new(100));
+        let style = ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {wide_msg}")?
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
+        bar.set_style(style);
+        bar.set_prefix(self.prefix.clone());
+
         let uid = gen_huid();
-        let session = make_quic_session(uid, ctrl, &agent)?;
+        let session = make_quic_session(uid, ctrl, &agent, bar)?;
 
         {
             let mut work = self.shared.lock();

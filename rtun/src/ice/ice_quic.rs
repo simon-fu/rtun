@@ -5,12 +5,14 @@ use async_trait::async_trait;
 use bytes::{BufMut, BytesMut, Buf, Bytes};
 use chrono::Local;
 use parking_lot::Mutex;
+use protobuf::Message;
 use quinn::{ServerConfig, default_runtime, Endpoint, ClientConfig, SendStream, RecvStream, Connection, VarInt};
+use quinn_proto::ConnectionStats;
 use rcgen::Certificate;
-use tokio::{sync::mpsc, io::{AsyncReadExt, AsyncRead, AsyncWrite}};
+use tokio::{sync::{mpsc, broadcast::{self, error::TryRecvError}}, io::{AsyncReadExt, AsyncRead, AsyncWrite}};
 use tracing::debug;
 
-use crate::async_rt::spawn_with_name;
+use crate::{async_rt::spawn_with_name, proto::{QuicStats, QuicPathStats}};
 
 use super::ice_peer::{IceConn, IceArgs};
 
@@ -156,16 +158,19 @@ impl UpgradeToQuic for IceConn {
         });
 
         let (_guard_tx, guard_rx) = mpsc::channel(1);
+        let (event_tx, event_rx) = broadcast::channel(1);
 
         let ctx = AliveContext {
+            conn: conn.clone(),
             sending_ping: Default::default(),
             recv_buf: Default::default(),
             send_buf: Default::default(),
             shared: shared.clone(),
             wr: keepalive.0,
             rd: keepalive.1,
-            _is_client: is_client,
-            guard_rx
+            is_client,
+            guard_rx,
+            event_tx: event_tx.clone(),
         };
 
         
@@ -176,7 +181,7 @@ impl UpgradeToQuic for IceConn {
 
         debug!("upgrade to quic");
 
-        let conn = QuicConn { conn, shared, _guard_tx };
+        let conn = QuicConn { conn, shared, _guard_tx, event_rx, };
         Ok(conn)
     }
 }
@@ -230,6 +235,7 @@ pub struct QuicConn {
     conn: Connection,
     shared: Arc<Shared>,
     _guard_tx: mpsc::Sender<()>,
+    event_rx: broadcast::Receiver<QEvent>,
 }
 
 impl Deref for QuicConn {
@@ -254,6 +260,26 @@ impl QuicConn {
         stats.rx_bytes = inner.udp_rx.bytes;
 
         Ok(stats)
+    }
+
+    pub fn try_remote_stats(&mut self) -> Option<QuicStats> {
+        loop {
+            let r = self.event_rx.try_recv();
+            match r {
+                Ok(ev) => {
+                    match ev {
+                        QEvent::RemoteStats(stats) => return Some(stats),
+                    }
+                },
+                Err(e) => {
+                    match e {
+                        TryRecvError::Empty => return None,
+                        TryRecvError::Closed => return None,
+                        TryRecvError::Lagged(_e) => {}, // try again
+                    }
+                },
+            }
+        }
     }
 
     pub fn is_ping_timeout(&self) -> bool {
@@ -287,7 +313,10 @@ pub struct Stats {
     pub rx_bytes: u64,
 }
 
-
+#[derive(Clone)]
+pub enum QEvent {
+    RemoteStats(QuicStats),
+}
 
 
 async fn keepalive_task(mut ctx: AliveContext) -> Result<()> {
@@ -304,14 +333,15 @@ async fn keepalive_task(mut ctx: AliveContext) -> Result<()> {
                 ctx.process_packet().await?;
             }
             _r = interval.tick(), if !ctx.sending_ping => {
-                ctx.send_buf.clear();
-
-                let ping = Ping::new();
-                let len = ping.write_to_buf(&mut ctx.send_buf)?;
-
-                ctx.wr.write_all(&ctx.send_buf[..len]).await?;
-                ctx.sending_ping = true;
-                // debug!("sent ping {ping:?}, buf.len {}", ctx.send_buf.len());
+                if ctx.is_client {
+                    ctx.send_buf.clear();
+                    let ping = Ping::new();
+                    let len = ping.write_to_buf(&mut ctx.send_buf)?;
+    
+                    ctx.wr.write_all(&ctx.send_buf[..len]).await?;
+                    ctx.sending_ping = true;
+                    // debug!("sent ping {ping:?}, buf.len {}", ctx.send_buf.len());
+                }
             }
             _r = ctx.guard_rx.recv() => {
                 debug!("read guard {_r:?}");
@@ -323,14 +353,16 @@ async fn keepalive_task(mut ctx: AliveContext) -> Result<()> {
 
 
 struct AliveContext {
+    conn: Connection,
     sending_ping: bool,
     recv_buf: BytesMut,
     send_buf: BytesMut,
     shared: Arc<Shared>,
     wr: SendStream, 
     rd: RecvStream,
-    _is_client: bool,
+    is_client: bool,
     guard_rx: mpsc::Receiver<()>,
+    event_tx: broadcast::Sender<QEvent>,
 }
 
 impl AliveContext {
@@ -353,8 +385,10 @@ impl AliveContext {
                     let pong = Pong::new(ping.req_ts);
                     let len = pong.write_to_buf(&mut self.send_buf)?;
                     self.wr.write_all(&self.send_buf[..len]).await?;
+                    self.send_buf.clear();
                     // debug!("recv {ping:?}, sent {pong:?}, buf.len {}", self.send_buf.len());
     
+                    self.send_stats().await?;
                 },
                 Packet::Pong(pong) => {
                     let now = Local::now().timestamp_millis();
@@ -366,25 +400,110 @@ impl AliveContext {
                     stats.latency = latency;
                     stats.update_ts = now;
                 },
+                Packet::Stats(packet) => {
+                    let _r = self.event_tx.send(QEvent::RemoteStats(packet.stats));
+                }
             }
         }
         
-        
-    
         Ok(())
+    }
+
+    async fn send_stats(&mut self) -> Result<()> {
+        let stats = self.conn.stats();
+        let stats = to_stats(&stats);
+        let stats = PacketStats::new(stats);
+        stats.write_to_buf(&mut self.send_buf)?;
+        self.wr.write_all(&self.send_buf[..]).await?;
+        self.send_buf.clear();
+
+        Ok(())
+    }
+
+}
+
+
+
+fn to_stats(stats: &ConnectionStats) -> QuicStats {
+    QuicStats {
+        path: Some(QuicPathStats {
+            rtt: Some(stats.path.rtt.as_millis() as u32).into(),
+            cwnd: Some(stats.path.cwnd).into(),
+            ..Default::default()
+        }).into(),
+        ..Default::default()
     }
 }
 
 
 
+#[derive(Debug)]
+struct PacketStats {
+    stats: QuicStats,
+}
+
+impl PacketStats {
+    fn new(stats: QuicStats) -> Self {
+        Self { 
+            stats,
+        }
+    }
+
+    fn write_to_buf<B: BufMut>(&self, mut buf: B) -> Result<usize> {
+        if buf.remaining_mut() < Self::MIN_LEN {
+            bail!("buf too small for stats")
+        }
+        
+        let payload_len = self.stats.compute_size() as u16;
+
+        if buf.remaining_mut() < (Self::MIN_LEN + payload_len as usize) {
+            bail!("buf too small for stats payload")
+        }
+
+        buf.put_u8(Self::START_BYTE);
+        buf.put_u16(payload_len);
+        self.stats.write_to_writer(&mut (&mut buf).writer())?;
+
+        Ok(Self::MIN_LEN)
+    }
+
+    fn parse_from(buf: &mut BytesMut) -> Result<Option<Self>> {
+        if buf.remaining() < Self::MIN_LEN {
+            return Ok(None)
+        }
+        
+        let mut data = &buf[..];
+        let first = data.get_u8();
+        if first != Self::START_BYTE {
+            bail!("invalid start byte")
+        }
+
+        let payload_len = data.get_u16() as usize;
+        if buf.remaining() < Self::MIN_LEN + payload_len {
+            return Ok(None)
+        }
+
+        let stats = QuicStats::parse_from_bytes(&data[..])?;
+
+        buf.advance(Self::MIN_LEN + payload_len);
+
+
+        Ok(Some(Self { stats }))
+    }
+
+    const MIN_LEN: usize = 3;
+    const START_BYTE: u8 = 0x81;
+}
+
 enum Packet {
     Ping(Ping),
     Pong(Pong),
+    Stats(PacketStats),
 }
 
 impl Packet {
     // fn parse_from(data: &[u8]) -> Result<Option<Self>> {
-    fn parse_from<B: Buf>(buf: B) -> Result<Option<Self>> {
+    fn parse_from(buf: &mut BytesMut) -> Result<Option<Self>> {
         let first = buf.chunk()[0];
         match first {
             Ping::START_BYTE => {
@@ -392,6 +511,9 @@ impl Packet {
             },
             Pong::START_BYTE => {
                 Ok(Pong::parse_from(buf)?.map(|x|Self::Pong(x)))
+            },
+            PacketStats::START_BYTE => {
+                Ok(PacketStats::parse_from(buf)?.map(|x|Self::Stats(x)))
             },
             _ => {
                 bail!("unknown start byte {first:02x}")
@@ -424,7 +546,7 @@ impl Ping {
         Ok(Self::MIN_LEN)
     }
 
-    fn parse_from<B: Buf>(mut buf: B) -> Result<Option<Self>> {
+    fn parse_from(buf: &mut BytesMut) -> Result<Option<Self>> {
         if buf.remaining() < Self::MIN_LEN {
             return Ok(None)
         }
@@ -468,7 +590,7 @@ impl Pong {
         Ok(Self::MIN_LEN)
     }
 
-    fn parse_from<B: Buf>(mut buf: B) -> Result<Option<Self>> {
+    fn parse_from(buf: &mut BytesMut) -> Result<Option<Self>> {
         if buf.remaining() < Self::MIN_LEN {
             return Ok(None)
         }
