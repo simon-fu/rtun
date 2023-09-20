@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration, io};
+use std::{net::SocketAddr, sync::Arc, time::Duration, io, collections::HashMap};
 
 use anyhow::{Result, Context};
 
@@ -9,8 +9,8 @@ use rtun::{ws::client::ws_connect_to, switch::{invoker_ctrl::{CtrlHandler, CtrlI
 use tokio::net::{TcpListener, TcpStream};
 
 
-use crate::{client_utils::client_select_url, rest_proto::get_agent_from_url};
-use super::{p2p_throughput::kick_p2p, quic_pool::AgentPool};
+use crate::{client_utils::{client_select_url, query_new_agents}, rest_proto::{get_agent_from_url, make_sub_url, make_ws_scheme}, cmd_socks::quic_pool::{make_pool, AddAgent, GetCh}};
+use super::{p2p_throughput::kick_p2p, quic_pool::QuicPoolInvoker};
 
 pub fn run(args: CmdArgs) -> Result<()> { 
     // init_log_and_run(do_run(args))?
@@ -29,33 +29,30 @@ pub fn run(args: CmdArgs) -> Result<()> {
 
 async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> { 
 
-    let shared = Arc::new(Shared {
-        data: Mutex::new(SharedData {
-            ctrl: None,
-        }),
-    });
+    if let Some(_socks_ws) = &args.socks_ws {
+        kick_ws_socks(args.clone()).await?;
+    }
     
     // let agent_pool = AgentPool::new();
-    let mut pools = Vec::new();
+    let pool = make_pool("pool".into(), multi.clone())?;
 
-    let (mut session, agent_name) = repeat_connect(&args).await;
-    // agent_pool.set_agent(agent_name.clone(), session.ctrl_client().clone_invoker()).await?;
+    let url = url::Url::parse(&args.url)
+    .with_context(||"invalid url")?;
+
+
 
     {
         let listen_addr = &args.listen;
         let listen_addr: SocketAddr = listen_addr.parse().with_context(|| format!("invalid addr {listen_addr:?}"))?;
 
-        for nn in 0..3 {
+        for nn in 0..1 {
             let port = listen_addr.port()+nn;
             let listen_addr = SocketAddr::new(listen_addr.ip(), port);
             let listener = TcpListener::bind(listen_addr).await
             .with_context(||format!("fail to bind address [{listen_addr}]"))?;
             tracing::info!("socks5(quic) listen on [{listen_addr}]");
     
-            // let pool = agent_pool.clone();
-            let pool = AgentPool::new(multi.clone(), port.to_string());
-            pool.set_agent(agent_name.clone(), session.ctrl_client().clone_invoker()).await?;
-            pools.push(pool.clone());
+            let pool = pool.invoker().clone();
     
             spawn_with_name(format!("local_sock-{port}"), async move {
                 let r = run_socks_via_quic(pool, listener).await;
@@ -63,17 +60,65 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
             });
         }
 
-    }
+        let mut agents = HashMap::new();
 
+        loop {
+            let r = query_new_agents(&url, &mut agents).await;
+            match r {
+                Ok(agents) => {
+                    // tracing::debug!("query_new_agents success [{agents:?}]");
+
+                    for agent in agents {
+                        let mut url = url.clone();
+                        
+                        make_sub_url(&mut url, Some(&agent.name), args.secret.as_deref())?;
+                        make_ws_scheme(&mut url)?;
+
+                        tracing::info!("new agent [{}]", agent.name);
+                        pool.invoker().invoke(AddAgent {
+                            name: agent.name,
+                            url: url.to_string(),
+                        }).await??;
+                    }
+                },
+                Err(e) => {
+                    tracing::debug!("query_new_agents failed [{e:?}]");
+                },
+            }
+            tokio::time::sleep(Duration::from_millis(1_000)).await
+        }
+    }
+}
+
+async fn kick_ws_socks(args: CmdArgs) -> Result<()> {
     if let Some(socks_ws) = &args.socks_ws {
         let listen_addr = if socks_ws == "0" || socks_ws == "1" || socks_ws == "true" {
             "0.0.0.0:13080"
         } else {
             socks_ws
         };
+
         let listener = TcpListener::bind(listen_addr).await
         .with_context(||format!("fail to bind address [{listen_addr}]"))?;
         tracing::info!("socks5(ws) listen on [{listen_addr}]");
+
+        spawn_with_name("ws_sock", async move {
+            connect_loop(args, listener).await
+        });
+    }
+
+
+    Ok(())
+}
+
+async fn connect_loop(args: CmdArgs, listener: TcpListener) -> Result<()> {
+    let shared = Arc::new(Shared {
+        data: Mutex::new(SharedData {
+            ctrl: None,
+        }),
+    });
+
+    if let Some(_socks_ws) = &args.socks_ws {
 
         let shared = shared.clone();
         spawn_with_name("local_sock", async move {
@@ -82,18 +127,12 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
         });
     }
 
-    let r = session.wait_for_completed().await;
-    tracing::info!("session finished {r:?}");
-
     loop {
 
-        let (mut session, name) = repeat_connect(&args).await;
+        let (mut session, _name) = repeat_connect(&args).await;
         // let mut session = make_stream_session(stream).await?;
 
         // agent_pool.set_agent(name, session.ctrl_client().clone_invoker()).await?;
-        for pool in pools.iter() {
-            pool.set_agent(name.clone(), session.ctrl_client().clone_invoker()).await?;
-        }
 
         if let Some(ptype) = args.mode {
             let invoker = session.ctrl_client().clone_invoker();
@@ -109,8 +148,93 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
 
         tokio::time::sleep(Duration::from_millis(1000)).await;
     }
-
 }
+
+// async fn do_run1(args: CmdArgs, multi: MultiProgress) -> Result<()> { 
+
+//     let shared = Arc::new(Shared {
+//         data: Mutex::new(SharedData {
+//             ctrl: None,
+//         }),
+//     });
+    
+//     // let agent_pool = AgentPool::new();
+//     let mut pools = Vec::new();
+
+//     let (mut session, agent_name) = repeat_connect(&args).await;
+//     // agent_pool.set_agent(agent_name.clone(), session.ctrl_client().clone_invoker()).await?;
+
+//     {
+//         let listen_addr = &args.listen;
+//         let listen_addr: SocketAddr = listen_addr.parse().with_context(|| format!("invalid addr {listen_addr:?}"))?;
+
+//         for nn in 0..3 {
+//             let port = listen_addr.port()+nn;
+//             let listen_addr = SocketAddr::new(listen_addr.ip(), port);
+//             let listener = TcpListener::bind(listen_addr).await
+//             .with_context(||format!("fail to bind address [{listen_addr}]"))?;
+//             tracing::info!("socks5(quic) listen on [{listen_addr}]");
+    
+//             // let pool = agent_pool.clone();
+//             let pool = AgentPool::new(multi.clone(), port.to_string());
+//             pool.set_agent(agent_name.clone(), session.ctrl_client().clone_invoker()).await?;
+//             pools.push(pool.clone());
+    
+//             spawn_with_name(format!("local_sock-{port}"), async move {
+//                 let r = run_socks_via_quic(pool, listener).await;
+//                 r
+//             });
+//         }
+
+//     }
+    
+
+//     if let Some(socks_ws) = &args.socks_ws {
+//         let listen_addr = if socks_ws == "0" || socks_ws == "1" || socks_ws == "true" {
+//             "0.0.0.0:13080"
+//         } else {
+//             socks_ws
+//         };
+//         let listener = TcpListener::bind(listen_addr).await
+//         .with_context(||format!("fail to bind address [{listen_addr}]"))?;
+//         tracing::info!("socks5(ws) listen on [{listen_addr}]");
+
+//         let shared = shared.clone();
+//         spawn_with_name("local_sock", async move {
+//             let r = run_socks_via_ctrl(shared, listener).await;
+//             r
+//         });
+//     }
+
+//     let r = session.wait_for_completed().await;
+//     tracing::info!("session finished {r:?}");
+
+//     loop {
+
+//         let (mut session, name) = repeat_connect(&args).await;
+//         // let mut session = make_stream_session(stream).await?;
+
+//         // agent_pool.set_agent(name, session.ctrl_client().clone_invoker()).await?;
+//         for pool in pools.iter() {
+//             pool.set_agent(name.clone(), session.ctrl_client().clone_invoker()).await?;
+//         }
+
+//         if let Some(ptype) = args.mode {
+//             let invoker = session.ctrl_client().clone_invoker();
+//             let _r = kick_p2p(invoker, ptype).await?;
+//         }
+
+//         {
+//             shared.data.lock().ctrl = Some(session.ctrl_client().clone_invoker());
+//         }
+        
+//         let r = session.wait_for_completed().await;
+//         tracing::info!("session finished {r:?}");
+
+//         tokio::time::sleep(Duration::from_millis(1000)).await;
+//     }
+
+// }
 
 async fn repeat_connect(args: &CmdArgs) -> (StreamSession<impl PacketSink, impl PacketSource>, String) {
     let mut last_success = true;
@@ -178,7 +302,7 @@ async fn try_connect(args: &CmdArgs) -> Result<(StreamSession<impl PacketSink, i
     Ok((session, agent_name.into_owned()))
 }
 
-async fn run_socks_via_quic<H: CtrlHandler>( pool: AgentPool<H>, listener: TcpListener ) -> Result<()> {
+async fn run_socks_via_quic( pool: QuicPoolInvoker, listener: TcpListener ) -> Result<()> {
 
     loop {
         let (mut stream, peer_addr)  = listener.accept().await.with_context(||"accept tcp failed")?;
@@ -188,7 +312,7 @@ async fn run_socks_via_quic<H: CtrlHandler>( pool: AgentPool<H>, listener: TcpLi
         let pool = pool.clone();
         tokio::spawn(async move {
             let r = async move {
-                let (mut wr1, mut rd1) = pool.get_ch().await?;
+                let (mut wr1, mut rd1) = pool.invoke(GetCh).await??.with_context(||"no available ch")?;
                 let (mut rd2, mut wr2) = stream.split();
                 tokio::select! {
                     r = tokio::io::copy(&mut rd2, &mut wr1) => {r?;},
@@ -204,6 +328,33 @@ async fn run_socks_via_quic<H: CtrlHandler>( pool: AgentPool<H>, listener: TcpLi
         
     }
 }
+
+// async fn run_socks_via_quic1<H: CtrlHandler>( pool: AgentPool<H>, listener: TcpListener ) -> Result<()> {
+
+//     loop {
+//         let (mut stream, peer_addr)  = listener.accept().await.with_context(||"accept tcp failed")?;
+        
+//         tracing::trace!("[{peer_addr}] client connected");
+
+//         let pool = pool.clone();
+//         tokio::spawn(async move {
+//             let r = async move {
+//                 let (mut wr1, mut rd1) = pool.get_ch().await?;
+//                 let (mut rd2, mut wr2) = stream.split();
+//                 tokio::select! {
+//                     r = tokio::io::copy(&mut rd2, &mut wr1) => {r?;},
+//                     r = tokio::io::copy(&mut rd1, &mut wr2) => {r?;},
+//                 }
+//                 Result::<()>::Ok(())
+//             }.await;
+//             tracing::trace!("[{peer_addr}] client finished with {r:?}");
+//             r
+//         });
+
+
+        
+//     }
+// }
 
 
 async fn run_socks_via_ctrl<H: CtrlHandler>( shared: Arc<Shared<H>>, listener: TcpListener ) -> Result<()> {
@@ -339,7 +490,7 @@ impl io::Write for LogWriter {
 
 
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[clap(name = "socks", author, about, version)]
 pub struct CmdArgs {
 

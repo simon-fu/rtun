@@ -1,4 +1,6 @@
 
+use std::collections::HashMap;
+
 use anyhow::{Result, Context, bail};
 
 use crate::rest_proto::{make_sub_url, make_ws_scheme, AgentInfo, make_pub_sessions};
@@ -32,6 +34,37 @@ pub async fn client_select_url(url_str: &str, agent: Option<&str>, secret: Optio
     Ok(url)
 }
 
+pub async fn query_new_agents(url: &url::Url, exist: &mut HashMap<String, AgentInfo>) -> Result<Vec<AgentInfo>> {
+    if url.scheme().eq_ignore_ascii_case("http") 
+    || url.scheme().eq_ignore_ascii_case("https") {
+        let mut agents = get_agents(url).await?;
+        // tracing::debug!("get_agents success [{agents:?}]");
+
+        let mut pos = 0;
+        for nn in 0..agents.len() {
+            match exist.get(&agents[nn].name) {
+                Some(_exist) => {},
+                None => {
+                    exist.insert(agents[nn].name.clone(), agents[nn].clone());
+                    if nn > pos {
+                        agents.swap(nn, pos);
+                    }
+                    pos += 1;
+                },
+            }
+        }
+        agents.resize(pos, AgentInfo {
+            name: "non-exist".into(),
+            addr: "".into(),
+            expire_at: 0,
+            ver: None,
+        });
+        Ok(agents)
+    } else {
+        bail!("unsupport scheme [{}]", url.scheme())
+    }
+}
+
 async fn query_and_select_agent(url: &url::Url) -> Result<AgentInfo> {
     let mut agents = get_agents(url)
     .await?;
@@ -46,7 +79,7 @@ async fn query_and_select_agent(url: &url::Url) -> Result<AgentInfo> {
     Ok(agents.swap_remove(0))
 }
 
-async fn get_agents(url: &url::Url) -> Result<Vec<AgentInfo>> {
+pub async fn get_agents(url: &url::Url) -> Result<Vec<AgentInfo>> {
     let mut url = url.clone();
     make_pub_sessions(&mut url)?;
     reqwest::get(url)

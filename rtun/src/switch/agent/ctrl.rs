@@ -326,7 +326,8 @@ async fn quic_tunnel_task(mut peer: IcePeer, local_cert: QuicIceCert, remote_cer
 
     loop {
         let pair = conn.accept_bi().await
-        .with_context(||"accpet bi failed")?;
+        .with_context(||"accept bi failed")?;
+        // tracing::debug!("accept bi ok");
         let stream = QuicStream::new(pair);
 
         let uid = gen_huid();

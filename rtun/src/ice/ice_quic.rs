@@ -9,7 +9,7 @@ use protobuf::Message;
 use quinn::{ServerConfig, default_runtime, Endpoint, ClientConfig, SendStream, RecvStream, Connection, VarInt};
 use quinn_proto::ConnectionStats;
 use rcgen::Certificate;
-use tokio::{sync::{mpsc, broadcast::{self, error::TryRecvError}}, io::{AsyncReadExt, AsyncRead, AsyncWrite}};
+use tokio::{sync::{mpsc, broadcast::{self, error::{TryRecvError, RecvError}}}, io::{AsyncReadExt, AsyncRead, AsyncWrite}};
 use tracing::debug;
 
 use crate::{async_rt::spawn_with_name, proto::{QuicStats, QuicPathStats}};
@@ -88,7 +88,7 @@ impl UpgradeToQuic for IceConn {
             let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key)?;
             Arc::get_mut(&mut server_config.transport).with_context(||"get transport config failed")?
             .max_concurrent_uni_streams(0_u8.into())
-            .max_idle_timeout(Some(VarInt::from_u32(90_000).into()));
+            .max_idle_timeout(Some(VarInt::from_u32(13_000).into()));
         
             server_config
         };
@@ -262,6 +262,25 @@ impl QuicConn {
         Ok(stats)
     }
 
+    pub async fn recv_remote_stats(&mut self) -> Result<QuicStats> {
+        loop {
+            let r = self.event_rx.recv().await;
+            match r {
+                Ok(ev) => {
+                    match ev {
+                        QEvent::RemoteStats(stats) => return Ok(stats),
+                    }
+                },
+                Err(e) => {
+                    match e {
+                        RecvError::Closed => bail!("Closed"),
+                        RecvError::Lagged(_e) => {}, // try again
+                    }
+                },
+            }
+        }
+    }
+
     pub fn try_remote_stats(&mut self) -> Option<QuicStats> {
         loop {
             let r = self.event_rx.try_recv();
@@ -288,7 +307,11 @@ impl QuicConn {
         };
 
         let elapsed_ms = Local::now().timestamp_millis() - update_ts;
-        Duration::from_millis(elapsed_ms as u64) >= (ping_interval() * 5/2)
+        Duration::from_millis(elapsed_ms as u64) >= self.get_ping_timeout()
+    }
+
+    pub fn get_ping_timeout(&self) -> Duration {
+        self.ping_interval() * 5/2
     }
 
     pub fn ping_interval(&self) -> Duration {
@@ -305,12 +328,23 @@ struct Shared {
     stats: Mutex<Stats>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Stats {
     pub latency: i64,
     pub update_ts: i64,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        Self { 
+            update_ts: Local::now().timestamp_millis(), 
+            latency: Default::default(), 
+            tx_bytes: Default::default(), 
+            rx_bytes: Default::default() 
+        }
+    }
 }
 
 #[derive(Clone)]

@@ -69,7 +69,7 @@ pub fn make_ws_scheme(url: &mut url::Url) -> Result<()> {
 }
 
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[allow(dead_code)]
 pub struct AgentInfo {
     pub name: String,
