@@ -1,5 +1,5 @@
 //! Network Utilities
-use tracing::{debug, trace};
+use tracing::trace;
 
 use std::{
     io,
@@ -54,7 +54,7 @@ where
     P: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    debug!("established tcp tunnel {} <-> {} bypassed", peer_addr, target_addr);
+    trace!("established tcp tunnel {} <-> {} bypassed", peer_addr, target_addr);
 
     match copy_bidirectional(plain, shadow).await {
         Ok((rn, wn)) => {

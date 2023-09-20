@@ -76,7 +76,7 @@ impl Socks4TcpHandler {
 
         match handshake_req.cd {
             Command::Connect => {
-                debug!("CONNECT {}", handshake_req.dst);
+                trace!("CONNECT {}", handshake_req.dst);
 
                 self.handle_socks4_connect(s, peer_addr, handshake_req.dst).await
             }

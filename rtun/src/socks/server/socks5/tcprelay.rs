@@ -234,7 +234,7 @@ impl Socks5TcpHandler {
         // 3. Handle Command
         match header.command {
             Command::TcpConnect => {
-                debug!("CONNECT {}", addr);
+                trace!("CONNECT {}", addr);
 
                 self.handle_tcp_connect(stream, peer_addr, addr).await
             }
