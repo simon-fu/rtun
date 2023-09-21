@@ -10,7 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 
 use crate::{client_utils::{client_select_url, query_new_agents}, rest_proto::{get_agent_from_url, make_sub_url, make_ws_scheme}, cmd_socks::quic_pool::{make_pool, AddAgent, GetCh}};
-use super::{p2p_throughput::kick_p2p, quic_pool::QuicPoolInvoker};
+use super::{p2p_throughput::kick_p2p, quic_pool::{QuicPoolInvoker, QuicPool}};
 
 pub fn run(args: CmdArgs) -> Result<()> { 
     // init_log_and_run(do_run(args))?
@@ -60,26 +60,35 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
             });
         }
 
+        if let Some(agent) = &args.agent {
+            add_agents(&pool, &url, &args, [agent.clone()].into_iter()).await?;
+            tokio::time::sleep(Duration::MAX/2).await;
+            return Ok(())
+        }
+
         let mut agents = HashMap::new();
 
         loop {
+
+
             let r = query_new_agents(&url, &mut agents).await;
             match r {
                 Ok(agents) => {
                     // tracing::debug!("query_new_agents success [{agents:?}]");
-
-                    for agent in agents {
-                        let mut url = url.clone();
+                    let iter = agents.into_iter().map(|x|x.name);
+                    add_agents(&pool, &url, &args, iter).await?;
+                    // for agent in agents {
+                    //     let mut url = url.clone();
                         
-                        make_sub_url(&mut url, Some(&agent.name), args.secret.as_deref())?;
-                        make_ws_scheme(&mut url)?;
+                    //     make_sub_url(&mut url, Some(&agent.name), args.secret.as_deref())?;
+                    //     make_ws_scheme(&mut url)?;
 
-                        tracing::info!("new agent [{}]", agent.name);
-                        pool.invoker().invoke(AddAgent {
-                            name: agent.name,
-                            url: url.to_string(),
-                        }).await??;
-                    }
+                    //     tracing::info!("new agent [{}]", agent.name);
+                    //     pool.invoker().invoke(AddAgent {
+                    //         name: agent.name,
+                    //         url: url.to_string(),
+                    //     }).await??;
+                    // }
                 },
                 Err(e) => {
                     tracing::debug!("query_new_agents failed [{e:?}]");
@@ -88,6 +97,25 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(1_000)).await
         }
     }
+}
+
+async fn add_agents<I>(pool: &QuicPool, url: &::url::Url, args: &CmdArgs, iter: I) -> Result<()> 
+where
+    I: Iterator<Item = String>,
+{
+    for agent in iter {
+        let mut url = url.clone();
+        
+        make_sub_url(&mut url, Some(&agent), args.secret.as_deref())?;
+        make_ws_scheme(&mut url)?;
+
+        tracing::info!("new agent [{}]", agent);
+        pool.invoker().invoke(AddAgent {
+            name: agent,
+            url: url.to_string(),
+        }).await??;
+    }
+    Ok(())
 }
 
 async fn kick_ws_socks(args: CmdArgs) -> Result<()> {

@@ -94,8 +94,9 @@ pub type StreamPair = (SendStream, RecvStream);
 
 
 pub type QuicPoolInvoker = Invoker<Entity>;
+pub type QuicPool = ActorHandle<Entity>;
 
-pub fn make_pool(name: String, multi: MultiProgress) -> Result<ActorHandle<Entity>> {
+pub fn make_pool(name: String, multi: MultiProgress) -> Result<QuicPool> {
     
     let mut interval = tokio::time::interval(Duration::from_millis(2000));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
