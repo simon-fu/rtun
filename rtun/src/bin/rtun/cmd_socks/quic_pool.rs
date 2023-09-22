@@ -322,7 +322,7 @@ impl Entity {
 }
 
 fn kick_connecting(conn_id: u64, agent: Arc<AgentShared>, event_tx: mpsc::Sender<Event>, bar: ProgressBar, origin: &str) -> mpsc::Sender<()> {
-    tracing::info!("kick connecting [{origin}]");
+    tracing::info!("kick connecting [{}-{}] [{origin}]", agent.name, conn_id,);
 
     update_bar_connecting(&bar);
 
@@ -527,11 +527,13 @@ fn update_bar_stats(bar: &ProgressBar, local: &ConnectionStats, remote: &QuicSta
 
     let path = &local.path;
     bar.set_message(format!(
-        "rtt {}/{remote_rtt}, cwnd {}/{remote_cwnd}, tx {}, rx {}", 
+        "rtt {}/{}, cwnd {}/{}, tx {}, rx {}", 
         path.rtt.as_millis(),
-        path.cwnd,
-        local.udp_tx.bytes,
-        local.udp_rx.bytes,
+        remote_rtt,
+        indicatif::HumanBytes(path.cwnd),
+        indicatif::HumanBytes(remote_cwnd),
+        indicatif::HumanBytes(local.udp_tx.bytes),
+        indicatif::HumanBytes(local.udp_rx.bytes),
     ));
 
     // bar.set_message(format!(
