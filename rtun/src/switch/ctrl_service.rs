@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Result, anyhow, Context, bail};
 
 use bytes::Bytes;
@@ -43,6 +45,7 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
     let mut agent_watch = agent.watch().await?;
 
     let mut next_ch_id = NextChId::default();
+    let alive_timeout = Duration::from_secs(60);
 
     loop {
         // let packet = ctrl_rx.recv_packet().await?;
@@ -50,6 +53,9 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
         let packet = tokio::select! {
             _r = agent_watch.watch() => bail!("agent has gone"),
             r = ctrl_rx.recv_packet() => r?,
+            _r = tokio::time::sleep(alive_timeout) => {
+                bail!("wait for ping timeout")
+            }
         };
 
         let cmd = C2ARequest::parse_from_bytes(&packet.payload)?
