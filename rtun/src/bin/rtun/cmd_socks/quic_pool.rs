@@ -1,11 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration, borrow::Cow};
 use anyhow::{Result, Context, bail};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use quinn::{SendStream, RecvStream};
 // use parking_lot::Mutex;
 use quinn_proto::ConnectionStats;
 use rtun::{switch::{invoker_ctrl::{CtrlHandler, CtrlInvoker}, session_stream::make_stream_session}, ice::{ice_quic::{QuicConn, QuicIceCert, UpgradeToQuic}, ice_peer::{IcePeer, IceConfig, IceArgs}}, proto::{QuicStats, P2PArgs, QuicSocksArgs, p2pargs::P2p_args, P2PQuicArgs, open_p2presponse::Open_p2p_rsp}, actor_service::{ActorHandle, start_actor, handle_first_none, handle_msg_none, Action, ActorEntity, AsyncHandler, Invoker}, ws::client::ws_connect_to, async_rt::spawn_with_name};
-use tokio::{time::{MissedTickBehavior, Interval}, sync::mpsc};
+use tokio::{time::{MissedTickBehavior, Interval, Instant}, sync::mpsc};
 
 // use super::quic_session::{QuicSession, make_quic_session, SetCtrl, StreamPair, ReqCh};
 
@@ -187,7 +187,7 @@ impl AsyncHandler<AddAgent> for Entity {
             bar.set_style(style);
             bar.set_prefix(format!("{name}-{nn}"));
 
-            let tx = kick_connecting(nn, agent.clone(), self.event_tx.clone(), bar, "add agent");
+            let tx = kick_connecting(nn, agent.clone(), self.event_tx.clone(), bar, true, "add agent");
             conns.push(ConnSlot {
                 id: nn,
                 state: ConnState::Connecting(tx),
@@ -239,7 +239,7 @@ impl Entity {
                     ConnState::Working(work) => {
                         if work.conn.is_ping_timeout() {
                             if let Some(bar) = work.bar.take() {
-                                let tx = kick_connecting(conn.id, agent.shared.clone(), self.event_tx.clone(), bar, "ping timeout");
+                                let tx = kick_connecting(conn.id, agent.shared.clone(), self.event_tx.clone(), bar, true, "ping timeout");
                                 conn.state = ConnState::Connecting(tx);
                             }
                         } else {
@@ -321,23 +321,23 @@ impl Entity {
     }
 }
 
-fn kick_connecting(conn_id: u64, agent: Arc<AgentShared>, event_tx: mpsc::Sender<Event>, bar: ProgressBar, origin: &str) -> mpsc::Sender<()> {
+fn kick_connecting(conn_id: u64, agent: Arc<AgentShared>, event_tx: mpsc::Sender<Event>, bar: ProgressBar, thrput: bool, origin: &str) -> mpsc::Sender<()> {
     tracing::info!("kick connecting [{}-{}] [{origin}]", agent.name, conn_id,);
-
-    update_bar_connecting(&bar);
 
     let (guard_tx, guard_rx) = mpsc::channel(1);
     spawn_with_name(format!("{}-conn-{conn_id}", agent.name), async move {
-        connecting_task(conn_id, agent, event_tx, bar, guard_rx).await
+        connecting_task(conn_id, agent, event_tx, bar, guard_rx, thrput).await
     });
     guard_tx
 }
 
-async fn connecting_task(conn_id: u64, agent: Arc<AgentShared>, tx: mpsc::Sender<Event>, bar: ProgressBar, mut guard_rx: mpsc::Receiver<()>) {
+async fn connecting_task(conn_id: u64, agent: Arc<AgentShared>, tx: mpsc::Sender<Event>, bar: ProgressBar, mut guard_rx: mpsc::Receiver<()>, thrput: bool) {
     loop {
         tracing::debug!("connecting");
+        update_bar_msg(&bar, "connecting");
+
         let r = tokio::select! {
-            r = try_connet(agent.url.as_str()) => r,
+            r = try_connet(&bar, agent.url.as_str(), thrput) => r,
             _r = guard_rx.recv() => {
                 tracing::debug!("dropped guard");
                 return
@@ -346,7 +346,6 @@ async fn connecting_task(conn_id: u64, agent: Arc<AgentShared>, tx: mpsc::Sender
 
         match r {
             Ok(conn) => {
-                tracing::debug!("successfully connected");
                 let _r = tx.send(Event::Connected { 
                     conn_id,
                     conn,
@@ -357,19 +356,75 @@ async fn connecting_task(conn_id: u64, agent: Arc<AgentShared>, tx: mpsc::Sender
             },
             Err(e) => {
                 tracing::debug!("connect failed [{e:?}]");
+                update_bar_msg(&bar, "connect failed, will try next");
             },
         }
         tokio::time::sleep(Duration::from_millis(5000)).await;
     }
 }
 
-async fn try_connet(url_str: &str) -> Result<QuicConn> {
+async fn try_connet(bar: &ProgressBar, url_str: &str, thrput: bool) -> Result<QuicConn> {
     tracing::debug!("connecting to {url_str}");
     let (stream, _r) = ws_connect_to(url_str).await
     .with_context(||format!("connect to agent failed"))?;
     let session = make_stream_session(stream.split(), false).await?;
     let ctrl = session.ctrl_client().clone_invoker();
-    punch(ctrl).await
+    let conn = punch(ctrl).await?;
+    
+    tracing::debug!("successfully connected");
+    update_bar_msg(&bar, "connected");
+
+    if thrput {
+        update_bar_msg(&bar, "check throughput...");
+        let (mut writer, mut reader) = conn.open_bi().await?;
+
+        let start_time = Instant::now();
+
+        writer.write_all(&[0x09, 0x00, 0x00]).await?;
+
+        let total_bytes = 1024 * 1024_u64;
+        let send_buf = vec![0_u8; 1024];
+        let mut recv_buf = vec![0_u8; 1024];
+
+        let mut sent_bytes = 0;
+        let mut recv_bytes = 0;
+
+        while recv_bytes < total_bytes {
+            let sbytes = ((total_bytes - sent_bytes)as usize).min(send_buf.len());
+            
+            tokio::select! {
+                r = writer.write(&send_buf[..sbytes]), if sbytes > 0 => {
+                    let n = r?;
+                    if n == 0 {
+                        bail!("write zero")
+                    }
+                    sent_bytes += n as u64;
+                }
+                r = reader.read(&mut recv_buf[..]) => {
+                    let n = r?.with_context(||"closed")?;
+                    if n == 0 {
+                        bail!("read zero")
+                    }
+                    recv_bytes += n as u64;
+                }
+            }
+        }
+
+        let elapsed = start_time.elapsed();
+
+        let speed = if elapsed > Duration::ZERO {
+            let milli = elapsed.as_millis() as u64;
+            total_bytes * 1000 / milli
+        } else {
+            total_bytes
+        };
+
+        let msg = format!("throughput [{}/s], total [{}/{elapsed:?}]", indicatif::HumanBytes(speed), indicatif::HumanBytes(total_bytes));
+        tracing::debug!("{msg}");
+        update_bar_msg(&bar, msg);
+    }
+
+    Ok(conn)
 }
 
 async fn punch<H: CtrlHandler>(ctrl: CtrlInvoker<H>) -> Result<QuicConn> {
@@ -485,7 +540,7 @@ impl ConnSlot {
                 Err(_e) => {
                     // tracing::info!("kick connecting for open ch failed [{e:?}]");
                     if let Some(bar) = work.bar.take() {
-                        let tx = kick_connecting(self.id, self.agent.clone(), self.event_tx.clone(), bar, "open_bi failed");
+                        let tx = kick_connecting(self.id, self.agent.clone(), self.event_tx.clone(), bar, true, "open_bi failed");
                         self.state = ConnState::Connecting(tx);
                     }
                 },
@@ -517,8 +572,8 @@ struct ConnWork {
 
 
 
-fn update_bar_connecting(bar: &ProgressBar) {
-    bar.set_message("connecting...");
+fn update_bar_msg(bar: &ProgressBar, msg: impl Into<Cow<'static, str>>) {
+    bar.set_message(msg);
 }
 
 fn update_bar_stats(bar: &ProgressBar, local: &ConnectionStats, remote: &QuicStats, ) {

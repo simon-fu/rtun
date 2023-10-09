@@ -131,7 +131,8 @@ async fn kick_ws_socks(args: CmdArgs) -> Result<()> {
         tracing::info!("socks5(ws) listen on [{listen_addr}]");
 
         spawn_with_name("ws_sock", async move {
-            connect_loop(args, listener).await
+            let r = connect_loop(args, listener).await;
+            tracing::debug!("finished {r:?}");
         });
     }
 
@@ -163,6 +164,7 @@ async fn connect_loop(args: CmdArgs, listener: TcpListener) -> Result<()> {
         // agent_pool.set_agent(name, session.ctrl_client().clone_invoker()).await?;
 
         if let Some(ptype) = args.mode {
+            tracing::info!("kick p2p [{ptype:?}]");
             let invoker = session.ctrl_client().clone_invoker();
             let _r = kick_p2p(invoker, ptype).await?;
         }
@@ -171,6 +173,7 @@ async fn connect_loop(args: CmdArgs, listener: TcpListener) -> Result<()> {
             shared.data.lock().ctrl = Some(session.ctrl_client().clone_invoker());
         }
         
+        tracing::info!("wait for session completed");
         let r = session.wait_for_completed().await;
         tracing::info!("session finished {r:?}");
 
@@ -326,7 +329,7 @@ async fn try_connect(args: &CmdArgs) -> Result<(StreamSession<impl PacketSink, i
     // let uid = gen_huid();
     // let mut switch = make_switch_pair(uid, stream.split()).await?;
     let session = make_stream_session(stream.split(), false).await?;
-    
+
     Ok((session, agent_name.into_owned()))
 }
 

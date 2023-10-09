@@ -2,9 +2,9 @@ use std::{io::{ErrorKind, self}, net::{SocketAddr, Ipv4Addr, SocketAddrV4}, sync
 
 use crate::{channel::{ChSender, ChReceiver, ch_stream::ChStream}, proto::OpenSocksArgs};
 
-use anyhow::{anyhow, Result, bail};
+use anyhow::{anyhow, Result, bail, Context};
 use bytes::Buf;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncBufRead, AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncBufRead, AsyncBufReadExt, BufReader, AsyncWriteExt};
 use crate::socks::server::{socks5::Socks5TcpHandler, socks4::Socks4TcpHandler};
 use shadowsocks::{config::Mode, ServerAddr, relay::socks5};
 use shadowsocks_service::local::{loadbalancing::{PingBalancerBuilder, PingBalancer}, context::ServiceContext, socks::config::Socks5AuthConfig, socks::socks4};
@@ -77,6 +77,13 @@ where
             );
             handler.handle_socks5_req(req, stream, peer_addr).await?;
             Ok(())
+        }
+
+        0x09 => {
+            // tracing::debug!("handle_custom ...");
+            let r = handle_custom(&mut stream).await.with_context(||"handle_custom");
+            // tracing::debug!("handle_custom finished [{r:?}]");
+            r
         }
 
         version => {
@@ -231,6 +238,38 @@ where
 //         }
 //     }
 // }
+
+async fn handle_custom<S>(stream: &mut S) -> Result<(), io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+
+    let cmd = stream.read_u8().await?;
+    match cmd {
+        0 => handle_echo(stream).await,
+        _ => {
+            error!("unsupported custom cmd {cmd:?}");
+            let err = io::Error::new(ErrorKind::Other, "unsupported custom cmd");
+            Err(err.into())
+        }
+    }
+}
+
+async fn handle_echo<S>(stream: &mut S) -> Result<(), io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buf = vec![0_u8; 16*1024];
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+
+        stream.write_all(&buf[..n]).await?;
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct Server {
