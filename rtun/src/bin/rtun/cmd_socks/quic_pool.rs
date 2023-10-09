@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration, borrow::Cow};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::{Result, Context, bail};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use quinn::{SendStream, RecvStream};
@@ -165,6 +165,9 @@ pub struct AddAgent {
     pub url: String,
 }
 
+const STYLE_GENERAL: &str = "{prefix:.bold.dim} {spinner} {wide_msg:}";
+const STYLE_SELECTED_AGENT: &str = "{prefix:.bold.dim} {spinner} {wide_msg:.blue}";
+const STYLE_SELECTED_CONN: &str = "{prefix:.bold.dim} {spinner} {wide_msg:.green}";
 
 #[async_trait::async_trait]
 impl AsyncHandler<AddAgent> for Entity {
@@ -182,22 +185,29 @@ impl AsyncHandler<AddAgent> for Entity {
         for nn in 1..3 {
 
             let bar = self.multi.add(ProgressBar::new(100));
-            let style = ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {wide_msg}")?
-            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
-            bar.set_style(style);
             bar.set_prefix(format!("{name}-{nn}"));
+            let bar = Bar::new(bar);
+            bar.update_style(STYLE_GENERAL)?;
 
-            let tx = kick_connecting(nn, agent.clone(), self.event_tx.clone(), bar, true, "add agent");
+            // let bar = self.multi.add(ProgressBar::new(100));
+            // let style = ProgressStyle::with_template(STYLE_GENERAL)?
+            // .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
+            // bar.set_style(style);
+            // bar.set_prefix(format!("{name}-{nn}"));
+
+            let check_speed = nn == 1;
+            let tx = kick_connecting(nn, agent.clone(), self.event_tx.clone(), bar, check_speed, "add agent");
             conns.push(ConnSlot {
                 id: nn,
                 state: ConnState::Connecting(tx),
                 agent: agent.clone(),
                 event_tx: self.event_tx.clone(),
+                check_speed,
             });
         }
 
         self.agents.insert(name, AgentSlot {
-            shared: agent,
+            // shared: agent,
             conns,
             rrobin: 0,
         });
@@ -233,22 +243,18 @@ impl Entity {
     fn handle_next(&mut self) -> Result<()> {
         // let mut futs = FuturesUnordered::new();
 
+        let mut has_timeout = false;
+
         for (_name, agent) in self.agents.iter_mut() {
             for conn in agent.conns.iter_mut() {
+                
                 match &mut conn.state {
                     ConnState::Working(work) => {
                         if work.conn.is_ping_timeout() {
-                            if let Some(bar) = work.bar.take() {
-                                let tx = kick_connecting(conn.id, agent.shared.clone(), self.event_tx.clone(), bar, true, "ping timeout");
-                                conn.state = ConnState::Connecting(tx);
-                            }
+                            conn.kick_connecting("ping timeout");
+                            has_timeout = true;
                         } else {
-                            if let Some(remote) = work.conn.try_remote_stats() {
-                                let local = work.conn.stats();
-                                if let Some(bar) = work.bar.as_ref() {
-                                    update_bar_stats(bar, &local, &remote);
-                                }
-                            }
+                            work.update_stats();
                         }
                     },
                     ConnState::Connecting(_tx) => { },
@@ -257,17 +263,48 @@ impl Entity {
             }
         }
 
+        if has_timeout {
+            if let Some(agent) = self.selected_agent.as_ref() {
+                if let Some(agent) = self.agents.get_mut(agent) {
+                    let mut has_work = false;
+                    for (index, conn) in agent.conns.iter_mut().enumerate() {
+                        match &conn.state {
+                            ConnState::Working(_) => {
+                                has_work = true;
+                            },
+                            ConnState::Connecting(_) => {
+                                if self.selected_conn == Some(index) {
+                                    self.selected_conn = None;
+                                }
+                            },
+                        }
+                    }
+
+                    if !has_work {
+                        self.selected_agent = None;
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
     async fn handle_event(&mut self, event: Event) {
         match event {
-            Event::Connected { conn_id, conn, agent, bar } => {
+            Event::Connected { conn_id, conn, agent, bar, speed } => {
                 if let Some(agent_slot) = self.agents.get_mut(&agent.name) {
-                    for slot in agent_slot.conns.iter_mut() {
+                    for (index, slot) in agent_slot.conns.iter_mut().enumerate() {
                         if slot.id == conn_id {
                             // tracing::debug!("do found conn [{}] [{}]", agent.name, conn_id);
                             slot.state = ConnState::Working(ConnWork { conn, bar: Some(bar), });
+
+                            if self.selected_agent.as_deref() == Some(agent.name.as_str()) {
+                                if speed.is_some() {
+                                    let _r = self.change_selected_conn(index);
+                                }
+                            }
+
                             return;
                         }
                     }
@@ -277,19 +314,59 @@ impl Entity {
         } 
     }
 
+    fn change_selected_conn(&mut self, new_index: usize) -> Result<()> {
+        if let Some(agent) = self.selected_agent.as_ref() {
+            if let Some(agent) = self.agents.get_mut(agent) {
+
+                if let Some(old) = self.selected_conn {
+                    agent.conns[old].update_style(STYLE_SELECTED_AGENT)?;
+                }
+
+                agent.conns[new_index].update_style(STYLE_SELECTED_CONN)?;
+                self.selected_conn = Some(new_index);
+            }
+        }
+
+        Ok(())
+    }
+    
+    fn clean_selected(&mut self) -> Result<()> {
+        if let Some(agent) = self.selected_agent.take() {
+            if let Some(agent) = self.agents.get_mut(&agent) {
+                for conn in agent.conns.iter_mut() {
+                    conn.update_style(STYLE_GENERAL)?;
+                }
+            }
+        }
+
+        self.selected_agent = None;
+        self.selected_conn = None;
+
+        Ok(())
+    }
+
     async fn get_ch(&mut self) -> Result<Option<StreamPair>> {
         let r = self.open_selected().await?;
         if let Some(pair) = r {
             return Ok(Some(pair))
         }
         
-        self.selected_agent = None;
-        self.selected_conn = None;
+        self.clean_selected()?;
 
         for (name, agent) in self.agents.iter_mut() {
-            let r = agent.open_rand().await;
-            if let Some(pair) = r {
+            let r = agent.open_priority().await;
+            if let Some((pair, index)) = r {
                 self.selected_agent = Some(name.clone());
+                self.selected_conn = Some(index);
+                
+                for (ci, conn) in agent.conns.iter_mut().enumerate() {
+                    if ci == index {
+                        conn.update_style(STYLE_SELECTED_CONN)?;
+                    } else {
+                        conn.update_style(STYLE_SELECTED_AGENT)?;
+                    }
+                }
+
                 return Ok(Some(pair))
             }
         }
@@ -311,8 +388,15 @@ impl Entity {
                     self.selected_conn = None;
                 }
 
-                let r = agent.open_rand().await;
-                return Ok(r)
+                let r = agent.open_priority().await;
+                return match r {
+                    Some((pair, index)) => {
+                        self.selected_conn = Some(index);
+                        agent.conns[index].update_style(STYLE_SELECTED_CONN)?;
+                        Ok(Some(pair))
+                    },
+                    None => Ok(None),
+                }
             }
         }
 
@@ -321,7 +405,7 @@ impl Entity {
     }
 }
 
-fn kick_connecting(conn_id: u64, agent: Arc<AgentShared>, event_tx: mpsc::Sender<Event>, bar: ProgressBar, thrput: bool, origin: &str) -> mpsc::Sender<()> {
+fn kick_connecting(conn_id: u64, agent: Arc<AgentShared>, event_tx: mpsc::Sender<Event>, bar: Bar, thrput: bool, origin: &str) -> mpsc::Sender<()> {
     tracing::info!("kick connecting [{}-{}] [{origin}]", agent.name, conn_id,);
 
     let (guard_tx, guard_rx) = mpsc::channel(1);
@@ -331,13 +415,16 @@ fn kick_connecting(conn_id: u64, agent: Arc<AgentShared>, event_tx: mpsc::Sender
     guard_tx
 }
 
-async fn connecting_task(conn_id: u64, agent: Arc<AgentShared>, tx: mpsc::Sender<Event>, bar: ProgressBar, mut guard_rx: mpsc::Receiver<()>, thrput: bool) {
+async fn connecting_task(conn_id: u64, agent: Arc<AgentShared>, tx: mpsc::Sender<Event>, mut bar: Bar, mut guard_rx: mpsc::Receiver<()>, thrput: bool) {
+    
+    let _r = bar.update_style(STYLE_GENERAL);
+
     loop {
         tracing::debug!("connecting");
-        update_bar_msg(&bar, "connecting");
+        bar.update_msg("connecting");
 
         let r = tokio::select! {
-            r = try_connet(&bar, agent.url.as_str(), thrput) => r,
+            r = try_connet(&mut bar, agent.url.as_str(), thrput) => r,
             _r = guard_rx.recv() => {
                 tracing::debug!("dropped guard");
                 return
@@ -345,25 +432,26 @@ async fn connecting_task(conn_id: u64, agent: Arc<AgentShared>, tx: mpsc::Sender
         };
 
         match r {
-            Ok(conn) => {
+            Ok((conn, speed)) => {
                 let _r = tx.send(Event::Connected { 
                     conn_id,
                     conn,
                     agent, 
                     bar, 
+                    speed,
                 }).await;
                 return;
             },
             Err(e) => {
                 tracing::debug!("connect failed [{e:?}]");
-                update_bar_msg(&bar, "connect failed, will try next");
+                bar.update_msg("connect failed, will try next");
             },
         }
         tokio::time::sleep(Duration::from_millis(5000)).await;
     }
 }
 
-async fn try_connet(bar: &ProgressBar, url_str: &str, thrput: bool) -> Result<QuicConn> {
+async fn try_connet(bar: &mut Bar, url_str: &str, thrput: bool) -> Result<(QuicConn, Option<u64>)> {
     tracing::debug!("connecting to {url_str}");
     let (stream, _r) = ws_connect_to(url_str).await
     .with_context(||format!("connect to agent failed"))?;
@@ -372,59 +460,69 @@ async fn try_connet(bar: &ProgressBar, url_str: &str, thrput: bool) -> Result<Qu
     let conn = punch(ctrl).await?;
     
     tracing::debug!("successfully connected");
-    update_bar_msg(&bar, "connected");
+    bar.update_msg("connected");
 
     if thrput {
-        update_bar_msg(&bar, "check throughput...");
-        let (mut writer, mut reader) = conn.open_bi().await?;
+        bar.update_msg("check speed...");
+        let (writer, reader) = conn.open_bi().await?;
+        let speed = echo_throughput(bar, writer, reader).await?;
+        if speed < 300_000 {
+            bail!("low speed [{speed}] < 300K")
+        }
+        Ok((conn, Some(speed)))
+    } else {
+        Ok((conn, None))
+    }
+}
 
-        let start_time = Instant::now();
+async fn echo_throughput(bar: &mut Bar, mut writer: SendStream, mut reader: RecvStream) -> Result<u64> {
+    
+    let start_time = Instant::now();
 
-        writer.write_all(&[0x09, 0x00, 0x00]).await?;
+    writer.write_all(&[0x09, 0x00, 0x00]).await?;
 
-        let total_bytes = 1024 * 1024_u64;
-        let send_buf = vec![0_u8; 1024];
-        let mut recv_buf = vec![0_u8; 1024];
+    let total_bytes = 1024 * 1024_u64;
+    let send_buf = vec![0_u8; 1024];
+    let mut recv_buf = vec![0_u8; 1024];
 
-        let mut sent_bytes = 0;
-        let mut recv_bytes = 0;
+    let mut sent_bytes = 0;
+    let mut recv_bytes = 0;
 
-        while recv_bytes < total_bytes {
-            let sbytes = ((total_bytes - sent_bytes)as usize).min(send_buf.len());
-            
-            tokio::select! {
-                r = writer.write(&send_buf[..sbytes]), if sbytes > 0 => {
-                    let n = r?;
-                    if n == 0 {
-                        bail!("write zero")
-                    }
-                    sent_bytes += n as u64;
+    while recv_bytes < total_bytes {
+        let sbytes = ((total_bytes - sent_bytes)as usize).min(send_buf.len());
+        
+        tokio::select! {
+            r = writer.write(&send_buf[..sbytes]), if sbytes > 0 => {
+                let n = r?;
+                if n == 0 {
+                    bail!("write zero")
                 }
-                r = reader.read(&mut recv_buf[..]) => {
-                    let n = r?.with_context(||"closed")?;
-                    if n == 0 {
-                        bail!("read zero")
-                    }
-                    recv_bytes += n as u64;
+                sent_bytes += n as u64;
+            }
+            r = reader.read(&mut recv_buf[..]) => {
+                let n = r?.with_context(||"closed")?;
+                if n == 0 {
+                    bail!("read zero")
                 }
+                recv_bytes += n as u64;
             }
         }
-
-        let elapsed = start_time.elapsed();
-
-        let speed = if elapsed > Duration::ZERO {
-            let milli = elapsed.as_millis() as u64;
-            total_bytes * 1000 / milli
-        } else {
-            total_bytes
-        };
-
-        let msg = format!("throughput [{}/s], total [{}/{elapsed:?}]", indicatif::HumanBytes(speed), indicatif::HumanBytes(total_bytes));
-        tracing::debug!("{msg}");
-        update_bar_msg(&bar, msg);
     }
 
-    Ok(conn)
+    let elapsed = start_time.elapsed();
+
+    let speed = if elapsed > Duration::ZERO {
+        let milli = elapsed.as_millis() as u64;
+        total_bytes * 1000 / milli
+    } else {
+        total_bytes
+    };
+
+    let msg = format!("throughput [{}/s], total [{}/{elapsed:?}]", indicatif::HumanBytes(speed), indicatif::HumanBytes(total_bytes));
+    tracing::debug!("{msg}");
+    bar.update_msg(msg);
+
+    Ok(speed)
 }
 
 async fn punch<H: CtrlHandler>(ctrl: CtrlInvoker<H>) -> Result<QuicConn> {
@@ -488,19 +586,33 @@ async fn punch<H: CtrlHandler>(ctrl: CtrlInvoker<H>) -> Result<QuicConn> {
 }
 
 struct AgentSlot {
-    shared: Arc<AgentShared>,
+    // shared: Arc<AgentShared>,
     conns: Vec<ConnSlot>,
     rrobin: usize,
 }
 
 impl AgentSlot {
-    async fn open_rand(&mut self) -> Option<StreamPair> {
+
+    async fn open_priority(&mut self) -> Option<(StreamPair, usize)> {
+        for index in 0..self.conns.len() {
+            let conn_slot = &mut self.conns[index];
+            if conn_slot.check_speed {
+                if let Some(pair) = conn_slot.open_ch().await {
+                    return Some((pair, index));
+                }
+            }
+        }
+
+        self.open_random().await
+    }
+
+    async fn open_random(&mut self) -> Option<(StreamPair, usize)> {
         for _ in 0..self.conns.len() {
             let index = self.next_robin();
             let conn_slot = &mut self.conns[index];
 
             if let Some(pair) = conn_slot.open_ch().await {
-                return Some(pair)
+                return Some((pair, index));
             }
         }
         None
@@ -527,9 +639,21 @@ struct ConnSlot {
     state: ConnState,
     event_tx: mpsc::Sender<Event>,
     agent: Arc<AgentShared>,
+    check_speed: bool,
 }
 
 impl ConnSlot {
+    fn kick_connecting(&mut self, origin: &str) {
+        let conn = self;
+
+        if let ConnState::Working(work) = &mut conn.state {    
+            if let Some(bar) = work.bar.take() {
+                let tx = kick_connecting(conn.id, conn.agent.clone(), conn.event_tx.clone(), bar, conn.check_speed, origin);
+                conn.state = ConnState::Connecting(tx);
+            }
+        }
+    }
+
     async fn open_ch(&mut self) -> Option<StreamPair> {
         if let ConnState::Working(work) = &mut self.state {
             let r = work.conn.open_bi().await;
@@ -539,14 +663,24 @@ impl ConnSlot {
                 },
                 Err(_e) => {
                     // tracing::info!("kick connecting for open ch failed [{e:?}]");
-                    if let Some(bar) = work.bar.take() {
-                        let tx = kick_connecting(self.id, self.agent.clone(), self.event_tx.clone(), bar, true, "open_bi failed");
-                        self.state = ConnState::Connecting(tx);
-                    }
+                    self.kick_connecting("open_bi failed");
+                    // if let Some(bar) = work.bar.take() {
+                    //     let tx = kick_connecting(self.id, self.agent.clone(), self.event_tx.clone(), bar, true, "open_bi failed");
+                    //     self.state = ConnState::Connecting(tx);
+                    // }
                 },
             }
         }
         None
+    }
+
+    fn update_style(&mut self, template: &str) -> Result<()> {
+        if let ConnState::Working(work) = &mut self.state {
+            if let Some(bar) = work.bar.as_mut() {
+                bar.update_style(template)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -560,50 +694,137 @@ enum Event {
         conn_id: u64,
         conn: QuicConn,
         agent: Arc<AgentShared>,
-        bar: ProgressBar,
+        bar: Bar,
+        speed: Option<u64>,
     }
 }
 
+struct Bar {
+    bar: ProgressBar,
+    msg: String,
+}
+
+impl Bar {
+    pub fn new(bar: ProgressBar) -> Self {
+        Self { bar, msg: "".into(), }
+    }
+
+    pub fn update_msg<S: Into<String>>(&mut self, msg: S) {
+        self.msg = msg.into();
+        self.bar.set_message(self.msg.clone());
+    }
+
+    pub fn update_style(&self, template: &str) -> Result<()> {
+        // tracing::debug!("update style {template}");
+    
+        let style = ProgressStyle::with_template(template)?
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
+
+        self.bar.set_style(style);
+
+        self.bar.set_message(self.msg.clone());
+        Ok(())
+    }
+
+    fn update_stats(&mut self, local: &ConnectionStats, remote: &QuicStats, ) {
+
+        let remote_rtt = remote.path().rtt();
+        let remote_cwnd = remote.path().cwnd();
+    
+        let path = &local.path;
+        self.update_msg(format!(
+            "rtt {}|{}, cwnd {}|{}, bytes {}|{}", 
+            path.rtt.as_millis(),
+            remote_rtt,
+            indicatif::HumanBytes(path.cwnd),
+            indicatif::HumanBytes(remote_cwnd),
+            indicatif::HumanBytes(local.udp_tx.bytes),
+            indicatif::HumanBytes(local.udp_rx.bytes),
+        ));
+        // tracing::debug!("updated stats");
+    
+        // bar.set_message(format!(
+        //     "rtt {}/{remote_rtt}, cwnd {}/{remote_cwnd}, ev {}, lost {}/{}, sent {}, pl {}/{}, black {}", 
+        //     path.rtt.as_millis(),
+        //     path.cwnd,
+        //     path.congestion_events,
+        //     path.lost_packets,
+        //     path.lost_bytes,
+        //     path.sent_packets,
+        //     path.sent_plpmtud_probes,
+        //     path.lost_plpmtud_probes,
+        //     path.black_holes_detected,
+        // ));
+    }
+    
+}
 
 struct ConnWork {
     conn: QuicConn,
-    bar: Option<ProgressBar>,
+    bar: Option<Bar>,
 }
 
+impl ConnWork {
+    // fn update_style(&self, template: &str) -> Result<()> {
+    //     if let Some(bar) = self.bar.as_ref() {
+    //         bar.update_style(template)?;
+    //     }
 
+    //     // tracing::debug!("update style {template}");
+    //     // if let Some(bar) = self.bar.as_ref() {
+    //     //     update_bar_style(bar, template)?;
+    //     // }
+    //     // self.update_stats();
+    //     Ok(())
+    // }
 
-fn update_bar_msg(bar: &ProgressBar, msg: impl Into<Cow<'static, str>>) {
-    bar.set_message(msg);
+    fn update_stats(&mut self) {
+        if let Some(remote) = self.conn.try_remote_stats() {
+            let local = self.conn.stats();
+            if let Some(bar) = self.bar.as_mut() {
+                bar.update_stats(&local, &remote);
+            }
+        }
+    }
 }
 
-fn update_bar_stats(bar: &ProgressBar, local: &ConnectionStats, remote: &QuicStats, ) {
-    let remote_rtt = remote.path().rtt();
-    let remote_cwnd = remote.path().cwnd();
+// fn update_bar_style(bar: &ProgressBar, template: &str) -> Result<()> {
+//     let style = ProgressStyle::with_template(template)?
+//     .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
+//     bar.set_style(style);
+//     Ok(())
+// }
 
-    let path = &local.path;
-    bar.set_message(format!(
-        "rtt {}/{}, cwnd {}/{}, tx {}, rx {}", 
-        path.rtt.as_millis(),
-        remote_rtt,
-        indicatif::HumanBytes(path.cwnd),
-        indicatif::HumanBytes(remote_cwnd),
-        indicatif::HumanBytes(local.udp_tx.bytes),
-        indicatif::HumanBytes(local.udp_rx.bytes),
-    ));
 
-    // bar.set_message(format!(
-    //     "rtt {}/{remote_rtt}, cwnd {}/{remote_cwnd}, ev {}, lost {}/{}, sent {}, pl {}/{}, black {}", 
-    //     path.rtt.as_millis(),
-    //     path.cwnd,
-    //     path.congestion_events,
-    //     path.lost_packets,
-    //     path.lost_bytes,
-    //     path.sent_packets,
-    //     path.sent_plpmtud_probes,
-    //     path.lost_plpmtud_probes,
-    //     path.black_holes_detected,
-    // ));
-}
+// fn update_bar_stats(bar: &ProgressBar, local: &ConnectionStats, remote: &QuicStats, ) {
+//     let remote_rtt = remote.path().rtt();
+//     let remote_cwnd = remote.path().cwnd();
+
+//     let path = &local.path;
+//     bar.set_message(format!(
+//         "rtt {}/{}, cwnd {}/{}, tx {}, rx {}", 
+//         path.rtt.as_millis(),
+//         remote_rtt,
+//         indicatif::HumanBytes(path.cwnd),
+//         indicatif::HumanBytes(remote_cwnd),
+//         indicatif::HumanBytes(local.udp_tx.bytes),
+//         indicatif::HumanBytes(local.udp_rx.bytes),
+//     ));
+//     // tracing::debug!("updated stats");
+
+//     // bar.set_message(format!(
+//     //     "rtt {}/{remote_rtt}, cwnd {}/{remote_cwnd}, ev {}, lost {}/{}, sent {}, pl {}/{}, black {}", 
+//     //     path.rtt.as_millis(),
+//     //     path.cwnd,
+//     //     path.congestion_events,
+//     //     path.lost_packets,
+//     //     path.lost_bytes,
+//     //     path.sent_packets,
+//     //     path.sent_plpmtud_probes,
+//     //     path.lost_plpmtud_probes,
+//     //     path.black_holes_detected,
+//     // ));
+// }
 
 // #[derive(Debug, Clone)]
 // pub struct ConnStats {

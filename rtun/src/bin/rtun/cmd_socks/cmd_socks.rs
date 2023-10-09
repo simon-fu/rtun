@@ -507,8 +507,10 @@ impl LogWriter {
 
 impl io::Write for LogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Ok(s) = std::str::from_utf8(buf) {
-            self.multi.println(s)?;
+        for line in LineIter(Some(buf)) {
+            if let Ok(s) = std::str::from_utf8(line) {
+                self.multi.println(s)?;
+            }
         }
         Ok(buf.len())
     }
@@ -518,6 +520,81 @@ impl io::Write for LogWriter {
     }
 }
 
+pub struct LineIter<'a>(pub Option<&'a [u8]>);
+
+impl<'a> Iterator for LineIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let data = self.0.take();
+        match data {
+            Some(data) => {
+                let r = data.iter().position(|x|*x == b'\r' || *x == b'\n');
+                match r {
+                    Some(n) => {
+                        let (line, data) = data.split_at(n);
+        
+                        let r = data.iter().position(|x|*x != b'\r' && *x != b'\n');
+                        match r {
+                            Some(n) => { 
+                                let (_r, data) = data.split_at(n); 
+                                self.0 = Some(data);
+                            },
+                            None => {
+                                // self.0 = Some(data);
+                            },
+                        }
+                        Some(line)
+                    },
+                    None => {
+                        Some(data)
+                    },
+                }
+            },
+            None => None,
+        }
+    }
+}
+
+#[test]
+fn test_line_iter() {
+    {
+        let list = vec![
+            "abc",
+            "abc\r",
+            "abc\n",
+            "abc\r\n",
+            "abc\n\r",
+        ];
+
+        for data in list {
+            let mut iter = LineIter(Some(data.as_bytes()));
+            assert_eq!(iter.next(), Some("abc".as_bytes()));
+            assert_eq!(iter.next(), None);
+        }
+    }
+
+    {
+        let list = vec![
+            "abc\rdef",
+            "abc\ndef",
+            "abc\r\ndef",
+            "abc\n\rdef",
+
+            "abc\rdef\r",
+            "abc\rdef\n",
+            "abc\rdef\r\n",
+            "abc\rdef\n\r",
+        ];
+
+        for data in list {
+            let mut iter = LineIter(Some(data.as_bytes()));
+            assert_eq!(iter.next(), Some("abc".as_bytes()));
+            assert_eq!(iter.next(), Some("def".as_bytes()));
+            assert_eq!(iter.next(), None);
+        }
+    }
+}
 
 
 

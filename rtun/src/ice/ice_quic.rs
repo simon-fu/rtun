@@ -428,7 +428,7 @@ impl AliveContext {
                     let now = Local::now().timestamp_millis();
                     let latency = now - pong.req_ts;
                     self.sending_ping = false;
-                    debug!("latency {latency} ms");
+                    tracing::trace!("latency {latency} ms");
                     // debug!("recv {pong:?}, now {now}, latency {latency} ms");
                     let mut stats = self.shared.stats.lock();
                     stats.latency = latency;
