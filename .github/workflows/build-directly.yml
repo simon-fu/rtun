@@ -7,6 +7,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   REPO_GIT_HASH: ${{ github.sha }}
+  RUST_LOG: rtun=debug
 
 jobs:
   build-rtun:
@@ -26,6 +27,6 @@ jobs:
         cd run-rtun
         docker run --rm simonfucn/ubuntu-rtun cat /usr/bin/rtun > ./rtun
         chmod +x ./rtun
-        RUST_LOG=rtun=debug ./rtun agent pub "${{ secrets.MY_RTUN_URL_DEV }}" --agent mydocker --expire_in 240 
+        ./rtun agent pub "${{ secrets.MY_RTUN_URL_DEV }}" --agent mydocker --expire_in 240 
 
 
