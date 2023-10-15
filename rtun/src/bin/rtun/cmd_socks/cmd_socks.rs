@@ -1,11 +1,12 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration, io, collections::HashMap};
+use std::{net::SocketAddr, sync::Arc, time::Duration, io, collections::HashMap, fmt};
 
-use anyhow::{Result, Context};
+use anyhow::{Result, Context, bail};
 
 use clap::Parser;
-use indicatif::MultiProgress;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use parking_lot::Mutex;
-use rtun::{ws::client::ws_connect_to, switch::{invoker_ctrl::{CtrlHandler, CtrlInvoker}, next_ch_id::NextChId, session_stream::{make_stream_session, StreamSession}, switch_sink::PacketSink, switch_source::PacketSource}, channel::{ChId, ChPair, ch_stream::ChStream}, proto::OpenSocksArgs, async_rt::spawn_with_name};
+use rtun::{ws::client::ws_connect_to, switch::{invoker_ctrl::{CtrlHandler, CtrlInvoker}, next_ch_id::NextChId, session_stream::{make_stream_session, StreamSession}, switch_sink::PacketSink, switch_source::PacketSource, agent::ch_socks::run_socks5_conn_bridge}, channel::{ChId, ChPair, ch_stream::ChStream}, proto::OpenSocksArgs, async_rt::spawn_with_name};
+use shadowsocks_service::local::socks::config::Socks5AuthConfig;
 use tokio::net::{TcpListener, TcpStream};
 
 
@@ -39,11 +40,15 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
     let url = url::Url::parse(&args.url)
     .with_context(||"invalid url")?;
 
+    let listen_addr = &args.listen;
+    let listen_addr: SocketAddr = listen_addr.parse().with_context(|| format!("invalid addr {listen_addr:?}"))?;
 
+    let mut bars = Vec::new();
+    const STYLE_GENERAL: &str = "{prefix:.bold.dim} {spinner} {wide_msg:}";
 
+    let mut _clash_server = None;
     {
-        let listen_addr = &args.listen;
-        let listen_addr: SocketAddr = listen_addr.parse().with_context(|| format!("invalid addr {listen_addr:?}"))?;
+        
 
         for nn in 0..1 {
             let port = listen_addr.port()+nn;
@@ -51,15 +56,127 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
             let listener = TcpListener::bind(listen_addr).await
             .with_context(||format!("fail to bind address [{listen_addr}]"))?;
             tracing::info!("socks5(quic) listen on [{listen_addr}]");
-    
+            
+            let bar = multi.add(ProgressBar::new(100));
+            bar.set_style(ProgressStyle::with_template(STYLE_GENERAL)?);
+            bar.set_message(format!("socks: {listen_addr}"));
+            bars.push(bar);
+
             let pool = pool.invoker().clone();
     
-            spawn_with_name(format!("local_sock-{port}"), async move {
+            spawn_with_name(format!("local_socks-{port}"), async move {
                 let r = run_socks_via_quic(pool, listener).await;
                 r
             });
         }
+    }
 
+    if args.tls_key.is_some() || args.tls_cert.is_some() {
+
+        // let key_path = "/Users/simon/simon/src/my_keys/simon.home/simon.home.rtcsdk.com.key";
+        // let cert_path = "/Users/simon/simon/src/my_keys/simon.home/simon.home.rtcsdk.com.pem";
+
+        // let key_path = "/tmp/pem/key.pem";
+        // let cert_path = "/tmp/pem/cert.pem";
+        
+        // let verifier = tls_util::SpecificClientCertVerifier::try_load("/tmp/pem/cert.pem").await?;
+        // let verifier = Arc::new(verifier);
+        // let verifier = tls_util::client_cert_verifier("/tmp/pem/ca.key.pem").await?;
+
+        let (key_path, cert_path) = match (args.tls_key.as_ref(), args.tls_cert.as_ref()) {
+            (Some(k), Some(c)) => (k, c),
+            _ => bail!("must have tls_key and tls_cert")
+        };
+
+        let mut opt_username = None;
+        let mut opt_password = None;
+
+        let auth = {
+            let mut cfg = Socks5AuthConfig::new();
+            if let Some(ss) = args.tls_user.as_ref() {
+                let mut split = ss.split(":");
+                let user_name = split.next().with_context(||"no tls username")?;
+                let password = split.next().with_context(||"no tls password")?;
+                cfg.passwd.add_user(user_name, password);
+
+                opt_username = Some(user_name.to_string());
+                opt_password = Some(password.to_string());
+                // cfg.passwd.add_user("rtun", "123");
+            }
+            
+            Arc::new(cfg)
+        };
+
+        let raw_cert = tokio::fs::read(cert_path).await?;
+        let raw_key = tokio::fs::read(key_path).await?;
+
+        let tls_cfg = tls_util::raw_cert_to_server_cfg(raw_key, raw_cert, None)?;
+        let acceptor = tls_util::acceptor_from_cfg(tls_cfg.clone())?;
+
+        let listen_addr: SocketAddr = match &args.tls_listen {
+            Some(v) => {
+                v.parse().with_context(|| format!("invalid addr {v:?}"))?
+            },
+            None => {
+                SocketAddr::new(listen_addr.ip(), listen_addr.port()+1)
+            }
+        };
+
+        // let mut listen_addr: SocketAddr = listen_addr.parse().with_context(|| format!("invalid addr {listen_addr:?}"))?;
+        // listen_addr.set_port(listen_addr.port() + 1);
+
+        let mut addrs = Vec::new();
+
+        for nn in 0..1 {
+            let port = listen_addr.port()+nn;
+            let listen_addr = SocketAddr::new(listen_addr.ip(), port);
+            let listener = TcpListener::bind(listen_addr).await
+            .with_context(||format!("fail to bind address [{listen_addr}]"))?;
+            addrs.push(listen_addr);
+            tracing::info!("tls_socks5(quic) listen on [{listen_addr}]");
+    
+            let bar = multi.add(ProgressBar::new(100));
+            bar.set_style(ProgressStyle::with_template(STYLE_GENERAL)?);
+            bar.set_message(format!("socks5-over-tls: {listen_addr} {:?}", args.tls_user));
+            bars.push(bar);
+            
+            let pool = pool.invoker().clone();
+            let acceptor = acceptor.clone();
+            let auth = auth.clone();
+            spawn_with_name(format!("tls_socks-{port}"), async move {
+                let r = run_tls_socks_via_quic(pool, listener, acceptor, auth).await;
+                r
+            });
+        }
+
+        if let Some(listen_addr) = &args.clash_listen {
+            let listen_addr = listen_addr.parse()?;
+            let web_path = "/clash/rtun.yml";
+            let dns_name = tls_util::try_load_cert_dns_name(cert_path).await?;
+
+            let content = ClashContent {
+                addrs: &addrs,
+                server: &dns_name,
+                username: opt_username.as_deref(),
+                password: opt_password.as_deref(),
+            }.to_string();
+            
+            
+            let server = clash_rest::server_for_clash(listen_addr, web_path, Some(tls_cfg), content).await?;
+            _clash_server = Some(server);
+
+            
+            let clash_text = format!("clash: https://{dns_name}:{}{web_path}", listen_addr.port());
+
+            let bar = multi.add(ProgressBar::new(100));
+            bar.set_style(ProgressStyle::with_template(STYLE_GENERAL)?);
+            bar.set_message(clash_text);
+            bars.push(bar);
+        }
+
+    }
+
+    {
         if let Some(agent) = &args.agent {
             add_agents(&pool, &url, &args, [agent.clone()].into_iter()).await?;
             tokio::time::sleep(Duration::MAX/2).await;
@@ -96,6 +213,73 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(1_000)).await
         }
+    }
+}
+
+struct ClashContent<'a> {
+    addrs: &'a Vec<SocketAddr>,
+    server: &'a str,
+    username: Option<&'a str>,
+    password: Option<&'a str>,
+}
+
+impl<'a> fmt::Display for ClashContent<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // https://dreamacro.github.io/clash/configuration/introduction.html
+        // port: 7890
+        // socks-port: 7891
+        // allow-lan: false
+        // mode: Rule
+        // log-level: info
+        // external-controller: '127.0.0.1:9090'
+
+        // let content: String = indoc::indoc!{ r#"
+        // proxies:
+        //   - name: "rtun1"
+        //     type: socks5
+        //     server: simon.home.rtcsdk.com
+        //     port: 22080
+        //     username: rtun
+        //     password: alliwym
+        //     tls: true
+        // proxy-groups:
+        //   - name: "rtunproxy"
+        //     type: select
+        //     proxies:
+        //       - rtun1
+        // rules:
+        //   - MATCH,rtunproxy
+        // "#}.into();
+
+
+        writeln!(f, "proxies:")?;
+        for (nn, addr) in self.addrs.iter().enumerate() {
+            let number = nn + 1;
+            writeln!(f, "  - name: \"rtun{number}\"")?;
+            writeln!(f, "    type: socks5")?;
+            writeln!(f, "    server: {}", self.server)?;
+            writeln!(f, "    port: {}", addr.port())?;
+            writeln!(f, "    tls: {}", true)?;
+
+            if let Some(s) = &self.username {
+                writeln!(f, "    username: {s}")?;
+            }
+
+            if let Some(s) = &self.password {
+                writeln!(f, "    password: {s}")?;
+            }
+        }
+
+        writeln!(f, "proxy-groups:")?;
+        writeln!(f, "  - name: \"rtunproxy\"")?;
+        writeln!(f, "    type: select")?;
+        writeln!(f, "    proxies: ")?;
+        for (nn, _addr) in self.addrs.iter().enumerate() {
+            let number = nn + 1;
+            writeln!(f, "      - rtun{number}")?;
+        }
+
+        Ok(())
     }
 }
 
@@ -354,11 +538,38 @@ async fn run_socks_via_quic( pool: QuicPoolInvoker, listener: TcpListener ) -> R
             tracing::trace!("[{peer_addr}] client finished with {r:?}");
             r
         });
-
-
         
     }
 }
+
+async fn run_tls_socks_via_quic( pool: QuicPoolInvoker, listener: TcpListener, acceptor: tokio_rustls::TlsAcceptor, auth: Arc<Socks5AuthConfig> ) -> Result<()> {
+
+    loop {
+        let (stream, peer_addr)  = listener.accept().await.with_context(||"accept tcp failed")?;
+        
+        tracing::trace!("[{peer_addr}] client connected");
+
+        let pool = pool.clone();
+        let acceptor = acceptor.clone();
+        let auth = auth.clone();
+        tokio::spawn(async move {
+            let r = async move {
+
+                let stream = acceptor.accept(stream).await?;
+                let (mut rd2, mut wr2) = tokio::io::split(stream);
+
+                let (mut wr1, mut rd1) = pool.invoke(GetCh).await??.with_context(||"no available ch")?;
+
+                run_socks5_conn_bridge(&mut rd2, &mut wr2, &mut rd1, &mut wr1, &auth).await
+                
+            }.await;
+            tracing::trace!("[{peer_addr}] client finished with {r:?}");
+            r
+        });
+        
+    }
+}
+
 
 // async fn run_socks_via_quic1<H: CtrlHandler>( pool: AgentPool<H>, listener: TcpListener ) -> Result<()> {
 
@@ -637,5 +848,240 @@ pub struct CmdArgs {
         long_help = "listen addr for socks via ws",
     )]
     socks_ws: Option<String>,
+
+    #[clap(
+        long = "tls-cert",
+        long_help = "socks-over-tls cert file",
+    )]
+    tls_cert: Option<String>,
+
+    #[clap(
+        long = "tls-key",
+        long_help = "socks-over-tls key file",
+    )]
+    tls_key: Option<String>,
+
+    #[clap(
+        long = "tls-user",
+        long_help = "socks-over-tls user:password",
+    )]
+    tls_user: Option<String>,
+
+    #[clap(
+        long = "tls-listen",
+        long_help = "tls listen address",
+    )]
+    tls_listen: Option<String>,
+
+    #[clap(
+        long = "clash-listen",
+        long_help = "http listen address for clash subscription",
+    )]
+    clash_listen: Option<String>,
 }
 
+
+mod tls_util {
+
+    use std::{io, sync::Arc};
+    use anyhow::{Result, bail};
+    use tokio_rustls::TlsAcceptor;
+    use rustls::{Certificate, ServerConfig, PrivateKey, server::ClientCertVerifier};
+    use webpki::EndEntityCert;
+
+    pub fn acceptor_from_cfg(config: Arc<ServerConfig>) -> Result<TlsAcceptor> {
+        let acceptor = TlsAcceptor::from(config);
+        Ok(acceptor)
+    }
+
+    // pub async fn acceptor_from_cert(key_file: &str, cert_file: &str, client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>) -> Result<TlsAcceptor> {
+
+    //     let config = try_load_server_certs(key_file, cert_file, client_cert_verifier).await?;
+    //     let acceptor = TlsAcceptor::from(config);
+    //     Ok(acceptor)
+    // }
+
+
+    // pub async fn try_load_server_certs(
+    //     key_file: &str, 
+    //     cert_file: &str, 
+    //     client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
+    // ) -> io::Result<Arc<ServerConfig>> {
+    //     let raw_cert = tokio::fs::read(cert_file).await?;
+    //     let raw_key = tokio::fs::read(key_file).await?;
+
+    //     raw_cert_to_server_cfg(raw_key, raw_cert, client_cert_verifier)
+    // }
+
+    pub fn raw_cert_to_server_cfg(
+        raw_key: Vec<u8>, 
+        raw_cert: Vec<u8>,
+        client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>
+    ) -> io::Result<Arc<ServerConfig>> {
+        use rustls_pemfile::Item;
+    
+        let certs = rustls_pemfile::certs(&mut raw_cert.as_ref())?;
+        let key = match rustls_pemfile::read_one(&mut raw_key.as_ref())? {
+            Some(Item::RSAKey(key)) | Some(Item::PKCS8Key(key)) | Some(Item::ECKey(key)) => key,
+            _ => return Err(io_other("private key format not supported")),
+        };
+
+        let certs: Vec<Certificate> = certs.into_iter().map(Certificate).collect();
+        let key = PrivateKey(key);
+    
+        // print_certs(certs.iter()).unwrap();
+
+        let builder = ServerConfig::builder().with_safe_defaults();
+
+        let builder = match client_cert_verifier {
+            Some(verifier) => {
+                tracing::debug!("aaa with_client_cert_verifier");
+                builder.with_client_cert_verifier(verifier)
+            },
+            None => builder.with_no_client_auth(),
+        };
+
+        let mut config = builder
+            .with_single_cert(certs, key)
+            .map_err(io_other)?;
+    
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    
+        Ok(Arc::new(config))
+    }
+
+
+    type BoxError = Box<dyn std::error::Error + Send + Sync>;
+    fn io_other<E: Into<BoxError>>(error: E) -> io::Error {
+        io::Error::new(io::ErrorKind::Other, error)
+    }
+
+    // pub async fn client_cert_verifier(ca_file: &str) -> Result<Arc<dyn ClientCertVerifier>> {
+    //     let root_store = load_root(ca_file).await?;
+    //     let verifier = AllowAnyAuthenticatedClient::new(root_store).boxed();
+    //     Ok(verifier)
+    // }
+
+    // async fn load_root(cert_file: &str) -> Result<RootCertStore> {
+    //     let data = tokio::fs::read(cert_file).await?;
+    //     let certs = rustls_pemfile::certs(&mut data.as_ref())?;
+    //     let certs: Vec<Certificate> = certs.into_iter().map(Certificate).collect();
+
+    //     let mut root_store = RootCertStore::empty();
+    //     for cert in certs {
+    //         root_store.add(&cert)?;
+    //     }
+
+    //     Ok(root_store)
+    // }
+
+    pub async fn try_load_cert_dns_name(
+        cert_file: &str, 
+    ) -> Result<String> {
+        
+        let cert = tokio::fs::read(cert_file).await?;    
+        let certs = rustls_pemfile::certs(&mut cert.as_ref())?;
+
+        for cert in certs {
+            let end_entity_cert = EndEntityCert::try_from(&cert[..])?;
+            for name in end_entity_cert.dns_names()? {
+                let name: &str = name.into();
+                if !name.is_empty() {
+                    return Ok(name.into())
+                }
+            }
+        }
+        bail!("no cert dns name found")
+    }
+
+
+    // pub fn print_certs<'a, I>(certs: I) -> Result<()> 
+    // where
+    //     I: Iterator<Item = &'a Certificate>,
+    // {
+    //     for cert in certs {
+    //         let end_entity_cert = webpki::EndEntityCert::try_from(&cert.0[..])?;
+    //         tracing::debug!("--");
+    //         for name in end_entity_cert.dns_names()? {
+    //             let name: &str = name.into();
+    //             tracing::debug!("  cert dns name [{name}]");
+    //         }
+    //     }
+    //     Ok(())
+    // }
+
+
+}
+
+mod clash_rest {
+    use anyhow::{Result, Context};
+    use axum::{Router, routing::get, response::IntoResponse, Extension};
+    use axum_server::{Handle, tls_rustls::RustlsConfig};
+    use rtun::async_rt::spawn_with_name;
+    use rustls::ServerConfig;
+    use tokio::{net::TcpListener, task::JoinHandle};
+    use std::{net::SocketAddr, sync::Arc, io};
+
+    pub async fn server_for_clash(listen_addr: SocketAddr, path: &str, tls_cfg: Option<Arc<ServerConfig>>, content: String) -> Result<ClashSubServer> {
+        // let content = "abc".to_string();
+        let shared = Arc::new(Shared {
+            content,
+        });
+
+        
+        async fn get_clash (
+            Extension(shared): Extension<Arc<Shared>>,
+        ) -> impl IntoResponse {
+            shared.content.clone()
+        }
+
+        let router = Router::new().route(path, get(get_clash));
+        let router = router
+        .layer(Extension(shared));
+
+        let tls_cfg = tls_cfg.map(RustlsConfig::from_config);
+        // let is_https = tls_cfg.is_some();
+
+        let listener = TcpListener::bind(listen_addr).await
+        .with_context(||format!("fail to bind [{}]", listen_addr))?
+        .into_std()
+        .with_context(||"tcp listener into std failed")?;
+
+        let server_handle = Handle::new();
+        
+        let task_name = format!("server");
+        let task = spawn_with_name(task_name, async move {
+            match tls_cfg {
+                Some(tls_cfg) => {
+                    
+                    axum_server::from_tcp_rustls(listener, tls_cfg)
+                    // axum_server::bind_rustls(addr, tls_cfg)
+                    .handle(server_handle)
+                    .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+                },
+                None => {
+                    axum_server::from_tcp(listener)
+                    // axum_server::bind(addr)
+                    .handle(server_handle)
+                    .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+                },
+            }
+            
+        });
+
+
+        Ok(ClashSubServer {
+            _task: task,
+        })
+    }
+
+    pub struct ClashSubServer {
+        _task: JoinHandle<io::Result<()>>,
+    }
+
+    struct Shared {
+        content: String,
+    }
+}

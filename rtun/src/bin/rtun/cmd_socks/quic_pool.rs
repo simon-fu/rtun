@@ -113,6 +113,7 @@ pub fn make_pool(name: String, multi: MultiProgress) -> Result<QuicPool> {
         interval,
         event_rx,
         event_tx,
+        last_check_speed: Instant::now(),
     };
     
     let actor = start_actor(
@@ -240,6 +241,7 @@ pub struct Entity {
     interval: Interval,
     event_tx: mpsc::Sender<Event>,
     event_rx: mpsc::Receiver<Event>,
+    last_check_speed: Instant,
 }
 
 impl Entity {
@@ -378,6 +380,11 @@ impl Entity {
     fn try_check_speed(&mut self) -> Result<()> {
 
         const TIMEOUT_MILLI: u64 = 60_000;
+        const INTERVAL_MILLI: u64 = TIMEOUT_MILLI/2;
+
+        if self.last_check_speed.elapsed() < Duration::from_millis(INTERVAL_MILLI) {
+            return Ok(())
+        }
 
         // if let Some(ci) = &mut self.selected {
         //     if let Some(agent) = self.agents.get_mut(&ci.agent.name) {

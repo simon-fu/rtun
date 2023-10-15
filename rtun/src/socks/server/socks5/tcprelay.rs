@@ -65,7 +65,7 @@ impl Socks5TcpHandler {
         }
     }
 
-    async fn check_auth<S>(&self, stream: &mut S, handshake_req: &HandshakeRequest) -> io::Result<()> 
+    pub async fn check_auth<S>(&self, stream: &mut S, handshake_req: &HandshakeRequest) -> io::Result<()> 
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {

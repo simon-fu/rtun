@@ -11,9 +11,19 @@ edition = "2021"
 tokio = { version = "=1.32.0", features = ["full"] }
 tokio-util = {version = "=0.7.8", features = ["full"]}
 tokio-stream = { version = "=0.1.14", features = ["sync"] }
-tokio-rustls = "=0.24.1"
 rustls = "=0.21.6"
-# rustls-pemfile = "=1.0.3"
+
+tokio-rustls = "=0.24.1"
+rustls-pemfile = "=1.0.3"
+webpki = { package = "rustls-webpki", version = "=0.101.6", features = ["alloc", "std"] }
+# webpki-roots = "=0.25.2"
+# webpki = "=0.22.4"
+# rustls-webpki = "0.101.6"
+
+# rustls-pemfile = "=2.0.0-alpha.1"
+# webpki = { package = "rustls-webpki", version = "=0.102.0-alpha.3", features = ["alloc", "std"] }
+
+indoc = "=2.0.4"
 
 futures="=0.3.28"
 anyhow = "=1.0.71"

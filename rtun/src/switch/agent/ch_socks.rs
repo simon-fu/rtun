@@ -271,6 +271,7 @@ where
     Ok(())
 }
 
+
 #[derive(Clone)]
 pub struct Server {
     context: Arc<ServiceContext>,
@@ -295,6 +296,194 @@ impl Server {
             mode,
             context,
         })
+    }
+}
+
+pub use socks_bridge::run_socks5_conn_bridge;
+
+mod socks_bridge {
+    use std::{io::{self, ErrorKind}, sync::Arc};
+    use shadowsocks::relay::socks5::{self, HandshakeRequest, HandshakeResponse, PasswdAuthRequest, PasswdAuthResponse};
+    use shadowsocks_service::local::socks::config::Socks5AuthConfig;
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt};
+    use anyhow::{Result, bail};
+    use tracing::{trace, error};
+
+    use super::read_socks5_handshake;
+
+    pub async fn run_socks5_conn_bridge<R1, W1, R2, W2>(
+        src_rd: &mut R1, src_wr: &mut W1,
+        dst_rd: &mut R2, dst_wr: &mut W2,
+        auth: &Arc<Socks5AuthConfig>, 
+        // peer_addr: SocketAddr, 
+    ) -> Result<()> 
+    where
+        R1: AsyncRead + Unpin,
+        W1: AsyncWrite + Unpin,
+        R2: AsyncRead + Unpin,
+        W2: AsyncWrite + Unpin,
+    {
+    
+        let mut version_buffer = [0u8; 1];
+    
+        let n = src_rd.read(&mut version_buffer).await?;
+        if n == 0 {
+            return Err(io::Error::from(ErrorKind::UnexpectedEof).into());
+        }
+    
+    
+        match version_buffer[0] {
+    
+            0x05 => { }
+    
+            version => {
+                error!("unsupported socks version {:x}", version);
+                let err = io::Error::new(ErrorKind::Other, "unsupported socks version");
+                return Err(err.into())
+            }
+        }
+    
+        let req = read_socks5_handshake(src_rd).await?;
+        check_auth(src_rd, src_wr, &req, auth).await?;
+
+        let req = HandshakeRequest::new(vec![socks5::SOCKS5_AUTH_METHOD_NONE]);
+        req.write_to(dst_wr).await?;
+
+        let rsp = HandshakeResponse::read_from(dst_rd).await?;
+        if rsp.chosen_method != socks5::SOCKS5_AUTH_METHOD_NONE {
+            let msg = format!("expect response method [None] but [{}]", rsp.chosen_method);
+            bail!("{msg}");
+        }
+
+        tokio::select! {
+            r = tokio::io::copy(dst_rd, src_wr) => {r?;},
+            r = tokio::io::copy(src_rd, dst_wr) => {r?;},
+        }
+        
+        Ok(())
+    }
+
+    async fn check_auth<R, W>(rd: &mut R, wr: &mut W, handshake_req: &HandshakeRequest, auth: &Arc<Socks5AuthConfig>) -> io::Result<()> 
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        use std::io::Error;
+
+        let allow_none = !auth.auth_required();
+
+        for method in handshake_req.methods.iter() {
+            match *method {
+                socks5::SOCKS5_AUTH_METHOD_PASSWORD => {
+                    let resp = HandshakeResponse::new(socks5::SOCKS5_AUTH_METHOD_PASSWORD);
+                    trace!("reply handshake {:?}", resp);
+                    resp.write_to(wr).await?;
+
+                    return check_auth_password(rd, wr, auth).await;
+                }
+                socks5::SOCKS5_AUTH_METHOD_NONE => {
+                    if !allow_none {
+                        trace!("none authentication method is not allowed");
+                    } else {
+                        let resp = HandshakeResponse::new(socks5::SOCKS5_AUTH_METHOD_NONE);
+                        trace!("reply handshake {:?}", resp);
+                        resp.write_to(wr).await?;
+
+                        return Ok(());
+                    }
+                }
+                _ => {
+                    trace!("unsupported authentication method {}", method);
+                }
+            }
+        }
+
+        let resp = HandshakeResponse::new(socks5::SOCKS5_AUTH_METHOD_NOT_ACCEPTABLE);
+        resp.write_to(wr).await?;
+
+        trace!("reply handshake {:?}", resp);
+
+        Err(Error::new(
+            ErrorKind::Other,
+            "currently shadowsocks-rust does not support authentication",
+        ))
+    }
+
+    async fn check_auth_password<R, W>(rd: &mut R, wr: &mut W, auth: &Arc<Socks5AuthConfig>) -> io::Result<()> 
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        use std::io::Error;
+
+        const PASSWORD_AUTH_STATUS_FAILURE: u8 = 255;
+
+        // Read initiation negociation
+
+        let req = match PasswdAuthRequest::read_from(rd).await {
+            Ok(i) => i,
+            Err(err) => {
+                let rsp = PasswdAuthResponse::new(err.as_reply().as_u8());
+                let _ = rsp.write_to(wr).await;
+
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    format!("Username/Password Authentication Initial request failed: {err}"),
+                ));
+            }
+        };
+
+        let user_name = match std::str::from_utf8(&req.uname) {
+            Ok(u) => u,
+            Err(..) => {
+                let rsp = PasswdAuthResponse::new(PASSWORD_AUTH_STATUS_FAILURE);
+                let _ = rsp.write_to(wr).await;
+
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    "Username/Password Authentication Initial request uname contains invaid characters",
+                ));
+            }
+        };
+
+        let password = match std::str::from_utf8(&req.passwd) {
+            Ok(u) => u,
+            Err(..) => {
+                let rsp = PasswdAuthResponse::new(PASSWORD_AUTH_STATUS_FAILURE);
+                let _ = rsp.write_to(wr).await;
+
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    "Username/Password Authentication Initial request passwd contains invaid characters",
+                ));
+            }
+        };
+
+        if auth.passwd.check_user(user_name, password) {
+            trace!(
+                "socks5 authenticated with Username/Password method, user: {}, password: {}",
+                user_name,
+                password
+            );
+
+            let rsp = PasswdAuthResponse::new(0);
+            rsp.write_to(wr).await?;
+
+            Ok(())
+        } else {
+            let rsp = PasswdAuthResponse::new(PASSWORD_AUTH_STATUS_FAILURE);
+            rsp.write_to(wr).await?;
+
+            error!(
+                "socks5 rejected Username/Password user: {}, password: {}",
+                user_name, password
+            );
+
+            Err(Error::new(
+                ErrorKind::Other,
+                format!("Username/Password Authentication failed, user: {user_name}, password: {password}"),
+            ))
+        }
     }
 }
 
