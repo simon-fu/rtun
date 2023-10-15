@@ -27,6 +27,7 @@ jobs:
         cd run-rtun
         docker run --rm simonfucn/ubuntu-rtun cat /usr/bin/rtun > ./rtun
         chmod +x ./rtun
+        echo RUST_LOG=$RUST_LOG
         ./rtun agent pub "${{ secrets.MY_RTUN_URL_DEV }}" --agent mydocker --expire_in 240 
 
 
