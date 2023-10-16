@@ -243,12 +243,12 @@ impl IcePeer {
         // let (socket, output) = BindingConfig::default()
         // .resolve_mapped_addr(servers.into_iter()).await?;
 
-        let socket = tokio_socket_bind("0.0.0.0:0").await?;
+        let socket = tokio_socket_bind("0.0.0.0:0").await.with_context(||"bind udp failed")?;
         let mut resolver = StunResolver::default();
-        resolver.resolve(&socket, servers.into_iter()).await?;
+        resolver.resolve(&socket, servers.into_iter()).await.with_context(||"stun resulve failed")?;
         
 
-        let local_addr = socket.local_addr()?;
+        let local_addr = socket.local_addr().with_context(||"get local addr failed")?;
 
         let mut candidates = Vec::new();
 
@@ -265,8 +265,8 @@ impl IcePeer {
             //     }
             // }
 
-            for r in ipnet_iter().await? {
-                let if_addr = r.with_context(||"ipnet_iter failed")?.addr();
+            for r in ipnet_iter().await.with_context(||"ipnet_iter failed")? {
+                let if_addr = r.with_context(||"ipnet_iter next failed")?.addr();
                 if (local_addr.is_ipv4() && if_addr.is_ipv4()) 
                 || (local_addr.is_ipv6() && if_addr.is_ipv6()) {
                     candidates.push(Candidate::host(SocketAddr::new(if_addr, local_addr.port()))?);
