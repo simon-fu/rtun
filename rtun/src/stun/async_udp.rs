@@ -420,15 +420,16 @@ impl<U: AsyncUdpSocket> AsyncUdpSocketOps for UdpSocketBridge<U> {
 //     Ok(BoxUdpSocket(socket))
 // }
 
-pub async fn tokio_socket_bind<A>(addr: A) -> io::Result<TokioUdpSocket> 
+pub async fn tokio_socket_bind<A>(addr: A) -> anyhow::Result<TokioUdpSocket> 
 where
     A: tokio::net::ToSocketAddrs,
 {
-    let socket = tokio::net::UdpSocket::bind(addr).await?;
-    let socket = socket.into_std()?;
-    UdpSocketState::configure((&socket).into())?;
+    use anyhow::Context;
+    let socket = tokio::net::UdpSocket::bind(addr).await.with_context(||"bind socket failed")?;
+    let socket = socket.into_std().with_context(||"into std socket failed")?;
+    UdpSocketState::configure((&socket).into()).with_context(||"config socket state failed")?;
     Ok(TokioUdpSocket {
-        io: tokio::net::UdpSocket::from_std(socket)?,
+        io: tokio::net::UdpSocket::from_std(socket).with_context(||"from std socket failed")?,
         inner: UdpSocketState::new(),
     })
 }
