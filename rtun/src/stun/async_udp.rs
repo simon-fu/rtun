@@ -427,7 +427,11 @@ where
     use anyhow::Context;
     let socket = tokio::net::UdpSocket::bind(addr).await.with_context(||"bind socket failed")?;
     let socket = socket.into_std().with_context(||"into std socket failed")?;
-    UdpSocketState::configure((&socket).into()).with_context(||"config socket state failed")?;
+    let r = UdpSocketState::configure((&socket).into()).with_context(||"config socket state failed");
+    if r.is_err() {
+        socket.set_nonblocking(true).with_context(||"set socket nonblocking failed")?;
+    }
+    
     Ok(TokioUdpSocket {
         io: tokio::net::UdpSocket::from_std(socket).with_context(||"from std socket failed")?,
         inner: UdpSocketState::new(),
