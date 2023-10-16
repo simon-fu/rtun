@@ -266,7 +266,7 @@ impl IcePeer {
             // }
 
             for r in ipnet_iter().await? {
-                let if_addr = r?.addr();
+                let if_addr = r.with_context(||"ipnet_iter failed")?.addr();
                 if (local_addr.is_ipv4() && if_addr.is_ipv4()) 
                 || (local_addr.is_ipv6() && if_addr.is_ipv6()) {
                     candidates.push(Candidate::host(SocketAddr::new(if_addr, local_addr.port()))?);
@@ -274,7 +274,7 @@ impl IcePeer {
             }
 
         } else {
-            candidates.push(Candidate::host(local_addr)?);
+            candidates.push(Candidate::host(local_addr).with_context(||"host candidate failed")?);
         }
 
 

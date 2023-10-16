@@ -227,17 +227,17 @@ impl<H: SwitchHanlder> AsyncHandler<OpOpenP2P> for Entity<H> {
     }
 }
 
-struct SetNoSocks(bool);
+// struct SetNoSocks(bool);
 
-#[async_trait::async_trait]
-impl<H: SwitchHanlder> AsyncHandler<SetNoSocks> for Entity<H> {
-    type Response = Result<()>; 
+// #[async_trait::async_trait]
+// impl<H: SwitchHanlder> AsyncHandler<SetNoSocks> for Entity<H> {
+//     type Response = Result<()>; 
 
-    async fn handle(&mut self, req: SetNoSocks) -> Self::Response {
-        self.disable_bridge_ch = req.0;
-        Ok(())
-    }
-}
+//     async fn handle(&mut self, req: SetNoSocks) -> Self::Response {
+//         self.disable_bridge_ch = req.0;
+//         Ok(())
+//     }
+// }
 
 impl<H: SwitchHanlder> CtrlHandler for Entity<H> {}
 

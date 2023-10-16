@@ -1,7 +1,7 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, Context};
 use futures::StreamExt;
 use if_watch::{tokio::IfWatcher, IpNet, IfEvent};
 use tokio::time::timeout;
@@ -9,7 +9,7 @@ use tokio::time::timeout;
 use crate::async_rt::dummy;
 
 pub async fn ipnet_iter() -> Result<IpNetIter> {
-    let mut watcher = IfWatcher::new()?;
+    let mut watcher = IfWatcher::new().with_context(||"new if watcher failed")?;
 
     let r = timeout(
         Duration::from_millis(1000), 
@@ -18,7 +18,7 @@ pub async fn ipnet_iter() -> Result<IpNetIter> {
 
     let mut first = None;
     if let Ok(Some(r)) = r {
-        let event = r?;
+        let event = r.with_context(||"next if event failed")?;
         match event {
             IfEvent::Up(ipnet) => first = Some(ipnet),
             IfEvent::Down(_r) => {},
@@ -78,7 +78,7 @@ impl Iterator for IpNetIter {
                 Poll::Ready(Ok(IfEvent::Down(_ipnet))) => {
                     
                 },
-                Poll::Ready(Err(e)) => return Some(Err(e.into())),
+                Poll::Ready(Err(e)) => return Some(Err(e).with_context(||"poll_if_event failed")),
                 Poll::Pending => return None
             }
         }
