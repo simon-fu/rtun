@@ -1,4 +1,4 @@
-name: Build rtun directly
+name: Build rtun directly rtun
 
 on:
   workflow_dispatch:
