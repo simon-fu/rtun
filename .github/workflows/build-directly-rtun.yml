@@ -1,0 +1,33 @@
+name: Build rtun directly
+
+on:
+  workflow_dispatch:
+
+
+env:
+  CARGO_TERM_COLOR: always
+  REPO_GIT_HASH: ${{ github.sha }}
+  RUST_LOG: rtun=debug
+
+jobs:
+  build-rtun:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+        
+    - name: display repo git hash and vars
+      run: |
+        echo REPO_GIT_HASH=$REPO_GIT_HASH
+        echo "SHELL=$SHELL"
+
+    - name: build rtun
+      run: |
+        mkdir run-rtun
+        cd run-rtun
+        docker run --rm simonfucn/ubuntu-rtun cat /usr/bin/rtun > ./rtun
+        chmod +x ./rtun
+        echo RUST_LOG=$RUST_LOG
+        ./rtun agent pub "${{ secrets.MY_RTUN_URL }}" --agent mydocker --expire_in 240 --secret ${{ secrets.MY_RTUN_SECRET }}
+
+
