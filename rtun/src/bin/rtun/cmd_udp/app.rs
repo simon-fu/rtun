@@ -35,12 +35,24 @@ pub struct AppAsync {
 }
 
 impl AppAsync {
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(self, listen: Option<String>) -> Result<()> {
+
+        let socket = match &listen {
+            Some(listen) => {
+                let socket = UdpSocket::bind(listen).await?;
+                {
+                    self.shared.state.lock().set_local(Some(socket.local_addr()?));
+                }
+                let _r = self.shared.event_tx.send(Event::PaintApp).await;
+                Some(socket)
+            },
+            None => None,
+        };
         // let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
         let entity = Entity {
             buf: vec![0;1700],
-            socket: None,
+            socket,
             shared: self.shared,
         };
     

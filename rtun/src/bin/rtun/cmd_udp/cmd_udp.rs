@@ -14,7 +14,7 @@ use tokio::sync::{oneshot, mpsc};
 use super::{tui::footer::{Event, FooterInput}, app::make_app};
 
 
-pub fn run(_args: CmdArgs) -> Result<()> { 
+pub fn run(args: CmdArgs) -> Result<()> { 
     
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(128);
     
@@ -25,13 +25,14 @@ pub fn run(_args: CmdArgs) -> Result<()> {
     
 
     let (app1, app2) = make_app(event_tx.clone())?;
+    let listen = args.listen.clone();
 
     let (async_tx, rx) = oneshot::channel();
     let thread = std::thread::spawn(|| {
         async_rt::run_multi_thread(async move {
             tokio::select! {
                 // r =  do_run(_args) => r,
-                r = app2.run() => r,
+                r = app2.run(listen) => r,
                 _r = rx => bail!("got exit"),
             }
         })
@@ -165,8 +166,7 @@ pub struct CmdArgs {
         short = 'l',
         long = "listen",
         long_help = "listen address",
-        default_value = "0.0.0.0:12080",
     )]
-    listen: String,
+    listen: Option<String>,
 }
 
