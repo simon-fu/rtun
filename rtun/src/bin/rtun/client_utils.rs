@@ -34,7 +34,7 @@ pub async fn client_select_url(url_str: &str, agent: Option<&str>, secret: Optio
     Ok(url)
 }
 
-pub async fn query_new_agents(url: &url::Url, exist: &mut HashMap<String, AgentInfo>) -> Result<Vec<AgentInfo>> {
+pub async fn query_new_agents(url: &url::Url, agent_regex: &regex::Regex, exist: &mut HashMap<String, AgentInfo>) -> Result<Vec<AgentInfo>> {
     if url.scheme().eq_ignore_ascii_case("http") 
     || url.scheme().eq_ignore_ascii_case("https") {
         let mut agents = get_agents(url).await?;
@@ -42,10 +42,15 @@ pub async fn query_new_agents(url: &url::Url, exist: &mut HashMap<String, AgentI
 
         let mut pos = 0;
         for nn in 0..agents.len() {
-            match exist.get(&agents[nn].name) {
+            let name = &agents[nn].name;
+            if !agent_regex.is_match(name) {
+                continue;
+            }
+
+            match exist.get(name) {
                 Some(_exist) => {},
                 None => {
-                    exist.insert(agents[nn].name.clone(), agents[nn].clone());
+                    exist.insert(name.clone(), agents[nn].clone());
                     if nn > pos {
                         agents.swap(nn, pos);
                     }

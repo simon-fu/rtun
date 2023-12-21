@@ -177,18 +177,32 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
     }
 
     {
-        if let Some(agent) = &args.agent {
-            add_agents(&pool, &url, &args, [agent.clone()].into_iter()).await?;
-            tokio::time::sleep(Duration::MAX/2).await;
-            return Ok(())
-        }
+        let agent_expr = match &args.agent {
+            Some(expr) => {
+                if !contains_regex_chars(expr) {
+                    tracing::info!("agent name is simple string");
+                    add_agents(&pool, &url, &args, [expr.clone()].into_iter()).await?;
+                    tokio::time::sleep(Duration::MAX/2).await;
+                    return Ok(())
+                }
+                expr
+            },
+            None => {
+                ".*"
+            }
+        };
+
+        tracing::info!("agent name expr: [{agent_expr}]");
+
+        let agent_regex = regex::Regex::new(agent_expr)
+        .with_context(||"invalid agent name regular expr")?;
 
         let mut agents = HashMap::new();
 
         loop {
 
 
-            let r = query_new_agents(&url, &mut agents).await;
+            let r = query_new_agents(&url, &agent_regex, &mut agents).await;
             match r {
                 Ok(agents) => {
                     // tracing::debug!("query_new_agents success [{agents:?}]");
@@ -214,6 +228,11 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(1_000)).await
         }
     }
+}
+
+fn contains_regex_chars(s: &str) -> bool {
+    let regex_chars = r".^$*+?()[]{}\|";
+    s.chars().any(|c| regex_chars.contains(c))
 }
 
 struct ClashContent<'a> {
@@ -1085,3 +1104,29 @@ mod clash_rest {
         content: String,
     }
 }
+
+mod regex_text {
+    #[test]
+    fn test_regex() {
+        // let rgx = regex::Regex::new("rtun-1").unwrap();
+        // assert!(rgx.is_match("rtun-1"), "{rgx}") ;
+        // println!("regular expr [{rgx}] captures_len [{}]", rgx.captures_len());
+
+
+        let rgx = regex::Regex::new("rtun-.*").unwrap();
+        assert!(rgx.is_match("rtun-"), "{rgx}") ;
+        assert!(rgx.is_match("rtun-1"), "{rgx}") ;
+        assert!(rgx.is_match("rtun-2"), "{rgx}") ;
+        assert!(!rgx.is_match("rtun1"), "{rgx}") ;
+        assert!(!rgx.is_match("home_mini"), "{rgx}") ;
+
+        let rgx = regex::Regex::new(".*").unwrap();
+        assert!(rgx.is_match("rtun-"), "{rgx}") ;
+        assert!(rgx.is_match("rtun-1"), "{rgx}") ;
+        assert!(rgx.is_match("rtun-2"), "{rgx}") ;
+        assert!(rgx.is_match("rtun1"), "{rgx}") ;
+        assert!(rgx.is_match("home_mini"), "{rgx}") ;
+    }
+}
+
+
