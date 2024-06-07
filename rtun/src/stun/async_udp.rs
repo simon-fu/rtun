@@ -460,7 +460,19 @@ impl AsyncUdpSocket for TokioUdpSocket {
         let inner = &self.inner;
         let io = &self.io;
         loop {
-            ready!(io.poll_send_ready(cx))?;
+            // ready!(io.poll_send_ready(cx))?;
+            // if let Ok(res) = io.try_io(Interest::WRITABLE, || {
+            //     inner.send(io.into(), state, transmits)
+            // }) {
+            //     return Poll::Ready(Ok(res));
+            // }
+
+            let r = ready!(io.poll_send_ready(cx));
+            if let Err(e) = &r {
+                tracing::warn!("poll_send_ready fail [{e:?}]");
+            }
+            r?;
+            
             if let Ok(res) = io.try_io(Interest::WRITABLE, || {
                 inner.send(io.into(), state, transmits)
             }) {
