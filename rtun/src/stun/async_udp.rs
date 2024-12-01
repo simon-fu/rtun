@@ -444,11 +444,15 @@ pub struct TokioUdpSocket {
     inner: UdpSocketState,
 }
 
-// impl TokioUdpSocket {
-//     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
-//         self.io.set_ttl(ttl)
-//     }
-// }
+impl TokioUdpSocket {
+    pub fn into_inner(self) -> tokio::net::UdpSocket {
+        self.io
+    }
+
+    // pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+    //     self.io.set_ttl(ttl)
+    // }
+}
 
 impl AsyncUdpSocket for TokioUdpSocket {
     fn poll_send(

@@ -29,7 +29,7 @@ pub struct IceConfig {
     pub compnent_id: Option<u16>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IceArgs {
     pub ufrag: String,
     pub pwd: String,
@@ -114,6 +114,10 @@ impl IcePeer {
         self.gather_until_done().await
     }
 
+    // pub async fn server_gather(&mut self, remote: IceArgs) -> Result<IceArgs> {
+    //     self.server_gather_with(remote, None).await
+    // }
+
     pub async fn server_gather(&mut self, remote: IceArgs) -> Result<IceArgs> {
         // self.is_client = false;
         
@@ -136,7 +140,7 @@ impl IcePeer {
         // }
 
         // tracing::debug!("prepare checking..");
-        let mut checker = self.make_checker(false)?;
+        let mut checker = self.make_checker(false, None)?;
         if let Some(socket) = self.socket.as_mut() {
             checker.prepare_checking()?;
             udp_flush(socket, &mut checker).await?;
@@ -195,7 +199,7 @@ impl IcePeer {
     //     Ok(config)
     // }
 
-    fn make_checker(&self, is_client: bool) -> Result<IceChecker> {
+    fn make_checker(&self, is_client: bool, timeout: Option<Duration>) -> Result<IceChecker> {
         let local = self.local.as_ref().with_context(||"no local args")?;
         let remote = self.remote.as_ref().with_context(||"no remote args")?;
 
@@ -210,6 +214,7 @@ impl IcePeer {
             username: format!("{}:{}", local.ufrag, remote.ufrag), 
             password: local.pwd.to_string(),
         })
+        .with_timeout(timeout)
         .into_exec();
 
         for cand in self.targets.iter() {
@@ -296,15 +301,20 @@ impl IcePeer {
     pub async fn dial(&mut self, remote: IceArgs) -> Result<IceConn> {
         self.set_remote(remote)?;
         let socket = self.socket.take().with_context(||"no socket")?;
-        self.negotiate(socket, true).await
+        self.negotiate(socket, true, None).await
     }
 
     pub async fn accept(&mut self) -> Result<IceConn> {
         let socket = self.socket.take().with_context(||"no socket")?;
-        self.negotiate(socket, false).await
+        self.negotiate(socket, false, None).await
     }
 
-    async fn negotiate(&mut self, socket: TokioUdpSocket, is_client: bool) -> Result<IceConn> {
+    pub async fn accept_timeout(&mut self, timeout: Duration) -> Result<IceConn> {
+        let socket = self.socket.take().with_context(||"no socket")?;
+        self.negotiate(socket, false, Some(timeout)).await
+    }
+
+    async fn negotiate(&mut self, socket: TokioUdpSocket, is_client: bool, timeout: Option<Duration>) -> Result<IceConn> {
 
 
 
@@ -315,7 +325,7 @@ impl IcePeer {
         // .resolve_ice(socket, self.targets.iter().map(|x|x.clone())).await?;
         // let select_addr = output.addr();
 
-        let mut checker = self.make_checker(is_client)?;
+        let mut checker = self.make_checker(is_client, timeout)?;
         debug!("start checking... (is_client {is_client}), {:?}", checker.config());
 
         checker.kick_checking(Instant::now())?;
@@ -362,8 +372,17 @@ impl IceConn {
         self.remote_addr
     }
 
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.0.local_addr()
+    }
+
     pub fn into_async_udp(self) -> UdpSocketBridge<impl AsyncUdpSocket> {
         self.socket
+    }
+
+    pub fn into_parts(self) -> (tokio::net::UdpSocket, CheckerConfig, SocketAddr) {
+        let r = self.socket.0.into_parts();
+        (r.0.into_inner(), r.1, self.remote_addr)
     }
 }
 

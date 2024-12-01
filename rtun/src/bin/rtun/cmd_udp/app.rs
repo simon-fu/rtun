@@ -463,7 +463,7 @@ pub struct SendCmdArgs {
 #[clap(name = "set")]
 pub struct SetCmdArgs {
     #[clap(
-        long_help = "key",
+        long_help = "key, supported keys: [target, ttl]",
     )]
     key: String,
 

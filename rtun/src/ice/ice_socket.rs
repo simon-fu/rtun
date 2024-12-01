@@ -416,6 +416,13 @@ impl CheckerConfig {
         }
     }
 
+    pub fn with_timeout(self, timeout: Option<Duration>) -> Self {
+        Self {
+            tsx_timeout: timeout,
+            ..self
+        }
+    }
+
     pub fn into_exec(self) -> IceChecker {
         IceChecker {
             config: self,
@@ -894,13 +901,17 @@ pub struct IceSocket<U> {
     config: CheckerConfig,
 }
 
-// impl<U> IceSocket<U> {
-//     pub fn new(socket: U) -> Self {
-//         Self { 
-//             socket, 
-//         }
-//     }
-// }
+impl<U> IceSocket<U> {
+    // pub fn new(socket: U) -> Self {
+    //     Self { 
+    //         socket, 
+    //     }
+    // }
+
+    pub fn into_parts(self) -> (U, CheckerConfig) {
+        (self.socket, self.config)
+    }
+}
 
 impl<U: AsyncUdpSocket> AsyncUdpSocket for IceSocket<U> {
     fn poll_send(

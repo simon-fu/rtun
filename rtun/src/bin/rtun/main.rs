@@ -39,6 +39,8 @@ pub mod cmd_local;
 
 pub mod cmd_udp;
 
+pub mod cmd_punch;
+
 pub mod cmd_quic;
 
 pub mod terminal;
@@ -67,6 +69,7 @@ enum SubCmd {
     Local(cmd_local::CmdArgs),
     Udp(cmd_udp::CmdArgs),
     Quic(cmd_quic::CmdArgs),
+    Punch(cmd_punch::CmdArgs),
 }
 
 fn main() -> Result<()> {
@@ -78,6 +81,7 @@ fn main() -> Result<()> {
         SubCmd::Local(args) => cmd_local::run(args),
         SubCmd::Udp(args) => cmd_udp::run(args),
         SubCmd::Quic(args) => cmd_quic::run(args),
+        SubCmd::Punch(args) => cmd_punch::run(args),
     }
 
     // init_log();
