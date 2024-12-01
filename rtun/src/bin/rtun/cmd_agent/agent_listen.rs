@@ -30,9 +30,18 @@ use crate::{rest_proto::{PUB_WS, SUB_WS, PUB_SESSIONS, PubParams, SubParams, Age
 
 
 pub async fn run(args: CmdArgs) -> Result<()> {
-    let addr: SocketAddr = args.addr.parse()
-    .with_context(||"invalid address")?;
+    let addr_r: Result<SocketAddr> = args.addr.parse()
+    .with_context(||"invalid address");
 
+    if let Ok(addr) = &addr_r {
+        return run_http(args, *addr).await;
+    }
+
+    bail!("invalid address [{}]", args.addr)
+}
+
+
+async fn run_http(args: CmdArgs, addr: SocketAddr) -> Result<()> {
     let mut local_agent = if !args.bridge {
         let uid = gen_huid();
         let agent = make_agent_ctrl(uid).await?;

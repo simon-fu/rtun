@@ -170,3 +170,111 @@ pub struct CmdArgs {
     listen: Option<String>,
 }
 
+
+#[cfg(test)]
+mod test_udp {
+    use std::{net::SocketAddr, sync::Arc, time::Duration};
+    use tokio::net::UdpSocket;
+    use tracing::{debug, Instrument};
+
+    #[tokio::test]
+    async fn test_udp() {
+        tracing_subscriber::fmt()
+        .with_max_level(tracing::metadata::LevelFilter::DEBUG)
+        .with_target(false)
+        .with_ansi(true)
+        .init();
+
+        let span = tracing::span!(parent: None, tracing::Level::DEBUG, "", s="root");
+        udp_loop().instrument(span).await;
+    }
+
+    async fn udp_loop() {
+        let local_addr: SocketAddr = "0.0.0.0:10000".parse().unwrap();
+        let socket = new_udp_reuseport(local_addr);
+        // let socket = UdpSocket::bind("0.0.0.0:10000").await.unwrap();
+        let socket = Arc::new(socket);
+        // let local_addr = socket.local_addr().unwrap();
+        debug!("listening at {}", local_addr);
+
+        // let connections: HashMap<String, Connection> = HashMap::new();
+        let mut buf = vec![0; 1700];
+        loop {
+            let (n, from) = socket.recv_from(&mut buf).await.unwrap();
+            debug!("n={n}, from {from}");
+            let peer_socket: Arc<UdpSocket> = new_udp_reuseport(local_addr).into();
+            // let peer_socket = {
+            //     let socket_fd = socket.as_raw_fd();
+            //     let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(socket_fd) };
+            //     UdpSocket::from_std(std_socket).unwrap()
+            // };
+
+            peer_socket.connect(from).await.unwrap();
+            let root_socket = socket.clone();
+            
+            let sid = format!("{from}");
+            let span = tracing::span!(parent: None, tracing::Level::DEBUG, "", s=&sid);
+
+            let _task = tokio::spawn(async move {
+                peer_loop(peer_socket, from, root_socket).await;
+            }.instrument(span));
+            // let _r = _task.await;
+        }
+    }
+
+    async fn peer_loop(socket: Arc<UdpSocket>, _peer_addr: SocketAddr, _root_socket: Arc<UdpSocket>) {
+        let mut buf = vec![0; 1700];
+        // let mut num = 0_u64;
+        loop {
+            debug!(" ===> ");
+            tokio::select! {
+                r = socket.recv(&mut buf) => {
+                    match r {
+                        Ok(n) => {
+                            debug!("recv n={n}");
+                        },
+                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                            debug!("ignore ConnectionRefused");
+                        }
+                        Err(e) => {
+                            debug!("recv error [{e:?}]");
+                        }
+                    }
+                }
+                _r = tokio::time::sleep(Duration::from_secs(3)) => {
+                    // num += 1;
+                    // let data = format!("hello {num}\n");
+                    // debug!("sending num {num} ...");
+                    // // root_socket.send_to(data.as_bytes(), peer_addr).await.unwrap();
+                    // let r = socket.send(data.as_bytes()).await;
+                    // debug!("sent num {num}, result {r:?}");
+                }
+            }
+            debug!(" <=== ");
+
+        }
+    }
+
+    fn new_udp_reuseport(local_addr: SocketAddr) -> UdpSocket {
+        let udp_sock = socket2::Socket::new(
+            if local_addr.is_ipv4() {
+                socket2::Domain::IPV4
+            } else {
+                socket2::Domain::IPV6
+            },
+            socket2::Type::DGRAM,
+            None,
+        )
+        .unwrap();
+        udp_sock.set_reuse_port(true).unwrap();
+        // udp_sock.set_reuse_address(true).unwrap();
+        // from tokio-rs/mio/blob/master/src/sys/unix/net.rs
+        udp_sock.set_cloexec(true).unwrap();
+        udp_sock.set_nonblocking(true).unwrap();
+        udp_sock.bind(&socket2::SockAddr::from(local_addr)).unwrap();
+        let udp_sock: std::net::UdpSocket = udp_sock.into();
+        udp_sock.try_into().unwrap()
+    }
+    
+}
+

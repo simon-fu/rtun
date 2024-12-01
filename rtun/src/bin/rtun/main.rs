@@ -39,6 +39,8 @@ pub mod cmd_local;
 
 pub mod cmd_udp;
 
+pub mod cmd_quic;
+
 pub mod terminal;
 
 pub mod client_ch_pty;
@@ -64,6 +66,7 @@ enum SubCmd {
     Agent(cmd_agent::CmdArgs),
     Local(cmd_local::CmdArgs),
     Udp(cmd_udp::CmdArgs),
+    Quic(cmd_quic::CmdArgs),
 }
 
 fn main() -> Result<()> {
@@ -74,6 +77,7 @@ fn main() -> Result<()> {
         SubCmd::Agent(args) => cmd_agent::run(args),
         SubCmd::Local(args) => cmd_local::run(args),
         SubCmd::Udp(args) => cmd_udp::run(args),
+        SubCmd::Quic(args) => cmd_quic::run(args),
     }
 
     // init_log();
