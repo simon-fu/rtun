@@ -14,8 +14,9 @@ use std::{collections::HashMap, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Buf, BufMut, BytesMut};
 use clap::Parser;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use dialoguer::{theme::ColorfulTheme, Input};
+use serde::de;
 use tokio::{net::UdpSocket, sync::mpsc};
 use tracing::{debug, info, span, Instrument, Level};
 use crate::{cmd_punch::{echo::{kick_echo_client, kick_echo_server}, udp_acceptor::{new_udp_reuseport_str, new_udp_reuseport_v4}}, init_log_and_run};
@@ -240,9 +241,9 @@ async fn client_side_loop(listen_socket: UdpSocket, tun: &mut TunRecver) -> Resu
                 // let id = (&packet[packet.len()-8..]).get_u64();
                 // assert!(id < 100, "{id}");
 
-                let tail = parse_tail(&packet, "client-send");
+                let meta = parse_meta(&packet).with_context(||"client-send")?;
 
-                debug!("send packet len [{}], [{tail:?}]", packet.len()-TAIL_LEN);
+                debug!("send packet len [{}], [{meta:?}]", packet.len());
                 let _r = tun.socket().send(&packet[..]).await;
                 
                 continue;
@@ -304,57 +305,62 @@ async fn server_side_loop(tun: &mut TunRecver, target: SocketAddr) -> Result<()>
             }
         }
 
-        let Some(v) = tun.demux() else {
-            continue;
-        };
-        debug!("recv packet len [{}], tail [{:?}]", v.1.len(), v.0);
+        for (id, packet) in tun.demux() {
+            debug!("recv packet len [{}], id [{:?}]", packet.len(), id);
 
-        let r = tun.send_packet_to_session((v.0.id, v.1)).await;
-        let Err((id, packet)) = r else {
-            continue;
-        };
+            let r = tun.send_packet_to_session((id, packet)).await;
+            let Err((id, packet)) = r else {
+                continue;
+            };
+    
+            debug!("new session, id [{id}]");
 
-        debug!("new session, id [{id}]");
-
-        let (tx, rx) = mpsc::channel(256);
-
-        let sender = SessionSender {
-            tx,
-        };
-
-        let _r = sender.tx.send(packet).await;
-
-        tun.add_sender(id, sender);
-
-        // let socket = UdpSocket::bind("0.0.0.0:0").await.with_context(||"bind session socket failed")?;
-        let socket = new_udp_reuseport_v4().with_context(||"bind session socket failed")?;
-        socket.connect(target).await.with_context(||"connect to target failed")?;
-        let socket = Arc::new(socket);
-
-        let (holder_tx, holder_rx) = mpsc::channel::<()>(1);
-
-        {
-            let socket = socket.clone();
-            let span = span!(parent: None, Level::DEBUG, "tun->target", id=&id);
-            tokio::spawn(async move {
-                let r = tun_to_target_loop(rx, &socket, holder_rx).await;
-                debug!("finished {r:?}");
-            }.instrument(span));    
+            make_session(tun, target, &mux_tx, id, packet).await?;
         }
-
-        {
-            let tx = mux_tx.clone();
-            let span = span!(parent: None, Level::DEBUG, "tun<-target", id=&id);
-            tokio::spawn(async move {
-                let r = target_to_tun_loop(id, &socket, tx).await;
-                debug!("finished {r:?}");
-                drop(holder_tx);
-            }.instrument(span));  
-        }
+        
     }
     Ok(())
 }
 
+async fn make_session(tun: &mut TunRecver, target: SocketAddr, mux_tx: &mpsc::Sender<BytesMut>, id: u64, packet: BytesMut ) -> Result<()> {
+    let (tx, rx) = mpsc::channel(256);
+
+    let sender = SessionSender {
+        tx,
+    };
+
+    let _r = sender.tx.send(packet).await;
+
+    tun.add_sender(id, sender);
+
+    // let socket = UdpSocket::bind("0.0.0.0:0").await.with_context(||"bind session socket failed")?;
+    let socket = new_udp_reuseport_v4().with_context(||"bind session socket failed")?;
+    socket.connect(target).await.with_context(||"connect to target failed")?;
+    let socket = Arc::new(socket);
+
+    let (holder_tx, holder_rx) = mpsc::channel::<()>(1);
+
+    {
+        let socket = socket.clone();
+        let span = span!(parent: None, Level::DEBUG, "tun->target", id=&id);
+        tokio::spawn(async move {
+            let r = tun_to_target_loop(rx, &socket, holder_rx).await;
+            debug!("finished {r:?}");
+        }.instrument(span));    
+    }
+
+    {
+        let tx = mux_tx.clone();
+        let span = span!(parent: None, Level::DEBUG, "tun<-target", id=&id);
+        tokio::spawn(async move {
+            let r = target_to_tun_loop(id, &socket, tx).await;
+            debug!("finished {r:?}");
+            drop(holder_tx);
+        }.instrument(span));  
+    }
+
+    Ok(())
+}
 
 
 
@@ -400,29 +406,15 @@ impl TunRecver {
         Ok(())
     }
 
-    fn demux(&mut self) -> Option<(Tail, BytesMut)> {
-        let buf = self.buf.get_mut();
-
-        let len = buf.len();
-
-        if len < 8 {
-            debug!("tun packet too short [{len}] < 8");
-            buf.clear();
-            return None
+    fn demux(&mut self) -> impl Iterator<Item = (u64, BytesMut)> {
+        PacketIter {
+            buf: self.buf.get_mut().split(),
         }
-
-        let tail = parse_tail(buf, "TunRecver.demux");
-
-        let packet = buf.split_to(len-TAIL_LEN);
-        buf.advance(TAIL_LEN);
-        // let id = buf.get_u64();
-
-        Some((tail, packet))
     }
 
     async fn demux_to_session(&mut self) {
-        if let Some(v) = self.demux() {
-            let _r = self.send_packet_to_session((v.0.id, v.1)).await;
+        for v in self.demux() {
+            let _r = self.send_packet_to_session(v).await;
         }
     }
 
@@ -445,9 +437,11 @@ async fn client_to_tun_loop(id: u64, mut socket: UdpReceiver, tx: mpsc::Sender<B
 
     loop {
         let buf = src_buf.get_mut();
+        
+        let builder = PacketBuilder::new(buf);
 
         let r = tokio::select! {
-            r = socket.recv_buf(buf) => {
+            r = socket.recv_buf(builder.buf) => {
                 r
             }
             _r = tokio::time::sleep(TIMEOUT) => {
@@ -455,13 +449,15 @@ async fn client_to_tun_loop(id: u64, mut socket: UdpReceiver, tx: mpsc::Sender<B
             }
         };
 
-        let len = r.with_context(||"recv from target faield")?;
-        check_eof(len)?;
+        {
+            let len = r.with_context(||"recv from target faield")?;
+            check_eof(len)?;
+        }
+ 
 
-        // buf.put_u64(id);
-        put_tail(buf, id);
+        let packet = builder.build(id);
         
-        let packet = buf.split_to(len+8);
+        // let packet = buf.split_to(len+8);
         assert!(buf.is_empty(), "buf len {}", buf.len());
         // debug!("mux packet len [{}]", packet.len());
 
@@ -490,45 +486,148 @@ async fn tun_to_client_loop(mut rx: mpsc::Receiver<BytesMut>, socket: UdpSender,
     }
 }
 
-const X25: crc::Crc<u16> = crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC);
-const TAIL_LEN: usize = 8;
+
+const META_LEN: usize = 8;
+
+struct PacketBuilder<'a> {
+    buf: &'a mut BytesMut,
+}
+
+impl<'a> PacketBuilder<'a> {
+    fn new(buf: &'a mut BytesMut) -> Self {
+        if buf.is_empty() {
+            buf.put_slice(&[0_u8; META_LEN]);
+        }
+
+        Self {
+            buf,
+        }
+    }
+
+    // fn buf<'s: 'a>(&'s mut self) -> &'s mut BytesMut {
+    //     self.buf
+    // }
+
+    fn build(self, id: u64) -> BytesMut {
+        build_meta(self.buf, id);
+        self.buf.split()
+    }
+}
+
+struct PacketIter {
+    buf: BytesMut,
+}
+
+
+impl Iterator for PacketIter {
+    type Item = (u64, BytesMut);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.buf.is_empty() {
+            return None
+        }
+        
+        let r = parse_meta(&self.buf[..]);
+
+        let meta = match r {
+            Err(e) => {
+                tracing::warn!("{e:?}");
+                return None
+            },
+            Ok(v) => v,
+        };
+
+        self.buf.advance(META_LEN);
+        let packet = self.buf.split_to(meta.len);
+        Some((meta.id, packet))
+    }
+}
 
 #[allow(unused)]
 #[derive(Debug)]
-struct Tail {
+struct Meta {
     id: u64,
-    csum: u16,
+    len: usize,
 }
 
-fn put_tail(buf: &mut BytesMut, id: u64) {    
+fn build_meta(buf: &mut BytesMut, id: u64) {
+    assert!(buf.len() >= META_LEN);
+        
+    let len = buf.len() - META_LEN;
+    let mut meta_buf = &mut buf[..META_LEN];
+
     let id_bytes = id.to_be_bytes();
-    buf.put_slice(&id_bytes[2..]);
-
-    let csum = X25.checksum(&buf[..]);
-    buf.put_u16(csum);
+    meta_buf.put_slice(&id_bytes[2..]);
+    
+    meta_buf.put_u16(len as u16);
 }
 
+fn parse_meta(buf: &[u8]) -> Result<Meta> {
+    // assert!(buf.len() >= META_LEN, "{}, {origin}", buf.len());
 
-fn parse_tail(buf: &BytesMut, origin: &str) -> Tail {
-    assert!(buf.len() >= TAIL_LEN, "{}, {origin}", buf.len());
+    if buf.len() < META_LEN {
+        bail!("packet as least [{META_LEN}] but [{}]", buf.len());
+    }
+
+    let mut meta_buf = &buf[..META_LEN];
     
-    let csum0 = X25.checksum(&buf[..buf.len()-2]);
-
-    let tail = &buf[buf.len()-TAIL_LEN..];
     let bytes = [
         0, 0, 
-        tail[0], tail[1], tail[2], tail[3], tail[4], tail[5]
+        meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3], meta_buf[4], meta_buf[5]
     ];
 
     let id = u64::from_be_bytes(bytes);
-    let csum = (&tail[6..]).get_u16();
-    assert_eq!(csum, csum0, "{origin}, id {id}, len {}", buf.len()-TAIL_LEN);
+    meta_buf.advance(6);
 
-    Tail {
-        id,
-        csum,
+    let len = meta_buf.get_u16() as usize;
+    if len > (buf.len() - META_LEN) {
+        bail!("meta.len [{len}] exceed [{}]", (buf.len() - META_LEN))
     }
+
+    Ok(Meta {
+        id,
+        len: len as usize,
+    })
 }
+
+// const X25: crc::Crc<u16> = crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC);
+
+// #[allow(unused)]
+// #[derive(Debug)]
+// struct Tail {
+//     id: u64,
+//     csum: u16,
+// }
+
+// fn put_tail(buf: &mut BytesMut, id: u64) {    
+//     let id_bytes = id.to_be_bytes();
+//     buf.put_slice(&id_bytes[2..]);
+
+//     let csum = X25.checksum(&buf[..]);
+//     buf.put_u16(csum);
+// }
+
+
+// fn parse_tail(buf: &BytesMut, origin: &str) -> Tail {
+//     assert!(buf.len() >= TAIL_LEN, "{}, {origin}", buf.len());
+    
+//     let csum0 = X25.checksum(&buf[..buf.len()-2]);
+
+//     let tail = &buf[buf.len()-TAIL_LEN..];
+//     let bytes = [
+//         0, 0, 
+//         tail[0], tail[1], tail[2], tail[3], tail[4], tail[5]
+//     ];
+
+//     let id = u64::from_be_bytes(bytes);
+//     let csum = (&tail[6..]).get_u16();
+//     assert_eq!(csum, csum0, "{origin}, id {id}, len {}", buf.len()-TAIL_LEN);
+
+//     Tail {
+//         id,
+//         csum,
+//     }
+// }
 
 
 
@@ -561,9 +660,11 @@ async fn target_to_tun_loop(id: u64, socket: &UdpSocket, tx: mpsc::Sender<BytesM
 
     loop {
         let buf = src_buf.get_mut();
+        let builder = PacketBuilder::new(buf);
+        // prepare_meta(buf);
         
         let r = tokio::select! {
-            r = socket.recv_buf(buf) => {
+            r = socket.recv_buf(builder.buf) => {
                 r
             }
             _r = tokio::time::sleep(TIMEOUT) => {
@@ -574,10 +675,11 @@ async fn target_to_tun_loop(id: u64, socket: &UdpSocket, tx: mpsc::Sender<BytesM
         let len = r.with_context(||"recv from target faield")?;
         check_eof(len)?;
 
-        // buf.put_u64(id);
-        put_tail(buf, id);
+        // // buf.put_u64(id);
+        // put_meta(buf, id);
         
-        let packet = buf.split_to(len+TAIL_LEN);
+        // let packet = buf.split_to(len+META_LEN);
+        let packet = builder.build(id);
 
         let r = tx.send(packet).await;
         if r.is_err() {
