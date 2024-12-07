@@ -210,6 +210,18 @@ impl UdpSocketConn {
         }
         
     }
+
+    async fn recv_buf<B: BufMut>(&self, buf: &mut B) -> Result<usize> {
+        loop {
+            let (len, from) = self.socket.recv_buf_from(buf).await?;
+            if from == self.target {
+                return Ok(len)
+            }
+
+            tracing::warn!("recv expect from [{}] but [{from}]", self.target);
+        }
+        
+    }
 }
 
 
@@ -393,12 +405,12 @@ impl TunRecver {
 
     async fn recv(&mut self) -> Result<()> {
 
-        // let buf = self.buf.get_mut();
-        // let (len, _from) = self.tun_socket.recv_buf_from(buf).await.with_context(||"tun socket recv failed")?;
+        let buf = self.buf.get_mut();
+        let len = self.tun_socket.recv_buf(buf).await.with_context(||"tun socket recv failed")?;
 
-        let mut buf = vec![0_u8; 1700];
-        let len = self.tun_socket.recv(&mut buf).await.with_context(||"tun socket recv failed")?;
-        self.buf.get_mut().put_slice(&buf[..len]);
+        // let mut buf = vec![0_u8; 1700];
+        // let len = self.tun_socket.recv(&mut buf).await.with_context(||"tun socket recv failed")?;
+        // self.buf.get_mut().put_slice(&buf[..len]);
 
         check_eof(len)?;
         debug!("aaa recv_buf len [{len}]");
