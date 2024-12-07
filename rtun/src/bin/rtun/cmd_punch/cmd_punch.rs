@@ -36,7 +36,9 @@ async fn do_run(args: CmdArgs) -> Result<()> {
         ..Default::default()
     });
 
-    let conn = if args.as_server {
+    let as_server = args.as_server;
+
+    let conn = if as_server {
         let remote_str: String = Input::with_theme(&ColorfulTheme::default())
         .with_prompt("server: input remote args")
         .interact_text().with_context(||"input remote args failed")?;
@@ -67,6 +69,23 @@ async fn do_run(args: CmdArgs) -> Result<()> {
     info!("punch connected [{}] -> [{}]", socket.local_addr()?, remote_addr);
 
     let tun_socket = Arc::new(socket);
+
+    const HELLO: &str = "hello punch";
+    if !as_server {
+        let r = tun_socket.send(HELLO.as_bytes()).await;
+        debug!("sent hello [{r:?}]");
+    } else {
+        let mut buf = vec![0_u8; 1700];
+        loop {
+            let len = tun_socket.recv(&mut buf[..]).await.with_context(||"recv hello failed")?;
+            let packet = &buf[..len];
+            if packet == HELLO.as_bytes() {
+                debug!("recv hello");
+                break;
+            }
+            tracing::warn!("expect hello but len [{}]", packet.len());
+        }
+    }
 
     
     if let Some(listen_addr) = &args.relay_listen {
