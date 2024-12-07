@@ -16,7 +16,6 @@ use bytes::{Buf, BufMut, BytesMut};
 use clap::Parser;
 use anyhow::{bail, Context, Result};
 use dialoguer::{theme::ColorfulTheme, Input};
-use serde::de;
 use tokio::{net::UdpSocket, sync::mpsc};
 use tracing::{debug, info, span, Instrument, Level};
 use crate::{cmd_punch::{echo::{kick_echo_client, kick_echo_server}, udp_acceptor::{new_udp_reuseport_str, new_udp_reuseport_v4}}, init_log_and_run};
@@ -68,10 +67,10 @@ async fn do_run(args: CmdArgs) -> Result<()> {
     // let remote_addr = conn.remote_addr();
     let (socket, _cfg, remote_addr) = conn.into_parts();
     // socket.connect(remote_addr).await.with_context(||"udp connect failed")?;
-    let tun_socket: Arc<UdpSocketConn> = Arc::new(UdpSocketConn {
+    let tun_socket: Arc<UdpSocketConn> = Arc::new(UdpSocketConn::try_new(
         socket,
-        target: remote_addr,
-    });
+        remote_addr,
+    ).await?);
     info!("punch connected [{}] -> [{}]", tun_socket.local_addr()?, remote_addr);
 
     // let tun_socket = Arc::new(socket);
@@ -183,46 +182,88 @@ async fn do_run(args: CmdArgs) -> Result<()> {
 
 }
 
+/// 用于控制 udp 是否要 connect
 struct UdpSocketConn {
     socket: UdpSocket,
-    target: SocketAddr,
 }
 
 impl UdpSocketConn {
+    async fn try_new(socket: UdpSocket, target: SocketAddr) -> Result<Self> {
+        socket.connect(target).await.with_context(||format!("fail to connect udp to [{target}]"))?;
+        Ok(Self {
+            socket,
+        })
+    }
+
     fn local_addr(&self) -> Result<SocketAddr> {
         let addr = self.socket.local_addr()?;
         Ok(addr)
     }
 
     async fn send(&self, packet: &[u8]) -> Result<()> {
-        self.socket.send_to(packet, self.target).await?;
+        self.socket.send(packet).await?;
         Ok(())
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-        loop {
-            let (len, from) = self.socket.recv_from(buf).await?;
-            if from == self.target {
-                return Ok(len)
-            }
-
-            tracing::warn!("recv expect from [{}] but [{from}]", self.target);
-        }
-        
+        let len = self.socket.recv(buf).await?;
+        Ok(len)
     }
 
     async fn recv_buf<B: BufMut>(&self, buf: &mut B) -> Result<usize> {
-        loop {
-            let (len, from) = self.socket.recv_buf_from(buf).await?;
-            if from == self.target {
-                return Ok(len)
-            }
-
-            tracing::warn!("recv expect from [{}] but [{from}]", self.target);
-        }
-        
+        let len = self.socket.recv_buf(buf).await?;
+        Ok(len)
     }
 }
+
+// /// 用于控制 udp 是否要 connect
+// struct UdpSocketConn {
+//     socket: UdpSocket,
+//     target: SocketAddr,
+// }
+
+// impl UdpSocketConn {
+//     async fn try_new(socket: UdpSocket, target: SocketAddr) -> Result<Self> {
+//         Ok(Self {
+//             socket,
+//             target,
+//         })
+//     }
+
+//     fn local_addr(&self) -> Result<SocketAddr> {
+//         let addr = self.socket.local_addr()?;
+//         Ok(addr)
+//     }
+
+//     async fn send(&self, packet: &[u8]) -> Result<()> {
+//         self.socket.send_to(packet, self.target).await?;
+//         Ok(())
+//     }
+
+//     async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+//         loop {
+//             let (len, from) = self.socket.recv_from(buf).await?;
+//             if from == self.target {
+//                 return Ok(len)
+//             }
+
+//             tracing::warn!("recv expect from [{}] but [{from}]", self.target);
+//         }
+        
+//     }
+
+//     async fn recv_buf<B: BufMut>(&self, buf: &mut B) -> Result<usize> {
+//         loop {
+//             let (len, from) = self.socket.recv_buf_from(buf).await?;
+//             if from == self.target {
+//                 return Ok(len)
+//             }
+
+//             tracing::warn!("recv expect from [{}] but [{from}]", self.target);
+//         }
+        
+//     }
+// }
 
 
 async fn client_side_loop(listen_socket: UdpSocket, tun: &mut TunRecver) -> Result<()> {
@@ -248,14 +289,11 @@ async fn client_side_loop(listen_socket: UdpSocket, tun: &mut TunRecver) -> Resu
                     return Ok(());
                 };
 
-                assert!(packet.len() > 8, "invalid packet len {}", packet.len());
-                // assert!(packet.len() <= 1408, "invalid packet len {}", packet.len());
-                // let id = (&packet[packet.len()-8..]).get_u64();
-                // assert!(id < 100, "{id}");
+                assert!(packet.len() > META_LEN, "invalid packet len {}", packet.len());
 
-                let meta = parse_meta(&packet).with_context(||"client-send")?;
+                // let meta = parse_meta(&packet).with_context(||"client-send")?;
+                // debug!("send packet len [{}], [{meta:?}]", packet.len());
 
-                debug!("send packet len [{}], [{meta:?}]", packet.len());
                 let _r = tun.socket().send(&packet[..]).await;
                 
                 continue;
@@ -318,7 +356,7 @@ async fn server_side_loop(tun: &mut TunRecver, target: SocketAddr) -> Result<()>
         }
 
         for (id, packet) in tun.demux() {
-            debug!("recv packet len [{}], id [{:?}]", packet.len(), id);
+            // debug!("recv packet len [{}], id [{:?}]", packet.len(), id);
 
             let r = tun.send_packet_to_session((id, packet)).await;
             let Err((id, packet)) = r else {
@@ -408,12 +446,7 @@ impl TunRecver {
         let buf = self.buf.get_mut();
         let len = self.tun_socket.recv_buf(buf).await.with_context(||"tun socket recv failed")?;
 
-        // let mut buf = vec![0_u8; 1700];
-        // let len = self.tun_socket.recv(&mut buf).await.with_context(||"tun socket recv failed")?;
-        // self.buf.get_mut().put_slice(&buf[..len]);
-
         check_eof(len)?;
-        debug!("aaa recv_buf len [{len}]");
 
         Ok(())
     }
@@ -603,43 +636,6 @@ fn parse_meta(buf: &[u8]) -> Result<Meta> {
 }
 
 // const X25: crc::Crc<u16> = crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC);
-
-// #[allow(unused)]
-// #[derive(Debug)]
-// struct Tail {
-//     id: u64,
-//     csum: u16,
-// }
-
-// fn put_tail(buf: &mut BytesMut, id: u64) {    
-//     let id_bytes = id.to_be_bytes();
-//     buf.put_slice(&id_bytes[2..]);
-
-//     let csum = X25.checksum(&buf[..]);
-//     buf.put_u16(csum);
-// }
-
-
-// fn parse_tail(buf: &BytesMut, origin: &str) -> Tail {
-//     assert!(buf.len() >= TAIL_LEN, "{}, {origin}", buf.len());
-    
-//     let csum0 = X25.checksum(&buf[..buf.len()-2]);
-
-//     let tail = &buf[buf.len()-TAIL_LEN..];
-//     let bytes = [
-//         0, 0, 
-//         tail[0], tail[1], tail[2], tail[3], tail[4], tail[5]
-//     ];
-
-//     let id = u64::from_be_bytes(bytes);
-//     let csum = (&tail[6..]).get_u16();
-//     assert_eq!(csum, csum0, "{origin}, id {id}, len {}", buf.len()-TAIL_LEN);
-
-//     Tail {
-//         id,
-//         csum,
-//     }
-// }
 
 
 
