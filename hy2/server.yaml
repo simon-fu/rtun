@@ -1,8 +1,8 @@
 listen: :12777
 
 tls:
-  cert: /Users/simon/simon/src/rtun/hy2/self_signed_certs/cert.pem
-  key: /Users/simon/simon/src/rtun/hy2/self_signed_certs/key.pem
+  cert: self_signed_certs/cert.pem
+  key: self_signed_certs/key.pem
   
   # cert: __tls_cert__
   # key: __tls_key__
