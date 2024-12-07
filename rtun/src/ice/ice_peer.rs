@@ -326,7 +326,8 @@ impl IcePeer {
         // let select_addr = output.addr();
 
         let mut checker = self.make_checker(is_client, timeout)?;
-        debug!("start checking... (is_client {is_client}), {:?}", checker.config());
+        debug!("start checking (is_client {is_client})...");
+        // debug!("start checking... (is_client {is_client}), {:?}", checker.config());
 
         checker.kick_checking(Instant::now())?;
         udp_run_until_done(&socket, &mut checker).await?;

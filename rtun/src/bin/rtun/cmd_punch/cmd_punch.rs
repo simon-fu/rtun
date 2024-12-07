@@ -9,15 +9,18 @@
 
 
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, io, net::SocketAddr, sync::Arc, time::Duration};
 
+use bytes::{Buf, BufMut, BytesMut};
 use clap::Parser;
 use anyhow::{Context, Result};
 use dialoguer::{theme::ColorfulTheme, Input};
-use tokio::net::UdpSocket;
-use tracing::debug;
-use crate::init_log_and_run;
+use tokio::{net::UdpSocket, sync::mpsc};
+use tracing::{debug, info, span, Instrument, Level};
+use crate::{cmd_punch::udp_acceptor::{new_udp_reuseport_str, new_udp_reuseport_v4}, init_log_and_run};
 use rtun::ice::ice_peer::{IceArgs, IceConfig, IcePeer};
+
+use super::udp_acceptor::{UdpAcceptor, UdpBuf, UdpReceiver, UdpSender};
 
 
 pub fn run(args: CmdArgs) -> Result<()> { 
@@ -25,83 +28,76 @@ pub fn run(args: CmdArgs) -> Result<()> {
 }
 
 async fn do_run(args: CmdArgs) -> Result<()> {
-    debug!("hello {args:?}");
     
-    debug!("kick gather candidate, servers {:?}", args.servers);
+    info!("kick gather candidate, servers {:?}", args.ice_servers);
 
     let mut peer = IcePeer::with_config(IceConfig {
-        servers: args.servers,
+        servers: args.ice_servers,
         ..Default::default()
     });
 
-    let conn = match args.remote {
-        Some(remote) => {
-            let remote_args: IceArgs = serde_json::from_str(&remote).with_context(||"parse remote args failed")?;
-            let local_args = peer.server_gather(remote_args).await.with_context(||"server_gather failed")?;
-            debug!("local args [\n{}\n]", serde_json::to_string(&local_args)?);
-            peer.accept_timeout(Duration::from_secs(999999)).await.with_context(||"accept failed")?
-        },
-        None => {
-            let local_args = peer.client_gather().await?;
-            debug!("local args [\n{}\n]", serde_json::to_string(&local_args)?);
+    let conn = if args.as_server {
+        let remote_str: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("server: input remote args")
+        .interact_text().with_context(||"input remote args failed")?;
 
-            let remote_str: String = Input::with_theme(&ColorfulTheme::default())
-            .with_prompt("remote args")
-            .interact_text().with_context(||"input remote args failed")?;
+        let remote_args: IceArgs = serde_json::from_str(&remote_str).with_context(||"parse remote args failed")?;
+        
+        let local_args = peer.server_gather(remote_args).await.with_context(||"server_gather failed")?;
+        info!("local args \n\n{}\n\n", serde_json::to_string(&local_args)?);
+        peer.accept_timeout(Duration::from_secs(999999)).await.with_context(||"accept failed")?
 
-            let remote_args: IceArgs = serde_json::from_str(&remote_str).with_context(||"parse remote args failed")?;
+    } else {
+        let local_args = peer.client_gather().await?;
+        info!("local args \n\n{}\n\n", serde_json::to_string(&local_args)?);
 
-            peer.dial(remote_args).await.with_context(||"dial failed")?
-        },
+        let remote_str: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("client: input remote args")
+        .interact_text().with_context(||"input remote args failed")?;
+
+        let remote_args: IceArgs = serde_json::from_str(&remote_str).with_context(||"parse remote args failed")?;
+
+        peer.dial(remote_args).await.with_context(||"dial failed")?
     };
 
-    debug!("connected [{}] -> [{}]", conn.local_addr()?, conn.remote_addr());
+    info!("punch connected [{}] -> [{}]", conn.local_addr()?, conn.remote_addr());
     // let remote_addr = conn.remote_addr();
     let (socket, _cfg, remote_addr) = conn.into_parts();
-    // let conn = conn.into_async_udp();
-    let r = socket.connect(remote_addr).await.with_context(||"udp connect failed");
-    debug!("udp connect result {r:?}");
-    let socket = Arc::new(socket);
+    socket.connect(remote_addr).await.with_context(||"udp connect failed")?;
+    let tun_socket = Arc::new(socket);
 
     
     if let Some(listen_addr) = &args.relay_listen {
-        let src = UdpSocket::bind(listen_addr).await.with_context(||format!("failed to listen at [{listen_addr}]"))?;
-        debug!("listen at [{listen_addr}]");
-        let mut buf = vec![0_u8; 1700];
-        let (len , from) = src.recv_from(&mut buf).await.with_context(||"recv first failed")?;
-        debug!("recv first from [{from}], len [{len}]");
-        src.connect(from).await.with_context(||"connect to from failed")?;
-        socket.send(&buf[..len]).await.with_context(||"send first failed")?;
-        debug!("relay path: from[{from}] -> [{}] -> [{}] -> tunnel", src.local_addr()?, socket.local_addr()?);
-        relay_udp(&src, &socket).await
-    } else if let Some(target_addr) = &args.relay_to {
+        let src = new_udp_reuseport_str(listen_addr)?;
+        info!("listen at [{listen_addr}]");
+        let mut tun = TunRecver::new(tun_socket.clone());
+        client_side_loop(src, &mut tun).await
         
-        let listen_addr = "0.0.0.0:0";
-        let dst = UdpSocket::bind(listen_addr).await.with_context(||format!("failed to listen at [{listen_addr}]"))?;
-        dst.connect(target_addr).await.with_context(||"connect to target failed")?;
-        debug!("relay path: tunnel -> [{}] -> [{}] -> target[{target_addr}]", socket.local_addr()?, dst.local_addr()?);
-        relay_udp(&socket, &dst).await
+    } else if let Some(target_addr) = &args.relay_to {
+        let target_addr: SocketAddr = target_addr.parse().with_context(||format!("invalid target addr [{target_addr}]"))?;
+        let mut tun = TunRecver::new(tun_socket.clone());
+        server_side_loop( &mut tun, target_addr).await
 
     } else {
 
         {
-            let socket = socket.clone();
+            let socket = tun_socket.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0_u8; 1700];
                 loop {
                     let r = socket.recv(&mut buf).await;
-                    debug!("recv {r:?}");
+                    info!("recv {r:?}");
                 }
             });
         }
 
         for n in 0..5 {
             let content = format!("msg {n}");
-            let r = socket.send(content.as_bytes()).await.with_context(||"udp sen d failed");
-            debug!("No.{n}: sent result [{r:?}]");
+            let r = tun_socket.send(content.as_bytes()).await.with_context(||"udp sen d failed");
+            info!("No.{n}: sent result [{r:?}]");
     
             // let len = socket.send_to(content.as_bytes(), remote_addr).await.with_context(||"udp sen dto failed")?;
-            // debug!("sent len [{len}]");
+            // info!("sent len [{len}]");
     
             tokio::time::sleep(Duration::from_millis(1000)).await;
         }
@@ -109,43 +105,355 @@ async fn do_run(args: CmdArgs) -> Result<()> {
         Ok(())
     }
 
-
 }
 
-async fn relay_udp(src: &UdpSocket, dst: &UdpSocket) -> Result<()> {
-    let mut src_buf = vec![0_u8; 1700];
-    let mut dst_buf = vec![0_u8; 1700];
+
+async fn client_side_loop(listen_socket: UdpSocket, tun: &mut TunRecver) -> Result<()> {
+
+    let (mux_tx, mut mux_rx) = mpsc::channel::<BytesMut>(128);
+    let mut acceptor = UdpAcceptor::try_new(listen_socket)?;
+    
+    let mut next_id = 0_u64;
 
     loop {
+        // let buf = buf.get_mut();
+        let (conn, from) = tokio::select! {
+            r = acceptor.accept() => {
+                r.with_context(||"accept faield")?
+            }
+            r = tun.recv() => {
+                r?;
+                tun.demux_to_session().await;
+                continue;
+            }
+            r = mux_rx.recv() => {
+                let Some(packet) = r else {
+                    return Ok(());
+                };
+                let _r = tun.socket().send(&packet[..]).await;
+                continue;
+            }
+        };
+
+        next_id += 1;
+        let id = next_id;
+
+        debug!("new udp client from [{from}], id [{id}]");
+        
+
+        let (tx, rx) = mpsc::channel(256);
+
+        tun.add_sender(id, SessionSender {
+            tx,
+        });
+
+        let (sender, recver) = conn.split();
+        let (holder_tx, holder_rx) = mpsc::channel::<()>(1);
+
+        {
+            let span = span!(parent: None, Level::DEBUG, "client<-tun", id=&id);
+            tokio::spawn(async move {
+                let r = tun_to_client_loop(rx, sender, holder_rx).await;
+                debug!("finished {r:?}");
+            }.instrument(span));    
+        }
+
+        {
+            let tx = mux_tx.clone();
+            let span = span!(parent: None, Level::DEBUG, "client->tun", id=&id);
+            tokio::spawn(async move {
+                let r = client_to_tun_loop(id, recver, tx).await;
+                debug!("finished {r:?}");
+                drop(holder_tx);
+            }.instrument(span));  
+        }
+        
+    }
+}
+
+async fn server_side_loop(tun: &mut TunRecver, target: SocketAddr) -> Result<()> {
+
+    let (mux_tx, mut mux_rx) = mpsc::channel::<BytesMut>(128);
+
+    loop {
+
         tokio::select! {
-            r = src.recv(&mut src_buf) => {
-                let len = r.with_context(||"src recv failed")?;
-                let _r = dst.send(&src_buf[..len]).await;
+            r = mux_rx.recv() => {
+                let Some(packet) = r else {
+                    break;
+                };
+                let _r = tun.socket().send(&packet[..]).await;
+                continue;
             }
-            r = dst.recv(&mut dst_buf) => {
-                let len = r.with_context(||"dst recv failed")?;
-                let _r = src.send(&dst_buf[..len]).await;
+            r = tun.recv() => {
+                r?;
             }
+        }
+
+        let Some(v) = tun.demux() else {
+            continue;
+        };
+
+        let r = tun.send_packet_to_session(v).await;
+        let Err((id, packet)) = r else {
+            continue;
+        };
+
+        debug!("new session, id [{id}]");
+
+        let (tx, rx) = mpsc::channel(256);
+
+        let sender = SessionSender {
+            tx,
+        };
+
+        let _r = sender.tx.send(packet).await;
+
+        tun.add_sender(id, sender);
+
+        // let socket = UdpSocket::bind("0.0.0.0:0").await.with_context(||"bind session socket failed")?;
+        let socket = new_udp_reuseport_v4().with_context(||"bind session socket failed")?;
+        socket.connect(target).await.with_context(||"connect to target failed")?;
+        let socket = Arc::new(socket);
+
+        let (holder_tx, holder_rx) = mpsc::channel::<()>(1);
+
+        {
+            let socket = socket.clone();
+            let span = span!(parent: None, Level::DEBUG, "tun->target", id=&id);
+            tokio::spawn(async move {
+                let r = tun_to_target_loop(rx, &socket, holder_rx).await;
+                debug!("finished {r:?}");
+            }.instrument(span));    
+        }
+
+        {
+            let tx = mux_tx.clone();
+            let span = span!(parent: None, Level::DEBUG, "tun<-target", id=&id);
+            tokio::spawn(async move {
+                let r = target_to_tun_loop(id, &socket, tx).await;
+                debug!("finished {r:?}");
+                drop(holder_tx);
+            }.instrument(span));  
+        }
+    }
+    Ok(())
+}
+
+
+
+
+struct SessionSender {
+    tx: mpsc::Sender<BytesMut>,
+}
+
+struct TunRecver {
+    tun_socket: Arc<UdpSocket>,
+    senders: HashMap<u64, SessionSender>,
+    buf: UdpBuf,
+}
+
+impl TunRecver {
+    fn new(tun_socket: Arc<UdpSocket>) -> Self {
+        Self {
+            tun_socket,
+            senders: Default::default(),
+            buf: Default::default(),
+        }
+    }
+
+    fn socket(&self) -> &Arc<UdpSocket> {
+        &self.tun_socket
+    }
+
+    fn add_sender(&mut self, id: u64, sender: SessionSender) {
+        self.senders.insert(id, sender);
+    }
+
+    async fn recv(&mut self) -> Result<()> {
+
+        let buf = self.buf.get_mut();
+
+        let len = self.tun_socket.recv_buf(buf).await.with_context(||"tun socket recv failed")?;
+        check_eof(len)?;
+
+        Ok(())
+    }
+
+    fn demux(&mut self) -> Option<(u64, BytesMut)> {
+        let buf = self.buf.get_mut();
+
+        let len = buf.len();
+
+        if len < 8 {
+            debug!("tun packet too short [{len}] < 8");
+            buf.clear();
+            return None
+        }
+
+        let packet = buf.split_to(len-8);
+        let id = buf.get_u64();
+
+        Some((id, packet))
+    }
+
+    async fn demux_to_session(&mut self) {
+        if let Some(v) = self.demux() {
+            let _r = self.send_packet_to_session(v).await;
+        }
+    }
+
+    async fn send_packet_to_session(&mut self, (id, packet): (u64, BytesMut)) -> Result<(), (u64, BytesMut)> {
+        match self.senders.get(&id) {
+            Some(sender) => {
+                let r = sender.tx.send(packet).await;
+                if r.is_err() {
+                    self.senders.remove(&id);
+                }
+                Ok(())
+            },
+            None => Err((id, packet)),
         }
     }
 }
+
+async fn client_to_tun_loop(id: u64, mut socket: UdpReceiver, tx: mpsc::Sender<BytesMut>) -> Result<()> {
+    let mut src_buf = UdpBuf::default();
+
+    loop {
+        let buf = src_buf.get_mut();
+
+        let r = tokio::select! {
+            r = socket.recv_buf(buf) => {
+                r
+            }
+            _r = tokio::time::sleep(TIMEOUT) => {
+                return timeout();
+            }
+        };
+
+        let len = r.with_context(||"recv from target faield")?;
+        check_eof(len)?;
+
+        buf.put_u64(id);
+        
+        let packet = buf.split_to(len+8);
+        // debug!("packet len [{len}]");
+
+        let r = tx.send(packet).await;
+        if r.is_err() {
+            debug!("tun has closed");
+            return Ok(())
+        }
+    }
+}
+
+async fn tun_to_client_loop(mut rx: mpsc::Receiver<BytesMut>, socket: UdpSender, mut holder_rx: mpsc::Receiver<()>) -> Result<()> {
+    loop {
+
+        let r = tokio::select! {
+            r = rx.recv() => r,
+            _r = holder_rx.recv() => return Ok(()),
+        };
+
+        let Some(packet) = r else {
+            debug!("tun has closed");
+            return Ok(())
+        };
+
+        let _r = socket.send(&packet[..]).await;
+    }
+}
+
+
+async fn tun_to_target_loop(mut rx: mpsc::Receiver<BytesMut>, socket: &UdpSocket, mut holder_rx: mpsc::Receiver<()>) -> Result<()> {
+    loop {
+        let r = tokio::select! {
+            r = rx.recv() => {
+                r    
+            }
+            _r = holder_rx.recv() => {
+                return Ok(())
+            }
+        };
+
+        // let r = rx.recv().await;
+
+        let Some(packet) = r else {
+            debug!("tun has closed");
+            return Ok(())
+        };
+
+        // debug!("packet len [{}]", packet.len());
+
+        let _r = socket.send(&packet[..]).await;
+    }
+}
+
+async fn target_to_tun_loop(id: u64, socket: &UdpSocket, tx: mpsc::Sender<BytesMut>) -> Result<()> {
+    let mut src_buf = UdpBuf::default();
+
+    loop {
+        let buf = src_buf.get_mut();
+        
+        let r = tokio::select! {
+            r = socket.recv_buf(buf) => {
+                r
+            }
+            _r = tokio::time::sleep(TIMEOUT) => {
+                return timeout();
+            }
+        };
+
+        let len = r.with_context(||"recv from target faield")?;
+        check_eof(len)?;
+
+        buf.put_u64(id);
+        
+        let packet = buf.split_to(len+8);
+
+        let r = tx.send(packet).await;
+        if r.is_err() {
+            debug!("tun has closed");
+            return Ok(())
+        }
+    }
+}
+
+#[inline]
+fn check_eof(len: usize) -> Result<()> {
+    if len == 0 {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into())
+    } else {
+        Ok(())
+    }
+}
+
+#[inline]
+fn timeout() -> Result<()> {
+    Err(io::Error::from(io::ErrorKind::TimedOut).into())
+}
+
+const TIMEOUT: Duration = Duration::from_secs(5*60);
+
+
 
 // refer https://github.com/clap-rs/clap/tree/master/clap_derive/examples
 #[derive(Parser, Debug)]
 #[clap(name = "punch", author, about, version)]
 pub struct CmdArgs {
     #[clap(
-        short = 's',
-        long = "server",
+        long = "ice-server",
         long_help = "stun/turn server address, eg. stun:stun.miwifi.com:3478",
     )]
-    servers: Vec<String>,
+    ice_servers: Vec<String>,
 
     #[clap(
-        long = "remote",
-        long_help = "remote ice args, run as server",
+        short = 's',
+        long_help = "run as server",
     )]
-    remote: Option<String>,
+    as_server: bool,
+
 
     #[clap(
         long = "relay-listen",
@@ -160,10 +468,5 @@ pub struct CmdArgs {
     relay_to: Option<String>,
 }
 
-// #[derive(Parser, Debug)]
-// pub enum SubCmd {
-//     Agent(sub_agent::CmdArgs),
-//     Bridge(sub_bridge::CmdArgs),
-// }
 
 
