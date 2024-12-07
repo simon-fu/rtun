@@ -43,6 +43,10 @@ pub mod cmd_punch;
 
 pub mod cmd_quic;
 
+pub mod cmd_echo;
+
+pub mod cmd_bench;
+
 pub mod terminal;
 
 pub mod client_ch_pty;
@@ -70,6 +74,8 @@ enum SubCmd {
     Udp(cmd_udp::CmdArgs),
     Quic(cmd_quic::CmdArgs),
     Punch(cmd_punch::CmdArgs),
+    Echo(cmd_echo::CmdArgs),
+    Bench(cmd_bench::CmdArgs),
 }
 
 fn main() -> Result<()> {
@@ -82,6 +88,8 @@ fn main() -> Result<()> {
         SubCmd::Udp(args) => cmd_udp::run(args),
         SubCmd::Quic(args) => cmd_quic::run(args),
         SubCmd::Punch(args) => cmd_punch::run(args),
+        SubCmd::Echo(args) => cmd_echo::run(args),
+        SubCmd::Bench(args) => cmd_bench::run(args),
     }
 
     // init_log();

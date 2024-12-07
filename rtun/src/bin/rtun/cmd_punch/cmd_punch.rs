@@ -30,7 +30,7 @@ pub fn run(args: CmdArgs) -> Result<()> {
 
 async fn do_run(args: CmdArgs) -> Result<()> {
     
-    info!("kick gather candidate, servers {:?}", args.ice_servers);
+    // info!("kick gather candidate, ice_servers {:?}", args.ice_servers);
 
     let mut peer = IcePeer::with_config(IceConfig {
         servers: args.ice_servers,
