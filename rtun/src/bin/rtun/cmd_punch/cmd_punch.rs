@@ -354,9 +354,13 @@ impl TunRecver {
 
     async fn recv(&mut self) -> Result<()> {
 
-        let buf = self.buf.get_mut();
+        // let buf = self.buf.get_mut();
+        // let (len, _from) = self.tun_socket.recv_buf_from(buf).await.with_context(||"tun socket recv failed")?;
 
-        let (len, _from) = self.tun_socket.recv_buf_from(buf).await.with_context(||"tun socket recv failed")?;
+        let mut buf = vec![0_u8; 1700];
+        let (len, _from) = self.tun_socket.recv_from(&mut buf).await.with_context(||"tun socket recv failed")?;
+        self.buf.get_mut().put_slice(&buf[..len]);
+
         check_eof(len)?;
         debug!("aaa recv_buf len [{len}]");
 
