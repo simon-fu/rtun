@@ -60,10 +60,12 @@ async fn do_run(args: CmdArgs) -> Result<()> {
         peer.dial(remote_args).await.with_context(||"dial failed")?
     };
 
-    info!("punch connected [{}] -> [{}]", conn.local_addr()?, conn.remote_addr());
+    
     // let remote_addr = conn.remote_addr();
     let (socket, _cfg, remote_addr) = conn.into_parts();
     socket.connect(remote_addr).await.with_context(||"udp connect failed")?;
+    info!("punch connected [{}] -> [{}]", socket.local_addr()?, remote_addr);
+
     let tun_socket = Arc::new(socket);
 
     
@@ -81,25 +83,63 @@ async fn do_run(args: CmdArgs) -> Result<()> {
     } else {
 
         {
+            let span = span!(parent: None, Level::DEBUG, "recv-verify");
             let socket = tun_socket.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0_u8; 1700];
+                let mut next_seq = 0_u64;
                 loop {
                     let r = socket.recv(&mut buf).await;
-                    info!("recv {r:?}");
+
+                    let len = match r {
+                        Ok(len) => len,
+                        Err(e) => {
+                            tracing::warn!("recv error [{e:?}]");
+                            continue;
+                        },
+                    };
+
+                    if len != 8 {
+                        tracing::warn!("invalid len [{len}], seq [{next_seq}]");
+                        continue;
+                    }
+
+                    let seq = (&buf[..8]).get_u64();
+                    if seq != next_seq {
+                        tracing::warn!("expect seq [{next_seq}], but [{seq}]");
+                        if seq > next_seq {
+                            next_seq = seq + 1;
+                        }
+                        continue;
+                    }
+                    info!("recv seq [{seq}] ok");
+                    next_seq += 1;
+                    
                 }
-            });
+            }.instrument(span));
         }
 
-        for n in 0..5 {
-            let content = format!("msg {n}");
-            let r = tun_socket.send(content.as_bytes()).await.with_context(||"udp sen d failed");
-            info!("No.{n}: sent result [{r:?}]");
+        let mut buf = BytesMut::new();
+        for n in 0..300_u64 {
+            // let content = format!("msg {n}");
+            // let r = tun_socket.send(content.as_bytes()).await.with_context(||"udp 
+            buf.put_u64(n);
+            let packet = buf.split_to(8);
+            let r = tun_socket.send(&packet[..]).await.with_context(||"udp sen d failed");
+
+            match r {
+                Ok(_len) => {
+                    // info!("No.{n}:  sent len [{_len}]");
+                },
+                Err(e) => {
+                    tracing::warn!("No.{n}: send error [{e:?}]");
+                },
+            }
     
             // let len = socket.send_to(content.as_bytes(), remote_addr).await.with_context(||"udp sen dto failed")?;
             // info!("sent len [{len}]");
     
-            tokio::time::sleep(Duration::from_millis(1000)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
         }
     
         Ok(())
@@ -110,7 +150,7 @@ async fn do_run(args: CmdArgs) -> Result<()> {
 
 async fn client_side_loop(listen_socket: UdpSocket, tun: &mut TunRecver) -> Result<()> {
 
-    let (mux_tx, mut mux_rx) = mpsc::channel::<BytesMut>(128);
+    let (mux_tx, mut mux_rx) = mpsc::channel::<BytesMut>(256);
     let mut acceptor = UdpAcceptor::try_new(listen_socket)?;
     
     let mut next_id = 0_u64;
@@ -173,7 +213,7 @@ async fn client_side_loop(listen_socket: UdpSocket, tun: &mut TunRecver) -> Resu
 
 async fn server_side_loop(tun: &mut TunRecver, target: SocketAddr) -> Result<()> {
 
-    let (mux_tx, mut mux_rx) = mpsc::channel::<BytesMut>(128);
+    let (mux_tx, mut mux_rx) = mpsc::channel::<BytesMut>(256);
 
     loop {
 
