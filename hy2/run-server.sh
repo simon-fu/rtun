@@ -16,4 +16,4 @@ cp $CURR_DIR/server.yaml $CFG_FILE
 # sed -i "s#__tls_cert__#$CERT_FILE#g" $CFG_FILE
 # sed -i "s#__tls_key__#$KEY_FILE#g" $CFG_FILE
 
-$CURR_DIR/hysteria-darwin-arm64 server -c $CFG_FILE
+$CURR_DIR/hysteria server -c $CFG_FILE
