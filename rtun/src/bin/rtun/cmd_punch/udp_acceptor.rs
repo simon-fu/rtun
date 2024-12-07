@@ -269,7 +269,7 @@ impl UdpBuf {
     #[inline]
     pub fn get_mut(&mut self) -> &mut BytesMut {
         
-        const RESERV_BUF_SIZE: usize = 1024*8;
+        
 
         let mut_len = self.buf.capacity() - self.buf.len();
 
@@ -283,7 +283,11 @@ impl UdpBuf {
     }
 }
 
-const MIN_BUF_SIZE: usize = 1700;
+const RESERV_BUF_SIZE: usize = 1024*32;
+const MIN_BUF_SIZE: usize = 1024*4;
+
+// const RESERV_BUF_SIZE: usize = 1024*8;
+// const MIN_BUF_SIZE: usize = 1700;
 
 
 
