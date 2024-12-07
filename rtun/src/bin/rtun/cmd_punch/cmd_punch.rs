@@ -176,8 +176,16 @@ async fn kick_echo_server(listen_addr: SocketAddr) -> Result<()> {
             };
 
             num += 1;
-            info!("recv num [{num}] from [{from}]");
-            let r = socket.send_to(&buf[..len], from).await;
+            let packet = &buf[..len];
+
+            let seq = if len == 8 {
+                Some((&packet[..]).get_u64())
+            } else {
+                None
+            };
+
+            info!("recv num [{num}], from [{from}], len [{len}], seq {seq:?}");
+            let r = socket.send_to(packet, from).await;
             match r {
                 Ok(_v) => {},
                 Err(e) => {
