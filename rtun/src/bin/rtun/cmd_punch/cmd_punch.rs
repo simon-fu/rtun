@@ -66,10 +66,14 @@ async fn do_run(args: CmdArgs) -> Result<()> {
     
     // let remote_addr = conn.remote_addr();
     let (socket, _cfg, remote_addr) = conn.into_parts();
-    socket.connect(remote_addr).await.with_context(||"udp connect failed")?;
-    info!("punch connected [{}] -> [{}]", socket.local_addr()?, remote_addr);
+    // socket.connect(remote_addr).await.with_context(||"udp connect failed")?;
+    let tun_socket: Arc<UdpSocketConn> = Arc::new(UdpSocketConn {
+        socket,
+        target: remote_addr,
+    });
+    info!("punch connected [{}] -> [{}]", tun_socket.local_addr()?, remote_addr);
 
-    let tun_socket = Arc::new(socket);
+    // let tun_socket = Arc::new(socket);
 
     const HELLO: &str = "hello punch";
     if !as_server {
@@ -176,6 +180,35 @@ async fn do_run(args: CmdArgs) -> Result<()> {
         Ok(())
     }
 
+}
+
+struct UdpSocketConn {
+    socket: UdpSocket,
+    target: SocketAddr,
+}
+
+impl UdpSocketConn {
+    fn local_addr(&self) -> Result<SocketAddr> {
+        let addr = self.socket.local_addr()?;
+        Ok(addr)
+    }
+
+    async fn send(&self, packet: &[u8]) -> Result<()> {
+        self.socket.send_to(packet, self.target).await?;
+        Ok(())
+    }
+
+    async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+        loop {
+            let (len, from) = self.socket.recv_from(buf).await?;
+            if from == self.target {
+                return Ok(len)
+            }
+
+            tracing::warn!("recv expect from [{}] but [{from}]", self.target);
+        }
+        
+    }
 }
 
 
@@ -330,13 +363,13 @@ struct SessionSender {
 }
 
 struct TunRecver {
-    tun_socket: Arc<UdpSocket>,
+    tun_socket: Arc<UdpSocketConn>,
     senders: HashMap<u64, SessionSender>,
     buf: UdpBuf,
 }
 
 impl TunRecver {
-    fn new(tun_socket: Arc<UdpSocket>) -> Self {
+    fn new(tun_socket: Arc<UdpSocketConn>) -> Self {
         Self {
             tun_socket,
             senders: Default::default(),
@@ -344,7 +377,7 @@ impl TunRecver {
         }
     }
 
-    fn socket(&self) -> &Arc<UdpSocket> {
+    fn socket(&self) -> &Arc<UdpSocketConn> {
         &self.tun_socket
     }
 
@@ -358,7 +391,7 @@ impl TunRecver {
         // let (len, _from) = self.tun_socket.recv_buf_from(buf).await.with_context(||"tun socket recv failed")?;
 
         let mut buf = vec![0_u8; 1700];
-        let (len, _from) = self.tun_socket.recv_from(&mut buf).await.with_context(||"tun socket recv failed")?;
+        let len = self.tun_socket.recv(&mut buf).await.with_context(||"tun socket recv failed")?;
         self.buf.get_mut().put_slice(&buf[..len]);
 
         check_eof(len)?;
