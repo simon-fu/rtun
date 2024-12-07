@@ -204,10 +204,12 @@ async fn client_side_loop(listen_socket: UdpSocket, tun: &mut TunRecver) -> Resu
 
                 assert!(packet.len() > 8, "invalid packet len {}", packet.len());
                 // assert!(packet.len() <= 1408, "invalid packet len {}", packet.len());
-                let id = (&packet[packet.len()-8..]).get_u64();
+                // let id = (&packet[packet.len()-8..]).get_u64();
                 // assert!(id < 100, "{id}");
 
-                debug!("send packet len [{}], id [{}]", packet.len()-8, id);
+                let tail = parse_tail(&packet, "client-send");
+
+                debug!("send packet len [{}], [{tail:?}]", packet.len()-TAIL_LEN);
                 let _r = tun.socket().send(&packet[..]).await;
                 
                 continue;
@@ -272,9 +274,9 @@ async fn server_side_loop(tun: &mut TunRecver, target: SocketAddr) -> Result<()>
         let Some(v) = tun.demux() else {
             continue;
         };
-        debug!("recv packet len [{}], id [{}]", v.1.len(), v.0);
+        debug!("recv packet len [{}], tail [{:?}]", v.1.len(), v.0);
 
-        let r = tun.send_packet_to_session(v).await;
+        let r = tun.send_packet_to_session((v.0.id, v.1)).await;
         let Err((id, packet)) = r else {
             continue;
         };
@@ -360,7 +362,7 @@ impl TunRecver {
         Ok(())
     }
 
-    fn demux(&mut self) -> Option<(u64, BytesMut)> {
+    fn demux(&mut self) -> Option<(Tail, BytesMut)> {
         let buf = self.buf.get_mut();
 
         let len = buf.len();
@@ -371,15 +373,18 @@ impl TunRecver {
             return None
         }
 
-        let packet = buf.split_to(len-8);
-        let id = buf.get_u64();
+        let tail = parse_tail(buf, "TunRecver.demux");
 
-        Some((id, packet))
+        let packet = buf.split_to(len-TAIL_LEN);
+        buf.advance(TAIL_LEN);
+        // let id = buf.get_u64();
+
+        Some((tail, packet))
     }
 
     async fn demux_to_session(&mut self) {
         if let Some(v) = self.demux() {
-            let _r = self.send_packet_to_session(v).await;
+            let _r = self.send_packet_to_session((v.0.id, v.1)).await;
         }
     }
 
@@ -415,11 +420,12 @@ async fn client_to_tun_loop(id: u64, mut socket: UdpReceiver, tx: mpsc::Sender<B
         let len = r.with_context(||"recv from target faield")?;
         check_eof(len)?;
 
-        buf.put_u64(id);
+        // buf.put_u64(id);
+        put_tail(buf, id);
         
         let packet = buf.split_to(len+8);
         assert!(buf.is_empty(), "buf len {}", buf.len());
-        // debug!("packet len [{len}]");
+        // debug!("mux packet len [{}]", packet.len());
 
         let r = tx.send(packet).await;
         if r.is_err() {
@@ -445,6 +451,47 @@ async fn tun_to_client_loop(mut rx: mpsc::Receiver<BytesMut>, socket: UdpSender,
         let _r = socket.send(&packet[..]).await;
     }
 }
+
+const X25: crc::Crc<u16> = crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC);
+const TAIL_LEN: usize = 8;
+
+#[allow(unused)]
+#[derive(Debug)]
+struct Tail {
+    id: u64,
+    csum: u16,
+}
+
+fn put_tail(buf: &mut BytesMut, id: u64) {    
+    let id_bytes = id.to_be_bytes();
+    buf.put_slice(&id_bytes[2..]);
+
+    let csum = X25.checksum(&buf[..]);
+    buf.put_u16(csum);
+}
+
+
+fn parse_tail(buf: &BytesMut, origin: &str) -> Tail {
+    assert!(buf.len() >= TAIL_LEN, "{}, {origin}", buf.len());
+    
+    let csum0 = X25.checksum(&buf[..buf.len()-2]);
+
+    let tail = &buf[buf.len()-TAIL_LEN..];
+    let bytes = [
+        0, 0, 
+        tail[0], tail[1], tail[2], tail[3], tail[4], tail[5]
+    ];
+
+    let id = u64::from_be_bytes(bytes);
+    let csum = (&tail[6..]).get_u16();
+    assert_eq!(csum, csum0, "{origin}, id {id}, len {}", buf.len()-TAIL_LEN);
+
+    Tail {
+        id,
+        csum,
+    }
+}
+
 
 
 async fn tun_to_target_loop(mut rx: mpsc::Receiver<BytesMut>, socket: &UdpSocket, mut holder_rx: mpsc::Receiver<()>) -> Result<()> {
@@ -489,9 +536,10 @@ async fn target_to_tun_loop(id: u64, socket: &UdpSocket, tx: mpsc::Sender<BytesM
         let len = r.with_context(||"recv from target faield")?;
         check_eof(len)?;
 
-        buf.put_u64(id);
+        // buf.put_u64(id);
+        put_tail(buf, id);
         
-        let packet = buf.split_to(len+8);
+        let packet = buf.split_to(len+TAIL_LEN);
 
         let r = tx.send(packet).await;
         if r.is_err() {
