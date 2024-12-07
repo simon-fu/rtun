@@ -358,6 +358,7 @@ impl TunRecver {
 
         let len = self.tun_socket.recv_buf(buf).await.with_context(||"tun socket recv failed")?;
         check_eof(len)?;
+        debug!("aaa recv_buf len [{len}]");
 
         Ok(())
     }
