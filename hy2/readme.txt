@@ -13,5 +13,7 @@ rtun punch -s --ice-server stun:stun.miwifi.com:3478 --relay-to 127.0.0.1:12777
 
 client-side
 ===========
+rtun shell "https://rtun.rtcsdk.com:9888" --secret SECRET --agent mydocker
+
 rtun punch --ice-server stun:stun.miwifi.com:3478 --relay-listen 0.0.0.0:13777
 ./run-client.sh
