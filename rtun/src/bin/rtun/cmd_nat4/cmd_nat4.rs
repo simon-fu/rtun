@@ -1,3 +1,8 @@
+/*
+    ./rtun nat4 nat4 -t 221.221.153.138:12333 --ttl 6 --count 512
+
+    ./rtun nat4 nat3 -l 0.0.0.0:12333 -t 36.112.207.162 --batch-interval 3000 --interval 500 --count 512
+*/
 use std::{collections::{HashMap, HashSet}, net::{IpAddr, SocketAddr}, sync::Arc, time::{Duration, Instant}, u64};
 
 use clap::Parser;
