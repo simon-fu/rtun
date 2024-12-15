@@ -28,6 +28,7 @@ async fn run_nat3(args: Nat3SendCmdArgs) -> Result<()> {
     }
 
     let socket = Arc::new(socket);
+    let local = socket.local_addr().with_context(||"get local address failed")?;
 
     let text = Arc::new(
         args.content.as_deref()
@@ -94,7 +95,7 @@ async fn run_nat3(args: Nat3SendCmdArgs) -> Result<()> {
                 break;
             }
 
-            info!("sent num [{num}]");
+            info!("sent num [{num}]: [{local}] => [{target_ip}]");
             tokio::time::sleep(interval).await;
         }
     }
