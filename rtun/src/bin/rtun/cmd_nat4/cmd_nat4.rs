@@ -186,6 +186,7 @@ async fn recv_loop(socket: Arc<UdpSocket>, text: &str, shared: &Arc<Shared>) -> 
 }
 
 async fn send_loop(socket: Arc<UdpSocket>, target: SocketAddr, content: &[u8], interval: Duration, shared: &Arc<Shared>) -> Result<()> {
+    let local = socket.local_addr().with_context(||"get local address failed")?;
     loop {
         {
             if !shared.connecteds.lock().is_empty() {
@@ -193,7 +194,7 @@ async fn send_loop(socket: Arc<UdpSocket>, target: SocketAddr, content: &[u8], i
             }
         }
         let len = socket.send_to(content, target).await.with_context(||"send_to failed")?;
-        info!("sent bytes [{len}] to [{target:?}]");
+        info!("sent to [{local}] => [{target}]: bytes [{len}]");
         tokio::time::sleep(interval).await;
     }
 }
