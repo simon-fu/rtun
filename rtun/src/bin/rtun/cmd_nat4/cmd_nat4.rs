@@ -1,7 +1,8 @@
-use std::{collections::HashMap, net::{IpAddr, SocketAddr}, sync::Arc, time::{Duration, Instant}, u64};
+use std::{collections::{HashMap, HashSet}, net::{IpAddr, SocketAddr}, sync::Arc, time::{Duration, Instant}, u64};
 
 use clap::Parser;
 use anyhow::{Context as _, Result};
+use futures::StreamExt;
 use parking_lot::Mutex;
 use rand::Rng as _;
 use tokio::net::UdpSocket;
@@ -19,10 +20,16 @@ async fn do_run(args: CmdArgs) -> Result<()> {
 }
 
 async fn run_nat3(args: Nat3SendCmdArgs) -> Result<()> { 
+    let target_ip: IpAddr = args.target.parse().with_context(||"invalid target ip")?;
+    let interval = Duration::from_millis(args.interval);
+    let batch_interval = Duration::from_millis(args.batch_interval);
+
+    let ttl = args.ttl;
+
     let socket = UdpSocket::bind(&args.listen).await
         .with_context(||format!("failed to bind socket addr [{}]", args.listen))?;
 
-    if let Some(ttl) = args.ttl {
+    if let Some(ttl) = ttl {
         socket.set_ttl(ttl).with_context(||"set ttl failed")?;
         info!("set ttl [{ttl}]")
     }
@@ -53,22 +60,29 @@ async fn run_nat3(args: Nat3SendCmdArgs) -> Result<()> {
     }
 
 
-    let target_ip: IpAddr = args.target.parse().with_context(||"invalid target ip")?;
-    let interval = Duration::from_millis(args.interval);
-    let batch_interval = Duration::from_millis(args.batch_interval);
+    
     
 
     let mut has_recv = false;
     let mut num = 0_usize;
+    let mut try_ports = HashSet::with_capacity(30000);
 
     while !has_recv {
         let start_time = Instant::now();
         let mut targets = Vec::with_capacity(args.count);
+
         for _ in 0..args.count {
+            
+            loop {
+                let port = rand::thread_rng().gen_range(1024..=u16::MAX);
+                if !try_ports.contains(&port) {
+                    try_ports.insert(port);
+                    let target = SocketAddr::new(target_ip, port);
+                    targets.push(target);
+                    break;
+                }
+            }
             num += 1;
-            let port = rand::thread_rng().gen_range(1024..=u16::MAX);
-            let target = SocketAddr::new(target_ip, port);
-            targets.push(target);
         }
 
         while start_time.elapsed() < batch_interval {
@@ -119,6 +133,14 @@ async fn run_nat4(args: Nat4SendCmdArgs) -> Result<()> {
         connecteds: Default::default(),
     });
 
+    let ttl = match args.ttl {
+        Some(ttl) => Some(ttl),
+        None => {
+            let hops = ping_and_half_hops(target.ip()).await.with_context(||"ping_and_get_hops failed")?;
+            hops
+        }
+    };
+
     let mut send_tasks = Vec::with_capacity(args.count);
 
     for _ in 0..args.count {
@@ -126,10 +148,10 @@ async fn run_nat4(args: Nat4SendCmdArgs) -> Result<()> {
         let socket = UdpSocket::bind(listen).await
             .with_context(||format!("failed to bind socket addr [{}]", listen))?;
 
-        if let Some(ttl) = args.ttl {
-            socket.set_ttl(ttl).with_context(||"set ttl failed")?;
-            info!("set ttl [{ttl}]")
-        }
+        // if let Some(ttl) = ttl {
+        //     socket.set_ttl(ttl).with_context(||"set ttl failed")?;
+        //     info!("set ttl [{ttl}]")
+        // }
 
         let socket = Arc::new(socket);
 
@@ -145,12 +167,27 @@ async fn run_nat4(args: Nat4SendCmdArgs) -> Result<()> {
         }
 
         {
-            let socket = socket.clone();
-            let content = text.clone();
-            let shared = shared.clone();
+            let sender = UdpSender {
+                socket: socket.clone(),
+                shared: shared.clone(),
+                text: text.clone(),
+                target,
+                interval,
+                
+            };
+
+            if let Some(ttl) = ttl {
+                sender.prepare_ttl(ttl).await.with_context(||"prepare_ttl failed")?;
+            }
+
+            
+            // let socket = socket.clone();
+            // let content = text.clone();
+            // let shared = shared.clone();
 
             let task = tokio::spawn(async move {
-                let r = send_loop(socket, target, content.as_bytes(), interval, &shared).await;
+                // let r = send_loop(socket, target, content.as_bytes(), interval, &shared).await;
+                let r = sender.send_loop().await;
                 info!("send finished [{r:?}]");
             });
 
@@ -164,6 +201,71 @@ async fn run_nat4(args: Nat4SendCmdArgs) -> Result<()> {
 
     shared.send_conn(&text, interval).await
 
+}
+
+async fn ping_and_half_hops(host: IpAddr) -> Result<Option<u32>> {
+    let Some(ttl) = ping_host(host).await? else {
+        return Ok(None)
+    };
+
+    info!("ping return ttl [{ttl}]");
+
+    let hops = if ttl <= 64 {
+        64 - ttl
+    } else if ttl <= 128{
+        128 - ttl
+    } else {
+        return Ok(None)
+    };
+
+    let half = hops / 2;
+    if half == 0 {
+        return Ok(None)
+    }
+    
+    info!("ping return half hops [{half}]");
+    Ok(Some(half))
+}
+
+async fn ping_host(host: IpAddr) -> Result<Option<u32>> {
+    info!("try ping host [{host}]...");
+
+    let payload = [0; 8];
+
+    let config = match host {
+        IpAddr::V4(_) => surge_ping::Config::default(),
+        IpAddr::V6(_) => surge_ping::Config::builder().kind(surge_ping::ICMP::V6).build(),
+    };
+    let client = surge_ping::Client::new(&config)?;
+    
+    let mut futs = futures::stream::FuturesUnordered::new();
+    for seq in 0..3 {
+        let client = client.clone();
+        futs.push(async move {
+            let mut pinger = client.pinger(host, surge_ping::PingIdentifier(rand::random())).await;
+            pinger.ping(surge_ping::PingSequence(seq), &payload).await
+        });
+
+        // let r = pinger.ping(surge_ping::PingSequence(seq), &payload).await;
+    }
+    
+    while let Some(r) = futs.next().await {
+        info!("ping result: {r:?}");
+        match r {
+            Ok((packet, _d)) => {
+                let ttl = match packet {
+                    surge_ping::IcmpPacket::V4(p) => p.get_ttl().map(|x|x as u32),
+                    surge_ping::IcmpPacket::V6(p) => Some(p.get_max_hop_limit() as u32),
+                };
+                if let Some(ttl) = ttl {
+                    return Ok(Some(ttl))
+                }
+            },
+            Err(_) => {},
+        }
+    }
+
+    Ok(None)
 }
 
 async fn recv_loop(socket: Arc<UdpSocket>, text: &str, shared: &Arc<Shared>) -> Result<()> {
@@ -186,19 +288,53 @@ async fn recv_loop(socket: Arc<UdpSocket>, text: &str, shared: &Arc<Shared>) -> 
     }
 }
 
-async fn send_loop(socket: Arc<UdpSocket>, target: SocketAddr, content: &[u8], interval: Duration, shared: &Arc<Shared>) -> Result<()> {
-    let local = socket.local_addr().with_context(||"get local address failed")?;
-    loop {
-        {
-            if !shared.connecteds.lock().is_empty() {
-                return Ok(())
+struct UdpSender {
+    socket: Arc<UdpSocket>, 
+    target: SocketAddr, 
+    text: Arc<String>, 
+    interval: Duration, 
+    shared: Arc<Shared>,
+}
+
+impl UdpSender {
+    async fn send_loop(&self) -> Result<()> {
+        let local = self.socket.local_addr().with_context(||"get local address failed")?;
+        loop {
+            {
+                if !self.shared.connecteds.lock().is_empty() {
+                    return Ok(())
+                }
             }
+            let len = self.socket.send_to(self.text.as_bytes(), self.target).await.with_context(||"send_to failed")?;
+            info!("sent to [{local}] => [{}]: bytes [{len}]", self.target);
+            tokio::time::sleep(self.interval).await;
         }
-        let len = socket.send_to(content, target).await.with_context(||"send_to failed")?;
-        info!("sent to [{local}] => [{target}]: bytes [{len}]");
-        tokio::time::sleep(interval).await;
+    }
+
+    async fn prepare_ttl(&self, max_ttl: u32) -> Result<()> {
+        let local = self.socket.local_addr().with_context(||"get local address failed")?;
+        for ttl in 1..=max_ttl {
+            self.socket.set_ttl(ttl).with_context(||format!("failed to set_ttl [{ttl}]"))?;
+            let len = self.socket.send_to(self.text.as_bytes(), self.target).await.with_context(||"send_to failed")?;
+            info!("prepare ttl [{ttl}]: [{local}] => [{}]: bytes [{len}]", self.target);
+        }
+        Ok(())
     }
 }
+
+// async fn send_loop(socket: Arc<UdpSocket>, target: SocketAddr, content: &[u8], interval: Duration, shared: &Arc<Shared>) -> Result<()> {
+//     let local = socket.local_addr().with_context(||"get local address failed")?;
+//     loop {
+//         {
+//             if !shared.connecteds.lock().is_empty() {
+//                 return Ok(())
+//             }
+//         }
+//         let len = socket.send_to(content, target).await.with_context(||"send_to failed")?;
+//         info!("sent to [{local}] => [{target}]: bytes [{len}]");
+//         tokio::time::sleep(interval).await;
+//     }
+// }
 
 struct Shared {
     connecteds: Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>,
