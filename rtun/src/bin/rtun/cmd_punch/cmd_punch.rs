@@ -29,8 +29,6 @@ pub fn run(args: CmdArgs) -> Result<()> {
 }
 
 async fn do_run(args: CmdArgs) -> Result<()> {
-    
-    // info!("kick gather candidate, ice_servers {:?}", args.ice_servers);
 
     let mut peer = IcePeer::with_config(IceConfig {
         servers: args.ice_servers,
@@ -46,12 +44,18 @@ async fn do_run(args: CmdArgs) -> Result<()> {
 
         let remote_args: IceArgs = serde_json::from_str(&remote_str).with_context(||"parse remote args failed")?;
         
+        info!("server gathering candidate...");
         let local_args = peer.server_gather(remote_args).await.with_context(||"server_gather failed")?;
+        info!("server gathering candidate done");
+
         info!("local args \n\n{}\n\n", serde_json::to_string(&local_args)?);
         peer.accept_timeout(Duration::from_secs(999999)).await.with_context(||"accept failed")?
 
     } else {
+        info!("client gathering candidate...");
         let local_args = peer.client_gather().await?;
+        info!("client gathering candidate done");
+        
         info!("local args \n\n{}\n\n", serde_json::to_string(&local_args)?);
 
         let remote_str: String = Input::with_theme(&ColorfulTheme::default())

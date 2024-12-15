@@ -7,6 +7,7 @@ TODO:
     - ok IfWatcher 在 github 上取到空列表
 */
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 use anyhow::{Result, Context};
@@ -19,7 +20,7 @@ use crate::ice::ice_candidate::parse_candidate;
 use crate::stun::async_udp::{AsyncUdpSocket, UdpSocketBridge, tokio_socket_bind, TokioUdpSocket};
 
 use super::ice_socket::{IceChecker, IceCreds, udp_run_until_done, StunResolver, CheckerConfig, udp_flush, IceSocket};
-use super::ice_candidate::{Candidate, server_reflexive};
+use super::ice_candidate::{server_reflexive, Candidate, CandidateKind};
 use super::ice_ipnet::ipnet_iter;
 
 #[derive(Debug, Default)]
@@ -41,6 +42,7 @@ struct Local {
     pub ufrag: String,
     pub pwd: String,
     pub candidates: Vec<Candidate>,
+    // pub nat4: Option<Nat4>,
     // pub cert: rcgen::Certificate,
 }
 
@@ -69,6 +71,34 @@ impl Local {
     //     // None
     // }
 }
+
+// struct Nat4 {
+//     targets: HashSet<SocketAddr>,
+// }
+
+// impl Nat4 {
+//     fn from_candidates(candidates: &[Candidate]) -> Option<Self> {
+//         let mut targets = HashSet::new();
+//         for (index, cand) in candidates.iter().enumerate() {
+//             if cand.raddr().is_some() && cand.kind() == CandidateKind::ServerReflexive && index < (candidates.len() - 1) {
+//                 for other in (&candidates[index+1..]).iter() {
+//                     if cand.raddr() == other.raddr() {
+//                         targets.insert(cand.addr());
+//                         targets.insert(other.addr());
+//                     }
+//                 }
+//             }
+//         }
+
+//         if targets.len() > 0 {
+//             Some(Self {
+//                 targets,
+//             })
+//         } else {
+//             None
+//         }
+//     }
+// }
 
 pub struct IcePeer {
     uid: HUId,
@@ -286,6 +316,7 @@ impl IcePeer {
         let local = Local {
             ufrag: HUId::random().to_string(),
             pwd: HUId::random().to_string(),
+            // nat4: Nat4::from_candidates(&candidates),
             candidates,
             // cert: rcgen::generate_simple_self_signed(vec!["localhost".into()])?,
         };

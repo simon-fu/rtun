@@ -12,7 +12,7 @@ use stun_codec::{Message, MessageClass, rfc5389::{methods::BINDING, attributes::
 use bytecodec::{EncodeExt, DecodeExt};
 use tokio::{time::Instant, net::{ToSocketAddrs, lookup_host}};
 
-use super::ice_attribute::Attribute;
+use super::{ice_attribute::Attribute, ice_candidate::CandidateKind};
 
 
 
@@ -102,6 +102,9 @@ pub struct StunResolver {
     inflight: UdpTsxMap<TransactionId, ()>,
     timeouts: VecDeque<UdpTsx<()>>,
     mapped_addrs: MappedAddrs,
+
+    num_servers: usize,
+    start_time: Option<Instant>,
 }
 
 impl StunResolver {
@@ -209,7 +212,10 @@ impl StunResolver {
         let mut lookup_futures = FuturesUnordered::new();
         for host in servers {
             lookup_futures.push(lookup_host(host));
+            resolver.num_servers += 1;
         }
+
+        resolver.start_time = Some(Instant::now());
 
         // if let Some(r) = lookup_futures.next().await {
         //     let iter = r?;
@@ -242,6 +248,24 @@ impl StunResolver {
 
 impl UdpOps for StunResolver {
     fn is_done(&self) -> bool {
+        if let Some(v) = self.min_success_response {
+            println!("aaa check min_success_response");
+            return self.mapped_addrs.num_success >= v;
+        }
+
+        if self.num_servers > 1 {
+            if self.mapped_addrs.nat_type() == Some(NatType::Symmetric) {
+                println!("aaa check Symmetric");
+                return true;
+            }
+            if let Some(time) = self.start_time {
+                if time.elapsed() < Duration::from_millis(2000) {
+                    return false;
+                }
+            }
+        }
+
+        println!("aaa check final");
         self.mapped_addrs.num_success >= self.min_success_response.unwrap_or(1)
     }
 
@@ -596,6 +620,9 @@ pub struct IceChecker {
     nominated_tsx_id: Option<TransactionId>,
     upgraded_ttl: bool,
     result: Option<CheckResult>,
+
+    local_nat4: Option<Nat4>,
+    remote_nat4: Option<Nat4>,
 }
 
 impl UdpOps for IceChecker {
@@ -652,6 +679,13 @@ impl IceChecker {
         &self.config
     }
 
+    pub fn set_local_candidates<'a, I>(&mut self, iter: I) 
+    where 
+        I: Iterator<Item = &'a Candidate> + 'a,
+    {
+        self.local_nat4 = Nat4::from_iter(iter);
+    }
+
     pub fn add_remote_candidate(&mut self, cand: Candidate) {
         self.remote_candidates.insert(cand.addr(), cand);
     }
@@ -685,6 +719,13 @@ impl IceChecker {
         for (_addr, cand) in self.remote_candidates.iter() {
             self.config.kick_req(cand, false, now, &mut self.tx_que, &mut self.inflight)?;
         }
+
+        self.remote_nat4 = Nat4::from_iter(self.remote_candidates.iter().map(|x|x.1));
+
+        if let Some(nat4) = &mut self.remote_nat4 {
+
+        }
+
         Ok(())
     }
 
@@ -891,6 +932,90 @@ impl IceChecker {
         Ok(())
     }
 
+}
+
+// struct Nat4 {
+//     targets: HashSet<SocketAddr>,
+// }
+
+// impl Nat4 {
+//     fn from_candidates(candidates: &[Candidate]) -> Option<Self> {
+//         let mut targets = HashSet::new();
+//         for (index, cand) in candidates.iter().enumerate() {
+//             if cand.raddr().is_some() && cand.kind() == CandidateKind::ServerReflexive && index < (candidates.len() - 1) {
+//                 for other in (&candidates[index+1..]).iter() {
+//                     if cand.raddr() == other.raddr() {
+//                         targets.insert(cand.addr());
+//                         targets.insert(other.addr());
+//                     }
+//                 }
+//             }
+//         }
+
+//         if targets.len() > 0 {
+//             Some(Self {
+//                 targets,
+//             })
+//         } else {
+//             None
+//         }
+//     }
+// }
+
+
+
+struct Nat4 {
+    targets: HashMap<SocketAddr, Vec<SocketAddr>>, // raddr -> targets
+}
+
+impl Nat4 {
+    fn from_iter<'a, I>(iter: I) -> Option<Self> 
+    where 
+        I: Iterator<Item = &'a Candidate> + 'a,
+    {
+        let  mut first: Option<&'a Candidate> = None;
+
+        let mut targets = HashMap::new();
+
+        for cand in iter {
+            if cand.kind() != CandidateKind::ServerReflexive {
+                continue;
+            }
+
+            let Some(raddr) = cand.raddr() else {
+                continue;
+            };
+
+            let Some(first) = first else  {
+                first = Some(cand);
+                continue;
+            };
+
+            if targets.is_empty() {
+                if Some(raddr) == first.raddr() {
+                    targets.insert(raddr, vec![first.addr(), cand.addr()]);
+                }
+                continue;
+            }
+
+            match targets.get_mut(&raddr) {
+                Some(exist) => {
+                    exist.push(cand.addr());
+                },
+                None => {
+                    targets.insert(raddr, vec![cand.addr()]);
+                },
+            }
+        }
+
+        if targets.len() > 0 {
+            Some(Self {
+                targets,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 
