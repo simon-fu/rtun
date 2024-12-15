@@ -175,9 +175,9 @@ async fn run_nat4(args: Nat4SendCmdArgs) -> Result<()> {
                 // shared: shared.clone(),
                 text: text.clone(),
                 target,
-                interval,
+                // interval,
                 local,
-                ttl,
+                // ttl,
             };
 
             if let Some(ttl) = ttl {
@@ -210,8 +210,11 @@ async fn run_nat4(args: Nat4SendCmdArgs) -> Result<()> {
             }
 
             sender.send_one().await?;
-            tokio::time::sleep(sender.interval).await;
         }
+
+        info!("send target [{}], num [{}], ttl [{:?}]", target, senders.len(), ttl);
+
+        tokio::time::sleep(interval).await;
     }
 
     shared.send_conn(&text, interval).await
@@ -307,10 +310,10 @@ struct UdpSender {
     socket: Arc<UdpSocket>, 
     target: SocketAddr, 
     text: Arc<String>, 
-    interval: Duration, 
+    // interval: Duration, 
     // shared: Arc<Shared>,
     local: SocketAddr,
-    ttl: Option<u32>,
+    // ttl: Option<u32>,
 }
 
 impl UdpSender {
@@ -330,7 +333,7 @@ impl UdpSender {
 
     async fn send_one(&self) -> Result<()> {
         let len = self.socket.send_to(self.text.as_bytes(), self.target).await.with_context(||"send_to failed")?;
-        info!("sent to [{}] => [{}]: ttl [{:?}], bytes [{len}]", self.local, self.target, self.ttl,);
+        debug!("sent to [{}] => [{}]: bytes [{len}]", self.local, self.target);
         Ok(())
     }
 
