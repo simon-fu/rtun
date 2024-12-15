@@ -39,6 +39,8 @@ pub mod cmd_local;
 
 pub mod cmd_udp;
 
+pub mod cmd_nat4;
+
 pub mod cmd_punch;
 
 pub mod cmd_quic;
@@ -72,6 +74,7 @@ enum SubCmd {
     Agent(cmd_agent::CmdArgs),
     Local(cmd_local::CmdArgs),
     Udp(cmd_udp::CmdArgs),
+    Nat4(cmd_nat4::CmdArgs),
     Quic(cmd_quic::CmdArgs),
     Punch(cmd_punch::CmdArgs),
     Echo(cmd_echo::CmdArgs),
@@ -86,6 +89,7 @@ fn main() -> Result<()> {
         SubCmd::Agent(args) => cmd_agent::run(args),
         SubCmd::Local(args) => cmd_local::run(args),
         SubCmd::Udp(args) => cmd_udp::run(args),
+        SubCmd::Nat4(args) => cmd_nat4::run(args),
         SubCmd::Quic(args) => cmd_quic::run(args),
         SubCmd::Punch(args) => cmd_punch::run(args),
         SubCmd::Echo(args) => cmd_echo::run(args),
