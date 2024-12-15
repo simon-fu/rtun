@@ -217,6 +217,7 @@ impl Shared {
         };
 
         let local = socket.local_addr().with_context(||"get local address faield")?;
+        socket.set_ttl(64).with_context(||"set_ttl 64 failed")?;
         
         loop {
 
