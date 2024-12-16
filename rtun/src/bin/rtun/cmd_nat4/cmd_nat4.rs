@@ -1,7 +1,11 @@
 /*
-    ./rtun nat4 nat4 -t 221.221.153.138:12333 --ttl 6 --count 512
+    usage: 
+        ./rtun nat4 nat4 -t 221.221.153.138:12333 --ttl 6 --count 512
 
-    ./rtun nat4 nat3 -l 0.0.0.0:12333 -t 36.112.207.162 --batch-interval 3000 --interval 500 --count 512
+        ./rtun nat4 nat3 -l 0.0.0.0:12333 -t 36.112.207.162 --batch-interval 3000 --interval 500 --count 512
+
+    TODO:
+        使用 https://github.com/fujiapple852/trippy 代替 surge_ping
 */
 use std::{collections::{HashMap, HashSet}, net::{IpAddr, SocketAddr}, sync::Arc, time::{Duration, Instant}, u64};
 
