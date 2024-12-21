@@ -15,34 +15,34 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v3
 
-    #   # 设置 Docker 缓存
-    #   - name: Cache Docker Layers
-    #     uses: actions/cache@v3
-    #     with:
-    #       path: /tmp/docker-cache
-    #       key: ${{ runner.os }}-docker-${{ github.sha }}
-    #       restore-keys: |
-    #         ${{ runner.os }}-docker-
+      # 设置 Docker 缓存
+      - name: Cache Docker Layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/docker-cache
+          key: ${{ runner.os }}-docker-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-docker-
 
-    #   # 使用 clux/muslrust 编译
-    #   - name: Build with clux/muslrust
-    #     run: |
-    #       docker run --rm \
-    #         -v "$(pwd)":/volume \
-    #         -w /volume \
-    #         "clux/muslrust:1.83.0-stable" cargo build --release
+      # 使用 clux/muslrust 编译
+      - name: Build with clux/muslrust
+        run: |
+          docker run --rm \
+            -v "$(pwd)":/volume \
+            -w /volume \
+            "clux/muslrust:1.83.0-stable" cargo build --release
 
-    #   # 打包编译结果
-    #   - name: Prepare Artifact
-    #     run: |
-    #       mkdir -p artifacts
-    #       cp target/x86_64-unknown-linux-musl/release/rtun artifacts/
-    #       tar -czvf artifacts.tar.gz -C artifacts .
-
+      # 打包编译结果
       - name: Prepare Artifact
         run: |
-          echo "hello" > ./artifacts.txt
-          cat ./artifacts.txt
+          mkdir -p artifacts
+          cp target/x86_64-unknown-linux-musl/release/rtun artifacts/rtun-linux-musl-x86_64
+          tar -czvf rtun-release.tar.gz -C artifacts .
+
+    #   - name: Prepare Artifact
+    #     run: |
+    #       echo "hello" > ./artifacts.txt
+    #       cat ./artifacts.txt
     
     #   - name: Upload binaries to release
     #     uses: svenstaro/upload-release-action@v2
@@ -67,7 +67,8 @@ jobs:
             prerelease: true
             body: 'This nightly release.'
             files: |
-                ./artifacts.txt
+                artifacts/rtun-linux-musl-x86_64
+                rtun-release.tar.gz
 
 
     #   # 检查 Release 是否存在
