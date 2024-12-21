@@ -30,3 +30,10 @@ version = "0.2.0"
 # # codegen-units = 1
 # # incremental = false
 # # # panic = 'abort'
+
+
+[profile.release]
+opt-level = 3
+strip = true
+panic = "abort"
+lto = "fat"
