@@ -3,10 +3,10 @@ name: Build Release
 on:
   workflow_dispatch: # 添加手动触发
   push:
-    tags:
-      - 'v*' # 仅在推送标签时触发
-    # branches:
-    #   - main  # 仅在推送到 main 分支时触发
+    # tags:
+    #   - 'v*' # 仅在推送标签时触发
+    branches:
+      - dev  # 仅在推送到 dev 分支时触发
 
 jobs:
   build:
@@ -17,60 +17,20 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      # 设置 Docker 缓存
-      - name: Cache Docker Layers
-        uses: actions/cache@v3
-        with:
-          path: /tmp/docker-cache
-          key: ${{ runner.os }}-docker-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-docker-
-
-      # 使用 clux/muslrust 编译
-      - name: Build with clux/muslrust
-        run: |
-          docker run --rm \
-            -v "$(pwd)":/volume \
-            -w /volume \
-            "clux/muslrust:1.83.0-stable" cargo build --release
-
-      # 打包编译结果
       - name: Prepare Artifact
         run: |
-          mkdir -p artifacts
-          cp target/x86_64-unknown-linux-musl/release/rtun artifacts/rtun-linux-musl-x86_64
-          tar -czvf rtun-release.tar.gz -C artifacts .
+          echo "hello" > ./artifacts.txt
+          cat ./artifacts.txt
 
-    #   - name: Prepare Artifact
-    #     run: |
-    #       echo "hello" > ./artifacts.txt
-    #       cat ./artifacts.txt
-    
-    #   - name: Upload binaries to release
-    #     uses: svenstaro/upload-release-action@v2
-    #     with:
-    #         # repo_name: owner/repository-name
-    #         # A personal access token for the GitHub repository in which the release will be created and edited.
-    #         # It is recommended to create the access token with the following scopes: `repo, user, admin:repo_hook`.
-    #         repo_token: ${{ secrets.GITHUB_TOKEN }}
-    #         file: ./artifacts.txt
-    #         asset_name: mything
-    #         tag: nightly
-    #         overwrite: true
-    #         body: "This is my release text"
-
-      - name: Update Nightly Release
-        uses: andelf/nightly-release@v1
-        env:
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Release
+        uses: softprops/action-gh-release@v2
         with:
-            tag_name: nightly
-            name: 'Nightly Release $$'
-            prerelease: true
-            body: 'This nightly release.'
+            repository: simon-fu/tts-release
+            # note you'll typically need to create a personal access token
+            # with permissions to create releases in the other repo
+            token: ${{ secrets.GITHUB_TOKEN }}
             files: |
-                artifacts/rtun-linux-musl-x86_64
-                rtun-release.tar.gz
+                ./artifacts.txt
 
 
     #   # 检查 Release 是否存在
