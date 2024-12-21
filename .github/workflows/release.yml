@@ -41,7 +41,7 @@ jobs:
 
       - name: Prepare Artifact
         run: |
-          echo "hello" artifacts.txt
+          echo "hello" > artifacts.txt
     
       - name: Upload binaries to release
         uses: svenstaro/upload-release-action@v2
