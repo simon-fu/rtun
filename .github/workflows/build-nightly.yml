@@ -1,12 +1,12 @@
-name: Build Release
+name: Build Nightly
 
 on:
   workflow_dispatch: # 添加手动触发
   push:
     tags:
       - 'v*' # 仅在推送标签时触发
-    # branches:
-    #   - main  # 仅在推送到 main 分支时触发
+    branches:
+      - main  # 仅在推送到 main 分支时触发
 
 jobs:
   build:
