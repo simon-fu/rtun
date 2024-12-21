@@ -44,18 +44,31 @@ jobs:
           echo "hello" > ./artifacts.txt
           cat ./artifacts.txt
     
-      - name: Upload binaries to release
-        uses: svenstaro/upload-release-action@v2
+    #   - name: Upload binaries to release
+    #     uses: svenstaro/upload-release-action@v2
+    #     with:
+    #         # repo_name: owner/repository-name
+    #         # A personal access token for the GitHub repository in which the release will be created and edited.
+    #         # It is recommended to create the access token with the following scopes: `repo, user, admin:repo_hook`.
+    #         repo_token: ${{ secrets.GITHUB_TOKEN }}
+    #         file: ./artifacts.txt
+    #         asset_name: mything
+    #         tag: nightly
+    #         overwrite: true
+    #         body: "This is my release text"
+
+      - name: Update Nightly Release
+        uses: andelf/nightly-release@v1
+        env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-            # repo_name: owner/repository-name
-            # A personal access token for the GitHub repository in which the release will be created and edited.
-            # It is recommended to create the access token with the following scopes: `repo, user, admin:repo_hook`.
-            repo_token: ${{ secrets.GITHUB_TOKEN }}
-            file: ./artifacts.txt
-            asset_name: mything
-            tag: nightly
-            overwrite: true
-            body: "This is my release text"
+            tag_name: nightly
+            name: 'Nightly Release $$'
+            prerelease: true
+            body: 'This nightly release.'
+            files: |
+                ./artifacts.txt
+
 
     #   # 检查 Release 是否存在
     #   - name: Check if Release exists
