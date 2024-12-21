@@ -1,4 +1,4 @@
-name: Build and Release Rust Project
+name: Build and Release Rtun
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch: # 添加手动触发
 
 jobs:
-  build-release-rtun:
+  build:
     runs-on: ubuntu-latest
 
     steps:
