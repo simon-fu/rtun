@@ -11,80 +11,64 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    # 检出代码
-    - name: Checkout Code
-      uses: actions/checkout@v3
+      # 检出代码
+      - name: Checkout Code
+        uses: actions/checkout@v3
 
-    # 设置 Docker 缓存
-    - name: Cache Docker Layers
-      uses: actions/cache@v3
-      with:
-        path: /tmp/docker-cache
-        key: ${{ runner.os }}-docker-${{ github.sha }}
-        restore-keys: |
-          ${{ runner.os }}-docker-
+      # 设置 Docker 缓存
+      - name: Cache Docker Layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/docker-cache
+          key: ${{ runner.os }}-docker-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-docker-
 
-    # 使用 clux/muslrust 编译
-    - name: Build with clux/muslrust
-      run: |
-        docker run --rm \
-          -v "$(pwd)":/volume \
-          -w /volume \
-          "clux/muslrust:1.83.0-stable" cargo build --release
+      # 使用 clux/muslrust 编译
+      - name: Build with clux/muslrust
+        run: |
+          docker run --rm \
+            -v "$(pwd)":/volume \
+            -w /volume \
+            "clux/muslrust:1.83.0-stable" cargo build --release
 
-    # 打包编译结果
-    - name: Prepare Artifact
-      run: |
-        mkdir -p artifacts
-        cp target/x86_64-unknown-linux-musl/release/rtun artifacts/
-        tar -czvf artifacts.tar.gz -C artifacts .
+      # 打包编译结果
+      - name: Prepare Artifact
+        run: |
+          mkdir -p artifacts
+          cp target/x86_64-unknown-linux-musl/release/rtun artifacts/
+          tar -czvf artifacts.tar.gz -C artifacts .
 
-    - name: Check if Release exists
-    id: check_release
-    run: |
-        if gh release view ${{ github.ref_name }}; then
-        echo "release_exists=true" >> $GITHUB_ENV
-        else
-        echo "release_exists=false" >> $GITHUB_ENV
-        fi
+      # 检查 Release 是否存在
+      - name: Check if Release exists
+        id: check_release
+        run: |
+          if gh release view ${{ github.ref_name }}; then
+            echo "release_exists=true" >> $GITHUB_ENV
+          else
+            echo "release_exists=false" >> $GITHUB_ENV
+          fi
 
-    - name: Create Release
-    if: env.release_exists == 'false'
-    id: create_release
-    uses: actions/create-release@v1
-    with:
-        tag_name: ${{ github.ref_name }}
-        release_name: ${{ github.ref_name }}
-        body: "Auto-generated release"
-        draft: false
-        prerelease: false
-        token: ${{ secrets.GITHUB_TOKEN }}   
-        
-    # 上传编译的可执行文件到 Release
-    - name: Upload Release Assets
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./artifacts.tar.gz
-        asset_name: release-artifacts.tar.gz
-        asset_content_type: application/gzip
+      # 创建 Release（如果不存在）
+      - name: Create Release
+        if: env.release_exists == 'false'
+        id: create_release
+        uses: actions/create-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: ${{ github.ref_name }}
+          body: "Auto-generated release"
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-#   release:
-#     needs: build
-#     runs-on: ubuntu-latest
-
-#     steps:
-#     # 创建 GitHub Release
-#     - name: Create Release
-#       id: create_release
-#       uses: actions/create-release@v1
-#       env:
-#         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-#       with:
-#         tag_name: ${{ github.ref_name }}
-#         release_name: Release ${{ github.ref_name }}
-#         draft: false
-#         prerelease: false
-
+      # 上传编译的可执行文件到 Release
+      - name: Upload Release Assets
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./artifacts.tar.gz
+          asset_name: release-artifacts.tar.gz
+          asset_content_type: application/gzip
