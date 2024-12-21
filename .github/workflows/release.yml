@@ -42,39 +42,52 @@ jobs:
       - name: Prepare Artifact
         run: |
           touch artifacts.tar.gz
-        
-      # 检查 Release 是否存在
-      - name: Check if Release exists
-        id: check_release
-        run: |
-          if gh release view ${{ github.ref_name }}; then
-            echo "release_exists=true" >> $GITHUB_ENV
-          else
-            echo "release_exists=false" >> $GITHUB_ENV
-          fi
-
-      # 创建 Release（如果不存在）
-      - name: Create Release
-        if: env.release_exists == 'false'
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+      - name: Upload binaries to release
+        uses: svenstaro/upload-release-action@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          release_name: ${{ github.ref_name }}
-          body: "Auto-generated release"
-          draft: false
-          prerelease: false
-        #   token: ${{ secrets.GITHUB_TOKEN }}
+            repo_name: owner/repository-name
+            # A personal access token for the GitHub repository in which the release will be created and edited.
+            # It is recommended to create the access token with the following scopes: `repo, user, admin:repo_hook`.
+            repo_token: ${{ secrets.GITHUB_TOKEN }}
+            file: artifacts.tar.gz
+            asset_name: mything
+            tag: ${{ github.ref }}
+            overwrite: true
+            body: "This is my release text"
 
-      # 上传编译的可执行文件到 Release
-      - name: Upload Release Assets
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./artifacts.tar.gz
-          asset_name: release-artifacts.tar.gz
-          asset_content_type: application/gzip
+    #   # 检查 Release 是否存在
+    #   - name: Check if Release exists
+    #     id: check_release
+    #     run: |
+    #       if gh release view ${{ github.ref_name }}; then
+    #         echo "release_exists=true" >> $GITHUB_ENV
+    #       else
+    #         echo "release_exists=false" >> $GITHUB_ENV
+    #       fi
+
+    #   # 创建 Release（如果不存在）
+    #   - name: Create Release
+    #     if: env.release_exists == 'false'
+    #     id: create_release
+    #     uses: actions/create-release@v1
+    #     env:
+    #       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    #     with:
+    #       tag_name: ${{ github.ref_name }}
+    #       release_name: ${{ github.ref_name }}
+    #       body: "Auto-generated release"
+    #       draft: false
+    #       prerelease: false
+    #     #   token: ${{ secrets.GITHUB_TOKEN }}
+
+    #   # 上传编译的可执行文件到 Release
+    #   - name: Upload Release Assets
+    #     uses: actions/upload-release-asset@v1
+    #     env:
+    #       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    #     with:
+    #       upload_url: ${{ steps.create_release.outputs.upload_url }}
+    #       asset_path: ./artifacts.tar.gz
+    #       asset_name: release-artifacts.tar.gz
+    #       asset_content_type: application/gzip
