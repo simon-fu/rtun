@@ -1,0 +1,44 @@
+name: Build Release
+
+on:
+  workflow_dispatch: # 添加手动触发
+  push:
+    # tags:
+    #   - 'v*' # 仅在推送标签时触发
+    branches:
+      - dev  # 仅在推送到 dev 分支时触发
+
+jobs:
+  build:
+    name: Build release Executable (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          # - os: macos-latest
+          #   target: x86_64-apple-darwin
+          # - os: macos-latest
+          #   target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v2
+      
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          override: true
+          components: clippy
+          target: ${{ matrix.target }}
+
+      - name: Build binary
+        uses: actions-rs/cargo@v1
+        with:
+          use-cross: true
+          command: build
+          args: --release --bin rtun --locked --target=${{ matrix.TARGET }}
+
+      - name: Parse output
+        run: |
+          echo bin=${{ env.PATH_BINARY }}
