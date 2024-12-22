@@ -17,10 +17,15 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-          # - os: macos-latest
-          #   target: x86_64-apple-darwin
-          # - os: macos-latest
-          #   target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+    env:
+      BINARY_EXTENSION: ${{ endsWith(matrix.target, '-msvc') && '.exe' || '' }}
+      PATH_BINARY: ${{ github.workspace }}/target/${{ matrix.TARGET }}/release/rtun${{ matrix.EXTENSION }}${{ endsWith(matrix.target, '-msvc') && '.exe' || '' }}
+      OPENSSL_STATIC: 1
 
     steps:
       - uses: actions/checkout@v2
