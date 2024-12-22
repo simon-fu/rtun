@@ -44,6 +44,36 @@ jobs:
           command: build
           args: --release --bin rtun --locked --target=${{ matrix.TARGET }}
 
-      - name: Parse output
+      - name: copy output
         run: |
           echo bin=${{ env.PATH_BINARY }}
+          cp ${{ env.PATH_BINARY }} ./rtun-${{ matrix.TARGET }}${{ env.BINARY_EXTENSION }}
+
+      - name: Upload output
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtun-artifact-${{ matrix.runs-on }}
+          path: ./rtun-${{ matrix.TARGET }}${{ env.BINARY_EXTENSION }}
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./all-builds
+          merge-multiple: true
+          # pattern: rtun-*
+          
+
+      - name: Update Nightly Release
+        uses: andelf/nightly-release@v1
+        env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+            tag_name: nightly
+            name: 'Nightly Release $$'
+            prerelease: true
+            body: 'This nightly release.'
+            files: |
+                ./all-builds/*
