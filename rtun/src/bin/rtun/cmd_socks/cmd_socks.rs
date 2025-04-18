@@ -93,7 +93,7 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
 
         let auth = {
             let mut cfg = Socks5AuthConfig::new();
-            if let Some(ss) = args.tls_user.as_ref() {
+            for ss in args.tls_user.iter() {
                 let mut split = ss.split(":");
                 let user_name = split.next().with_context(||"no tls username")?;
                 let password = split.next().with_context(||"no tls password")?;
@@ -103,6 +103,17 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
                 opt_password = Some(password.to_string());
                 // cfg.passwd.add_user("rtun", "123");
             }
+            
+            // if let Some(ss) = args.tls_user.as_ref() {
+            //     let mut split = ss.split(":");
+            //     let user_name = split.next().with_context(||"no tls username")?;
+            //     let password = split.next().with_context(||"no tls password")?;
+            //     cfg.passwd.add_user(user_name, password);
+
+            //     opt_username = Some(user_name.to_string());
+            //     opt_password = Some(password.to_string());
+            //     // cfg.passwd.add_user("rtun", "123");
+            // }
             
             Arc::new(cfg)
         };
@@ -884,7 +895,7 @@ pub struct CmdArgs {
         long = "tls-user",
         long_help = "socks-over-tls user:password",
     )]
-    tls_user: Option<String>,
+    tls_user: Vec<String>,
 
     #[clap(
         long = "tls-listen",
