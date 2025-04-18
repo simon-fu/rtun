@@ -894,7 +894,7 @@ pub struct CmdArgs {
     #[clap(
         long = "tls-user",
         long_help = "socks-over-tls user:password",
-        num_args = 0..,
+        // num_args = 0..,
     )]
     tls_user: Vec<String>,
 
