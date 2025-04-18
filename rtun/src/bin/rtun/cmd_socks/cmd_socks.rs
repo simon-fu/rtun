@@ -103,7 +103,7 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
                 opt_password = Some(password.to_string());
                 // cfg.passwd.add_user("rtun", "123");
             }
-            
+
             // if let Some(ss) = args.tls_user.as_ref() {
             //     let mut split = ss.split(":");
             //     let user_name = split.next().with_context(||"no tls username")?;
@@ -894,6 +894,7 @@ pub struct CmdArgs {
     #[clap(
         long = "tls-user",
         long_help = "socks-over-tls user:password",
+        num_args = 0..,
     )]
     tls_user: Vec<String>,
 
