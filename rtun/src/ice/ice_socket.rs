@@ -134,11 +134,12 @@ impl StunResolver {
         self.inflight.is_empty() && self.tx_que.is_empty()
     }
 
-    pub fn kick_targets<I>(&mut self, iter: I, now: Instant) -> Result<()> 
+    pub fn kick_targets<I>(&mut self, iter: I, now: Instant, host: Option<&'_ str>) -> Result<()> 
     where
         I: Iterator<Item = SocketAddr>,
     {
         for target in iter {
+            tracing::debug!("kick stun host {host:?}, target [{target}]");
             self.kick_target(target, now)?;
         }
         Ok(())
@@ -205,13 +206,18 @@ impl StunResolver {
     where
         U: AsyncUdpSocket + Unpin,
         I: Iterator<Item = A>,
-        A: ToSocketAddrs,
+        A: ToSocketAddrs + ToString,
     {
         let resolver = self;
 
         let mut lookup_futures = FuturesUnordered::new();
         for host in servers {
-            lookup_futures.push(lookup_host(host));
+            lookup_futures.push(async {
+                let addr = host.to_string();
+                let r = lookup_host(host).await
+                    .with_context(||format!("failed to lookup host [{}]", addr))?;
+                Result::<_>::Ok((r, addr))
+            });
             resolver.num_servers += 1;
         }
 
@@ -236,8 +242,18 @@ impl StunResolver {
                     r?;
                 },
                 r = lookup_futures.next(), if !lookup_futures.is_empty() => {
-                    if let Some(Ok(iter)) = r {
-                        resolver.kick_targets(iter, Instant::now())?;
+                    match r {
+                        Some(Ok((iter, addr))) => {
+                            resolver.kick_targets(iter, Instant::now(), Some(addr.as_str()))?;
+                        }
+
+                        Some(Err(e)) => {
+                            tracing::debug!("resolve error [{e:?}]");
+                        }
+
+                        None => {
+                            tracing::debug!("resolve None");
+                        }
                     }
                 }
             }
@@ -265,8 +281,14 @@ impl UdpOps for StunResolver {
             }
         }
 
-        println!("aaa check final");
-        self.mapped_addrs.num_success >= self.min_success_response.unwrap_or(1)
+        let min_response = self.min_success_response.unwrap_or(1);
+        let done = self.mapped_addrs.num_success >= min_response;
+        println!("aaa check final, num_success {}, min_response {}, done {}", self.mapped_addrs.num_success, min_response, done);
+        done
+        
+
+        // println!("aaa check final");
+        // self.mapped_addrs.num_success >= self.min_success_response.unwrap_or(1)
     }
 
     fn tx_que(&mut self) -> &mut UdpTxQue {
@@ -1306,6 +1328,12 @@ mod test {
             "stun1.l.google.com:19302",
             "stun2.l.google.com:19302",
             "stun.qq.com:3478",
+
+            "stun.miwifi.com:3478",
+            "stun.chat.bilibili.com:3478",
+            "stun.cloudflare.com:3478",
+            
+            // "124.222.49.56:3478", // stun.qq.com:3478 dns
         ].into_iter()).await.unwrap();
 
         let mapped = resolver.into_mapped_addrs();
@@ -1332,6 +1360,7 @@ mod test {
             "stun1.l.google.com:19302",
             "stun2.l.google.com:19302",
             "stun.qq.com:3478",
+            // "124.222.49.56:3478", // stun.qq.com:3478 dns
         ].into_iter()).await.unwrap();
 
         let mapped = resolver.into_mapped_addrs();

@@ -670,7 +670,7 @@ async fn connecting_task(conn_id: u64, agent: Arc<AgentShared>, tx: mpsc::Sender
 }
 
 async fn try_connet(bar: &mut Bar, url_str: &str, ck_speed: bool) -> Result<(QuicConn, Option<u64>)> {
-    tracing::debug!("connecting to {url_str}");
+    tracing::debug!("connecting to [{url_str}]");
 
     let conn = tokio::time::timeout(Duration::from_secs(10), async {
         let (stream, _r) = ws_connect_to(url_str).await
@@ -754,9 +754,15 @@ async fn echo_throughput(bar: &mut Bar, mut writer: SendStream, mut reader: Recv
 
 async fn punch<H: CtrlHandler>(ctrl: CtrlInvoker<H>) -> Result<QuicConn> {
     let ice_servers = vec![
+        "stun:stun.miwifi.com:3478".into(),
+        "stun:stun.chat.bilibili.com:3478".into(),
+        "stun:stun.cloudflare.com:3478".into(),
+
         "stun:stun1.l.google.com:19302".into(),
         "stun:stun2.l.google.com:19302".into(),
         "stun:stun.qq.com:3478".into(),
+
+        // "124.222.49.56:3478".into(), // stun.qq.com:3478 dns
     ];
 
     let mut peer = IcePeer::with_config(IceConfig {
@@ -764,7 +770,7 @@ async fn punch<H: CtrlHandler>(ctrl: CtrlInvoker<H>) -> Result<QuicConn> {
         ..Default::default()
     });
 
-    tracing::debug!("kick gather candidate");
+    tracing::debug!("kick gather candidate ...");
     let local_args = peer.client_gather().await?;
     tracing::debug!("local args {local_args:?}");
 
