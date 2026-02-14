@@ -4,7 +4,7 @@ on:
   schedule:
     - cron:  '0 1,3,5,7,9,11,13,15,17,19,21,23 * * *'
   workflow_dispatch:
-    
+
 env:
   AGENT_NAME_BASE: rtun1-1
 
@@ -15,8 +15,7 @@ jobs:
     # container: simonfucn/ubuntu-rtun:latest
 
     steps:
-
-    - name: run-agent
+    - name: Configure AGENT_NAME
       shell: bash
       run: |
         if [ "${{ github.event_name }}" == "schedule" ]; then
@@ -34,11 +33,17 @@ jobs:
           echo "Determined Type: Other (Push/etc)"
         fi
 
+    - name: Download 
+      run: |
         mkdir run-rtun
         cd run-rtun
-        wget https://github.com/simon-fu/rtun/releases/download/rtun_latest/rtun-x86_64-unknown-linux-musl
+        wget -q https://github.com/simon-fu/rtun/releases/download/rtun_latest/rtun-x86_64-unknown-linux-musl
         chmod +x ./rtun-x86_64-unknown-linux-musl
 
+    - name: run-agent
+      run: |
+        cd run-rtun
+        
         echo RUST_LOG=$RUST_LOG
         echo AGENT_NAME=$AGENT_NAME
 
