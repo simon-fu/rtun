@@ -24,36 +24,42 @@ jobs:
 
     env:
       BINARY_EXTENSION: ${{ endsWith(matrix.target, '-msvc') && '.exe' || '' }}
-      PATH_BINARY: ${{ github.workspace }}/target/${{ matrix.TARGET }}/release/rtun${{ matrix.EXTENSION }}${{ endsWith(matrix.target, '-msvc') && '.exe' || '' }}
+      PATH_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/rtun${{ matrix.EXTENSION }}${{ endsWith(matrix.target, '-msvc') && '.exe' || '' }}
       OPENSSL_STATIC: 1
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       
-      - uses: actions-rs/toolchain@v1
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          override: true
-          components: clippy
-          target: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+
+      - name: Show tool versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+          cross --version
 
       - name: Build binary
-        uses: actions-rs/cargo@v1
-        with:
-          use-cross: true
-          command: build
-          args: --release --bin rtun --locked --target=${{ matrix.TARGET }}
+        shell: bash
+        run: |
+          cross build --release --bin rtun --locked --target=${{ matrix.target }}
 
       - name: copy output
         run: |
           echo bin=${{ env.PATH_BINARY }}
-          cp ${{ env.PATH_BINARY }} ./rtun-${{ matrix.TARGET }}${{ env.BINARY_EXTENSION }}
+          cp ${{ env.PATH_BINARY }} ./rtun-${{ matrix.target }}${{ env.BINARY_EXTENSION }}
 
       - name: Upload output
         uses: actions/upload-artifact@v4
         with:
-          name: rtun-artifact-${{ matrix.TARGET }}
-          path: ./rtun-${{ matrix.TARGET }}${{ env.BINARY_EXTENSION }}
+          name: rtun-artifact-${{ matrix.target }}
+          path: ./rtun-${{ matrix.target }}${{ env.BINARY_EXTENSION }}
 
   release:
     needs: build
