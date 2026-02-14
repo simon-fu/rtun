@@ -81,6 +81,12 @@ enum SubCmd {
     Bench(cmd_bench::CmdArgs),
 }
 
+// Avoid musl's default allocator due to lackluster performance
+// https://nickb.dev/blog/default-musl-allocator-considered-harmful-to-performance
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> Result<()> {
     let args = CmdArgs::parse();
     match args.cmd {

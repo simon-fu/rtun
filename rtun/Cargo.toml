@@ -118,6 +118,9 @@ fast-socks5 = "=0.9.6"
 
 surge-ping = "=0.8.1"
 
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1.48"
+
 [build-dependencies]
 # prost-build = { version = "=0.9.0" }
 # protobuf-codegen-pure = "=2"
