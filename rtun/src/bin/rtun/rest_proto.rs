@@ -79,7 +79,7 @@ pub struct AgentInfo {
     pub ver: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PubParams {
     pub agent: Option<String>,
     pub token: String,

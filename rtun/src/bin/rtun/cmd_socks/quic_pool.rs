@@ -166,6 +166,7 @@ impl ActorEntity for Entity {
 pub struct AddAgent {
     pub name: String,
     pub url: String,
+    pub quic_insecure: bool,
 }
 
 const STYLE_GENERAL: &str = "{prefix:.bold.dim} {spinner} {wide_msg:}";
@@ -181,6 +182,7 @@ impl AsyncHandler<AddAgent> for Entity {
         let agent = Arc::new(AgentShared {
             name: req.name,
             url: req.url,
+            quic_insecure: req.quic_insecure,
         });
 
         let mut conns = Vec::new();
@@ -642,7 +644,7 @@ async fn connecting_task(conn_id: u64, agent: Arc<AgentShared>, tx: mpsc::Sender
         bar.update_msg("connecting");
 
         let r = tokio::select! {
-            r = try_connet(&mut bar, agent.url.as_str(), ck_speed) => r,
+            r = try_connet(&mut bar, agent.url.as_str(), ck_speed, agent.quic_insecure) => r,
             _r = guard_rx.recv() => {
                 tracing::debug!("dropped guard");
                 return
@@ -669,15 +671,25 @@ async fn connecting_task(conn_id: u64, agent: Arc<AgentShared>, tx: mpsc::Sender
     }
 }
 
-async fn try_connet(bar: &mut Bar, url_str: &str, ck_speed: bool) -> Result<(QuicConn, Option<u64>)> {
+async fn try_connet(bar: &mut Bar, url_str: &str, ck_speed: bool, quic_insecure: bool) -> Result<(QuicConn, Option<u64>)> {
     tracing::debug!("connecting to [{url_str}]");
 
     let conn = tokio::time::timeout(Duration::from_secs(10), async {
-        let (stream, _r) = ws_connect_to(url_str).await
-        .with_context(||format!("connect to agent failed"))?;
-        let session = make_stream_session(stream.split(), false).await?;
-        let ctrl = session.ctrl_client().clone_invoker();
-        punch(ctrl).await
+        let url = url::Url::parse(url_str).with_context(|| format!("invalid url [{}]", url_str))?;
+
+        if url.scheme().eq_ignore_ascii_case("quic") {
+            let stream = crate::quic_signal::connect_sub_with_opts(&url, quic_insecure).await
+            .with_context(|| "connect to agent failed")?;
+            let session = make_stream_session(stream.split(), false).await?;
+            let ctrl = session.ctrl_client().clone_invoker();
+            punch(ctrl).await
+        } else {
+            let (stream, _r) = ws_connect_to(url_str).await
+            .with_context(|| "connect to agent failed")?;
+            let session = make_stream_session(stream.split(), false).await?;
+            let ctrl = session.ctrl_client().clone_invoker();
+            punch(ctrl).await
+        }
         // let conn = punch(ctrl).await?;
         // Result::<()>::Ok(())
     }).await.with_context(||"connect timeout")??;
@@ -864,6 +876,7 @@ impl AgentSlot {
 struct AgentShared {
     name: String,
     url: String,
+    quic_insecure: bool,
 }
 
 

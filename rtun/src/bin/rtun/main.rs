@@ -59,6 +59,8 @@ pub mod client_utils;
 
 pub mod secret;
 
+pub mod quic_signal;
+
 // refer https://github.com/clap-rs/clap/tree/master/clap_derive/examples
 #[derive(Parser, Debug)]
 #[clap(name = "rtun", author, about, version=ver_full())]

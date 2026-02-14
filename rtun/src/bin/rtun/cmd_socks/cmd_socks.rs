@@ -1,6 +1,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration, io, collections::HashMap, fmt};
 
 use anyhow::{Result, Context, bail};
+use chrono::Local;
 
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -10,7 +11,7 @@ use shadowsocks_service::local::socks::config::Socks5AuthConfig;
 use tokio::net::{TcpListener, TcpStream};
 
 
-use crate::{client_utils::{client_select_url, query_new_agents}, rest_proto::{get_agent_from_url, make_sub_url, make_ws_scheme}, cmd_socks::quic_pool::{make_pool, AddAgent, GetCh}};
+use crate::{client_utils::{client_select_url, query_new_agents}, rest_proto::{AgentInfo, get_agent_from_url, make_sub_url, make_ws_scheme}, secret::token_gen, cmd_socks::quic_pool::{make_pool, AddAgent, GetCh}};
 use super::{p2p_throughput::kick_p2p, quic_pool::{QuicPoolInvoker, QuicPool}};
 
 pub fn run(args: CmdArgs) -> Result<()> { 
@@ -213,7 +214,11 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
         loop {
 
 
-            let r = query_new_agents(&url, &agent_regex, &mut agents).await;
+            let r = if url.scheme().eq_ignore_ascii_case("quic") {
+                query_new_agents_quic(&url, &agent_regex, &mut agents, args.quic_insecure).await
+            } else {
+                query_new_agents(&url, &agent_regex, &mut agents).await
+            };
             match r {
                 Ok(agents) => {
                     // tracing::debug!("query_new_agents success [{agents:?}]");
@@ -319,17 +324,68 @@ where
 {
     for agent in iter {
         let mut url = url.clone();
-        
-        make_sub_url(&mut url, Some(&agent), args.secret.as_deref())?;
-        make_ws_scheme(&mut url)?;
+
+        if url.scheme().eq_ignore_ascii_case("quic") {
+            make_sub_quic_url(&mut url, Some(&agent), args.secret.as_deref())?;
+        } else {
+            make_sub_url(&mut url, Some(&agent), args.secret.as_deref())?;
+            make_ws_scheme(&mut url)?;
+        }
 
         tracing::info!("new agent [{}]", agent);
         pool.invoker().invoke(AddAgent {
             name: agent,
             url: url.to_string(),
+            quic_insecure: args.quic_insecure,
         }).await??;
     }
     Ok(())
+}
+
+fn make_sub_quic_url(url: &mut url::Url, agent_name: Option<&str>, secret: Option<&str>) -> Result<()> {
+    if let Some(agent_name) = agent_name {
+        url.query_pairs_mut().append_pair("agent", agent_name);
+    }
+
+    let token = token_gen(secret, Local::now().timestamp_millis() as u64)?;
+    url.query_pairs_mut().append_pair("token", token.as_str());
+    Ok(())
+}
+
+async fn query_new_agents_quic(
+    url: &url::Url,
+    agent_regex: &regex::Regex,
+    exist: &mut HashMap<String, AgentInfo>,
+    quic_insecure: bool,
+) -> Result<Vec<AgentInfo>> {
+    let mut agents = crate::quic_signal::query_sessions_with_opts(url, quic_insecure).await?;
+
+    let mut pos = 0;
+    for nn in 0..agents.len() {
+        let name = &agents[nn].name;
+        if !agent_regex.is_match(name) {
+            continue;
+        }
+
+        if !exist.contains_key(name) {
+            exist.insert(name.clone(), agents[nn].clone());
+            if nn > pos {
+                agents.swap(nn, pos);
+            }
+            pos += 1;
+        }
+    }
+
+    agents.resize(
+        pos,
+        AgentInfo {
+            name: "non-exist".into(),
+            addr: "".into(),
+            expire_at: 0,
+            ver: None,
+        },
+    );
+    Ok(agents)
 }
 
 async fn kick_ws_socks(args: CmdArgs) -> Result<()> {
@@ -868,6 +924,12 @@ pub struct CmdArgs {
     secret: Option<String>,
 
     #[clap(
+        long = "quic-insecure",
+        long_help = "skip quic tls certificate verification (quic:// only)",
+    )]
+    quic_insecure: bool,
+
+    #[clap(
         long = "mode",
         long_help = "tunnel mode",
     )]
@@ -1140,5 +1202,3 @@ mod regex_text {
         assert!(rgx.is_match("home_mini"), "{rgx}") ;
     }
 }
-
-

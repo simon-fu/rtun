@@ -10,10 +10,10 @@ use clap::Parser;
 use axum::{Extension, extract::Query, http::StatusCode, Json};
 use futures::{StreamExt, stream::SplitStream};
 use parking_lot::Mutex;
-use rtun::{huid::{gen_huid::gen_huid, HUId}, channel::{ChId, ChPair}, switch::{ctrl_service::spawn_ctrl_service, agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker}, ctrl_client, invoker_ctrl::{CtrlInvoker, CtrlHandler}, session_stream::make_stream_session, switch_pair::{SwitchPairEntity, make_switch_pair}}, ws::server::{WsStreamAxum, WsSource}, async_rt::spawn_with_name, proto::KickDownArgs};
+use rtun::{huid::{gen_huid::gen_huid, HUId}, channel::{ChId, ChPair}, switch::{ctrl_service::spawn_ctrl_service, agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker}, ctrl_client, invoker_ctrl::{CtrlInvoker, CtrlHandler}, session_stream::make_stream_session, switch_pair::{SwitchPairEntity, make_switch_pair}, switch_sink::PacketSink, switch_source::PacketSource}, ws::server::{WsStreamAxum, WsSource}, async_rt::spawn_with_name, proto::KickDownArgs};
 use tokio::net::TcpListener;
 
-use std::{sync::Arc, collections::HashMap};
+use std::{sync::Arc, collections::HashMap, path::Path, time::Duration};
 use std::net::SocketAddr;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use axum::{
@@ -26,7 +26,7 @@ use axum::{
     Router,
 };
 
-use crate::{rest_proto::{PUB_WS, SUB_WS, PUB_SESSIONS, PubParams, SubParams, AgentInfo}, secret::token_verify};
+use crate::{quic_signal::{self, PubResponse, SessionsResponse, SignalRequest, SignalResponse, StatusResponse}, rest_proto::{PUB_WS, SUB_WS, PUB_SESSIONS, PubParams, SubParams, AgentInfo}, secret::token_verify};
 
 
 pub async fn run(args: CmdArgs) -> Result<()> {
@@ -64,7 +64,7 @@ async fn run_http(args: CmdArgs, addr: SocketAddr) -> Result<()> {
     .route("/echo/ws", get(handle_ws_echo));
 
     let router = app
-    .layer(Extension(shared))
+    .layer(Extension(shared.clone()))
     .layer(
         TraceLayer::new_for_http()
             .make_span_with(DefaultMakeSpan::default().include_headers(true)),
@@ -75,6 +75,17 @@ async fn run_http(args: CmdArgs, addr: SocketAddr) -> Result<()> {
         args.https_cert.as_deref(),
     ).await
     .with_context(|| "open https key/cert file failed")?;
+
+    {
+        let shared = shared.clone();
+        let key_file = args.https_key.clone();
+        let cert_file = args.https_cert.clone();
+        spawn_with_name("quic-signal-server", async move {
+            let r = run_quic_signal(shared, addr, key_file.as_deref(), cert_file.as_deref()).await;
+            tracing::debug!("quic signal server finished [{r:?}]");
+            r
+        });
+    }
 
     let is_https = tls_cfg.is_some();
 
@@ -186,6 +197,179 @@ async fn try_load_https_cert(key_file: Option<&str>, cert_file: Option<&str>) ->
     Ok(None)
 }
 
+async fn run_quic_signal(shared: Arc<Shared>, addr: SocketAddr, key_file: Option<&str>, cert_file: Option<&str>) -> Result<()> {
+    let server_crypto = match try_load_quic_cert(key_file, cert_file).await? {
+        Some(v) => v,
+        None => {
+            tracing::info!("quic signaling disabled (need --https-key and --https-cert)");
+            return Ok(());
+        }
+    };
+
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
+    Arc::get_mut(&mut server_config.transport)
+    .with_context(|| "get quic transport config failed")?
+    .max_concurrent_uni_streams(0_u8.into())
+    .keep_alive_interval(Some(Duration::from_secs(3)))
+    .max_idle_timeout(Some(quinn::VarInt::from_u32(30_000).into()));
+
+    let endpoint = quinn::Endpoint::server(server_config, addr)
+    .with_context(|| format!("failed to bind quic://{}", addr))?;
+
+    tracing::info!("agent listening on quic://{}", addr);
+
+    while let Some(conn) = endpoint.accept().await {
+        let shared = shared.clone();
+        spawn_with_name("quic-signal-conn", async move {
+            let r = handle_quic_signal_conn(shared, conn).await;
+            tracing::debug!("quic signal conn finished [{r:?}]");
+            r
+        });
+    }
+
+    Ok(())
+}
+
+async fn handle_quic_signal_conn(shared: Arc<Shared>, conn: quinn::Connecting) -> Result<()> {
+    let conn = conn.await.with_context(|| "setup quic connection failed")?;
+    let addr = conn.remote_address();
+    let uid = gen_huid();
+
+    let (mut tx, mut rx) = conn.accept_bi().await.with_context(|| "accept first stream failed")?;
+    let req = quic_signal::read_request(&mut rx).await.with_context(|| "read quic request failed")?;
+
+    match req {
+        SignalRequest::Pub(mut params) => {
+            if let Err(e) = token_verify(shared.secret.as_deref(), &params.token) {
+                let rsp = SignalResponse::Pub(PubResponse::err(format!("unauthorized: {e}")));
+                write_response_and_finish(&mut tx, &rsp).await?;
+                return Ok(());
+            }
+
+            if params.agent.is_none() {
+                params.agent = Some(uid.to_string());
+            }
+            let agent_name = params.agent.clone();
+
+            let rsp = SignalResponse::Pub(PubResponse::ok(agent_name));
+            quic_signal::write_response(&mut tx, &rsp).await?;
+
+            let stream = quic_signal::QuicSignalStream::new(tx, rx, None);
+            handle_pub_conn_quic(shared, uid, stream, addr, params).await
+        }
+        SignalRequest::Sub(params) => {
+            if let Err(e) = token_verify(shared.secret.as_deref(), &params.token) {
+                let rsp = SignalResponse::Sub(StatusResponse::err(format!("unauthorized: {e}")));
+                write_response_and_finish(&mut tx, &rsp).await?;
+                return Ok(());
+            }
+
+            let agent_name = params.agent.as_deref().unwrap_or("local");
+
+            if agent_name == "local" {
+                if let Some(local) = shared.local.as_ref() {
+                    let rsp = SignalResponse::Sub(StatusResponse::ok());
+                    quic_signal::write_response(&mut tx, &rsp).await?;
+                    let stream = quic_signal::QuicSignalStream::new(tx, rx, None);
+                    return run_sub_agent_stream(local.clone(), uid, stream.split()).await;
+                }
+            }
+
+            let ctrl = {
+                shared
+                    .data
+                    .lock()
+                    .agent_clients
+                    .get(agent_name)
+                    .map(|x| x.ctrl_invoker.clone())
+            };
+            if let Some(ctrl) = ctrl {
+                let rsp = SignalResponse::Sub(StatusResponse::ok());
+                quic_signal::write_response(&mut tx, &rsp).await?;
+                let stream = quic_signal::QuicSignalStream::new(tx, rx, None);
+                let stream = stream.split();
+
+                return match ctrl {
+                    CtrlClientAgent::Ws(ctrl) => run_sub_agent_stream(ctrl, uid, stream).await,
+                    CtrlClientAgent::Quic(ctrl) => run_sub_agent_stream(ctrl, uid, stream).await,
+                };
+            }
+
+            let rsp = SignalResponse::Sub(StatusResponse::err(format!("not found agent [{}]", agent_name)));
+            write_response_and_finish(&mut tx, &rsp).await?;
+            Ok(())
+        }
+        SignalRequest::Sessions => {
+            let rsp = SignalResponse::Sessions(SessionsResponse::ok(collect_pub_sessions(&shared)));
+            write_response_and_finish(&mut tx, &rsp).await?;
+            Ok(())
+        }
+    }
+}
+
+async fn write_response_and_finish(tx: &mut quinn::SendStream, rsp: &SignalResponse) -> Result<()> {
+    quic_signal::write_response(tx, rsp).await?;
+    tx.finish().await.with_context(|| "finish quic response failed")?;
+    Ok(())
+}
+
+async fn try_load_quic_cert(key_file: Option<&str>, cert_file: Option<&str>) -> Result<Option<rustls::ServerConfig>> {
+    if let (Some(key_path), Some(cert_path)) = (key_file, cert_file) {
+        let key_path: &Path = key_path.as_ref();
+        let cert_path: &Path = cert_path.as_ref();
+
+        let key = tokio::fs::read(key_path).await.context("failed to read private key")?;
+        let key = if key_path.extension().map_or(false, |x| x == "der") {
+            rustls::PrivateKey(key)
+        } else {
+            let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)
+                .context("malformed PKCS #8 private key")?;
+            match pkcs8.into_iter().next() {
+                Some(x) => rustls::PrivateKey(x),
+                None => {
+                    let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)
+                        .context("malformed PKCS #1 private key")?;
+                    match rsa.into_iter().next() {
+                        Some(x) => rustls::PrivateKey(x),
+                        None => {
+                            anyhow::bail!("no private keys found");
+                        }
+                    }
+                }
+            }
+        };
+
+        let cert_chain = tokio::fs::read(cert_path).await.context("failed to read certificate chain")?;
+        let cert_chain = if cert_path.extension().map_or(false, |x| x == "der") {
+            vec![rustls::Certificate(cert_chain)]
+        } else {
+            rustls_pemfile::certs(&mut &*cert_chain)
+                .context("invalid PEM-encoded certificate")?
+                .into_iter()
+                .map(rustls::Certificate)
+                .collect()
+        };
+
+        let server_crypto = rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)?;
+
+        return Ok(Some(server_crypto));
+    }
+
+    if key_file.is_some() || cert_file.is_some() {
+        if key_file.is_none() {
+            bail!("no key file");
+        }
+        if cert_file.is_none() {
+            bail!("no cert file");
+        }
+    }
+
+    Ok(None)
+}
+
 async fn handle_ws_pub(
     Extension(shared): Extension<Arc<Shared>>,
     ws: WebSocketUpgrade,
@@ -246,7 +430,7 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
         shared.data.lock().agent_clients.insert(key.clone(), AgentSession { 
             uid,
             addr, 
-            ctrl_invoker,
+            ctrl_invoker: CtrlClientAgent::Ws(ctrl_invoker),
             expire_at: params.expire_in.map(
                 |x|Local::now().timestamp_millis() as u64  + x 
             ) .unwrap_or(u64::MAX/2),
@@ -256,11 +440,15 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
     
     if let Some(old) = old {
         tracing::info!("kick agent session [{key}]-[{}], addr [{}]", old.uid, old.addr);
-        let _r = old.ctrl_invoker.kick_down(KickDownArgs {
-            code: -1,
-            reason: "replace by other session".into(),
-            ..Default::default()
-        }).await;
+        kick_agent_session(
+            &old.ctrl_invoker,
+            KickDownArgs {
+                code: -1,
+                reason: "replace by other session".into(),
+                ..Default::default()
+            },
+        )
+        .await;
     }
     
     tracing::info!("add agent session [{key}]-[{}], addr [{}]", uid, addr);
@@ -294,6 +482,88 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
     Ok(())
 }
 
+async fn handle_pub_conn_quic(
+    shared: Arc<Shared>,
+    uid: HUId,
+    stream: quic_signal::QuicSignalStream,
+    addr: SocketAddr,
+    params: PubParams,
+) -> Result<()> {
+    let mut session = make_stream_session(stream.split(), shared.disable_bridge_ch).await?;
+
+    let key = params.agent.clone().unwrap_or_else(|| uid.to_string());
+    let old = {
+        let ctrl_invoker = session.ctrl_client().clone_invoker();
+        shared.data.lock().agent_clients.insert(
+            key.clone(),
+            AgentSession {
+                uid,
+                addr,
+                ctrl_invoker: CtrlClientAgent::Quic(ctrl_invoker),
+                expire_at: params
+                    .expire_in
+                    .map(|x| Local::now().timestamp_millis() as u64 + x)
+                    .unwrap_or(u64::MAX / 2),
+                ver: params.ver.clone(),
+            },
+        )
+    };
+
+    if let Some(old) = old {
+        tracing::info!("kick agent session [{key}]-[{}], addr [{}]", old.uid, old.addr);
+        kick_agent_session(
+            &old.ctrl_invoker,
+            KickDownArgs {
+                code: -1,
+                reason: "replace by other session".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    tracing::info!("add agent session [{key}]-[{}], addr [{}]", uid, addr);
+
+    let _r = session.wait_for_completed().await;
+
+    let _r = {
+        let mut data = shared.data.lock();
+        let r = data.agent_clients.remove_entry(&key);
+        match r {
+            Some((key, value)) => {
+                if value.uid == uid {
+                    Some(value)
+                } else {
+                    data.agent_clients.insert(key, value);
+                    None
+                }
+            }
+            None => None,
+        }
+    };
+
+    if _r.is_some() {
+        tracing::info!("remove agent session [{key}]-[{uid}], addr [{addr}]");
+    }
+
+    Ok(())
+}
+
+fn collect_pub_sessions(shared: &Arc<Shared>) -> Vec<AgentInfo> {
+    shared
+        .data
+        .lock()
+        .agent_clients
+        .iter()
+        .map(|x| AgentInfo {
+            name: x.0.clone(),
+            addr: x.1.addr.to_string(),
+            expire_at: x.1.expire_at,
+            ver: x.1.ver.clone(),
+        })
+        .collect()
+}
+
 
 async fn get_pub_sessions (
     Extension(shared): Extension<Arc<Shared>>,
@@ -303,16 +573,7 @@ async fn get_pub_sessions (
     //     return StatusCode::UNAUTHORIZED.into_response()
     // }
 
-    let sessions: Vec<AgentInfo> = {
-        shared.data.lock().agent_clients.iter().map(|x|{
-            AgentInfo {
-                name: x.0.clone(),
-                addr: x.1.addr.to_string(),
-                expire_at: x.1.expire_at,
-                ver: x.1.ver.clone(),
-            }
-        }).collect()
-    };
+    let sessions = collect_pub_sessions(&shared);
     Json(sessions)
 }
 
@@ -353,7 +614,10 @@ async fn handle_ws_sub(
         tracing::info!("[{uid}] [{addr}] sub agent [{agent_name}]");
 
         return ws.on_upgrade(move |socket| async move {
-            let r = run_sub_agent(ctrl, uid, socket).await;
+            let r = match ctrl {
+                CtrlClientAgent::Ws(ctrl) => run_sub_agent(ctrl, uid, socket).await,
+                CtrlClientAgent::Quic(ctrl) => run_sub_agent(ctrl, uid, socket).await,
+            };
             tracing::info!("[{}] sub conn finished with [{:?}]", uid, r);
         })
     }
@@ -402,15 +666,17 @@ async fn handle_ws_sub(
 
 
 async fn run_sub_agent<H1: CtrlHandler>(ctrl: CtrlInvoker<H1>, uid: HUId, socket: WebSocket) -> Result<()> {
-    // let mut session = make_ws_server_switch(uid, socket).await?;
+    run_sub_agent_stream(ctrl, uid, WsStreamAxum::new(socket.split()).split()).await
+}
 
-    // let mut session = make_stream_switch(uid, WsStreamAxum::new(socket.split())).await?;
-    let mut session = make_switch_pair(uid, WsStreamAxum::new(socket.split()).split()).await?;
+async fn run_sub_agent_stream<H1, S1, S2>(ctrl: CtrlInvoker<H1>, uid: HUId, stream: (S1, S2)) -> Result<()>
+where
+    H1: CtrlHandler,
+    S1: PacketSink,
+    S2: PacketSource,
+{
+    let mut session = make_switch_pair(uid, stream).await?;
     let switch = session.clone_invoker();
-
-    // let mut session = make_stream_session( WsStreamAxum::new(socket.split()).split() ).await?;
-    // let switch = session.switch().clone_invoker();
-
 
     let ctrl_ch_id = ChId(0);
     let (ctrl_tx, ctrl_rx) = ChPair::new(ctrl_ch_id).split();
@@ -419,9 +685,18 @@ async fn run_sub_agent<H1: CtrlHandler>(ctrl: CtrlInvoker<H1>, uid: HUId, socket
     spawn_ctrl_service(uid, ctrl, switch, ChPair { tx: ctrl_tx, rx: ctrl_rx });
 
     let _r = session.wait_for_completed().await;
-
-
     Ok(())
+}
+
+async fn kick_agent_session(ctrl: &CtrlClientAgent, args: KickDownArgs) {
+    match ctrl {
+        CtrlClientAgent::Ws(ctrl) => {
+            let _r = ctrl.kick_down(args.clone()).await;
+        }
+        CtrlClientAgent::Quic(ctrl) => {
+            let _r = ctrl.kick_down(args).await;
+        }
+    }
 }
 
 
@@ -448,8 +723,15 @@ struct AgentSession {
 }
 
 
-// type CtrlClientAgent =  CtrlInvoker<ctrl_client::Entity<StreamSwitchEntity<WsStreamAxum<WebSocket>>>>;
-type CtrlClientAgent =  CtrlInvoker<ctrl_client::Entity<SwitchPairEntity< WsSource<SplitStream<WebSocket>> >>>;
+// type WsCtrlClientAgent =  CtrlInvoker<ctrl_client::Entity<StreamSwitchEntity<WsStreamAxum<WebSocket>>>>;
+type WsCtrlClientAgent = CtrlInvoker<ctrl_client::Entity<SwitchPairEntity<WsSource<SplitStream<WebSocket>>>>>;
+type QuicCtrlClientAgent = CtrlInvoker<ctrl_client::Entity<SwitchPairEntity<quic_signal::QuicSource>>>;
+
+#[derive(Clone)]
+enum CtrlClientAgent {
+    Ws(WsCtrlClientAgent),
+    Quic(QuicCtrlClientAgent),
+}
 
 
 
@@ -496,4 +778,3 @@ pub struct CmdArgs {
     )]
     disable_bridge_ch: bool,
 }
-
