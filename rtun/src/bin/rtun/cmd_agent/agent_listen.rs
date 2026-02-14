@@ -29,8 +29,8 @@ use axum::{
 
 use crate::{quic_signal::{self, PubResponse, SessionsResponse, SignalRequest, SignalResponse, StatusResponse}, rest_proto::{PUB_WS, SUB_WS, PUB_SESSIONS, PubParams, SubParams, AgentInfo}, secret::token_verify};
 
-const CERT_RELOAD_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const CERT_RELOAD_DEBOUNCE: Duration = Duration::from_secs(2);
+const CERT_RELOAD_POLL_INTERVAL: Duration = Duration::from_secs(15);
+const CERT_RELOAD_DEBOUNCE: Duration = Duration::from_secs(3);
 
 
 pub async fn run(args: CmdArgs) -> Result<()> {
