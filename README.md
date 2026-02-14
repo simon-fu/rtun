@@ -32,11 +32,11 @@ GitHub Actions: `.github/workflows/build-manual-release.yml`
   - 版本化：`rtun_YYMMDD_<commit7>`
   - 固定最新：`rtun_latest`
 
-## Dev Auto Build Workflow
+## Nightly Auto Build Workflow
 
-GitHub Actions: `.github/workflows/build-dev.yml`
+GitHub Actions: `.github/workflows/build-nightly.yml`
 
-- 推送到 `dev` 分支时自动触发编译（`push`）
+- 推送到 `main` 分支时自动触发编译（`push`）
 - 也支持手动触发（`workflow_dispatch`）
 - 编译 3 个目标：
   - `x86_64-unknown-linux-musl`
@@ -44,7 +44,8 @@ GitHub Actions: `.github/workflows/build-dev.yml`
   - `aarch64-apple-darwin`
 - 发布到固定的 `nightly` 预发布（`tag_name: nightly`）
 - 没有版本化 release id；每次执行都会更新同一个 `nightly`（覆盖同名资产）
-- 当前 `build-dev.yml` 不生成 `.sha256` 文件
+- 与手动发布的 `rtun_latest` 不同，`nightly` 表示 `main` 分支的滚动最新构建
+- 当前 `build-nightly.yml` 不生成 `.sha256` 文件
 
 ## Verify SHA256
 
