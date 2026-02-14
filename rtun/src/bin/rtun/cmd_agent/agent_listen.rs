@@ -11,9 +11,10 @@ use axum::{Extension, extract::Query, http::StatusCode, Json};
 use futures::{StreamExt, stream::SplitStream};
 use parking_lot::Mutex;
 use rtun::{huid::{gen_huid::gen_huid, HUId}, channel::{ChId, ChPair}, switch::{ctrl_service::spawn_ctrl_service, agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker}, ctrl_client, invoker_ctrl::{CtrlInvoker, CtrlHandler}, session_stream::make_stream_session, switch_pair::{SwitchPairEntity, make_switch_pair}, switch_sink::PacketSink, switch_source::PacketSource}, ws::server::{WsStreamAxum, WsSource}, async_rt::spawn_with_name, proto::KickDownArgs};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
-use std::{sync::Arc, collections::HashMap, path::Path, time::Duration};
+use std::{sync::Arc, collections::HashMap, path::Path, time::{Duration, Instant}};
 use std::net::SocketAddr;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use axum::{
@@ -27,6 +28,9 @@ use axum::{
 };
 
 use crate::{quic_signal::{self, PubResponse, SessionsResponse, SignalRequest, SignalResponse, StatusResponse}, rest_proto::{PUB_WS, SUB_WS, PUB_SESSIONS, PubParams, SubParams, AgentInfo}, secret::token_verify};
+
+const CERT_RELOAD_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const CERT_RELOAD_DEBOUNCE: Duration = Duration::from_secs(2);
 
 
 pub async fn run(args: CmdArgs) -> Result<()> {
@@ -76,12 +80,24 @@ async fn run_http(args: CmdArgs, addr: SocketAddr) -> Result<()> {
     ).await
     .with_context(|| "open https key/cert file failed")?;
 
+    if let (Some(tls_cfg), Some(key_file), Some(cert_file)) = (
+        tls_cfg.clone(),
+        args.https_key.clone(),
+        args.https_cert.clone(),
+    ) {
+        spawn_with_name("https-cert-reloader", async move {
+            let r = run_https_cert_reloader(tls_cfg, key_file, cert_file).await;
+            tracing::debug!("https cert reloader finished [{r:?}]");
+            r
+        });
+    }
+
     {
         let shared = shared.clone();
         let key_file = args.https_key.clone();
         let cert_file = args.https_cert.clone();
         spawn_with_name("quic-signal-server", async move {
-            let r = run_quic_signal(shared, addr, key_file.as_deref(), cert_file.as_deref()).await;
+            let r = run_quic_signal(shared, addr, key_file, cert_file).await;
             tracing::debug!("quic signal server finished [{r:?}]");
             r
         });
@@ -197,15 +213,73 @@ async fn try_load_https_cert(key_file: Option<&str>, cert_file: Option<&str>) ->
     Ok(None)
 }
 
-async fn run_quic_signal(shared: Arc<Shared>, addr: SocketAddr, key_file: Option<&str>, cert_file: Option<&str>) -> Result<()> {
-    let server_crypto = match try_load_quic_cert(key_file, cert_file).await? {
-        Some(v) => v,
-        None => {
-            tracing::info!("quic signaling disabled (need --https-key and --https-cert)");
-            return Ok(());
-        }
-    };
+async fn cert_pair_fingerprint(key_file: &str, cert_file: &str) -> Result<String> {
+    let raw_key = tokio::fs::read(key_file)
+    .await
+    .with_context(|| format!("read key file failed [{key_file}]"))?;
 
+    let raw_cert = tokio::fs::read(cert_file)
+    .await
+    .with_context(|| format!("read cert file failed [{cert_file}]"))?;
+
+    let mut hasher = Sha256::new();
+    hasher.update((raw_key.len() as u64).to_le_bytes());
+    hasher.update(raw_key);
+    hasher.update((raw_cert.len() as u64).to_le_bytes());
+    hasher.update(raw_cert);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+async fn run_https_cert_reloader(tls_cfg: RustlsConfig, key_file: String, cert_file: String) -> Result<()> {
+    let mut active_fingerprint = cert_pair_fingerprint(&key_file, &cert_file).await?;
+    let mut pending_fingerprint: Option<String> = None;
+    let mut pending_since = Instant::now();
+
+    tracing::info!("https cert auto-reload enabled, key [{}], cert [{}]", key_file, cert_file);
+
+    loop {
+        tokio::time::sleep(CERT_RELOAD_POLL_INTERVAL).await;
+
+        let current_fingerprint = match cert_pair_fingerprint(&key_file, &cert_file).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("https cert watch read failed: {e}");
+                continue;
+            }
+        };
+
+        if current_fingerprint == active_fingerprint {
+            pending_fingerprint = None;
+            continue;
+        }
+
+        let should_reload = match pending_fingerprint.as_deref() {
+            Some(v) if v == current_fingerprint => pending_since.elapsed() >= CERT_RELOAD_DEBOUNCE,
+            _ => {
+                pending_fingerprint = Some(current_fingerprint.clone());
+                pending_since = Instant::now();
+                false
+            }
+        };
+        if !should_reload {
+            continue;
+        }
+
+        match tls_cfg.reload_from_pem_file(&cert_file, &key_file).await {
+            Ok(()) => {
+                tracing::info!("https cert reloaded from key [{}], cert [{}]", key_file, cert_file);
+                active_fingerprint = current_fingerprint;
+                pending_fingerprint = None;
+            }
+            Err(e) => {
+                tracing::warn!("https cert reload failed, keep old cert: {e}");
+                pending_since = Instant::now();
+            }
+        }
+    }
+}
+
+fn make_quic_server_config(server_crypto: rustls::ServerConfig) -> Result<quinn::ServerConfig> {
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
     Arc::get_mut(&mut server_config.transport)
     .with_context(|| "get quic transport config failed")?
@@ -213,8 +287,96 @@ async fn run_quic_signal(shared: Arc<Shared>, addr: SocketAddr, key_file: Option
     .keep_alive_interval(Some(Duration::from_secs(3)))
     .max_idle_timeout(Some(quinn::VarInt::from_u32(30_000).into()));
 
+    Ok(server_config)
+}
+
+async fn run_quic_cert_reloader(endpoint: quinn::Endpoint, key_file: String, cert_file: String) -> Result<()> {
+    let mut active_fingerprint = cert_pair_fingerprint(&key_file, &cert_file).await?;
+    let mut pending_fingerprint: Option<String> = None;
+    let mut pending_since = Instant::now();
+
+    tracing::info!("quic cert auto-reload enabled, key [{}], cert [{}]", key_file, cert_file);
+
+    loop {
+        tokio::time::sleep(CERT_RELOAD_POLL_INTERVAL).await;
+
+        let current_fingerprint = match cert_pair_fingerprint(&key_file, &cert_file).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("quic cert watch read failed: {e}");
+                continue;
+            }
+        };
+
+        if current_fingerprint == active_fingerprint {
+            pending_fingerprint = None;
+            continue;
+        }
+
+        let should_reload = match pending_fingerprint.as_deref() {
+            Some(v) if v == current_fingerprint => pending_since.elapsed() >= CERT_RELOAD_DEBOUNCE,
+            _ => {
+                pending_fingerprint = Some(current_fingerprint.clone());
+                pending_since = Instant::now();
+                false
+            }
+        };
+        if !should_reload {
+            continue;
+        }
+
+        let server_crypto = match try_load_quic_cert(Some(&key_file), Some(&cert_file)).await {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                tracing::warn!("quic cert reload skipped: missing key/cert");
+                pending_since = Instant::now();
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("quic cert reload parse failed, keep old cert: {e}");
+                pending_since = Instant::now();
+                continue;
+            }
+        };
+
+        let server_config = match make_quic_server_config(server_crypto) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("quic cert reload build server config failed, keep old cert: {e}");
+                pending_since = Instant::now();
+                continue;
+            }
+        };
+
+        endpoint.set_server_config(Some(server_config));
+        tracing::info!("quic cert reloaded from key [{}], cert [{}]", key_file, cert_file);
+        active_fingerprint = current_fingerprint;
+        pending_fingerprint = None;
+    }
+}
+
+async fn run_quic_signal(shared: Arc<Shared>, addr: SocketAddr, key_file: Option<String>, cert_file: Option<String>) -> Result<()> {
+    let server_crypto = match try_load_quic_cert(key_file.as_deref(), cert_file.as_deref()).await? {
+        Some(v) => v,
+        None => {
+            tracing::info!("quic signaling disabled (need --https-key and --https-cert)");
+            return Ok(());
+        }
+    };
+
+    let server_config = make_quic_server_config(server_crypto)?;
+
     let endpoint = quinn::Endpoint::server(server_config, addr)
     .with_context(|| format!("failed to bind quic://{}", addr))?;
+
+    if let (Some(key_file), Some(cert_file)) = (key_file.clone(), cert_file.clone()) {
+        let endpoint2 = endpoint.clone();
+        spawn_with_name("quic-cert-reloader", async move {
+            let r = run_quic_cert_reloader(endpoint2, key_file, cert_file).await;
+            tracing::debug!("quic cert reloader finished [{r:?}]");
+            r
+        });
+    }
 
     tracing::info!("agent listening on quic://{}", addr);
 
