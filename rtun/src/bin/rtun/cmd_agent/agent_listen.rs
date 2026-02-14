@@ -480,29 +480,34 @@ async fn try_load_quic_cert(key_file: Option<&str>, cert_file: Option<&str>) -> 
         let key_path: &Path = key_path.as_ref();
         let cert_path: &Path = cert_path.as_ref();
 
-        let key = tokio::fs::read(key_path).await.context("failed to read private key")?;
-        let key = if key_path.extension().map_or(false, |x| x == "der") {
-            rustls::PrivateKey(key)
+        let raw_key = tokio::fs::read(key_path).await.context("failed to read private key")?;
+        let key = if key_path.extension().map_or(false, |x| x.eq_ignore_ascii_case("der")) {
+            rustls::PrivateKey(raw_key)
         } else {
-            let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)
-                .context("malformed PKCS #8 private key")?;
-            match pkcs8.into_iter().next() {
-                Some(x) => rustls::PrivateKey(x),
-                None => {
-                    let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)
-                        .context("malformed PKCS #1 private key")?;
-                    match rsa.into_iter().next() {
-                        Some(x) => rustls::PrivateKey(x),
-                        None => {
-                            anyhow::bail!("no private keys found");
-                        }
+            let mut reader = raw_key.as_slice();
+            let mut parsed_key = None;
+            loop {
+                let item = rustls_pemfile::read_one(&mut reader)
+                    .context("invalid PEM-encoded private key")?;
+                match item {
+                    Some(rustls_pemfile::Item::PKCS8Key(k))
+                    | Some(rustls_pemfile::Item::RSAKey(k))
+                    | Some(rustls_pemfile::Item::ECKey(k)) => {
+                        parsed_key = Some(rustls::PrivateKey(k));
+                        break;
                     }
+                    Some(_) => continue,
+                    None => break,
                 }
+            }
+            match parsed_key {
+                Some(k) => k,
+                None => bail!("no private keys found (supported formats: PKCS#8, PKCS#1, SEC1)"),
             }
         };
 
         let cert_chain = tokio::fs::read(cert_path).await.context("failed to read certificate chain")?;
-        let cert_chain = if cert_path.extension().map_or(false, |x| x == "der") {
+        let cert_chain = if cert_path.extension().map_or(false, |x| x.eq_ignore_ascii_case("der")) {
             vec![rustls::Certificate(cert_chain)]
         } else {
             rustls_pemfile::certs(&mut &*cert_chain)
