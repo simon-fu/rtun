@@ -19,6 +19,33 @@ rtun agent pub "https://xxx.com:8888" --agent rtun --expire_in 60 --secret sec12
 rtun socks --listen 0.0.0.0:2080 "https://xxx.com:8888" --secret sec123
 ```
 
+## Relay Subcommand (Planned)
+
+以下为 `relay` 子命令的需求定稿（计划中，尚未实现）。
+
+- 子命令：`rtun relay`
+- 规则参数：`-L [proto://]<listen_addr>?to=<target_addr>`
+- `proto` 省略时默认 `udp`
+- `-L` 可重复，用于配置多条转发规则
+- 当前仅支持 `udp`，`tcp` 语法预留给后续扩展
+- `target_addr` 当前仅支持 `IP:PORT`（不支持域名）
+- 仅支持正向模式：本地监听 -> 远端目标 -> 回包返回本地发送方
+- UDP 业务流量通过底层 P2P 通道转发，不使用现有 QUIC 隧道
+- 支持参数：
+  - `--udp-idle-timeout`（默认 `120s`）
+  - `--udp-max-payload`（默认按底层通道可发送上限自动计算）
+- 超过 `udp-max-payload` 的 UDP 包默认丢弃（并记录日志）
+
+示例：
+
+```bash
+rtun relay \
+  -L udp://0.0.0.0:15353?to=8.8.8.8:53 \
+  -L 0.0.0.0:15354?to=8.8.4.4:53 \
+  "quic://127.0.0.1:8888" \
+  --secret sec123 --quic-insecure
+```
+
 ## Manual Release Workflow
 
 GitHub Actions: `.github/workflows/build-manual-release.yml`
