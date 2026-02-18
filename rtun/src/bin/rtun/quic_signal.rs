@@ -285,11 +285,14 @@ fn parse_pub_params(url: &url::Url) -> Result<PubParams> {
     let mut agent = None;
     let mut token = None;
     let mut expire_in = None;
+    let mut instance_id = None;
     let mut ver = None;
 
     for (k, v) in url.query_pairs() {
         if k == "agent" {
             agent = Some(v.to_string());
+        } else if k == "instance_id" {
+            instance_id = Some(v.to_string());
         } else if k == "token" {
             token = Some(v.to_string());
         } else if k == "expire_in" {
@@ -307,6 +310,7 @@ fn parse_pub_params(url: &url::Url) -> Result<PubParams> {
         agent,
         token,
         expire_in,
+        instance_id,
         ver,
     })
 }
@@ -314,10 +318,13 @@ fn parse_pub_params(url: &url::Url) -> Result<PubParams> {
 fn parse_sub_params(url: &url::Url) -> Result<SubParams> {
     let mut agent = None;
     let mut token = None;
+    let mut instance_id = None;
 
     for (k, v) in url.query_pairs() {
         if k == "agent" {
             agent = Some(v.to_string());
+        } else if k == "instance_id" {
+            instance_id = Some(v.to_string());
         } else if k == "token" {
             token = Some(v.to_string());
         }
@@ -328,6 +335,7 @@ fn parse_sub_params(url: &url::Url) -> Result<SubParams> {
         agent,
         token,
         expire_in: None,
+        instance_id,
         ver: None,
     })
 }
@@ -486,3 +494,31 @@ impl Sink<ChPacket> for QuicSink {
 }
 
 impl PacketSink for QuicSink {}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_sub_params;
+
+    #[test]
+    fn parse_sub_params_with_instance_id() {
+        let url = url::Url::parse(
+            "quic://127.0.0.1:8888?agent=rtun&instance_id=i-123&token=t-abc",
+        )
+        .unwrap();
+
+        let params = parse_sub_params(&url).unwrap();
+        assert_eq!(params.agent.as_deref(), Some("rtun"));
+        assert_eq!(params.instance_id.as_deref(), Some("i-123"));
+        assert_eq!(params.token, "t-abc");
+    }
+
+    #[test]
+    fn parse_sub_params_without_instance_id() {
+        let url = url::Url::parse("quic://127.0.0.1:8888?agent=rtun&token=t-abc").unwrap();
+
+        let params = parse_sub_params(&url).unwrap();
+        assert_eq!(params.agent.as_deref(), Some("rtun"));
+        assert!(params.instance_id.is_none());
+        assert_eq!(params.token, "t-abc");
+    }
+}

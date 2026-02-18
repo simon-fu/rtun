@@ -408,6 +408,8 @@ async fn handle_quic_signal_conn(shared: Arc<Shared>, conn: quinn::Connecting) -
                 return Ok(());
             }
 
+            // instance_id is server generated; ignore any client-provided value.
+            params.instance_id = None;
             if params.agent.is_none() {
                 params.agent = Some(uid.to_string());
             }
@@ -427,6 +429,7 @@ async fn handle_quic_signal_conn(shared: Arc<Shared>, conn: quinn::Connecting) -
             }
 
             let agent_name = params.agent.as_deref().unwrap_or("local");
+            let req_instance_id = params.instance_id.as_deref();
 
             if agent_name == "local" {
                 if let Some(local) = shared.local.as_ref() {
@@ -437,29 +440,28 @@ async fn handle_quic_signal_conn(shared: Arc<Shared>, conn: quinn::Connecting) -
                 }
             }
 
-            let ctrl = {
-                shared
-                    .data
-                    .lock()
-                    .agent_clients
-                    .get(agent_name)
-                    .map(|x| x.ctrl_invoker.clone())
+            let lookup = {
+                let data = shared.data.lock();
+                lookup_agent_ctrl(&data, agent_name, req_instance_id)
             };
-            if let Some(ctrl) = ctrl {
-                let rsp = SignalResponse::Sub(StatusResponse::ok());
-                quic_signal::write_response(&mut tx, &rsp).await?;
-                let stream = quic_signal::QuicSignalStream::new(tx, rx, None);
-                let stream = stream.split();
+            match lookup {
+                Ok(ctrl) => {
+                    let rsp = SignalResponse::Sub(StatusResponse::ok());
+                    quic_signal::write_response(&mut tx, &rsp).await?;
+                    let stream = quic_signal::QuicSignalStream::new(tx, rx, None);
+                    let stream = stream.split();
 
-                return match ctrl {
-                    CtrlClientAgent::Ws(ctrl) => run_sub_agent_stream(ctrl, uid, stream).await,
-                    CtrlClientAgent::Quic(ctrl) => run_sub_agent_stream(ctrl, uid, stream).await,
-                };
+                    return match ctrl {
+                        CtrlClientAgent::Ws(ctrl) => run_sub_agent_stream(ctrl, uid, stream).await,
+                        CtrlClientAgent::Quic(ctrl) => run_sub_agent_stream(ctrl, uid, stream).await,
+                    };
+                }
+                Err(reason) => {
+                    let rsp = SignalResponse::Sub(StatusResponse::err(reason));
+                    write_response_and_finish(&mut tx, &rsp).await?;
+                    Ok(())
+                }
             }
-
-            let rsp = SignalResponse::Sub(StatusResponse::err(format!("not found agent [{}]", agent_name)));
-            write_response_and_finish(&mut tx, &rsp).await?;
-            Ok(())
         }
         SignalRequest::Sessions => {
             let rsp = SignalResponse::Sessions(SessionsResponse::ok(collect_pub_sessions(&shared)));
@@ -550,6 +552,8 @@ async fn handle_ws_pub(
 
     let uid = gen_huid();
     tracing::debug!("[{}] pub connected from {addr}, {params:?}", uid);
+    // instance_id is server generated; ignore any client-provided value.
+    params.instance_id = None;
     
     let agent_name = match params.agent.as_deref() {
         Some(v) => v.to_string(),
@@ -592,10 +596,12 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
     // let mut ctrl_client = make_ctrl_client(uid, ctrl_pair, switch).await?;
     
     let key = params.agent.unwrap_or_else(||uid.to_string());
+    let instance_id = uid.to_string();
     let old = {
         let ctrl_invoker = session.ctrl_client().clone_invoker();
         shared.data.lock().agent_clients.insert(key.clone(), AgentSession { 
             uid,
+            instance_id: instance_id.clone(),
             addr, 
             ctrl_invoker: CtrlClientAgent::Ws(ctrl_invoker),
             expire_at: params.expire_in.map(
@@ -618,7 +624,7 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
         .await;
     }
     
-    tracing::info!("add agent session [{key}]-[{}], addr [{}]", uid, addr);
+    tracing::info!("add agent session [{key}]-[{}], instance [{instance_id}], addr [{}]", uid, addr);
 
     let _r = session.wait_for_completed().await; 
     
@@ -640,7 +646,7 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
     };
 
     if _r.is_some() {
-        tracing::info!("remove agent session [{key}]-[{uid}], addr [{addr}]");
+        tracing::info!("remove agent session [{key}]-[{uid}], instance [{instance_id}], addr [{addr}]");
     }
     
 
@@ -659,12 +665,14 @@ async fn handle_pub_conn_quic(
     let mut session = make_stream_session(stream.split(), shared.disable_bridge_ch).await?;
 
     let key = params.agent.clone().unwrap_or_else(|| uid.to_string());
+    let instance_id = uid.to_string();
     let old = {
         let ctrl_invoker = session.ctrl_client().clone_invoker();
         shared.data.lock().agent_clients.insert(
             key.clone(),
             AgentSession {
                 uid,
+                instance_id: instance_id.clone(),
                 addr,
                 ctrl_invoker: CtrlClientAgent::Quic(ctrl_invoker),
                 expire_at: params
@@ -689,7 +697,7 @@ async fn handle_pub_conn_quic(
         .await;
     }
 
-    tracing::info!("add agent session [{key}]-[{}], addr [{}]", uid, addr);
+    tracing::info!("add agent session [{key}]-[{}], instance [{instance_id}], addr [{}]", uid, addr);
 
     let _r = session.wait_for_completed().await;
 
@@ -710,7 +718,7 @@ async fn handle_pub_conn_quic(
     };
 
     if _r.is_some() {
-        tracing::info!("remove agent session [{key}]-[{uid}], addr [{addr}]");
+        tracing::info!("remove agent session [{key}]-[{uid}], instance [{instance_id}], addr [{addr}]");
     }
 
     Ok(())
@@ -726,6 +734,7 @@ fn collect_pub_sessions(shared: &Arc<Shared>) -> Vec<AgentInfo> {
             name: x.0.clone(),
             addr: x.1.addr.to_string(),
             expire_at: x.1.expire_at,
+            instance_id: Some(x.1.instance_id.clone()),
             ver: x.1.ver.clone(),
         })
         .collect()
@@ -759,6 +768,7 @@ async fn handle_ws_sub(
     tracing::debug!("connected from {addr}, {params:?}", );
 
     let agent_name = params.agent.as_deref().unwrap_or("local");
+    let req_instance_id = params.instance_id.as_deref();
     if agent_name == "local" {
         if let Some(local) = shared.local.as_ref() {
             let uid = gen_huid();
@@ -773,26 +783,25 @@ async fn handle_ws_sub(
         }
     }
 
-    let r = {
-        shared.data.lock().agent_clients.get(agent_name).map(|x|x.ctrl_invoker.clone()) 
+    let lookup = {
+        let data = shared.data.lock();
+        lookup_agent_ctrl(&data, agent_name, req_instance_id)
     };
-    if let Some(ctrl) = r {
-        let uid = gen_huid();
-        tracing::info!("[{uid}] [{addr}] sub agent [{agent_name}]");
+    match lookup {
+        Ok(ctrl) => {
+            let uid = gen_huid();
+            tracing::info!("[{uid}] [{addr}] sub agent [{agent_name}]");
 
-        return ws.on_upgrade(move |socket| async move {
-            let r = match ctrl {
-                CtrlClientAgent::Ws(ctrl) => run_sub_agent(ctrl, uid, socket).await,
-                CtrlClientAgent::Quic(ctrl) => run_sub_agent(ctrl, uid, socket).await,
-            };
-            tracing::info!("[{}] sub conn finished with [{:?}]", uid, r);
-        })
+            ws.on_upgrade(move |socket| async move {
+                let r = match ctrl {
+                    CtrlClientAgent::Ws(ctrl) => run_sub_agent(ctrl, uid, socket).await,
+                    CtrlClientAgent::Quic(ctrl) => run_sub_agent(ctrl, uid, socket).await,
+                };
+                tracing::info!("[{}] sub conn finished with [{:?}]", uid, r);
+            })
+        }
+        Err(reason) => (StatusCode::NOT_FOUND, reason).into_response(),
     }
-
-    (
-        StatusCode::NOT_FOUND,
-        format!("Not found agent {:?}", params.agent),
-    ).into_response()
 }
 
 
@@ -883,10 +892,33 @@ struct SharedData {
 
 struct AgentSession {
     uid: HUId,
+    instance_id: String,
     addr: SocketAddr,
     ctrl_invoker: CtrlClientAgent,
     expire_at: u64,
     ver: Option<String>,
+}
+
+fn lookup_agent_ctrl(
+    data: &SharedData,
+    agent_name: &str,
+    req_instance_id: Option<&str>,
+) -> std::result::Result<CtrlClientAgent, String> {
+    let session = data
+        .agent_clients
+        .get(agent_name)
+        .ok_or_else(|| format!("not found agent [{agent_name}]"))?;
+
+    if let Some(req_instance_id) = req_instance_id {
+        if session.instance_id != req_instance_id {
+            return Err(format!(
+                "instance mismatch for agent [{agent_name}], want [{req_instance_id}], actual [{}]",
+                session.instance_id
+            ));
+        }
+    }
+
+    Ok(session.ctrl_invoker.clone())
 }
 
 

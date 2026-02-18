@@ -382,6 +382,7 @@ async fn query_new_agents_quic(
             name: "non-exist".into(),
             addr: "".into(),
             expire_at: 0,
+            instance_id: None,
             ver: None,
         },
     );

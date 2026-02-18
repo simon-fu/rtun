@@ -76,6 +76,8 @@ pub struct AgentInfo {
     pub addr: String,
     pub expire_at: u64,
     #[serde(skip_serializing_if="Option::is_none")]
+    pub instance_id: Option<String>,
+    #[serde(skip_serializing_if="Option::is_none")]
     pub ver: Option<String>,
 }
 
@@ -84,6 +86,7 @@ pub struct PubParams {
     pub agent: Option<String>,
     pub token: String,
     pub expire_in: Option<u64>,
+    pub instance_id: Option<String>,
     pub ver: Option<String>,
 }
 
