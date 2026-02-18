@@ -977,3 +977,41 @@ impl Drop for ChItem {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn udp_relay_same_flow_should_keep_stable_target_src_port_across_tunnels() -> Result<()> {
+        // UDP connect() does not require target to be online; use a fixed local address
+        // so this test only validates flow/socket reuse semantics.
+        let target_addr: SocketAddr = "127.0.0.1:9".parse()?;
+        let (flow_tx, _flow_rx) = mpsc::channel::<RelayFlowPacket>(8);
+
+        // Simulate same flow_id arriving via two different tunnels on agent side.
+        let mut flow_a = new_relay_flow(1, target_addr, flow_tx.clone(), 1200)
+            .await
+            .with_context(|| "create first relay flow failed")?;
+        let mut flow_b = new_relay_flow(1, target_addr, flow_tx, 1200)
+            .await
+            .with_context(|| "create second relay flow failed")?;
+
+        let src_port_a = flow_a.socket.local_addr()?.port();
+        let src_port_b = flow_b.socket.local_addr()?.port();
+
+        if let Some(stop_tx) = flow_a.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(stop_tx) = flow_b.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+
+        assert_eq!(
+            src_port_a, src_port_b,
+            "same flow should preserve target-side source port across tunnel switch, but changed from [{src_port_a}] to [{src_port_b}]"
+        );
+
+        Ok(())
+    }
+}

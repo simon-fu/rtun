@@ -204,6 +204,355 @@ async fn relay_quic_smoke_multi_tunnel_e2e() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual reproducer: fixed source burst + sticky target peer"]
+async fn relay_quic_fixed_source_burst_multi_tunnel_e2e() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (cert_path, key_path) = write_test_cert_pair(temp.path())?;
+
+    let signal_port = reserve_tcp_port()?;
+    let relay_port = reserve_udp_port()?;
+
+    let (echo_addr, sticky_stats, echo_stop, echo_task) = spawn_udp_sticky_echo_server().await?;
+    let signal_addr = format!("127.0.0.1:{signal_port}");
+    let relay_addr: SocketAddr = format!("127.0.0.1:{relay_port}").parse()?;
+    let quic_url = format!("quic://{signal_addr}");
+    let rule = format!("udp://{relay_addr}?to={echo_addr}");
+
+    let mut listen = Proc::spawn(
+        "listen",
+        [
+            "agent",
+            "listen",
+            "--addr",
+            signal_addr.as_str(),
+            "--https-key",
+            key_path.to_string_lossy().as_ref(),
+            "--https-cert",
+            cert_path.to_string_lossy().as_ref(),
+            "--secret",
+            TEST_SECRET,
+        ],
+    )
+    .await?;
+
+    let mut publisher = Proc::spawn(
+        "pub",
+        [
+            "agent",
+            "pub",
+            quic_url.as_str(),
+            "--agent",
+            "relay-e2e-fixed-src",
+            "--expire_in",
+            "10",
+            "--secret",
+            TEST_SECRET,
+            "--quic-insecure",
+        ],
+    )
+    .await?;
+
+    let mut relay = Proc::spawn(
+        "relay",
+        [
+            "relay",
+            "-L",
+            rule.as_str(),
+            quic_url.as_str(),
+            "--agent",
+            "^relay-e2e-fixed-src$",
+            "--secret",
+            TEST_SECRET,
+            "--quic-insecure",
+            "--udp-idle-timeout",
+            "30",
+            "--p2p-min-channels",
+            "1",
+            "--p2p-max-channels",
+            "3",
+        ],
+    )
+    .await?;
+
+    let run_result = async {
+        wait_for_process_log_contains(
+            &mut relay,
+            "relay tunnel connected: idx [0]",
+            Duration::from_secs(30),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let source = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .with_context(|| "bind fixed source udp client failed")?;
+
+        let lock_probe = b"fixed-source-lock-probe";
+        source
+            .send_to(lock_probe.as_slice(), relay_addr)
+            .await
+            .with_context(|| format!("send lock probe to relay failed [{relay_addr}]"))?;
+        let lock_replies = recv_udp_replies_until(&source, 1, Duration::from_secs(1))
+            .await
+            .with_context(|| "recv lock probe reply failed")?;
+        if lock_replies.len() != 1 || lock_replies[0] != lock_probe {
+            let stats = sticky_stats_snapshot(&sticky_stats);
+            bail!(
+                "sticky lock probe failed, got {:?}, want {:?}, sticky_stats={stats:?}\n{}",
+                lock_replies,
+                lock_probe,
+                dump_process_logs([&listen, &publisher, &relay])
+            );
+        }
+
+        set_sticky_mode(&sticky_stats, true);
+        let baseline = sticky_stats_snapshot(&sticky_stats).accepted_payloads.len();
+        let mut expected = Vec::with_capacity(5);
+        for idx in 0..5 {
+            let payload = format!("fixed-source-burst-{idx}").into_bytes();
+            source
+                .send_to(payload.as_slice(), relay_addr)
+                .await
+                .with_context(|| format!("send burst udp to relay failed [{relay_addr}]"))?;
+            expected.push(payload);
+        }
+
+        let replies = recv_udp_replies_until(&source, expected.len(), Duration::from_secs(3))
+            .await
+            .with_context(|| "recv burst replies failed")?;
+
+        if replies.len() != expected.len() {
+            let stats = sticky_stats_snapshot(&sticky_stats);
+            bail!(
+                "fixed source burst reply count mismatch: got [{}], want [{}], sticky_stats={stats:?}\n{}",
+                replies.len(),
+                expected.len(),
+                dump_process_logs([&listen, &publisher, &relay])
+            );
+        }
+
+        let mut got_sorted = replies;
+        got_sorted.sort();
+        let mut expected_sorted = expected;
+        expected_sorted.sort();
+        if got_sorted != expected_sorted {
+            let stats = sticky_stats_snapshot(&sticky_stats);
+            bail!(
+                "fixed source burst payload mismatch, sticky_stats={stats:?}\n{}",
+                dump_process_logs([&listen, &publisher, &relay])
+            );
+        }
+
+        let stats = wait_for_sticky_accepted_count(
+            &sticky_stats,
+            baseline.saturating_add(5),
+            Duration::from_secs(2),
+        )
+        .await;
+        if stats.accepted_payloads.len() < baseline.saturating_add(5) {
+            bail!(
+                "sticky target observed too few packets after burst: got [{}], want_at_least [{}], sticky_stats={stats:?}\n{}",
+                stats.accepted_payloads.len(),
+                baseline.saturating_add(5),
+                dump_process_logs([&listen, &publisher, &relay])
+            );
+        }
+        if stats.dropped_non_primary > 0 {
+            bail!(
+                "sticky target dropped packets from non-primary peer, sticky_stats={stats:?}\n{}",
+                dump_process_logs([&listen, &publisher, &relay])
+            );
+        }
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    relay.terminate().await;
+    publisher.terminate().await;
+    listen.terminate().await;
+
+    let _ = echo_stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), echo_task).await;
+
+    run_result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_quic_same_flow_target_src_port_should_stay_stable_e2e() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (cert_path, key_path) = write_test_cert_pair(temp.path())?;
+
+    let signal_port = reserve_tcp_port()?;
+    let relay_port = reserve_udp_port()?;
+
+    let (echo_addr, observer, echo_stop, echo_task) = spawn_udp_observer_echo_server().await?;
+    let signal_addr = format!("127.0.0.1:{signal_port}");
+    let relay_addr: SocketAddr = format!("127.0.0.1:{relay_port}").parse()?;
+    let quic_url = format!("quic://{signal_addr}");
+    let rule = format!("udp://{relay_addr}?to={echo_addr}");
+
+    let mut listen = Proc::spawn(
+        "listen",
+        [
+            "agent",
+            "listen",
+            "--addr",
+            signal_addr.as_str(),
+            "--https-key",
+            key_path.to_string_lossy().as_ref(),
+            "--https-cert",
+            cert_path.to_string_lossy().as_ref(),
+            "--secret",
+            TEST_SECRET,
+        ],
+    )
+    .await?;
+
+    let mut publisher = Proc::spawn(
+        "pub",
+        [
+            "agent",
+            "pub",
+            quic_url.as_str(),
+            "--agent",
+            "relay-e2e-stable-flow",
+            "--expire_in",
+            "10",
+            "--secret",
+            TEST_SECRET,
+            "--quic-insecure",
+        ],
+    )
+    .await?;
+
+    let mut relay = Proc::spawn(
+        "relay",
+        [
+            "relay",
+            "-L",
+            rule.as_str(),
+            quic_url.as_str(),
+            "--agent",
+            "^relay-e2e-stable-flow$",
+            "--secret",
+            TEST_SECRET,
+            "--quic-insecure",
+            "--udp-idle-timeout",
+            "120",
+            "--p2p-min-channels",
+            "1",
+            "--p2p-max-channels",
+            "3",
+            "--p2p-channel-lifetime",
+            "8",
+        ],
+    )
+    .await?;
+
+    let run_result = async {
+        wait_for_process_log_contains(
+            &mut relay,
+            "relay tunnel connected: idx [0]",
+            Duration::from_secs(30),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let source = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .with_context(|| "bind fixed source udp client failed")?;
+
+        let payloads: Vec<Vec<u8>> = (0..5)
+            .map(|i| format!("stable-flow-{i}").into_bytes())
+            .collect();
+
+        // First packets go through initial tunnel.
+        source
+            .send_to(payloads[0].as_slice(), relay_addr)
+            .await
+            .with_context(|| format!("send udp to relay failed [{relay_addr}]"))?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        source
+            .send_to(payloads[1].as_slice(), relay_addr)
+            .await
+            .with_context(|| format!("send udp to relay failed [{relay_addr}]"))?;
+
+        wait_for_process_log_contains(
+            &mut relay,
+            "relay tunnel rotated:",
+            Duration::from_secs(45),
+        )
+        .await?;
+
+        // Remaining packets are sent after tunnel rotation.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for payload in payloads.iter().skip(2) {
+            source
+                .send_to(payload.as_slice(), relay_addr)
+                .await
+                .with_context(|| format!("send udp to relay failed [{relay_addr}]"))?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let snapshot = observer_snapshot(&observer);
+            let observed: Vec<(Vec<u8>, SocketAddr)> = payloads
+                .iter()
+                .filter_map(|payload| {
+                    snapshot
+                        .records
+                        .iter()
+                        .find(|(p, _)| p == payload)
+                        .map(|(_, addr)| (payload.clone(), *addr))
+                })
+                .collect();
+            let src_ports: std::collections::BTreeSet<u16> =
+                observed.iter().map(|(_, addr)| addr.port()).collect();
+
+            if observed.len() >= 3 && src_ports.len() > 1 {
+                bail!(
+                    "same flow target-side source port changed across migration, ports={src_ports:?}, observed={observed:?}\n{}",
+                    dump_process_logs([&listen, &publisher, &relay])
+                );
+            }
+
+            if observed.len() == payloads.len() {
+                if src_ports.len() != 1 {
+                    bail!(
+                        "same flow target-side source port changed across migration, ports={src_ports:?}, observed={observed:?}\n{}",
+                        dump_process_logs([&listen, &publisher, &relay])
+                    );
+                }
+                break;
+            }
+
+            if Instant::now() >= deadline {
+                bail!(
+                    "wait observed payload timeout, payloads={payloads:?}, observed_records={:?}\n{}",
+                    snapshot.records,
+                    dump_process_logs([&listen, &publisher, &relay])
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    relay.terminate().await;
+    publisher.terminate().await;
+    listen.terminate().await;
+
+    let _ = echo_stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), echo_task).await;
+
+    run_result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "slow/manual: relay long-run stability; run on demand"]
 async fn relay_quic_longrun_e2e() -> Result<()> {
     let temp = TempDir::new()?;
@@ -537,6 +886,51 @@ async fn udp_roundtrip_with_timeout(
     Ok(())
 }
 
+async fn recv_udp_replies_until(
+    socket: &UdpSocket,
+    expected: usize,
+    timeout: Duration,
+) -> Result<Vec<Vec<u8>>> {
+    let deadline = Instant::now() + timeout;
+    let mut out = Vec::with_capacity(expected);
+    let mut recv_buf = [0_u8; 4096];
+    while out.len() < expected {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let remain = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remain, socket.recv_from(&mut recv_buf)).await {
+            Ok(Ok((n, _))) => out.push(recv_buf[..n].to_vec()),
+            Ok(Err(e)) => return Err(e).with_context(|| "recv burst reply failed"),
+            Err(_) => break,
+        }
+    }
+    Ok(out)
+}
+
+async fn wait_for_process_log_contains(
+    proc: &mut Proc,
+    pattern: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        proc.ensure_running()?;
+        let combined = format!("{}\n{}", proc.stdout(), proc.stderr());
+        if combined.contains(pattern) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "wait process log timeout, pattern [{}] not found in [{}]",
+                pattern,
+                proc.name
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 async fn spawn_udp_echo_server() -> Result<(SocketAddr, oneshot::Sender<()>, JoinHandle<Result<()>>)> {
     let socket = UdpSocket::bind("127.0.0.1:0")
         .await
@@ -562,6 +956,140 @@ async fn spawn_udp_echo_server() -> Result<(SocketAddr, oneshot::Sender<()>, Joi
     });
 
     Ok((addr, stop_tx, task))
+}
+
+#[derive(Debug, Default, Clone)]
+struct UdpObserverStats {
+    records: Vec<(Vec<u8>, SocketAddr)>,
+}
+
+async fn spawn_udp_observer_echo_server() -> Result<(
+    SocketAddr,
+    Arc<Mutex<UdpObserverStats>>,
+    oneshot::Sender<()>,
+    JoinHandle<Result<()>>,
+)> {
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .with_context(|| "bind udp observer echo server failed")?;
+    let addr = socket.local_addr()?;
+    let stats = Arc::new(Mutex::new(UdpObserverStats::default()));
+
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let task_stats = stats.clone();
+    let task = tokio::spawn(async move {
+        let mut buf = [0_u8; 4096];
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => {
+                    return Ok(());
+                }
+                r = socket.recv_from(&mut buf) => {
+                    let (n, from) = r.with_context(|| "observer recv_from failed")?;
+                    {
+                        let mut guard = task_stats.lock().unwrap();
+                        guard.records.push((buf[..n].to_vec(), from));
+                    }
+                    socket.send_to(&buf[..n], from)
+                        .await
+                        .with_context(|| format!("observer send_to failed [{from}]"))?;
+                }
+            }
+        }
+    });
+
+    Ok((addr, stats, stop_tx, task))
+}
+
+fn observer_snapshot(stats: &Arc<Mutex<UdpObserverStats>>) -> UdpObserverStats {
+    let guard = stats.lock().unwrap();
+    guard.clone()
+}
+#[derive(Debug, Default, Clone)]
+struct UdpStickyEchoStats {
+    sticky_peer: Option<SocketAddr>,
+    sticky_mode: bool,
+    observed_peers: Vec<SocketAddr>,
+    dropped_non_primary: usize,
+    accepted_payloads: Vec<Vec<u8>>,
+}
+
+async fn spawn_udp_sticky_echo_server() -> Result<(
+    SocketAddr,
+    Arc<Mutex<UdpStickyEchoStats>>,
+    oneshot::Sender<()>,
+    JoinHandle<Result<()>>,
+)> {
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .with_context(|| "bind udp sticky echo server failed")?;
+    let addr = socket.local_addr()?;
+    let stats = Arc::new(Mutex::new(UdpStickyEchoStats::default()));
+
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let task_stats = stats.clone();
+    let task = tokio::spawn(async move {
+        let mut buf = [0_u8; 4096];
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => {
+                    return Ok(());
+                }
+                r = socket.recv_from(&mut buf) => {
+                    let (n, from) = r.with_context(|| "sticky echo recv_from failed")?;
+                    let accepted = {
+                        let mut stats = task_stats.lock().unwrap();
+                        if !stats.observed_peers.contains(&from) {
+                            stats.observed_peers.push(from);
+                        }
+                        if !stats.sticky_mode {
+                            stats.sticky_peer = Some(from);
+                            stats.accepted_payloads.push(buf[..n].to_vec());
+                            true
+                        } else if stats.sticky_peer == Some(from) {
+                            stats.accepted_payloads.push(buf[..n].to_vec());
+                            true
+                        } else {
+                            stats.dropped_non_primary = stats.dropped_non_primary.saturating_add(1);
+                            false
+                        }
+                    };
+                    if accepted {
+                        socket.send_to(&buf[..n], from)
+                            .await
+                            .with_context(|| format!("sticky echo send_to failed [{from}]"))?;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok((addr, stats, stop_tx, task))
+}
+
+fn sticky_stats_snapshot(stats: &Arc<Mutex<UdpStickyEchoStats>>) -> UdpStickyEchoStats {
+    let guard = stats.lock().unwrap();
+    guard.clone()
+}
+
+fn set_sticky_mode(stats: &Arc<Mutex<UdpStickyEchoStats>>, sticky: bool) {
+    let mut guard = stats.lock().unwrap();
+    guard.sticky_mode = sticky;
+}
+
+async fn wait_for_sticky_accepted_count(
+    stats: &Arc<Mutex<UdpStickyEchoStats>>,
+    expected: usize,
+    timeout: Duration,
+) -> UdpStickyEchoStats {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = sticky_stats_snapshot(stats);
+        if snapshot.accepted_payloads.len() >= expected || Instant::now() >= deadline {
+            return snapshot;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 fn reserve_tcp_port() -> Result<u16> {
