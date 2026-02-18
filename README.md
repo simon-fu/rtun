@@ -106,6 +106,33 @@ rtun relay \
 - 仅当显式提供 `--log-file <path>` 时写日志文件；未提供时不落盘日志
 - 非 `--tui` 模式保持现有控制台日志行为
 
+### 实施里程碑（建议）
+
+- P0：多通道智能路由核心能力（通道池、选路、flow 迁移、通道到期替换）
+- P1：可观测性与运维（`--tui` + 关键事件日志）
+- P2：自动化集成测试（覆盖端到端与切换场景，防回归）
+- P3：稳定性与性能收敛（长跑测试、参数调优、热点路径优化）
+
+### P2 自动化集成测试清单（防回归）
+
+测试框架目标：
+
+- 启动三个实例：`agent listen`、`agent pub`、`relay`
+- 启动本地 UDP echo/业务模拟服务，验证端到端数据正确性
+
+覆盖范围（包含但不限于）：
+
+- 基础转发：`relay -L` 单规则与多规则
+- 端到端正确性：双向收发、内容一致性、并发 flow
+- 信令协议：`https://` 与 `quic://`
+- agent 选择：按 `expire_at` 降序选择最新可用实例
+- agent 切换：到期后“先连后切”；新 agent 不可连时保持旧 agent 工作
+- 通道切换：到期替换、停止新 flow 分配、flow 排空后关闭旧通道
+- flow 迁移：通道退化时迁移至更优通道（flow 级迁移）
+- UDP 空闲超时：`--udp-idle-timeout` 行为正确
+- UDP 负载上限：`--udp-max-payload` 超限丢包行为正确
+- 编码兼容：`obfs-v1` 与 `obfs_seed=0` 兼容路径
+
 ## Manual Release Workflow
 
 GitHub Actions: `.github/workflows/build-manual-release.yml`
