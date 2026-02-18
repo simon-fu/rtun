@@ -178,6 +178,7 @@ mod test_udp {
     use tracing::{debug, Instrument};
 
     #[tokio::test]
+    #[ignore = "manual long-running UDP debug test"]
     async fn test_udp() {
         tracing_subscriber::fmt()
         .with_max_level(tracing::metadata::LevelFilter::DEBUG)
@@ -277,4 +278,3 @@ mod test_udp {
     }
     
 }
-
