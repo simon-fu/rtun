@@ -1,7 +1,10 @@
 use std::{
     cmp::Ordering,
     collections::HashMap,
+    fs::OpenOptions,
+    io,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -11,7 +14,7 @@ use chrono::Local;
 use clap::Parser;
 use regex::Regex;
 use rtun::{
-    async_rt::spawn_with_name,
+    async_rt::{run_multi_thread, spawn_with_name},
     ice::ice_peer::{IceArgs, IceConfig, IcePeer},
     proto::{open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, P2PArgs, UdpRelayArgs},
     switch::{
@@ -29,7 +32,7 @@ use tokio::{
 
 use crate::{
     client_utils::get_agents,
-    init_log_and_run, quic_signal,
+    init_log2, quic_signal,
     rest_proto::{make_sub_url, make_ws_scheme, AgentInfo},
     secret::token_gen,
 };
@@ -53,7 +56,71 @@ const FLOW_MIGRATE_LOAD_GAP: usize = 2;
 const TUNNEL_STALE_THRESHOLD: Duration = Duration::from_secs(12);
 
 pub fn run(args: CmdArgs) -> Result<()> {
-    init_log_and_run(do_run(args))?
+    init_relay_log(&args)?;
+    run_multi_thread(do_run(args))??;
+    Ok(())
+}
+
+type SharedLogFile = Arc<std::sync::Mutex<std::fs::File>>;
+
+fn init_relay_log(args: &CmdArgs) -> Result<()> {
+    let to_stdout = !args.tui;
+    let log_file = match args.log_file.as_ref() {
+        Some(path) => {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("open relay log file failed [{}]", path.display()))?;
+            Some(Arc::new(std::sync::Mutex::new(file)))
+        }
+        None => None,
+    };
+
+    init_log2(move || RelayLogWriter::new(to_stdout, log_file.clone()));
+    Ok(())
+}
+
+struct RelayLogWriter {
+    to_stdout: bool,
+    log_file: Option<SharedLogFile>,
+}
+
+impl RelayLogWriter {
+    fn new(to_stdout: bool, log_file: Option<SharedLogFile>) -> Self {
+        Self {
+            to_stdout,
+            log_file,
+        }
+    }
+}
+
+impl io::Write for RelayLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.to_stdout {
+            io::stdout().write_all(buf)?;
+        }
+        if let Some(log_file) = self.log_file.as_ref() {
+            let mut file = log_file
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "relay log file lock poisoned"))?;
+            file.write_all(buf)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.to_stdout {
+            io::stdout().flush()?;
+        }
+        if let Some(log_file) = self.log_file.as_ref() {
+            let mut file = log_file
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "relay log file lock poisoned"))?;
+            file.flush()?;
+        }
+        Ok(())
+    }
 }
 
 async fn do_run(args: CmdArgs) -> Result<()> {
@@ -1927,6 +1994,18 @@ pub struct CmdArgs {
         long_help = "skip quic tls certificate verification (quic:// only)"
     )]
     quic_insecure: bool,
+
+    #[clap(
+        long = "tui",
+        long_help = "enable relay tui mode, suppress console logs"
+    )]
+    tui: bool,
+
+    #[clap(
+        long = "log-file",
+        long_help = "write relay logs to file path (disabled when not set)"
+    )]
+    log_file: Option<PathBuf>,
 
     #[clap(
         long = "udp-idle-timeout",
