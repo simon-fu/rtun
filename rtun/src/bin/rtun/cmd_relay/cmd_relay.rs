@@ -430,7 +430,7 @@ impl Drop for RelayTuiTerminalGuard {
 
 #[derive(Debug)]
 struct RelayTuiAgentRow {
-    rule: String,
+    rule_idx: usize,
     name: String,
     instance_id: String,
     addr: String,
@@ -440,7 +440,7 @@ struct RelayTuiAgentRow {
 
 #[derive(Debug)]
 struct RelayTuiTunnelRow {
-    rule: String,
+    rule_idx: usize,
     tunnel_idx: usize,
     mode: String,
     state: &'static str,
@@ -451,13 +451,89 @@ struct RelayTuiTunnelRow {
 
 #[derive(Debug)]
 struct RelayTuiFlowRow {
-    rule: String,
+    rule_idx: usize,
     flow_id: u64,
     src: SocketAddr,
     target: SocketAddr,
     tunnel_idx: usize,
     idle_for_ms: u64,
     route_age_ms: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RelayTuiRowBudgets {
+    rules: usize,
+    agents: usize,
+    tunnels: usize,
+    flows: usize,
+    events: usize,
+}
+
+fn compute_relay_tui_row_budgets(
+    height: usize,
+    rules_total: usize,
+    agents_total: usize,
+    tunnels_total: usize,
+    flows_total: usize,
+    events_total: usize,
+) -> RelayTuiRowBudgets {
+    fn cap(total: usize, guess: usize) -> usize {
+        if total == 0 {
+            0
+        } else {
+            total.min(guess.max(1))
+        }
+    }
+
+    // header + summary + per-section title/header lines.
+    let reserved = 10;
+    let available = height.saturating_sub(reserved);
+
+    let mut b = RelayTuiRowBudgets {
+        rules: cap(rules_total, available / 8),
+        agents: cap(agents_total, available / 6),
+        tunnels: cap(tunnels_total, available / 3),
+        flows: cap(flows_total, available / 3),
+        events: cap(events_total, available / 8),
+    };
+
+    let min_rules = usize::from(rules_total > 0);
+    let min_agents = usize::from(agents_total > 0);
+    let min_tunnels = usize::from(tunnels_total > 0);
+    let min_flows = usize::from(flows_total > 0);
+    let min_events = usize::from(events_total > 0);
+    let mut used = b.rules + b.agents + b.tunnels + b.flows + b.events;
+
+    while used > available {
+        if b.events > min_events {
+            b.events -= 1;
+            used -= 1;
+            continue;
+        }
+        if b.flows > min_flows {
+            b.flows -= 1;
+            used -= 1;
+            continue;
+        }
+        if b.tunnels > min_tunnels {
+            b.tunnels -= 1;
+            used -= 1;
+            continue;
+        }
+        if b.agents > min_agents {
+            b.agents -= 1;
+            used -= 1;
+            continue;
+        }
+        if b.rules > min_rules {
+            b.rules -= 1;
+            used -= 1;
+            continue;
+        }
+        break;
+    }
+
+    b
 }
 
 async fn run_relay_tui(state_hubs: Vec<RelayStateHub>) -> Result<()> {
@@ -635,11 +711,10 @@ fn render_relay_tui(
     let mut tunnel_rows = Vec::<RelayTuiTunnelRow>::new();
     let mut flow_rows = Vec::<RelayTuiFlowRow>::new();
 
-    for snapshot in snapshots.iter() {
-        let rule = format!("{}=>{}", snapshot.listen, snapshot.target);
+    for (rule_idx, snapshot) in snapshots.iter().enumerate() {
         if let Some(agent) = snapshot.selected_agent.as_ref() {
             agent_rows.push(RelayTuiAgentRow {
-                rule: rule.clone(),
+                rule_idx,
                 name: agent.name.clone(),
                 instance_id: agent.instance_id.clone().unwrap_or_else(|| "-".to_string()),
                 addr: agent.addr.clone(),
@@ -657,7 +732,7 @@ fn render_relay_tui(
                 "down"
             };
             tunnel_rows.push(RelayTuiTunnelRow {
-                rule: rule.clone(),
+                rule_idx,
                 tunnel_idx: tunnel.tunnel_idx,
                 mode: tunnel.mode.clone().unwrap_or_else(|| "-".to_string()),
                 state,
@@ -669,7 +744,7 @@ fn render_relay_tui(
 
         for flow in snapshot.flows.iter() {
             flow_rows.push(RelayTuiFlowRow {
-                rule: rule.clone(),
+                rule_idx,
                 flow_id: flow.flow_id,
                 src: flow.src,
                 target: flow.target,
@@ -681,108 +756,141 @@ fn render_relay_tui(
     }
 
     agent_rows.sort_by(|a, b| {
-        b.expire_at
-            .cmp(&a.expire_at)
+        b.connected
+            .cmp(&a.connected)
+            .then_with(|| b.expire_at.cmp(&a.expire_at))
+            .then_with(|| a.rule_idx.cmp(&b.rule_idx))
             .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.rule.cmp(&b.rule))
     });
     tunnel_rows.sort_by(|a, b| {
         b.flow_count
             .cmp(&a.flow_count)
+            .then_with(|| a.rule_idx.cmp(&b.rule_idx))
             .then_with(|| a.tunnel_idx.cmp(&b.tunnel_idx))
-            .then_with(|| a.rule.cmp(&b.rule))
     });
     flow_rows.sort_by(|a, b| {
-        a.idle_for_ms
-            .cmp(&b.idle_for_ms)
+        b.route_age_ms
+            .cmp(&a.route_age_ms)
+            .then_with(|| b.idle_for_ms.cmp(&a.idle_for_ms))
+            .then_with(|| a.rule_idx.cmp(&b.rule_idx))
             .then_with(|| a.flow_id.cmp(&b.flow_id))
-            .then_with(|| a.rule.cmp(&b.rule))
     });
 
-    let mut lines = Vec::<String>::new();
-    lines.push(format!(
-        "rtun relay tui  {}  q/esc:quit  r:refresh  rules:{} agents:{} tunnels:{} flows:{}",
-        Local::now().format("%H:%M:%S"),
+    let budgets = compute_relay_tui_row_budgets(
+        height,
         snapshots.len(),
         agent_rows.len(),
         tunnel_rows.len(),
-        flow_rows.len()
-    ));
-    lines.push(String::new());
+        flow_rows.len(),
+        recent_events.len(),
+    );
+    let compact_mode = width < 120;
 
-    lines.push("Agents".to_string());
-    lines.push("rule | name | instance | addr | expire_in | connected".to_string());
+    let mut lines = Vec::<String>::new();
+    lines.push(format!(
+        "rtun relay tui {}  q/esc:quit  r:refresh",
+        Local::now().format("%H:%M:%S"),
+    ));
+    lines.push(format!(
+        "screen:{}x{}  rules:{} agents:{} tunnels:{} flows:{} events:{}",
+        width,
+        height,
+        snapshots.len(),
+        agent_rows.len(),
+        tunnel_rows.len(),
+        flow_rows.len(),
+        recent_events.len(),
+    ));
+    lines.push("[Rules]".to_string());
+    let rule_limit = budgets.rules.max(1);
+    for (rule_idx, snapshot) in snapshots.iter().take(rule_limit).enumerate() {
+        let agent_text = match snapshot.selected_agent.as_ref() {
+            Some(agent) => {
+                let expire_in = agent.expire_at.saturating_sub(now_ms) / 1000;
+                format!(
+                    "agent={} inst={} conn={} exp={}s",
+                    agent.name,
+                    agent.instance_id.as_deref().unwrap_or("-"),
+                    if agent.connected { "up" } else { "down" },
+                    expire_in
+                )
+            }
+            None => "agent=-".to_string(),
+        };
+        lines.push(format!(
+            "R{rule_idx} {} -> {}  {agent_text}",
+            snapshot.listen, snapshot.target
+        ));
+    }
+    if snapshots.len() > rule_limit {
+        lines.push(format!("... {} more rules", snapshots.len() - rule_limit));
+    }
+
+    lines.push("[Agents]".to_string());
+    lines.push(format_relay_tui_agent_header(width, compact_mode));
     if agent_rows.is_empty() {
         lines.push("-".to_string());
     } else {
-        for row in agent_rows.iter().take(12) {
-            let expire_in = row.expire_at.saturating_sub(now_ms) / 1000;
-            lines.push(format!(
-                "{} | {} | {} | {} | {}s | {}",
-                row.rule,
-                row.name,
-                row.instance_id,
-                row.addr,
-                expire_in,
-                if row.connected { "yes" } else { "no" }
+        for row in agent_rows.iter().take(budgets.agents.max(1)) {
+            lines.push(format_relay_tui_agent_row(
+                row,
+                now_ms,
+                width,
+                compact_mode,
             ));
         }
-        if agent_rows.len() > 12 {
-            lines.push(format!("... {} more agents", agent_rows.len() - 12));
+        if agent_rows.len() > budgets.agents.max(1) {
+            lines.push(format!(
+                "... {} more agents",
+                agent_rows.len() - budgets.agents.max(1)
+            ));
         }
     }
-    lines.push(String::new());
 
-    lines.push("Tunnels".to_string());
-    lines.push("rule | idx | mode | state | flows | last_active | expires_in".to_string());
+    lines.push("[Tunnels]".to_string());
+    lines.push(format_relay_tui_tunnel_header(width, compact_mode));
     if tunnel_rows.is_empty() {
         lines.push("-".to_string());
     } else {
-        for row in tunnel_rows.iter().take(24) {
+        for row in tunnel_rows.iter().take(budgets.tunnels.max(1)) {
+            lines.push(format_relay_tui_tunnel_row(row, width, compact_mode));
+        }
+        if tunnel_rows.len() > budgets.tunnels.max(1) {
             lines.push(format!(
-                "{} | {} | {} | {} | {} | {} | {}",
-                row.rule,
-                row.tunnel_idx,
-                row.mode,
-                row.state,
-                row.flow_count,
-                format_millis_ago(row.last_active_ago_ms),
-                format_millis_in(row.expires_in_ms),
+                "... {} more tunnels",
+                tunnel_rows.len() - budgets.tunnels.max(1)
             ));
         }
-        if tunnel_rows.len() > 24 {
-            lines.push(format!("... {} more tunnels", tunnel_rows.len() - 24));
-        }
     }
-    lines.push(String::new());
 
-    lines.push("Flows".to_string());
-    lines.push("rule | flow_id | src | target | tunnel | idle | route_age".to_string());
+    lines.push("[Flows]".to_string());
+    lines.push(format_relay_tui_flow_header(width, compact_mode));
     if flow_rows.is_empty() {
         lines.push("-".to_string());
     } else {
-        for row in flow_rows.iter().take(32) {
-            lines.push(format!(
-                "{} | {} | {} | {} | {} | {} | {}",
-                row.rule,
-                row.flow_id,
-                row.src,
-                row.target,
-                row.tunnel_idx,
-                format_millis_ago(Some(row.idle_for_ms)),
-                format_millis_ago(Some(row.route_age_ms)),
-            ));
+        for row in flow_rows.iter().take(budgets.flows.max(1)) {
+            lines.push(format_relay_tui_flow_row(row, width, compact_mode));
         }
-        if flow_rows.len() > 32 {
-            lines.push(format!("... {} more flows", flow_rows.len() - 32));
+        if flow_rows.len() > budgets.flows.max(1) {
+            lines.push(format!(
+                "... {} more flows",
+                flow_rows.len() - budgets.flows.max(1)
+            ));
         }
     }
 
     if !recent_events.is_empty() {
-        lines.push(String::new());
-        lines.push("Recent Events".to_string());
-        for line in recent_events.iter() {
+        lines.push("[Recent Events]".to_string());
+        let event_limit = budgets.events.max(1);
+        let start = recent_events.len().saturating_sub(event_limit);
+        for line in recent_events.iter().skip(start) {
             lines.push(line.clone());
+        }
+        if recent_events.len() > event_limit {
+            lines.push(format!(
+                "... {} older events",
+                recent_events.len() - event_limit
+            ));
         }
     }
 
@@ -794,10 +902,194 @@ fn render_relay_tui(
 
     execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
     for line in render_lines.iter() {
-        writeln!(stdout, "{}", clip_line_width(line, width))?;
+        write!(stdout, "{}\r\n", clip_line_width(line, width))?;
     }
     stdout.flush()?;
     Ok(())
+}
+
+fn format_relay_tui_agent_header(width: usize, compact: bool) -> String {
+    if compact {
+        return "R name conn exp addr inst".to_string();
+    }
+    let addr_w = width.saturating_sub(3 + 1 + 12 + 1 + 14 + 1 + 5 + 1 + 8 + 1);
+    if addr_w < 12 {
+        return "R name conn exp addr inst".to_string();
+    }
+    format!(
+        "{} {} {} {} {} {}",
+        relay_tui_cell("R", 3),
+        relay_tui_cell("name", 12),
+        relay_tui_cell("instance", 14),
+        relay_tui_cell("conn", 5),
+        relay_tui_cell("expire", 8),
+        relay_tui_cell("addr", addr_w),
+    )
+}
+
+fn format_relay_tui_agent_row(
+    row: &RelayTuiAgentRow,
+    now_ms: u64,
+    width: usize,
+    compact: bool,
+) -> String {
+    let expire_in = row.expire_at.saturating_sub(now_ms) / 1000;
+    if compact {
+        return format!(
+            "R{} {} {} exp={}s {} inst={}",
+            row.rule_idx,
+            row.name,
+            if row.connected { "up" } else { "down" },
+            expire_in,
+            row.addr,
+            row.instance_id
+        );
+    }
+
+    let addr_w = width.saturating_sub(3 + 1 + 12 + 1 + 14 + 1 + 5 + 1 + 8 + 1);
+    if addr_w < 12 {
+        return format!(
+            "R{} {} {} exp={}s {} inst={}",
+            row.rule_idx,
+            row.name,
+            if row.connected { "up" } else { "down" },
+            expire_in,
+            row.addr,
+            row.instance_id
+        );
+    }
+
+    format!(
+        "{} {} {} {} {} {}",
+        relay_tui_cell(&format!("R{}", row.rule_idx), 3),
+        relay_tui_cell(&row.name, 12),
+        relay_tui_cell(&row.instance_id, 14),
+        relay_tui_cell(if row.connected { "up" } else { "down" }, 5),
+        relay_tui_cell(format!("{expire_in}s").as_str(), 8),
+        relay_tui_cell(&row.addr, addr_w),
+    )
+}
+
+fn format_relay_tui_tunnel_header(width: usize, compact: bool) -> String {
+    if compact || width < 76 {
+        return "R idx st mode flows active exp".to_string();
+    }
+    format!(
+        "{} {} {} {} {} {} {}",
+        relay_tui_cell("R", 3),
+        relay_tui_cell("idx", 3),
+        relay_tui_cell("state", 6),
+        relay_tui_cell("mode", 8),
+        relay_tui_cell("flows", 5),
+        relay_tui_cell("active", 12),
+        relay_tui_cell("expire", 12),
+    )
+}
+
+fn format_relay_tui_tunnel_row(row: &RelayTuiTunnelRow, width: usize, compact: bool) -> String {
+    let active = format_millis_ago(row.last_active_ago_ms);
+    let expire = format_millis_in(row.expires_in_ms);
+    if compact || width < 76 {
+        return format!(
+            "R{} {} {} {} flows={} active={} exp={}",
+            row.rule_idx, row.tunnel_idx, row.state, row.mode, row.flow_count, active, expire
+        );
+    }
+    format!(
+        "{} {} {} {} {} {} {}",
+        relay_tui_cell(&format!("R{}", row.rule_idx), 3),
+        relay_tui_cell(format!("{}", row.tunnel_idx).as_str(), 3),
+        relay_tui_cell(row.state, 6),
+        relay_tui_cell(&row.mode, 8),
+        relay_tui_cell(format!("{}", row.flow_count).as_str(), 5),
+        relay_tui_cell(&active, 12),
+        relay_tui_cell(&expire, 12),
+    )
+}
+
+fn format_relay_tui_flow_header(width: usize, compact: bool) -> String {
+    if compact {
+        return "R flow tun idle route src -> target".to_string();
+    }
+    let path_w = width.saturating_sub(3 + 1 + 11 + 1 + 4 + 1 + 10 + 1 + 10 + 1);
+    if path_w < 18 {
+        return "R flow tun idle route src -> target".to_string();
+    }
+    format!(
+        "{} {} {} {} {} {}",
+        relay_tui_cell("R", 3),
+        relay_tui_cell("flow_id", 11),
+        relay_tui_cell("tun", 4),
+        relay_tui_cell("idle", 10),
+        relay_tui_cell("route", 10),
+        relay_tui_cell("src -> target", path_w),
+    )
+}
+
+fn format_relay_tui_flow_row(row: &RelayTuiFlowRow, width: usize, compact: bool) -> String {
+    let idle = format_millis_ago(Some(row.idle_for_ms));
+    let route = format_millis_ago(Some(row.route_age_ms));
+    let path = format!("{} -> {}", row.src, row.target);
+    if compact {
+        return format!(
+            "R{} {} t{} idle={} route={} {}",
+            row.rule_idx, row.flow_id, row.tunnel_idx, idle, route, path
+        );
+    }
+    let path_w = width.saturating_sub(3 + 1 + 11 + 1 + 4 + 1 + 10 + 1 + 10 + 1);
+    if path_w < 18 {
+        return format!(
+            "R{} {} t{} idle={} route={} {}",
+            row.rule_idx, row.flow_id, row.tunnel_idx, idle, route, path
+        );
+    }
+    format!(
+        "{} {} {} {} {} {}",
+        relay_tui_cell(&format!("R{}", row.rule_idx), 3),
+        relay_tui_cell(format!("{}", row.flow_id).as_str(), 11),
+        relay_tui_cell(format!("{}", row.tunnel_idx).as_str(), 4),
+        relay_tui_cell(&idle, 10),
+        relay_tui_cell(&route, 10),
+        relay_tui_cell(&path, path_w),
+    )
+}
+
+fn relay_tui_cell(v: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let clipped = relay_tui_truncate(v, width);
+    let len = clipped.chars().count();
+    if len >= width {
+        return clipped;
+    }
+
+    let mut out = String::with_capacity(width);
+    out.push_str(&clipped);
+    out.push_str(&" ".repeat(width - len));
+    out
+}
+
+fn relay_tui_truncate(v: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let char_count = v.chars().count();
+    if char_count <= width {
+        return v.to_string();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    let mut out = String::with_capacity(width);
+    for (idx, ch) in v.chars().enumerate() {
+        if idx + 1 >= width {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
 }
 
 fn clip_line_width(line: &str, width: usize) -> String {
