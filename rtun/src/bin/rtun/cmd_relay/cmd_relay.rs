@@ -43,6 +43,8 @@ const LOOP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const FLOW_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const UDP_RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const UDP_RELAY_HEARTBEAT_FLOW_ID: u64 = 0;
+const DEFAULT_P2P_MIN_CHANNELS: usize = 1;
+const DEFAULT_P2P_MAX_CHANNELS: usize = 1;
 
 pub fn run(args: CmdArgs) -> Result<()> {
     init_log_and_run(do_run(args))?
@@ -65,6 +67,8 @@ async fn do_run(args: CmdArgs) -> Result<()> {
     };
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
     let max_payload = resolve_udp_max_payload(args.udp_max_payload)?;
+    let channel_pool = ChannelPoolConfig::new(args.p2p_min_channels, args.p2p_max_channels)?;
+    channel_pool.ensure_phase0_single_channel()?;
 
     let mut rules = Vec::with_capacity(args.local_rules.len());
     for rule in args.local_rules {
@@ -76,9 +80,11 @@ async fn do_run(args: CmdArgs) -> Result<()> {
     }
 
     tracing::info!(
-        "relay defaults: udp_idle_timeout={}s, udp_max_payload={} bytes",
+        "relay defaults: udp_idle_timeout={}s, udp_max_payload={} bytes, p2p_channels={}/{}",
         idle_timeout_secs,
-        max_payload
+        max_payload,
+        channel_pool.min_channels,
+        channel_pool.max_channels
     );
 
     for (idx, rule) in rules.into_iter().enumerate() {
@@ -89,6 +95,7 @@ async fn do_run(args: CmdArgs) -> Result<()> {
             agent_regex: agent_regex.clone(),
             idle_timeout,
             max_payload,
+            channel_pool,
             rule,
         };
 
@@ -106,6 +113,11 @@ async fn do_run(args: CmdArgs) -> Result<()> {
 }
 
 async fn run_worker(worker: RelayWorker) -> Result<()> {
+    let desired_channels = worker.channel_pool.desired_channels(0);
+    tracing::debug!(
+        "relay channel pool bootstrap: active_flows=0, desired_channels={desired_channels}"
+    );
+
     let local = Arc::new(
         UdpSocket::bind(worker.rule.listen)
             .await
@@ -857,7 +869,53 @@ struct RelayWorker {
     agent_regex: Regex,
     idle_timeout: Duration,
     max_payload: usize,
+    channel_pool: ChannelPoolConfig,
     rule: RelayRule,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChannelPoolConfig {
+    min_channels: usize,
+    max_channels: usize,
+}
+
+impl ChannelPoolConfig {
+    fn new(min_channels: usize, max_channels: usize) -> Result<Self> {
+        if min_channels == 0 {
+            bail!("p2p min channels must be >= 1");
+        }
+        if max_channels == 0 {
+            bail!("p2p max channels must be >= 1");
+        }
+        if min_channels > max_channels {
+            bail!(
+                "p2p min channels [{}] must be <= max channels [{}]",
+                min_channels,
+                max_channels
+            );
+        }
+        Ok(Self {
+            min_channels,
+            max_channels,
+        })
+    }
+
+    fn desired_channels(self, active_flows: usize) -> usize {
+        if active_flows == 0 {
+            self.min_channels
+        } else {
+            self.max_channels
+        }
+    }
+
+    fn ensure_phase0_single_channel(self) -> Result<()> {
+        if self.min_channels == 1 && self.max_channels == 1 {
+            return Ok(());
+        }
+        bail!(
+            "multi-channel pool is not enabled in this phase, please set --p2p-min-channels=1 --p2p-max-channels=1"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -969,13 +1027,27 @@ pub struct CmdArgs {
         long_help = "max udp payload in bytes (default auto from p2p limit)"
     )]
     udp_max_payload: Option<usize>,
+
+    #[clap(
+        long = "p2p-min-channels",
+        long_help = "min relay p2p channels (phase0 currently only supports 1)",
+        default_value_t = DEFAULT_P2P_MIN_CHANNELS
+    )]
+    p2p_min_channels: usize,
+
+    #[clap(
+        long = "p2p-max-channels",
+        long_help = "max relay p2p channels (phase0 currently only supports 1)",
+        default_value_t = DEFAULT_P2P_MAX_CHANNELS
+    )]
+    p2p_max_channels: usize,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         decode_udp_relay_packet, encode_udp_relay_packet, max_udp_payload_auto, pick_latest_agent,
-        resolve_udp_max_payload, RelayRule, UdpRelayCodec,
+        resolve_udp_max_payload, ChannelPoolConfig, RelayRule, UdpRelayCodec,
     };
     use crate::rest_proto::AgentInfo;
     use regex::Regex;
@@ -1067,6 +1139,29 @@ mod tests {
         let regex = Regex::new("b").unwrap();
         let selected = pick_latest_agent(agents, &regex, 1_000);
         assert!(selected.is_err());
+    }
+
+    #[test]
+    fn channel_pool_config_validation() {
+        assert!(ChannelPoolConfig::new(0, 1).is_err());
+        assert!(ChannelPoolConfig::new(1, 0).is_err());
+        assert!(ChannelPoolConfig::new(2, 1).is_err());
+        assert!(ChannelPoolConfig::new(1, 2).is_ok());
+    }
+
+    #[test]
+    fn channel_pool_desired_channels() {
+        let cfg = ChannelPoolConfig::new(1, 3).unwrap();
+        assert_eq!(cfg.desired_channels(0), 1);
+        assert_eq!(cfg.desired_channels(1), 3);
+    }
+
+    #[test]
+    fn channel_pool_phase0_single_channel_only() {
+        let cfg = ChannelPoolConfig::new(1, 1).unwrap();
+        assert!(cfg.ensure_phase0_single_channel().is_ok());
+        let cfg = ChannelPoolConfig::new(1, 2).unwrap();
+        assert!(cfg.ensure_phase0_single_channel().is_err());
     }
 
     fn test_agent(name: &str, addr: &str, expire_at: u64, instance_id: Option<&str>) -> AgentInfo {
