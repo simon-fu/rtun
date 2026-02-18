@@ -250,12 +250,13 @@ async fn run_relay_session<H: CtrlHandler>(
     let conn = peer.dial(remote_ice).await?;
     let (socket, _cfg, remote_addr) = conn.into_parts();
     socket.connect(remote_addr).await?;
-    relay_loop(local, socket, idle_timeout, max_payload).await
+    relay_loop(local, socket, target, idle_timeout, max_payload).await
 }
 
 async fn relay_loop(
     local: &UdpSocket,
     tunnel: UdpSocket,
+    target: SocketAddr,
     idle_timeout: Duration,
     max_payload: usize,
 ) -> Result<()> {
@@ -292,12 +293,26 @@ async fn relay_loop(
                         updated_at: now,
                     });
                     flow_to_src.insert(flow_id, from);
+                    tracing::debug!(
+                        "relay flow created: id [{}], src [{}], target [{}]",
+                        flow_id,
+                        from,
+                        target
+                    );
                     flow_id
                 };
 
                 let mut packet = BytesMut::with_capacity(UDP_RELAY_META_LEN + n);
                 encode_udp_relay_packet(&mut packet, flow_id, &local_buf[..n])?;
-                tunnel.send(&packet[..]).await?;
+                if let Err(e) = tunnel.send(&packet[..]).await {
+                    tracing::warn!(
+                        "relay flow closed(error): id [{}], src [{}], reason [{}]",
+                        flow_id,
+                        from,
+                        e
+                    );
+                    return Err(e.into());
+                }
             }
             r = tunnel.recv(&mut tun_buf) => {
                 let n = r?;
@@ -315,7 +330,14 @@ async fn relay_loop(
                     if let Some(flow) = src_to_flow.get_mut(&from) {
                         flow.updated_at = Instant::now();
                     }
-                    let _ = local.send_to(payload, from).await;
+                    if let Err(e) = local.send_to(payload, from).await {
+                        tracing::warn!(
+                            "relay flow closed(error): id [{}], src [{}], reason [{}]",
+                            flow_id,
+                            from,
+                            e
+                        );
+                    }
                 } else {
                     tracing::debug!("drop tunnel packet for unknown flow [{}]", flow_id);
                 }
@@ -335,11 +357,18 @@ fn cleanup_client_flows(
     let now = Instant::now();
     let mut expired = Vec::new();
     for (src, flow) in src_to_flow.iter() {
-        if now.duration_since(flow.updated_at) >= idle_timeout {
-            expired.push((*src, flow.flow_id));
+        let idle_elapsed = now.duration_since(flow.updated_at);
+        if idle_elapsed >= idle_timeout {
+            expired.push((*src, flow.flow_id, idle_elapsed));
         }
     }
-    for (src, flow_id) in expired {
+    for (src, flow_id, idle_elapsed) in expired {
+        tracing::debug!(
+            "relay flow closed(timeout): id [{}], src [{}], idle={}s",
+            flow_id,
+            src,
+            idle_elapsed.as_secs()
+        );
         src_to_flow.remove(&src);
         flow_to_src.remove(&flow_id);
     }
