@@ -55,6 +55,12 @@ rtun relay \
 - 通过 `(agent_name, instance_id)` 绑定，避免同名 agent 重启混淆
 - 超过 `udp-max-payload` 的包默认丢弃并记日志
 
+已知问题与后续改进：
+
+- [x] 建立 P2P 连接后，`relay` 数据面当前没有心跳包；长时间空闲时可能被 NAT 回收映射，导致 P2P 中断（已实现保活心跳）
+- [ ] 当前 UDP 数据包格式固定为 `flow_id(6 bytes) + len(2 bytes) + payload(len bytes)`，容易被运营商/GFW做特征识别并触发限速或断连
+- [ ] 当前未支持 Hysteria2 的端口跳跃能力
+
 ## Manual Release Workflow
 
 GitHub Actions: `.github/workflows/build-manual-release.yml`

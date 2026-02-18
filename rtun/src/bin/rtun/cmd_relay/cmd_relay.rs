@@ -36,6 +36,8 @@ const DEFAULT_P2P_PACKET_LIMIT: usize = 1400;
 const UDP_RELAY_META_LEN: usize = 8;
 const LOOP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const FLOW_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
+const UDP_RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+const UDP_RELAY_HEARTBEAT_FLOW_ID: u64 = 0;
 
 pub fn run(args: CmdArgs) -> Result<()> {
     init_log_and_run(do_run(args))?
@@ -268,6 +270,8 @@ async fn relay_loop(
 
     let mut cleanup = time::interval(FLOW_CLEANUP_INTERVAL);
     cleanup.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut heartbeat = time::interval(UDP_RELAY_HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -321,6 +325,9 @@ async fn relay_loop(
                 }
 
                 let (flow_id, payload) = decode_udp_relay_packet(&tun_buf[..n])?;
+                if flow_id == UDP_RELAY_HEARTBEAT_FLOW_ID && payload.is_empty() {
+                    continue;
+                }
                 if payload.len() > max_payload {
                     tracing::warn!("drop oversized tunnel udp packet: flow [{}], size [{}], max [{}]", flow_id, payload.len(), max_payload);
                     continue;
@@ -344,6 +351,11 @@ async fn relay_loop(
             }
             _ = cleanup.tick() => {
                 cleanup_client_flows(&mut src_to_flow, &mut flow_to_src, idle_timeout);
+            }
+            _ = heartbeat.tick() => {
+                let mut packet = BytesMut::with_capacity(UDP_RELAY_META_LEN);
+                encode_udp_relay_packet(&mut packet, UDP_RELAY_HEARTBEAT_FLOW_ID, &[])?;
+                tunnel.send(&packet[..]).await?;
             }
         }
     }

@@ -375,6 +375,8 @@ async fn quic_tunnel_task(
 const UDP_RELAY_META_LEN: usize = 8;
 const UDP_RELAY_DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const UDP_RELAY_PACKET_LIMIT: usize = 1400;
+const UDP_RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+const UDP_RELAY_HEARTBEAT_FLOW_ID: u64 = 0;
 
 async fn handle_udp_relay(mut remote_args: UdpRelayArgs) -> Result<OpenP2PResponse> {
     let remote_ice: IceArgs = remote_args
@@ -479,6 +481,8 @@ async fn run_udp_relay_server_loop(
     let (flow_tx, mut flow_rx) = mpsc::channel::<RelayFlowPacket>(1024);
     let mut cleanup_interval = tokio::time::interval(Duration::from_secs(1));
     cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat_interval = tokio::time::interval(UDP_RELAY_HEARTBEAT_INTERVAL);
+    heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -488,6 +492,9 @@ async fn run_udp_relay_server_loop(
                     bail!("udp relay tunnel closed");
                 }
                 let (flow_id, payload) = decode_udp_relay_packet(&tunnel_buf[..n])?;
+                if flow_id == UDP_RELAY_HEARTBEAT_FLOW_ID && payload.is_empty() {
+                    continue;
+                }
                 if payload.len() > max_payload {
                     tracing::warn!("drop oversized udp relay request: flow [{}], size [{}], max [{}]", flow_id, payload.len(), max_payload);
                     continue;
@@ -525,6 +532,11 @@ async fn run_udp_relay_server_loop(
             }
             _ = cleanup_interval.tick() => {
                 cleanup_relay_flows(&mut flows, idle_timeout);
+            }
+            _ = heartbeat_interval.tick() => {
+                let mut frame = BytesMut::with_capacity(UDP_RELAY_META_LEN);
+                encode_udp_relay_packet(&mut frame, UDP_RELAY_HEARTBEAT_FLOW_ID, &[])?;
+                tunnel.send(&frame[..]).await?;
             }
         }
     }
