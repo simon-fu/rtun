@@ -110,7 +110,7 @@ impl<A: FooterApp> DrawState<A> {
                     self.app_lines = self.app.on_paint(term)?;
                     input.init_state(&mut self.input, term, render)?;
                     init_input = true;
-                    // render = TermThemeRenderer::new(&term, &theme); // aaa
+                    // render = TermThemeRenderer::new(&term, &theme); // TODO
                     // last_line_len = 0;
                 }
 

@@ -171,16 +171,16 @@ impl IcePeer {
         self.set_remote(remote)?;
 
         // let config = self.binding_config(false)?;
-        // tracing::debug!("{} aaa server gather config {config:?}", self.uid);
+        // tracing::debug!("{} server gather config {config:?}", self.uid);
 
         // if let Some(socket) = self.socket.as_mut() {
         //     socket.set_ttl(3)?;
         //     for target in self.targets.iter() {
-        //         tracing::debug!("aaa server gather send to {target:?}");
+        //         tracing::debug!("server gather send to {target:?}");
         //         let data = config.make_req_bytes(target, false)?;
         //         socket.as_socket().send_to(data.into(), target.addr()).await?;
         //     }
-        //     // tokio::time::sleep(std::time::Duration::MAX/2).await; // aaa
+        //     // tokio::time::sleep(std::time::Duration::MAX/2).await; // TODO
         //     let rrr = 0;
         // }
 
@@ -372,7 +372,7 @@ impl IcePeer {
         timeout: Option<Duration>,
     ) -> Result<IceConn> {
         // let config = self.binding_config(is_client)?;
-        // tracing::debug!("{} aaa negotiate config {config:?}", self.uid);
+        // tracing::debug!("{} negotiate config {config:?}", self.uid);
 
         // let (socket, output) = config
         // .resolve_ice(socket, self.targets.iter().map(|x|x.clone())).await?;

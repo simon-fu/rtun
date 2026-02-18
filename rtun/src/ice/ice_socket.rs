@@ -285,13 +285,13 @@ impl StunResolver {
 impl UdpOps for StunResolver {
     fn is_done(&self) -> bool {
         if let Some(v) = self.min_success_response {
-            println!("aaa check min_success_response");
+            // println!("check min_success_response");
             return self.mapped_addrs.num_success >= v;
         }
 
         if self.num_servers > 1 {
             if self.mapped_addrs.nat_type() == Some(NatType::Symmetric) {
-                println!("aaa check Symmetric");
+                // println!("check Symmetric");
                 return true;
             }
             if let Some(time) = self.start_time {
@@ -303,13 +303,13 @@ impl UdpOps for StunResolver {
 
         let min_response = self.min_success_response.unwrap_or(1);
         let done = self.mapped_addrs.num_success >= min_response;
-        println!(
-            "aaa check final, num_success {}, min_response {}, done {}",
-            self.mapped_addrs.num_success, min_response, done
-        );
+        // println!(
+        //     "check final, num_success {}, min_response {}, done {}",
+        //     self.mapped_addrs.num_success, min_response, done
+        // );
         done
 
-        // println!("aaa check final");
+        // println!("check final");
         // self.mapped_addrs.num_success >= self.min_success_response.unwrap_or(1)
     }
 

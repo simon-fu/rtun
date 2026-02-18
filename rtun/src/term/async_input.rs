@@ -27,10 +27,10 @@ impl Stream for AsynInput {
     type Item = Result<PtyEvent>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
-        // tracing::debug!("aaa AsynInput::poll start\r");
+        // tracing::debug!("AsynInput::poll start\r");
 
         if let Poll::Ready(Some(_r)) = self.size_signal.poll_recv(cx) {
-            // tracing::debug!("aaa AsynInput::poll has resize event\r");
+            // tracing::debug!("AsynInput::poll has resize event\r");
 
             let mut size = get_term_size();
 
@@ -42,20 +42,20 @@ impl Stream for AsynInput {
                 .map(|x| PtyEvent::Resize(x))
                 .with_context(|| "can't get terminal size");
 
-            // tracing::debug!("aaa AsynInput::poll return resize {:?}\r", r);
+            // tracing::debug!("AsynInput::poll return resize {:?}\r", r);
             return Poll::Ready(Some(r));
         }
 
         let r = self.stdin.poll_next_unpin(cx);
-        // tracing::debug!("aaa AsynInput::poll stdin result {:?}\r", r);
+        // tracing::debug!("AsynInput::poll stdin result {:?}\r", r);
         match r {
             Poll::Ready(r) => {
                 let r = r.map(|x| x.map(|y| PtyEvent::StdinData(y)).map_err(|e| e.into()));
-                // tracing::debug!("aaa AsynInput::poll return stdin {:?}\r", r);
+                // tracing::debug!("AsynInput::poll return stdin {:?}\r", r);
                 return Poll::Ready(r);
             }
             Poll::Pending => {
-                // tracing::debug!("aaa AsynInput::poll return Pending\r");
+                // tracing::debug!("AsynInput::poll return Pending\r");
                 return Poll::Pending;
             }
         }
