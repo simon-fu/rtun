@@ -100,6 +100,7 @@ message P2PArgs  {
         QuicSocksArgs quic_socks        = 1;
         QuicThroughputArgs quic_thrput  = 2;
         WebrtcThroughputArgs webrtc_thrput = 3;
+        UdpRelayArgs udp_relay          = 4;
     }
 }
 
@@ -110,6 +111,13 @@ message P2PQuicArgs {
 
 message QuicSocksArgs {
     P2PQuicArgs base                    = 1;
+}
+
+message UdpRelayArgs {
+    P2PIceArgs ice                      = 1;
+    string target_addr                  = 2;
+    uint32 idle_timeout_secs            = 3;
+    uint32 max_payload                  = 4;
 }
 
 message P2PDtlsArgs {
