@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 
 // pub fn write_built_file() -> Result<()> {
 //     built::write_built_file().with_context(||"write_built_file fail")?;
@@ -33,33 +33,29 @@ pub struct AppVersion {
 
 impl AppVersion {
     pub fn try_new() -> Result<Self> {
-        let src = std::env::var("CARGO_MANIFEST_DIR")
-        .with_context(||"no var CARGO_MANIFEST_DIR")?;
+        let src =
+            std::env::var("CARGO_MANIFEST_DIR").with_context(|| "no var CARGO_MANIFEST_DIR")?;
 
-        let pkg_ver = std::env::var("CARGO_PKG_VERSION")
-            .with_context(||"no var CARGO_PKG_VERSION")?;
+        let pkg_ver =
+            std::env::var("CARGO_PKG_VERSION").with_context(|| "no var CARGO_PKG_VERSION")?;
 
         let (git_branch, git_hash) = get_git_branch_and_hash(src.as_ref())?;
-        
-        let version_brief = {
-            format!("{}.{}",pkg_ver, git_hash)
-        };
-        
+
+        let version_brief = { format!("{}.{}", pkg_ver, git_hash) };
 
         let envmap = EnvMap::new();
 
         let version_full = {
-
             let now = chrono::offset::Local::now();
-        
+
             let target = envmap.get("TARGET")?;
-        
+
             let rustc_cmd = envmap.get("RUSTC")?;
             let rustc_version = get_version_from_cmd(rustc_cmd.as_ref())?;
-        
+
             let profile = envmap.get("PROFILE")?;
             let features = envmap.get_features();
-        
+
             format!(
                 "version [{}.{}], build at [{}], for [{}], by [{}], profile [{}], features {:?}",
                 version_brief,
@@ -71,7 +67,7 @@ impl AppVersion {
                 features,
             )
         };
-        
+
         Ok(Self {
             brief: version_brief,
             full: version_full,
@@ -92,10 +88,8 @@ fn get_version_from_cmd(executable: &std::ffi::OsStr) -> std::io::Result<String>
 }
 
 fn get_git_branch_and_hash(src: &std::path::Path) -> anyhow::Result<(String, String)> {
-
     let env_git_branch = std::env::var("REPO_GIT_BRANCH").ok();
     let env_git_hash = std::env::var("REPO_GIT_HASH").ok();
-    
 
     let (repo_head, repo_commit, _commit_short) = match get_repo_head(src.as_ref()) {
         Ok(Some((b, c, cs))) => (b, Some(c), Some(cs)),
@@ -113,9 +107,9 @@ fn get_git_branch_and_hash(src: &std::path::Path) -> anyhow::Result<(String, Str
             }
 
             branch
-            .map(|x|x.to_string())
-            .unwrap_or_else(||"unknown".into())
-        },
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        }
     };
 
     let commit = if env_git_hash.is_some() {
@@ -125,8 +119,8 @@ fn get_git_branch_and_hash(src: &std::path::Path) -> anyhow::Result<(String, Str
     };
 
     let commit = commit
-        .map(|x|(&x[..7.min(x.len())]).to_string())
-        .unwrap_or_else(||"unknown".into());
+        .map(|x| (&x[..7.min(x.len())]).to_string())
+        .unwrap_or_else(|| "unknown".into());
 
     Ok((branch, commit))
 }
@@ -144,8 +138,6 @@ fn get_git_branch_and_hash(src: &std::path::Path) -> anyhow::Result<(String, Str
 //     .with_context(||"empty repo desc")?;
 //     Ok(hash_or_tag)
 // }
-
-
 
 // fn get_repo_description(root: &std::path::Path) -> Result<Option<(String, bool)>, git2::Error> {
 //     match git2::Repository::discover(root) {
@@ -210,7 +202,6 @@ fn get_repo_head(
     }
 }
 
-
 pub struct EnvMap {
     envs: HashMap<String, String>,
 }
@@ -226,9 +217,7 @@ impl EnvMap {
             }
         }
 
-        Self {
-            envs,
-        }
+        Self { envs }
     }
 
     pub fn get_features(&self) -> Vec<String> {
@@ -244,15 +233,13 @@ impl EnvMap {
         features
     }
 
-    pub fn get(&self, key: &str) -> Result<&str>{
-        self.envs.get(key)
-        .with_context(||format!("Not found env [{}]", key))
-        .map(|x|x.as_str())
+    pub fn get(&self, key: &str) -> Result<&str> {
+        self.envs
+            .get(key)
+            .with_context(|| format!("Not found env [{}]", key))
+            .map(|x| x.as_str())
     }
 }
-
-
-
 
 // macro_rules! print_env_var {
 //     ($key:expr) => {
@@ -265,19 +252,19 @@ impl EnvMap {
 
 //     // src dir ["/Users/simon/simon/src/tts-rs/tts-rs"]
 //     let src = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-//     println!("dddddd src dir [{:?}]", src); 
+//     println!("dddddd src dir [{:?}]", src);
 
 //     // dst dir ["/Users/simon/simon/src/tts-rs/target/debug/build/tts-f79a9fc4a424e96c/out"]
 //     let dst = std::env::var("OUT_DIR").unwrap();
-//     println!("dddddd dst dir [{:?}]", dst); 
+//     println!("dddddd dst dir [{:?}]", dst);
 
 //     // [Some(("8f01411", true))]
 //     let r = built::util::get_repo_description(src.as_ref()).unwrap();
-//     println!("dddddd repo desc [{:?}]", r); 
-    
+//     println!("dddddd repo desc [{:?}]", r);
+
 //     // [Some((Some("refs/heads/main"), "8f014111b0525a7e9d901048783e13421c674064"))]
 //     let r = built::util::get_repo_head(src.as_ref()).unwrap();
-//     println!("dddddd repo head [{:?}]", r); 
+//     println!("dddddd repo head [{:?}]", r);
 
 //     // CARGO_PKG_VERSION ["1.0.8"]
 //     print_env_var!("CARGO_PKG_VERSION");
@@ -287,6 +274,5 @@ impl EnvMap {
 
 //     // PROFILE ["debug"]
 //     print_env_var!("PROFILE");
-    
-// }
 
+// }

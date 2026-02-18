@@ -1,9 +1,14 @@
-use std::{task::{Poll, self}, pin::Pin, io};
+use std::{
+    io,
+    pin::Pin,
+    task::{self, Poll},
+};
 
-use tokio::io::{AsyncRead, ReadBuf, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::{ChSender, ChReceiver, ChPair, ch_send_stream::ChSendStream, ch_recv_stream::ChRecvStream};
-
+use super::{
+    ch_recv_stream::ChRecvStream, ch_send_stream::ChSendStream, ChPair, ChReceiver, ChSender,
+};
 
 pub struct ChStream {
     tx: ChSendStream,
@@ -50,12 +55,17 @@ impl AsyncWrite for ChStream {
         Pin::new(&mut self.tx).poll_write(cx, buf)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<(), io::Error>> {
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.tx).poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<(), io::Error>> {
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.tx).poll_shutdown(cx)
     }
 }
-

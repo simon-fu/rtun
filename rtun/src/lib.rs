@@ -1,4 +1,3 @@
-
 pub mod async_rt;
 
 pub mod async_stdin;
@@ -33,7 +32,7 @@ pub mod socks;
 
 pub mod version;
 
-pub mod stun; 
+pub mod stun;
 
 pub mod ice;
 

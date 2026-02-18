@@ -1,6 +1,5 @@
-use bytes::{Bytes, Buf};
+use bytes::{Buf, Bytes};
 use tokio::io::ReadBuf;
-
 
 pub struct BytesCursor {
     data: Bytes,
@@ -9,10 +8,7 @@ pub struct BytesCursor {
 
 impl From<Bytes> for BytesCursor {
     fn from(data: Bytes) -> Self {
-        Self {
-            pos: 0,
-            data,
-        }
+        Self { pos: 0, data }
     }
 }
 
@@ -38,35 +34,29 @@ pub struct BytesReader {
 
 impl From<Bytes> for BytesReader {
     fn from(data: Bytes) -> Self {
-        Self {
-            data,
-            pos: 0,
-        }
+        Self { data, pos: 0 }
     }
 }
 
 impl BytesReader {
-
     pub fn peek_buf(&mut self, buf: &mut ReadBuf<'_>) -> usize {
-        
         let num = self.remaining().min(buf.remaining());
 
         if num > 0 {
             buf.put_slice(&self.data[self.pos..num]);
         }
-        
+
         num
     }
 
     pub fn read_buf(&mut self, buf: &mut ReadBuf<'_>) -> usize {
-        
         let num = self.remaining().min(buf.remaining());
 
         if num > 0 {
-            buf.put_slice(&self.data[self.pos..self.pos+num]);
+            buf.put_slice(&self.data[self.pos..self.pos + num]);
             self.pos += num;
         }
-        
+
         num
     }
 
@@ -75,7 +65,7 @@ impl BytesReader {
     }
 
     #[inline]
-    pub  fn remaining(&self) -> usize {
+    pub fn remaining(&self) -> usize {
         self.data.len() - self.pos
     }
 }

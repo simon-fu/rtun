@@ -1,7 +1,6 @@
 use anyhow::Result;
 use tokio::sync::broadcast;
 
-
 pub struct CtrlGuard(broadcast::Sender<()>);
 
 impl CtrlGuard {
@@ -27,4 +26,3 @@ impl CtrlWatch {
 pub struct OpWatch;
 
 pub type WatchResult = Result<CtrlWatch>;
-

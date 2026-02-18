@@ -22,10 +22,10 @@
 //     let uid = gen_huid();
 //     let handle = start_actor(
 //         format!("agent-service-{}", uid),
-//         entity, 
+//         entity,
 //         handle_first_none,
-//         wait_next_none, 
-//         handle_next_none, 
+//         wait_next_none,
+//         handle_next_none,
 //         handle_msg,
 //     );
 
@@ -38,7 +38,6 @@
 //     pub ch_id: ChannelId,
 // }
 
-
 // #[async_trait::async_trait]
 // impl AsyncHandler<OpOpenShell> for Entity {
 //     type Response = Result<()>; //: MessageResponse<Self, M>;
@@ -48,12 +47,9 @@
 //     }
 // }
 
-
-
 // async fn handle_msg(_entity: &mut Entity, _msg: Msg) -> Result<Action> {
 //     Ok(Action::None)
 // }
-
 
 // type Next = ();
 // struct Entity {
@@ -75,5 +71,3 @@
 //         self
 //     }
 // }
-
-

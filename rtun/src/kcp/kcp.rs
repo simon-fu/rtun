@@ -10,7 +10,7 @@ use bytes::{Buf, BufMut, BytesMut};
 
 use super::error::Error;
 use super::KcpResult;
-use tracing::{trace, debug};
+use tracing::{debug, trace};
 
 const KCP_RTO_NDL: u32 = 30; // no delay min rto
 const KCP_RTO_MIN: u32 = 100; // normal min rto

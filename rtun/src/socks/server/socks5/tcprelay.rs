@@ -7,25 +7,16 @@ use std::{
     sync::Arc,
 };
 
-use tracing::{debug, error, trace, warn};
 use shadowsocks::{
     config::Mode,
     relay::socks5::{
-        self,
-        Address,
-        Command,
-        Error as Socks5Error,
-        HandshakeRequest,
-        HandshakeResponse,
-        PasswdAuthRequest,
-        PasswdAuthResponse,
-        Reply,
-        TcpRequestHeader,
-        TcpResponseHeader,
+        self, Address, Command, Error as Socks5Error, HandshakeRequest, HandshakeResponse,
+        PasswdAuthRequest, PasswdAuthResponse, Reply, TcpRequestHeader, TcpResponseHeader,
     },
     ServerAddr,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+use tracing::{debug, error, trace, warn};
 
 use shadowsocks_service::{
     local::{
@@ -65,7 +56,11 @@ impl Socks5TcpHandler {
         }
     }
 
-    pub async fn check_auth<S>(&self, stream: &mut S, handshake_req: &HandshakeRequest) -> io::Result<()> 
+    pub async fn check_auth<S>(
+        &self,
+        stream: &mut S,
+        handshake_req: &HandshakeRequest,
+    ) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -110,7 +105,7 @@ impl Socks5TcpHandler {
         ))
     }
 
-    async fn check_auth_password<S>(&self, stream: &mut S) -> io::Result<()> 
+    async fn check_auth_password<S>(&self, stream: &mut S) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -186,7 +181,11 @@ impl Socks5TcpHandler {
         }
     }
 
-    pub async fn handle_socks5_client<S>(self, mut stream: S, peer_addr: SocketAddr) -> io::Result<()> 
+    pub async fn handle_socks5_client<S>(
+        self,
+        mut stream: S,
+        peer_addr: SocketAddr,
+    ) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -201,17 +200,21 @@ impl Socks5TcpHandler {
                 return Err(err.into());
             }
         };
-        
-        self.handle_socks5_req(handshake_req, stream, peer_addr).await
+
+        self.handle_socks5_req(handshake_req, stream, peer_addr)
+            .await
     }
 
-    pub async fn handle_socks5_req<S>(self, handshake_req: HandshakeRequest, mut stream: S, peer_addr: SocketAddr) -> io::Result<()> 
+    pub async fn handle_socks5_req<S>(
+        self,
+        handshake_req: HandshakeRequest,
+        mut stream: S,
+        peer_addr: SocketAddr,
+    ) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         // 1. Handshake
-
-
 
         trace!("socks5 {:?}", handshake_req);
         self.check_auth(&mut stream, &handshake_req).await?;
@@ -220,7 +223,10 @@ impl Socks5TcpHandler {
         let header = match TcpRequestHeader::read_from(&mut stream).await {
             Ok(h) => h,
             Err(err) => {
-                debug!("failed to get TcpRequestHeader: {}, peer: {}", err, peer_addr);
+                debug!(
+                    "failed to get TcpRequestHeader: {}, peer: {}",
+                    err, peer_addr
+                );
                 let rh = TcpResponseHeader::new(err.as_reply(), Address::SocketAddress(peer_addr));
                 rh.write_to(&mut stream).await?;
                 return Err(err.into());
@@ -258,7 +264,7 @@ impl Socks5TcpHandler {
         mut stream: S,
         peer_addr: SocketAddr,
         target_addr: Address,
-    ) -> io::Result<()> 
+    ) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -277,7 +283,8 @@ impl Socks5TcpHandler {
         } else {
             let server = self.balancer.best_tcp_server();
 
-            let r = AutoProxyClientStream::connect(self.context.clone(), &server, &target_addr).await;
+            let r =
+                AutoProxyClientStream::connect(self.context.clone(), &server, &target_addr).await;
             server_opt = Some(server);
 
             r
@@ -286,8 +293,10 @@ impl Socks5TcpHandler {
         let mut remote = match remote_result {
             Ok(remote) => {
                 // Tell the client that we are ready
-                let header =
-                    TcpResponseHeader::new(socks5::Reply::Succeeded, Address::SocketAddress(remote.local_addr()?));
+                let header = TcpResponseHeader::new(
+                    socks5::Reply::Succeeded,
+                    Address::SocketAddress(remote.local_addr()?),
+                );
                 header.write_to(&mut stream).await?;
 
                 trace!("sent header: {:?}", header);
@@ -309,7 +318,7 @@ impl Socks5TcpHandler {
             }
         };
 
-        // // by simon => 
+        // // by simon =>
 
         // match server_opt {
         //     Some(server) => {
@@ -318,15 +327,14 @@ impl Socks5TcpHandler {
         //     }
         //     None => establish_tcp_tunnel_bypassed(&mut stream, &mut remote, peer_addr, &target_addr).await,
         // }
-        
+
         let _server_opt = server_opt;
         establish_tcp_tunnel_bypassed(&mut stream, &mut remote, peer_addr, &target_addr).await
 
         // // by simon <=
-
     }
 
-    async fn handle_udp_associate<S>(self, mut stream: S, client_addr: Address) -> io::Result<()> 
+    async fn handle_udp_associate<S>(self, mut stream: S, client_addr: Address) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -341,7 +349,8 @@ impl Socks5TcpHandler {
 
         // shadowsocks accepts both TCP and UDP from the same address
 
-        let rh = TcpResponseHeader::new(socks5::Reply::Succeeded, self.udp_bind_addr.as_ref().into());
+        let rh =
+            TcpResponseHeader::new(socks5::Reply::Succeeded, self.udp_bind_addr.as_ref().into());
         rh.write_to(&mut stream).await?;
 
         // Hold connection until EOF.
@@ -350,4 +359,3 @@ impl Socks5TcpHandler {
         Ok(())
     }
 }
-

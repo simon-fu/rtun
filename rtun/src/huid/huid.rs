@@ -1,15 +1,17 @@
-
-use std::{convert::TryFrom, sync::{Arc, atomic::AtomicU64}};
+use std::{
+    convert::TryFrom,
+    sync::{atomic::AtomicU64, Arc},
+};
 
 use anyhow::bail;
 
 lazy_static::lazy_static!(
     pub static ref CHARS: [char; 62] = [
-        'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 
-        'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 
+        'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J',
+        'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T',
         'U', 'V', 'W', 'X', 'Y', 'Z',
-        'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 
-        'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 
+        'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j',
+        'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't',
         'u', 'v', 'w', 'x', 'y', 'z',
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
     ];
@@ -23,17 +25,16 @@ lazy_static::lazy_static!(
         }
         data
     };
-    
+
     static ref MAX: u64 = 62*62*62*62*62*62*62*62;
 );
 
 #[derive(Default, PartialEq, Eq, PartialOrd, Ord, Clone, Hash, Copy)]
 pub struct HUId {
-    id: u64
+    id: u64,
 }
 
 impl HUId {
-
     pub fn random() -> Self {
         Self::from(random_id())
     }
@@ -62,22 +63,22 @@ impl HUId {
             (self.id >> 32 & 0xFF) as u8 as char,
             (self.id >> 24 & 0xFF) as u8 as char,
             (self.id >> 16 & 0xFF) as u8 as char,
-            (self.id >>  8 & 0xFF) as u8 as char,
-            (self.id       & 0xFF) as u8 as char,
+            (self.id >> 8 & 0xFF) as u8 as char,
+            (self.id & 0xFF) as u8 as char,
         ]
     }
 
     #[inline]
     pub fn to_bytes(&self) -> [u8; 8] {
         [
-            (self.id >> 56 & 0xFF) as u8 ,
-            (self.id >> 48 & 0xFF) as u8 ,
-            (self.id >> 40 & 0xFF) as u8 ,
-            (self.id >> 32 & 0xFF) as u8 ,
-            (self.id >> 24 & 0xFF) as u8 ,
-            (self.id >> 16 & 0xFF) as u8 ,
-            (self.id >>  8 & 0xFF) as u8 ,
-            (self.id       & 0xFF) as u8 ,
+            (self.id >> 56 & 0xFF) as u8,
+            (self.id >> 48 & 0xFF) as u8,
+            (self.id >> 40 & 0xFF) as u8,
+            (self.id >> 32 & 0xFF) as u8,
+            (self.id >> 24 & 0xFF) as u8,
+            (self.id >> 16 & 0xFF) as u8,
+            (self.id >> 8 & 0xFF) as u8,
+            (self.id & 0xFF) as u8,
         ]
     }
 
@@ -93,7 +94,6 @@ impl HUId {
         }
         Ok(())
     }
-
 }
 
 impl AsRef<HUId> for HUId {
@@ -112,7 +112,7 @@ impl From<u64> for HUId {
             id = id | (c << 56);
             n = n / (CHARS.len() as u64);
         }
-        Self {id}
+        Self { id }
     }
 }
 
@@ -212,10 +212,10 @@ pub struct OrderBuild {
 
 impl OrderBuild {
     pub fn start_from_random() -> Self {
-        Self{
-            id: AtomicU64::new(random_id()) 
+        Self {
+            id: AtomicU64::new(random_id()),
         }
-    }    
+    }
 }
 
 impl NextId for OrderBuild {
@@ -240,7 +240,7 @@ mod test {
     #[test]
     fn test_print_default() {
         let builder = OrderBuild::default();
-        for _ in 0 .. 200 {
+        for _ in 0..200 {
             let uid = builder.next_id();
             println!("{}, {:#X}, {}, {:?}", uid, uid.id, uid.to_string(), builder);
             assert!(uid.to_u64() == HUId::from(uid.to_u64()).to_u64());
@@ -251,7 +251,7 @@ mod test {
     #[test]
     fn test_print_random() {
         let builder = OrderBuild::start_from_random();
-        for _ in 0 .. 200 {
+        for _ in 0..200 {
             let uid = builder.next_id();
             println!("{:#X}, {}, {:?}", uid.id, uid.to_string(), builder);
             assert!(uid.to_u64() == HUId::from(uid.to_u64()).to_u64());
@@ -261,21 +261,21 @@ mod test {
     #[test]
     fn test_basic() {
         let builder = OrderBuild::default();
-        
+
         {
             let mut i = 0_usize;
             while i < 26 {
-                assert!(CHARS[i] == ('A' as u8 + (i-0) as u8) as char);
+                assert!(CHARS[i] == ('A' as u8 + (i - 0) as u8) as char);
                 i += 1;
             }
 
             while i < 52 {
-                assert!(CHARS[i] == ('a' as u8 + (i-26) as u8) as char);
+                assert!(CHARS[i] == ('a' as u8 + (i - 26) as u8) as char);
                 i += 1;
             }
 
             while i < 62 {
-                assert!(CHARS[i] == ('0' as u8 + (i-52) as u8) as char);
+                assert!(CHARS[i] == ('0' as u8 + (i - 52) as u8) as char);
                 i += 1;
             }
         }

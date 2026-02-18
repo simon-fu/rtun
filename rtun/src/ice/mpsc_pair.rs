@@ -1,15 +1,16 @@
-
-use std::{pin::Pin, task::{Poll, self}, io::{self, ErrorKind}};
+use std::{
+    io::{self, ErrorKind},
+    pin::Pin,
+    task::{self, Poll},
+};
 
 use anyhow::Result;
-use bytes::{Bytes, BytesMut, BufMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use futures::{AsyncRead, AsyncWrite};
-use tokio::{sync::mpsc, io::ReadBuf};
+use tokio::{io::ReadBuf, sync::mpsc};
 use tokio_util::sync::PollSender;
 
-
 use super::bytes_utils::BytesReader;
-
 
 pub struct MpscPair {
     pub writer: MpscWriter,
@@ -57,7 +58,7 @@ pub struct MpscWriter {
 
 impl From<mpsc::Sender<Bytes>> for MpscWriter {
     fn from(tx: mpsc::Sender<Bytes>) -> Self {
-        Self { 
+        Self {
             buf: Default::default(),
             tx: PollSender::new(tx),
         }
@@ -71,20 +72,18 @@ impl MpscWriter {
         buf: &[u8],
     ) -> Poll<Result<(), io::Error>> {
         match self.tx.poll_reserve(cx) {
-            Poll::Ready(r) => {
-                match r {
-                    Ok(_r) => {
-                        self.buf.put_slice(buf);
-                        let data = self.buf.split().freeze();
-                        
-                        let r = self.tx.send_item(data);
-                        match r {
-                            Ok(_r) => Poll::Ready(Ok(())),
-                            Err(_e) => Poll::Ready(Err(ErrorKind::ConnectionAborted.into())),
-                        }
-                    },
-                    Err(_e) => Poll::Ready(Err(ErrorKind::ConnectionAborted.into())),
+            Poll::Ready(r) => match r {
+                Ok(_r) => {
+                    self.buf.put_slice(buf);
+                    let data = self.buf.split().freeze();
+
+                    let r = self.tx.send_item(data);
+                    match r {
+                        Ok(_r) => Poll::Ready(Ok(())),
+                        Err(_e) => Poll::Ready(Err(ErrorKind::ConnectionAborted.into())),
+                    }
                 }
+                Err(_e) => Poll::Ready(Err(ErrorKind::ConnectionAborted.into())),
             },
             Poll::Pending => Poll::Pending,
         }
@@ -92,7 +91,6 @@ impl MpscWriter {
 }
 
 impl AsyncWrite for MpscWriter {
-
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut task::Context<'_>,
@@ -105,7 +103,10 @@ impl AsyncWrite for MpscWriter {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut task::Context<'_>) -> Poll<Result<(), io::Error>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
         Poll::Ready(Ok(()))
     }
 
@@ -115,12 +116,11 @@ impl AsyncWrite for MpscWriter {
             Poll::Ready(r) => {
                 self.tx.close();
                 Poll::Ready(r)
-            },
+            }
             Poll::Pending => Poll::Pending,
         }
     }
 }
-
 
 pub struct MpscReader {
     rx: mpsc::Receiver<Bytes>,
@@ -139,18 +139,17 @@ impl AsyncRead for MpscReader {
         cx: &mut task::Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-
         let mut buf = ReadBuf::new(buf);
         let buf = &mut buf;
 
         if let Some(reader) = &mut self.reader {
             if reader.raw_data().len() == 0 {
-                return Poll::Ready(Ok(0))
+                return Poll::Ready(Ok(0));
             }
 
             let num = reader.read_buf(buf);
             if num > 0 {
-                return Poll::Ready(Ok(num))
+                return Poll::Ready(Ok(num));
             }
 
             self.reader = None;
@@ -165,18 +164,11 @@ impl AsyncRead for MpscReader {
                 self.reader = Some(reader);
                 Poll::Ready(Ok(num))
             }
-            Poll::Ready(None) => {
-                Poll::Ready(Err(ErrorKind::ConnectionAborted.into()))
-            }
+            Poll::Ready(None) => Poll::Ready(Err(ErrorKind::ConnectionAborted.into())),
             Poll::Pending => Poll::Pending,
         }
-        
     }
 }
-
-
-
-
 
 // type KcpCtrl = Kcp<KcpWriteBuf>;
 
@@ -199,4 +191,3 @@ impl AsyncRead for MpscReader {
 // fn into_io<E: std::fmt::Debug>(e: E) -> io::Error {
 //     io::Error::new(ErrorKind::ConnectionAborted, format!("{:?}", e))
 // }
-

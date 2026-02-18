@@ -1,8 +1,8 @@
-
-
-
+use crate::{
+    actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker},
+    channel::{ChId, ChSender, ChTx},
+};
 use anyhow::Result;
-use crate::{channel::{ChId, ChSender, ChTx}, actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker}};
 
 use super::entity_watch::{OpWatch, WatchResult};
 
@@ -21,13 +21,13 @@ pub struct ReqGetMuxTx;
 
 pub type ReqGetMuxTxResult = Result<ChTx>;
 
-pub trait SwitchHanlder: ActorEntity 
-+ AsyncHandler<ReqAddChannel, Response = AddChannelResult>
-+ AsyncHandler<ReqRemoveChannel, Response = RemoveChannelResult>
-+ AsyncHandler<ReqGetMuxTx, Response = ReqGetMuxTxResult>
-+ AsyncHandler<OpWatch, Response = WatchResult>
+pub trait SwitchHanlder:
+    ActorEntity
+    + AsyncHandler<ReqAddChannel, Response = AddChannelResult>
+    + AsyncHandler<ReqRemoveChannel, Response = RemoveChannelResult>
+    + AsyncHandler<ReqGetMuxTx, Response = ReqGetMuxTxResult>
+    + AsyncHandler<OpWatch, Response = WatchResult>
 {
-
 }
 
 #[derive(Clone)]
@@ -35,14 +35,12 @@ pub struct SwitchInvoker<H: SwitchHanlder> {
     invoker: Invoker<H>,
 }
 
-impl<E> SwitchInvoker<E> 
+impl<E> SwitchInvoker<E>
 where
     E: SwitchHanlder,
 {
     pub fn new(invoker: Invoker<E>) -> Self {
-        Self {
-            invoker,
-        }
+        Self { invoker }
     }
 
     pub fn downgrade(&self) -> SwitchInvokerWeak<E> {
@@ -72,11 +70,9 @@ where
     }
 }
 
-
-
 // impl<'a, H: SwitchHanlder> AsRef<SwitchRef<'a, H>> for SwitchInvoker<H> {
 //     fn as_ref(&self) -> &SwitchRef<'a, H> {
-        
+
 //     }
 // }
 
@@ -85,7 +81,7 @@ where
 //     invoker: &'a Invoker<H>,
 // }
 
-// impl<'a, E> SwitchRef<'a, E> 
+// impl<'a, E> SwitchRef<'a, E>
 // where
 //     E: SwitchHanlder,
 // {
@@ -114,22 +110,13 @@ where
 //     }
 // }
 
-
-
 #[derive(Clone)]
 pub struct SwitchInvokerWeak<H: SwitchHanlder> {
     weak: WeakInvoker<H>,
 }
 
-impl <E: SwitchHanlder> SwitchInvokerWeak<E> {
+impl<E: SwitchHanlder> SwitchInvokerWeak<E> {
     pub fn upgrade(&self) -> Option<SwitchInvoker<E>> {
-        self.weak.upgrade().map(|invoker| SwitchInvoker {
-            invoker,
-        })
+        self.weak.upgrade().map(|invoker| SwitchInvoker { invoker })
     }
 }
-
-
-
-
-

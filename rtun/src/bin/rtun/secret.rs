@@ -1,22 +1,17 @@
-
-
-use anyhow::{Result, bail};
-use sha2::Sha256;
+use anyhow::{bail, Result};
+use base64::{engine::general_purpose, Engine as _};
 use hmac::{Hmac, Mac};
-use base64::{Engine as _, engine::general_purpose};
+use sha2::Sha256;
 // use hex_literal::hex;
-
 
 type HmacSha256 = Hmac<Sha256>;
 
 pub fn token_gen(secret: Option<&str>, nonce: u64) -> Result<String> {
-    Secret::try_new(secret)?
-    .gen_token(nonce)
+    Secret::try_new(secret)?.gen_token(nonce)
 }
 
 pub fn token_verify(secret: Option<&str>, token: &str) -> Result<()> {
-    Secret::try_new(secret)?
-    .verify_token(token)
+    Secret::try_new(secret)?.verify_token(token)
 }
 
 pub struct Secret {
@@ -25,7 +20,7 @@ pub struct Secret {
 }
 
 impl Secret {
-    pub fn try_new(secret: Option<&str>) ->Result<Self> {
+    pub fn try_new(secret: Option<&str>) -> Result<Self> {
         let secret = secret.unwrap_or("tKwC83s8");
 
         Ok(Self {
@@ -45,8 +40,8 @@ impl Secret {
         };
 
         self.buf[..8].clone_from_slice(&input[..]);
-        self.buf[8..8+mac_bytes.len()].clone_from_slice(&mac_bytes[..]);
-        let encoded = general_purpose::STANDARD_NO_PAD.encode(&self.buf[..8+mac_bytes.len()]);
+        self.buf[8..8 + mac_bytes.len()].clone_from_slice(&mac_bytes[..]);
+        let encoded = general_purpose::STANDARD_NO_PAD.encode(&self.buf[..8 + mac_bytes.len()]);
 
         // let mut encoded = String::new();
         // general_purpose::STANDARD_NO_PAD.encode_string(input, &mut encoded);
@@ -56,7 +51,6 @@ impl Secret {
     }
 
     pub fn verify_token(&mut self, token: &str) -> Result<()> {
-        
         // self.buf.clear();
 
         let len = general_purpose::STANDARD_NO_PAD.decode_slice(token, &mut self.buf)?;
@@ -66,7 +60,7 @@ impl Secret {
 
         let nonce = &self.buf[0..8];
         let mac_input = &self.buf[8..len];
-        
+
         let mac_output = {
             let mut mac = HmacSha256::new_from_slice(self.secret.as_ref())?;
             mac.update(nonce);
@@ -79,26 +73,32 @@ impl Secret {
 
         Ok(())
     }
-
-    
 }
 
 #[test]
 fn test() {
     {
         let token = Secret::try_new(None).unwrap().gen_token(123).unwrap();
-        Secret::try_new(None).unwrap().verify_token(token.as_str()).unwrap();
+        Secret::try_new(None)
+            .unwrap()
+            .verify_token(token.as_str())
+            .unwrap();
     }
 
     {
         let secret = Some("it is demo secret");
         let token = Secret::try_new(secret).unwrap().gen_token(321).unwrap();
-        Secret::try_new(secret).unwrap().verify_token(token.as_str()).unwrap();
+        Secret::try_new(secret)
+            .unwrap()
+            .verify_token(token.as_str())
+            .unwrap();
 
         let r = Secret::try_new(None).unwrap().verify_token(token.as_str());
         assert!(r.is_err(), "{r:?}");
 
-        let r = Secret::try_new(Some("wrong secret")).unwrap().verify_token(token.as_str());
+        let r = Secret::try_new(Some("wrong secret"))
+            .unwrap()
+            .verify_token(token.as_str());
         assert!(r.is_err(), "{r:?}");
     }
 }

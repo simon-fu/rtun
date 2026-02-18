@@ -4,7 +4,6 @@
 
 // use super::ch_shell::open_shell;
 
-
 // pub(super) async fn channel_service(tx: ChSender, mut rx: ChReceiver) -> Result<()> {
 //     let packet = rx.recv_packet().await?;
 
@@ -13,7 +12,7 @@
 //     .with_context(||"no c2a_req_args")?;
 //     match cmd {
 //         C2a_req_args::OpenSell(args) => {
-            
+
 //             let r = open_shell(args).await;
 
 //             let (rsp, shell) = match r {
@@ -30,15 +29,15 @@
 
 //                 let uid = gen_huid();
 //                 tracing::debug!("open shell [{}]", uid);
-                
+
 //                 let name = format!("shell-{}", uid);
 //                 spawn_with_name(name, async move {
-                    
+
 //                     let r = shell.run(tx, rx).await;
 //                     tracing::debug!("finished with [{:?}]", r);
-        
+
 //                     // TODO: remove channel
-        
+
 //                 });
 
 //             }
@@ -49,5 +48,3 @@
 //     }
 //     Ok(())
 // }
-
-

@@ -1,15 +1,25 @@
-
-use std::{io::{self, ErrorKind}, time::Duration};
+use std::{
+    io::{self, ErrorKind},
+    time::Duration,
+};
 
 use anyhow::Result;
-use bytes::{Bytes, BytesMut, Buf};
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::{sync::mpsc, time::Instant};
 
-use crate::{kcp::{kcp2::{Kcp, KcpWriteBuf}, Error as KcpError}, async_rt::spawn_with_name, ice::bytes_utils::BytesCursor};
+use crate::{
+    async_rt::spawn_with_name,
+    ice::bytes_utils::BytesCursor,
+    kcp::{
+        kcp2::{Kcp, KcpWriteBuf},
+        Error as KcpError,
+    },
+};
 
-use super::{webrtc_ice_peer::{IceConn, IceWriteHalf}, mpsc_pair::MpscPair};
-
-
+use super::{
+    mpsc_pair::MpscPair,
+    webrtc_ice_peer::{IceConn, IceWriteHalf},
+};
 
 pub trait UpgradeToKcp {
     fn upgrade_to_kcp(self, conv: u32) -> Result<IceKcpConnection>;
@@ -23,7 +33,6 @@ impl UpgradeToKcp for IceConn {
 }
 
 fn kick_xfer(conn: IceConn, conv: u32) -> MpscPair {
-
     let mut kcp = Kcp::new_stream(conv, KcpWriteBuf::new(()));
     kcp.set_wndsize(256, 256);
     // kcp.set_nodelay(true, 20, 2, true);
@@ -43,8 +52,12 @@ fn kick_xfer(conn: IceConn, conv: u32) -> MpscPair {
     }
 }
 
-async fn kcp_task(mut kcp: KcpCtrl, conn: IceConn, tx: mpsc::Sender<Bytes>, mut rx: mpsc::Receiver<Bytes>) -> Result<()> {
-
+async fn kcp_task(
+    mut kcp: KcpCtrl,
+    conn: IceConn,
+    tx: mpsc::Sender<Bytes>,
+    mut rx: mpsc::Receiver<Bytes>,
+) -> Result<()> {
     let (mut rd, mut wr) = conn.split();
 
     let limit = LimitArgs {
@@ -60,13 +73,12 @@ async fn kcp_task(mut kcp: KcpCtrl, conn: IceConn, tx: mpsc::Sender<Bytes>, mut 
     let mut next = kcp_update(&mut kcp)?;
 
     loop {
-        
         kcp_try_send(&mut kcp, &mut pending_to_kcp, &limit)?;
 
         if pending_to_conn.is_none() {
-            pending_to_conn = kcp.output_mut().pop_front().map(|x|x.into());
+            pending_to_conn = kcp.output_mut().pop_front().map(|x| x.into());
         }
-        
+
         if pending_to_tx.is_none() {
             kcp_recv_buf.resize(1700, 0);
             let num = kcp_try_recv(&mut kcp, &mut kcp_recv_buf[..])?;
@@ -93,7 +105,7 @@ async fn kcp_task(mut kcp: KcpCtrl, conn: IceConn, tx: mpsc::Sender<Bytes>, mut 
                 if len == 0 {
                     break;
                 }
-                
+
                 kcp_try_input(&mut kcp, &conn_rd_buf[..len])?;
             },
             r = tx.reserve(), if pending_to_tx.is_some() => {
@@ -140,9 +152,12 @@ async fn kcp_task(mut kcp: KcpCtrl, conn: IceConn, tx: mpsc::Sender<Bytes>, mut 
     Ok(())
 }
 
-
-async fn conn_try_send(wr: &mut IceWriteHalf, pending: &mut Option<BytesCursor>, _limit: &LimitArgs) -> Result<()> {
-    if let Some(cursor) = pending { 
+async fn conn_try_send(
+    wr: &mut IceWriteHalf,
+    pending: &mut Option<BytesCursor>,
+    _limit: &LimitArgs,
+) -> Result<()> {
+    if let Some(cursor) = pending {
         while cursor.remaining() > 0 {
             let num = wr.write_data(cursor.chunk()).await?;
             cursor.advance(num);
@@ -152,7 +167,11 @@ async fn conn_try_send(wr: &mut IceWriteHalf, pending: &mut Option<BytesCursor>,
     Ok(())
 }
 
-fn kcp_try_send(kcp: &mut KcpCtrl, pending: &mut Option<BytesCursor>, limit: &LimitArgs) -> Result<()> {
+fn kcp_try_send(
+    kcp: &mut KcpCtrl,
+    pending: &mut Option<BytesCursor>,
+    limit: &LimitArgs,
+) -> Result<()> {
     if let Some(cursor) = pending {
         let max_wait_snd = (kcp.snd_wnd() as usize) + 8;
         while cursor.remaining() > 0 && kcp.wait_snd() < max_wait_snd {
@@ -160,7 +179,7 @@ fn kcp_try_send(kcp: &mut KcpCtrl, pending: &mut Option<BytesCursor>, limit: &Li
             let num = kcp.send(&cursor.chunk()[..num])?;
             cursor.advance(num);
         }
-        
+
         if cursor.remaining() == 0 {
             pending.take();
         }
@@ -203,7 +222,6 @@ struct LimitArgs {
     max_send_size: usize,
 }
 
-
 type KcpCtrl = Kcp<KcpWriteBuf>;
 
 fn kcp_update(kcp: &mut KcpCtrl) -> io::Result<Instant> {
@@ -217,7 +235,9 @@ fn kcp_update(kcp: &mut KcpCtrl) -> io::Result<Instant> {
 #[inline]
 pub fn now_millis() -> u32 {
     let start = std::time::SystemTime::now();
-    let since_the_epoch = start.duration_since(std::time::UNIX_EPOCH).expect("time went afterwards");
+    let since_the_epoch = start
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time went afterwards");
     // (since_the_epoch.as_secs() * 1000 + since_the_epoch.subsec_millis() as u64) as u32
     since_the_epoch.as_millis() as u32
 }
@@ -225,4 +245,3 @@ pub fn now_millis() -> u32 {
 fn into_io<E: std::fmt::Debug>(e: E) -> io::Error {
     io::Error::new(ErrorKind::ConnectionAborted, format!("{:?}", e))
 }
-

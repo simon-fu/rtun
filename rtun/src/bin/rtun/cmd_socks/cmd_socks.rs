@@ -1,20 +1,40 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration, io, collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, io, net::SocketAddr, sync::Arc, time::Duration};
 
-use anyhow::{Result, Context, bail};
+use anyhow::{bail, Context, Result};
 use chrono::Local;
 
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use parking_lot::Mutex;
-use rtun::{ws::client::ws_connect_to, switch::{invoker_ctrl::{CtrlHandler, CtrlInvoker}, next_ch_id::NextChId, session_stream::{make_stream_session, StreamSession}, switch_sink::PacketSink, switch_source::PacketSource, agent::ch_socks::run_socks5_conn_bridge}, channel::{ChId, ChPair, ch_stream::ChStream}, proto::OpenSocksArgs, async_rt::spawn_with_name};
+use rtun::{
+    async_rt::spawn_with_name,
+    channel::{ch_stream::ChStream, ChId, ChPair},
+    proto::OpenSocksArgs,
+    switch::{
+        agent::ch_socks::run_socks5_conn_bridge,
+        invoker_ctrl::{CtrlHandler, CtrlInvoker},
+        next_ch_id::NextChId,
+        session_stream::{make_stream_session, StreamSession},
+        switch_sink::PacketSink,
+        switch_source::PacketSource,
+    },
+    ws::client::ws_connect_to,
+};
 use shadowsocks_service::local::socks::config::Socks5AuthConfig;
 use tokio::net::{TcpListener, TcpStream};
 
+use super::{
+    p2p_throughput::kick_p2p,
+    quic_pool::{QuicPool, QuicPoolInvoker},
+};
+use crate::{
+    client_utils::{client_select_url, query_new_agents},
+    cmd_socks::quic_pool::{make_pool, AddAgent, GetCh},
+    rest_proto::{get_agent_from_url, make_sub_url, make_ws_scheme, AgentInfo},
+    secret::token_gen,
+};
 
-use crate::{client_utils::{client_select_url, query_new_agents}, rest_proto::{AgentInfo, get_agent_from_url, make_sub_url, make_ws_scheme}, secret::token_gen, cmd_socks::quic_pool::{make_pool, AddAgent, GetCh}};
-use super::{p2p_throughput::kick_p2p, quic_pool::{QuicPoolInvoker, QuicPool}};
-
-pub fn run(args: CmdArgs) -> Result<()> { 
+pub fn run(args: CmdArgs) -> Result<()> {
     // init_log_and_run(do_run(args))?
 
     let multi = MultiProgress::new();
@@ -22,49 +42,46 @@ pub fn run(args: CmdArgs) -> Result<()> {
         let multi = multi.clone();
         crate::init_log2(move || LogWriter::new(multi.clone()));
     }
-    
-    crate::async_rt::run_multi_thread(async move {
-        do_run(args, multi).await
-    })??;
+
+    crate::async_rt::run_multi_thread(async move { do_run(args, multi).await })??;
     Ok(())
 }
 
-async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> { 
-
+async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
     if let Some(_socks_ws) = &args.socks_ws {
         kick_ws_socks(args.clone()).await?;
     }
-    
+
     // let agent_pool = AgentPool::new();
     let pool = make_pool("pool".into(), multi.clone())?;
 
-    let url = url::Url::parse(&args.url)
-    .with_context(||"invalid url")?;
+    let url = url::Url::parse(&args.url).with_context(|| "invalid url")?;
 
     let listen_addr = &args.listen;
-    let listen_addr: SocketAddr = listen_addr.parse().with_context(|| format!("invalid addr {listen_addr:?}"))?;
+    let listen_addr: SocketAddr = listen_addr
+        .parse()
+        .with_context(|| format!("invalid addr {listen_addr:?}"))?;
 
     let mut bars = Vec::new();
     const STYLE_GENERAL: &str = "{prefix:.bold.dim} {spinner} {wide_msg:}";
 
     let mut _clash_server = None;
     {
-        
-
         for nn in 0..1 {
-            let port = listen_addr.port()+nn;
+            let port = listen_addr.port() + nn;
             let listen_addr = SocketAddr::new(listen_addr.ip(), port);
-            let listener = TcpListener::bind(listen_addr).await
-            .with_context(||format!("fail to bind address [{listen_addr}]"))?;
+            let listener = TcpListener::bind(listen_addr)
+                .await
+                .with_context(|| format!("fail to bind address [{listen_addr}]"))?;
             tracing::info!("socks5(quic) listen on [{listen_addr}]");
-            
+
             let bar = multi.add(ProgressBar::new(100));
             bar.set_style(ProgressStyle::with_template(STYLE_GENERAL)?);
             bar.set_message(format!("socks: {listen_addr}"));
             bars.push(bar);
 
             let pool = pool.invoker().clone();
-    
+
             spawn_with_name(format!("local_socks-{port}"), async move {
                 let r = run_socks_via_quic(pool, listener).await;
                 r
@@ -73,20 +90,19 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
     }
 
     if args.tls_key.is_some() || args.tls_cert.is_some() {
-
         // let key_path = "/Users/simon/simon/src/my_keys/simon.home/simon.home.rtcsdk.com.key";
         // let cert_path = "/Users/simon/simon/src/my_keys/simon.home/simon.home.rtcsdk.com.pem";
 
         // let key_path = "/tmp/pem/key.pem";
         // let cert_path = "/tmp/pem/cert.pem";
-        
+
         // let verifier = tls_util::SpecificClientCertVerifier::try_load("/tmp/pem/cert.pem").await?;
         // let verifier = Arc::new(verifier);
         // let verifier = tls_util::client_cert_verifier("/tmp/pem/ca.key.pem").await?;
 
         let (key_path, cert_path) = match (args.tls_key.as_ref(), args.tls_cert.as_ref()) {
             (Some(k), Some(c)) => (k, c),
-            _ => bail!("must have tls_key and tls_cert")
+            _ => bail!("must have tls_key and tls_cert"),
         };
 
         let mut opt_username = None;
@@ -96,8 +112,8 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
             let mut cfg = Socks5AuthConfig::new();
             for ss in args.tls_user.iter() {
                 let mut split = ss.split(":");
-                let user_name = split.next().with_context(||"no tls username")?;
-                let password = split.next().with_context(||"no tls password")?;
+                let user_name = split.next().with_context(|| "no tls username")?;
+                let password = split.next().with_context(|| "no tls password")?;
                 cfg.passwd.add_user(user_name, password);
 
                 opt_username = Some(user_name.to_string());
@@ -115,7 +131,7 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
             //     opt_password = Some(password.to_string());
             //     // cfg.passwd.add_user("rtun", "123");
             // }
-            
+
             Arc::new(cfg)
         };
 
@@ -126,12 +142,8 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
         let acceptor = tls_util::acceptor_from_cfg(tls_cfg.clone())?;
 
         let listen_addr: SocketAddr = match &args.tls_listen {
-            Some(v) => {
-                v.parse().with_context(|| format!("invalid addr {v:?}"))?
-            },
-            None => {
-                SocketAddr::new(listen_addr.ip(), listen_addr.port()+1)
-            }
+            Some(v) => v.parse().with_context(|| format!("invalid addr {v:?}"))?,
+            None => SocketAddr::new(listen_addr.ip(), listen_addr.port() + 1),
         };
 
         // let mut listen_addr: SocketAddr = listen_addr.parse().with_context(|| format!("invalid addr {listen_addr:?}"))?;
@@ -140,18 +152,22 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
         let mut addrs = Vec::new();
 
         for nn in 0..1 {
-            let port = listen_addr.port()+nn;
+            let port = listen_addr.port() + nn;
             let listen_addr = SocketAddr::new(listen_addr.ip(), port);
-            let listener = TcpListener::bind(listen_addr).await
-            .with_context(||format!("fail to bind address [{listen_addr}]"))?;
+            let listener = TcpListener::bind(listen_addr)
+                .await
+                .with_context(|| format!("fail to bind address [{listen_addr}]"))?;
             addrs.push(listen_addr);
             tracing::info!("tls_socks5(quic) listen on [{listen_addr}]");
-    
+
             let bar = multi.add(ProgressBar::new(100));
             bar.set_style(ProgressStyle::with_template(STYLE_GENERAL)?);
-            bar.set_message(format!("socks5-over-tls: {listen_addr} {:?}", args.tls_user));
+            bar.set_message(format!(
+                "socks5-over-tls: {listen_addr} {:?}",
+                args.tls_user
+            ));
             bars.push(bar);
-            
+
             let pool = pool.invoker().clone();
             let acceptor = acceptor.clone();
             let auth = auth.clone();
@@ -171,13 +187,13 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
                 server: &dns_name,
                 username: opt_username.as_deref(),
                 password: opt_password.as_deref(),
-            }.to_string();
-            
-            
-            let server = clash_rest::server_for_clash(listen_addr, web_path, Some(tls_cfg), content).await?;
+            }
+            .to_string();
+
+            let server =
+                clash_rest::server_for_clash(listen_addr, web_path, Some(tls_cfg), content).await?;
             _clash_server = Some(server);
 
-            
             let clash_text = format!("clash: https://{dns_name}:{}{web_path}", listen_addr.port());
 
             let bar = multi.add(ProgressBar::new(100));
@@ -185,7 +201,6 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
             bar.set_message(clash_text);
             bars.push(bar);
         }
-
     }
 
     {
@@ -194,26 +209,22 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
                 if !contains_regex_chars(expr) {
                     tracing::info!("agent name is simple string");
                     add_agents(&pool, &url, &args, [expr.clone()].into_iter()).await?;
-                    tokio::time::sleep(Duration::MAX/2).await;
-                    return Ok(())
+                    tokio::time::sleep(Duration::MAX / 2).await;
+                    return Ok(());
                 }
                 expr
-            },
-            None => {
-                ".*"
             }
+            None => ".*",
         };
 
         tracing::info!("agent name expr: [{agent_expr}]");
 
-        let agent_regex = regex::Regex::new(agent_expr)
-        .with_context(||"invalid agent name regular expr")?;
+        let agent_regex =
+            regex::Regex::new(agent_expr).with_context(|| "invalid agent name regular expr")?;
 
         let mut agents = HashMap::new();
 
         loop {
-
-
             let r = if url.scheme().eq_ignore_ascii_case("quic") {
                 query_new_agents_quic(&url, &agent_regex, &mut agents, args.quic_insecure).await
             } else {
@@ -222,11 +233,11 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
             match r {
                 Ok(agents) => {
                     // tracing::debug!("query_new_agents success [{agents:?}]");
-                    let iter = agents.into_iter().map(|x|x.name);
+                    let iter = agents.into_iter().map(|x| x.name);
                     add_agents(&pool, &url, &args, iter).await?;
                     // for agent in agents {
                     //     let mut url = url.clone();
-                        
+
                     //     make_sub_url(&mut url, Some(&agent.name), args.secret.as_deref())?;
                     //     make_ws_scheme(&mut url)?;
 
@@ -236,10 +247,10 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
                     //         url: url.to_string(),
                     //     }).await??;
                     // }
-                },
+                }
                 Err(e) => {
                     tracing::debug!("query_new_agents failed [{e:?}]");
-                },
+                }
             }
             tokio::time::sleep(Duration::from_millis(1_000)).await
         }
@@ -286,7 +297,6 @@ impl<'a> fmt::Display for ClashContent<'a> {
         //   - MATCH,rtunproxy
         // "#}.into();
 
-
         writeln!(f, "proxies:")?;
         for (nn, addr) in self.addrs.iter().enumerate() {
             let number = nn + 1;
@@ -318,7 +328,7 @@ impl<'a> fmt::Display for ClashContent<'a> {
     }
 }
 
-async fn add_agents<I>(pool: &QuicPool, url: &::url::Url, args: &CmdArgs, iter: I) -> Result<()> 
+async fn add_agents<I>(pool: &QuicPool, url: &::url::Url, args: &CmdArgs, iter: I) -> Result<()>
 where
     I: Iterator<Item = String>,
 {
@@ -333,16 +343,22 @@ where
         }
 
         tracing::info!("new agent [{}]", agent);
-        pool.invoker().invoke(AddAgent {
-            name: agent,
-            url: url.to_string(),
-            quic_insecure: args.quic_insecure,
-        }).await??;
+        pool.invoker()
+            .invoke(AddAgent {
+                name: agent,
+                url: url.to_string(),
+                quic_insecure: args.quic_insecure,
+            })
+            .await??;
     }
     Ok(())
 }
 
-fn make_sub_quic_url(url: &mut url::Url, agent_name: Option<&str>, secret: Option<&str>) -> Result<()> {
+fn make_sub_quic_url(
+    url: &mut url::Url,
+    agent_name: Option<&str>,
+    secret: Option<&str>,
+) -> Result<()> {
     if let Some(agent_name) = agent_name {
         url.query_pairs_mut().append_pair("agent", agent_name);
     }
@@ -397,8 +413,9 @@ async fn kick_ws_socks(args: CmdArgs) -> Result<()> {
             socks_ws
         };
 
-        let listener = TcpListener::bind(listen_addr).await
-        .with_context(||format!("fail to bind address [{listen_addr}]"))?;
+        let listener = TcpListener::bind(listen_addr)
+            .await
+            .with_context(|| format!("fail to bind address [{listen_addr}]"))?;
         tracing::info!("socks5(ws) listen on [{listen_addr}]");
 
         spawn_with_name("ws_sock", async move {
@@ -407,19 +424,15 @@ async fn kick_ws_socks(args: CmdArgs) -> Result<()> {
         });
     }
 
-
     Ok(())
 }
 
 async fn connect_loop(args: CmdArgs, listener: TcpListener) -> Result<()> {
     let shared = Arc::new(Shared {
-        data: Mutex::new(SharedData {
-            ctrl: None,
-        }),
+        data: Mutex::new(SharedData { ctrl: None }),
     });
 
     if let Some(_socks_ws) = &args.socks_ws {
-
         let shared = shared.clone();
         spawn_with_name("local_sock", async move {
             let r = run_socks_via_ctrl(shared, listener).await;
@@ -428,7 +441,6 @@ async fn connect_loop(args: CmdArgs, listener: TcpListener) -> Result<()> {
     }
 
     loop {
-
         let (mut session, _name) = repeat_connect(&args).await;
         // let mut session = make_stream_session(stream).await?;
 
@@ -443,7 +455,7 @@ async fn connect_loop(args: CmdArgs, listener: TcpListener) -> Result<()> {
         {
             shared.data.lock().ctrl = Some(session.ctrl_client().clone_invoker());
         }
-        
+
         tracing::info!("wait for session completed");
         let r = session.wait_for_completed().await;
         tracing::info!("session finished {r:?}");
@@ -452,14 +464,14 @@ async fn connect_loop(args: CmdArgs, listener: TcpListener) -> Result<()> {
     }
 }
 
-// async fn do_run1(args: CmdArgs, multi: MultiProgress) -> Result<()> { 
+// async fn do_run1(args: CmdArgs, multi: MultiProgress) -> Result<()> {
 
 //     let shared = Arc::new(Shared {
 //         data: Mutex::new(SharedData {
 //             ctrl: None,
 //         }),
 //     });
-    
+
 //     // let agent_pool = AgentPool::new();
 //     let mut pools = Vec::new();
 
@@ -476,12 +488,12 @@ async fn connect_loop(args: CmdArgs, listener: TcpListener) -> Result<()> {
 //             let listener = TcpListener::bind(listen_addr).await
 //             .with_context(||format!("fail to bind address [{listen_addr}]"))?;
 //             tracing::info!("socks5(quic) listen on [{listen_addr}]");
-    
+
 //             // let pool = agent_pool.clone();
 //             let pool = AgentPool::new(multi.clone(), port.to_string());
 //             pool.set_agent(agent_name.clone(), session.ctrl_client().clone_invoker()).await?;
 //             pools.push(pool.clone());
-    
+
 //             spawn_with_name(format!("local_sock-{port}"), async move {
 //                 let r = run_socks_via_quic(pool, listener).await;
 //                 r
@@ -489,7 +501,6 @@ async fn connect_loop(args: CmdArgs, listener: TcpListener) -> Result<()> {
 //         }
 
 //     }
-    
 
 //     if let Some(socks_ws) = &args.socks_ws {
 //         let listen_addr = if socks_ws == "0" || socks_ws == "1" || socks_ws == "true" {
@@ -529,7 +540,7 @@ async fn connect_loop(args: CmdArgs, listener: TcpListener) -> Result<()> {
 //         {
 //             shared.data.lock().ctrl = Some(session.ctrl_client().clone_invoker());
 //         }
-        
+
 //         let r = session.wait_for_completed().await;
 //         tracing::info!("session finished {r:?}");
 
@@ -538,7 +549,9 @@ async fn connect_loop(args: CmdArgs, listener: TcpListener) -> Result<()> {
 
 // }
 
-async fn repeat_connect(args: &CmdArgs) -> (StreamSession<impl PacketSink, impl PacketSource>, String) {
+async fn repeat_connect(
+    args: &CmdArgs,
+) -> (StreamSession<impl PacketSink, impl PacketSource>, String) {
     let mut last_success = true;
 
     loop {
@@ -547,14 +560,14 @@ async fn repeat_connect(args: &CmdArgs) -> (StreamSession<impl PacketSink, impl 
         match r {
             Ok(r) => {
                 return r;
-            },
+            }
             Err(e) => {
                 if last_success {
                     last_success = false;
                     tracing::warn!("connect failed [{e:?}]");
                     tracing::info!("try reconnecting...");
                 }
-            },
+            }
         }
 
         tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -575,9 +588,8 @@ async fn repeat_connect(args: &CmdArgs) -> (StreamSession<impl PacketSink, impl 
 
 //     // pub type Invoker = CtrlInvoker<Entity<Entity<impl PacketSource>>>;
 //     pub type SessionInvoker = SwitchPairInvoker<Source>;
-    
-// }
 
+// }
 
 struct Shared<H: CtrlHandler> {
     data: Mutex<SharedData<H>>,
@@ -587,14 +599,17 @@ struct SharedData<H: CtrlHandler> {
     ctrl: Option<CtrlInvoker<H>>,
 }
 
-async fn try_connect(args: &CmdArgs) -> Result<(StreamSession<impl PacketSink, impl PacketSource>, String)> {
+async fn try_connect(
+    args: &CmdArgs,
+) -> Result<(StreamSession<impl PacketSink, impl PacketSource>, String)> {
     let url = client_select_url(&args.url, args.agent.as_deref(), args.secret.as_deref()).await?;
     let url_str = url.as_str();
 
-    let (stream, _r) = ws_connect_to(url_str).await
-    .with_context(||format!("connect to agent failed"))?;
+    let (stream, _r) = ws_connect_to(url_str)
+        .await
+        .with_context(|| format!("connect to agent failed"))?;
 
-    let agent_name = get_agent_from_url(&url).with_context(||"can't get agent name")?;
+    let agent_name = get_agent_from_url(&url).with_context(|| "can't get agent name")?;
     tracing::info!("connected to agent {agent_name:?}");
 
     // let uid = gen_huid();
@@ -604,36 +619,48 @@ async fn try_connect(args: &CmdArgs) -> Result<(StreamSession<impl PacketSink, i
     Ok((session, agent_name.into_owned()))
 }
 
-async fn run_socks_via_quic( pool: QuicPoolInvoker, listener: TcpListener ) -> Result<()> {
-
+async fn run_socks_via_quic(pool: QuicPoolInvoker, listener: TcpListener) -> Result<()> {
     loop {
-        let (mut stream, peer_addr)  = listener.accept().await.with_context(||"accept tcp failed")?;
-        
+        let (mut stream, peer_addr) = listener
+            .accept()
+            .await
+            .with_context(|| "accept tcp failed")?;
+
         tracing::trace!("[{peer_addr}] client connected");
 
         let pool = pool.clone();
         tokio::spawn(async move {
             let r = async move {
-                let (mut wr1, mut rd1) = pool.invoke(GetCh).await??.with_context(||"no available ch")?;
+                let (mut wr1, mut rd1) = pool
+                    .invoke(GetCh)
+                    .await??
+                    .with_context(|| "no available ch")?;
                 let (mut rd2, mut wr2) = stream.split();
                 tokio::select! {
                     r = tokio::io::copy(&mut rd2, &mut wr1) => {r?;},
                     r = tokio::io::copy(&mut rd1, &mut wr2) => {r?;},
                 }
                 Result::<()>::Ok(())
-            }.await;
+            }
+            .await;
             tracing::trace!("[{peer_addr}] client finished with {r:?}");
             r
         });
-        
     }
 }
 
-async fn run_tls_socks_via_quic( pool: QuicPoolInvoker, listener: TcpListener, acceptor: tokio_rustls::TlsAcceptor, auth: Arc<Socks5AuthConfig> ) -> Result<()> {
-
+async fn run_tls_socks_via_quic(
+    pool: QuicPoolInvoker,
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    auth: Arc<Socks5AuthConfig>,
+) -> Result<()> {
     loop {
-        let (stream, peer_addr)  = listener.accept().await.with_context(||"accept tcp failed")?;
-        
+        let (stream, peer_addr) = listener
+            .accept()
+            .await
+            .with_context(|| "accept tcp failed")?;
+
         tracing::trace!("[{peer_addr}] client connected");
 
         let pool = pool.clone();
@@ -641,28 +668,28 @@ async fn run_tls_socks_via_quic( pool: QuicPoolInvoker, listener: TcpListener, a
         let auth = auth.clone();
         tokio::spawn(async move {
             let r = async move {
-
                 let stream = acceptor.accept(stream).await?;
                 let (mut rd2, mut wr2) = tokio::io::split(stream);
 
-                let (mut wr1, mut rd1) = pool.invoke(GetCh).await??.with_context(||"no available ch")?;
+                let (mut wr1, mut rd1) = pool
+                    .invoke(GetCh)
+                    .await??
+                    .with_context(|| "no available ch")?;
 
                 run_socks5_conn_bridge(&mut rd2, &mut wr2, &mut rd1, &mut wr1, &auth).await
-                
-            }.await;
+            }
+            .await;
             tracing::trace!("[{peer_addr}] client finished with {r:?}");
             r
         });
-        
     }
 }
-
 
 // async fn run_socks_via_quic1<H: CtrlHandler>( pool: AgentPool<H>, listener: TcpListener ) -> Result<()> {
 
 //     loop {
 //         let (mut stream, peer_addr)  = listener.accept().await.with_context(||"accept tcp failed")?;
-        
+
 //         tracing::trace!("[{peer_addr}] client connected");
 
 //         let pool = pool.clone();
@@ -680,51 +707,45 @@ async fn run_tls_socks_via_quic( pool: QuicPoolInvoker, listener: TcpListener, a
 //             r
 //         });
 
-
-        
 //     }
 // }
 
-
-async fn run_socks_via_ctrl<H: CtrlHandler>( shared: Arc<Shared<H>>, listener: TcpListener ) -> Result<()> {
+async fn run_socks_via_ctrl<H: CtrlHandler>(
+    shared: Arc<Shared<H>>,
+    listener: TcpListener,
+) -> Result<()> {
     let mut next_ch_id = NextChId::default();
     loop {
-        let (stream, peer_addr)  = listener.accept().await.with_context(||"accept tcp failed")?;
-        
+        let (stream, peer_addr) = listener
+            .accept()
+            .await
+            .with_context(|| "accept tcp failed")?;
+
         tracing::trace!("[{peer_addr}] client connected");
 
-        let r = {
-            shared.data.lock().ctrl.clone()
-        };
+        let r = { shared.data.lock().ctrl.clone() };
 
         match r {
             Some(ctrl) => {
                 let ch_id = next_ch_id.next_ch_id();
-        
+
                 tokio::spawn(async move {
-                    
-                    let r = handle_client(
-                        ctrl,
-                        ch_id,
-                        stream, 
-                        peer_addr,
-                    ).await;
+                    let r = handle_client(ctrl, ch_id, stream, peer_addr).await;
                     tracing::trace!("[{peer_addr}] client finished with {r:?}");
                     r
                 });
-            },
-            None => {},
+            }
+            None => {}
         }
     }
 }
 
-async fn handle_client<H: CtrlHandler>( 
-    ctrl: CtrlInvoker<H>, 
-    ch_id: ChId, 
-    mut stream: TcpStream, 
-    peer_addr: SocketAddr 
+async fn handle_client<H: CtrlHandler>(
+    ctrl: CtrlInvoker<H>,
+    ch_id: ChId,
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
 ) -> Result<()> {
-
     let (ch_tx, ch_rx) = ChPair::new(ch_id).split();
 
     let open_args = OpenSocksArgs {
@@ -734,13 +755,15 @@ async fn handle_client<H: CtrlHandler>(
     };
 
     let ch_tx = {
-        let r = ctrl.open_socks(ch_tx, open_args).await
-        .with_context(||"open socks ch failed");
+        let r = ctrl
+            .open_socks(ch_tx, open_args)
+            .await
+            .with_context(|| "open socks ch failed");
         match r {
             Ok(v) => v,
             Err(e) => {
                 tracing::debug!("{e:?}");
-                return Err(e)
+                return Err(e);
             }
         }
     };
@@ -752,7 +775,7 @@ async fn handle_client<H: CtrlHandler>(
     let mut ch_stream = ChStream::new2(ch_tx, ch_rx);
     // let r = copy_stream_bidir(&mut stream, &mut ch_stream).await;
     let r = tokio::io::copy_bidirectional(&mut stream, &mut ch_stream).await;
-    
+
     let _r = ctrl.close_channel(ch_id).await;
     r?;
     Ok(())
@@ -770,7 +793,7 @@ async fn handle_client<H: CtrlHandler>(
 //             tokio::select! {
 //                 r = ch_rx.recv_packet() => {
 //                     let packet = r.with_context(||"recv but channel closed")?;
-    
+
 //                     stream.write_all(&packet.payload[..]).await
 //                     .with_context(||"write but stream closed")?;
 //                 },
@@ -793,10 +816,9 @@ struct LogWriter {
     // buf: BytesMut,
 }
 
-
 impl LogWriter {
     pub fn new(multi: MultiProgress) -> Self {
-        Self { 
+        Self {
             multi,
             // buf: BytesMut::new(),
         }
@@ -827,28 +849,26 @@ impl<'a> Iterator for LineIter<'a> {
         let data = self.0.take();
         match data {
             Some(data) => {
-                let r = data.iter().position(|x|*x == b'\r' || *x == b'\n');
+                let r = data.iter().position(|x| *x == b'\r' || *x == b'\n');
                 match r {
                     Some(n) => {
                         let (line, data) = data.split_at(n);
-        
-                        let r = data.iter().position(|x|*x != b'\r' && *x != b'\n');
+
+                        let r = data.iter().position(|x| *x != b'\r' && *x != b'\n');
                         match r {
-                            Some(n) => { 
-                                let (_r, data) = data.split_at(n); 
+                            Some(n) => {
+                                let (_r, data) = data.split_at(n);
                                 self.0 = Some(data);
-                            },
+                            }
                             None => {
                                 // self.0 = Some(data);
-                            },
+                            }
                         }
                         Some(line)
-                    },
-                    None => {
-                        Some(data)
-                    },
+                    }
+                    None => Some(data),
                 }
-            },
+            }
             None => None,
         }
     }
@@ -857,13 +877,7 @@ impl<'a> Iterator for LineIter<'a> {
 #[test]
 fn test_line_iter() {
     {
-        let list = vec![
-            "abc",
-            "abc\r",
-            "abc\n",
-            "abc\r\n",
-            "abc\n\r",
-        ];
+        let list = vec!["abc", "abc\r", "abc\n", "abc\r\n", "abc\n\r"];
 
         for data in list {
             let mut iter = LineIter(Some(data.as_bytes()));
@@ -878,7 +892,6 @@ fn test_line_iter() {
             "abc\ndef",
             "abc\r\ndef",
             "abc\n\rdef",
-
             "abc\rdef\r",
             "abc\rdef\n",
             "abc\rdef\r\n",
@@ -894,64 +907,42 @@ fn test_line_iter() {
     }
 }
 
-
-
 #[derive(Parser, Debug, Clone)]
 #[clap(name = "socks", author, about, version)]
 pub struct CmdArgs {
-
-    #[clap(help="eg: http://127.0.0.1:8080")]
+    #[clap(help = "eg: http://127.0.0.1:8080")]
     url: String,
 
-    #[clap(
-        short = 'a',
-        long = "agent",
-        long_help = "agent name",
-    )]
+    #[clap(short = 'a', long = "agent", long_help = "agent name")]
     agent: Option<String>,
 
     #[clap(
         short = 'l',
         long = "listen",
         long_help = "listen address",
-        default_value = "0.0.0.0:12080",
+        default_value = "0.0.0.0:12080"
     )]
     listen: String,
 
-    #[clap(
-        long = "secret",
-        long_help = "authentication secret",
-    )]
+    #[clap(long = "secret", long_help = "authentication secret")]
     secret: Option<String>,
 
     #[clap(
         long = "quic-insecure",
-        long_help = "skip quic tls certificate verification (quic:// only)",
+        long_help = "skip quic tls certificate verification (quic:// only)"
     )]
     quic_insecure: bool,
 
-    #[clap(
-        long = "mode",
-        long_help = "tunnel mode",
-    )]
+    #[clap(long = "mode", long_help = "tunnel mode")]
     mode: Option<u32>,
 
-    #[clap(
-        long = "socks-ws",
-        long_help = "listen addr for socks via ws",
-    )]
+    #[clap(long = "socks-ws", long_help = "listen addr for socks via ws")]
     socks_ws: Option<String>,
 
-    #[clap(
-        long = "tls-cert",
-        long_help = "socks-over-tls cert file",
-    )]
+    #[clap(long = "tls-cert", long_help = "socks-over-tls cert file")]
     tls_cert: Option<String>,
 
-    #[clap(
-        long = "tls-key",
-        long_help = "socks-over-tls key file",
-    )]
+    #[clap(long = "tls-key", long_help = "socks-over-tls key file")]
     tls_key: Option<String>,
 
     #[clap(
@@ -961,26 +952,22 @@ pub struct CmdArgs {
     )]
     tls_user: Vec<String>,
 
-    #[clap(
-        long = "tls-listen",
-        long_help = "tls listen address",
-    )]
+    #[clap(long = "tls-listen", long_help = "tls listen address")]
     tls_listen: Option<String>,
 
     #[clap(
         long = "clash-listen",
-        long_help = "http listen address for clash subscription",
+        long_help = "http listen address for clash subscription"
     )]
     clash_listen: Option<String>,
 }
 
-
 mod tls_util {
 
+    use anyhow::{bail, Result};
+    use rustls::{server::ClientCertVerifier, Certificate, PrivateKey, ServerConfig};
     use std::{io, sync::Arc};
-    use anyhow::{Result, bail};
     use tokio_rustls::TlsAcceptor;
-    use rustls::{Certificate, ServerConfig, PrivateKey, server::ClientCertVerifier};
     use webpki::EndEntityCert;
 
     pub fn acceptor_from_cfg(config: Arc<ServerConfig>) -> Result<TlsAcceptor> {
@@ -995,10 +982,9 @@ mod tls_util {
     //     Ok(acceptor)
     // }
 
-
     // pub async fn try_load_server_certs(
-    //     key_file: &str, 
-    //     cert_file: &str, 
+    //     key_file: &str,
+    //     cert_file: &str,
     //     client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
     // ) -> io::Result<Arc<ServerConfig>> {
     //     let raw_cert = tokio::fs::read(cert_file).await?;
@@ -1008,12 +994,12 @@ mod tls_util {
     // }
 
     pub fn raw_cert_to_server_cfg(
-        raw_key: Vec<u8>, 
+        raw_key: Vec<u8>,
         raw_cert: Vec<u8>,
-        client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>
+        client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
     ) -> io::Result<Arc<ServerConfig>> {
         use rustls_pemfile::Item;
-    
+
         let certs = rustls_pemfile::certs(&mut raw_cert.as_ref())?;
         let key = match rustls_pemfile::read_one(&mut raw_key.as_ref())? {
             Some(Item::RSAKey(key)) | Some(Item::PKCS8Key(key)) | Some(Item::ECKey(key)) => key,
@@ -1022,7 +1008,7 @@ mod tls_util {
 
         let certs: Vec<Certificate> = certs.into_iter().map(Certificate).collect();
         let key = PrivateKey(key);
-    
+
         // print_certs(certs.iter()).unwrap();
 
         let builder = ServerConfig::builder().with_safe_defaults();
@@ -1031,19 +1017,16 @@ mod tls_util {
             Some(verifier) => {
                 tracing::debug!("aaa with_client_cert_verifier");
                 builder.with_client_cert_verifier(verifier)
-            },
+            }
             None => builder.with_no_client_auth(),
         };
 
-        let mut config = builder
-            .with_single_cert(certs, key)
-            .map_err(io_other)?;
-    
+        let mut config = builder.with_single_cert(certs, key).map_err(io_other)?;
+
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    
+
         Ok(Arc::new(config))
     }
-
 
     type BoxError = Box<dyn std::error::Error + Send + Sync>;
     fn io_other<E: Into<BoxError>>(error: E) -> io::Error {
@@ -1069,11 +1052,8 @@ mod tls_util {
     //     Ok(root_store)
     // }
 
-    pub async fn try_load_cert_dns_name(
-        cert_file: &str, 
-    ) -> Result<String> {
-        
-        let cert = tokio::fs::read(cert_file).await?;    
+    pub async fn try_load_cert_dns_name(cert_file: &str) -> Result<String> {
+        let cert = tokio::fs::read(cert_file).await?;
         let certs = rustls_pemfile::certs(&mut cert.as_ref())?;
 
         for cert in certs {
@@ -1081,15 +1061,14 @@ mod tls_util {
             for name in end_entity_cert.dns_names()? {
                 let name: &str = name.into();
                 if !name.is_empty() {
-                    return Ok(name.into())
+                    return Ok(name.into());
                 }
             }
         }
         bail!("no cert dns name found")
     }
 
-
-    // pub fn print_certs<'a, I>(certs: I) -> Result<()> 
+    // pub fn print_certs<'a, I>(certs: I) -> Result<()>
     // where
     //     I: Iterator<Item = &'a Certificate>,
     // {
@@ -1103,72 +1082,65 @@ mod tls_util {
     //     }
     //     Ok(())
     // }
-
-
 }
 
 mod clash_rest {
-    use anyhow::{Result, Context};
-    use axum::{Router, routing::get, response::IntoResponse, Extension};
-    use axum_server::{Handle, tls_rustls::RustlsConfig};
+    use anyhow::{Context, Result};
+    use axum::{response::IntoResponse, routing::get, Extension, Router};
+    use axum_server::{tls_rustls::RustlsConfig, Handle};
     use rtun::async_rt::spawn_with_name;
     use rustls::ServerConfig;
+    use std::{io, net::SocketAddr, sync::Arc};
     use tokio::{net::TcpListener, task::JoinHandle};
-    use std::{net::SocketAddr, sync::Arc, io};
 
-    pub async fn server_for_clash(listen_addr: SocketAddr, path: &str, tls_cfg: Option<Arc<ServerConfig>>, content: String) -> Result<ClashSubServer> {
+    pub async fn server_for_clash(
+        listen_addr: SocketAddr,
+        path: &str,
+        tls_cfg: Option<Arc<ServerConfig>>,
+        content: String,
+    ) -> Result<ClashSubServer> {
         // let content = "abc".to_string();
-        let shared = Arc::new(Shared {
-            content,
-        });
+        let shared = Arc::new(Shared { content });
 
-        
-        async fn get_clash (
-            Extension(shared): Extension<Arc<Shared>>,
-        ) -> impl IntoResponse {
+        async fn get_clash(Extension(shared): Extension<Arc<Shared>>) -> impl IntoResponse {
             shared.content.clone()
         }
 
         let router = Router::new().route(path, get(get_clash));
-        let router = router
-        .layer(Extension(shared));
+        let router = router.layer(Extension(shared));
 
         let tls_cfg = tls_cfg.map(RustlsConfig::from_config);
         // let is_https = tls_cfg.is_some();
 
-        let listener = TcpListener::bind(listen_addr).await
-        .with_context(||format!("fail to bind [{}]", listen_addr))?
-        .into_std()
-        .with_context(||"tcp listener into std failed")?;
+        let listener = TcpListener::bind(listen_addr)
+            .await
+            .with_context(|| format!("fail to bind [{}]", listen_addr))?
+            .into_std()
+            .with_context(|| "tcp listener into std failed")?;
 
         let server_handle = Handle::new();
-        
+
         let task_name = format!("server");
         let task = spawn_with_name(task_name, async move {
             match tls_cfg {
                 Some(tls_cfg) => {
-                    
                     axum_server::from_tcp_rustls(listener, tls_cfg)
-                    // axum_server::bind_rustls(addr, tls_cfg)
-                    .handle(server_handle)
-                    .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-                    .await
-                },
+                        // axum_server::bind_rustls(addr, tls_cfg)
+                        .handle(server_handle)
+                        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                        .await
+                }
                 None => {
                     axum_server::from_tcp(listener)
-                    // axum_server::bind(addr)
-                    .handle(server_handle)
-                    .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-                    .await
-                },
+                        // axum_server::bind(addr)
+                        .handle(server_handle)
+                        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                        .await
+                }
             }
-            
         });
 
-
-        Ok(ClashSubServer {
-            _task: task,
-        })
+        Ok(ClashSubServer { _task: task })
     }
 
     pub struct ClashSubServer {
@@ -1187,19 +1159,18 @@ mod regex_text {
         // assert!(rgx.is_match("rtun-1"), "{rgx}") ;
         // println!("regular expr [{rgx}] captures_len [{}]", rgx.captures_len());
 
-
         let rgx = regex::Regex::new("rtun-.*").unwrap();
-        assert!(rgx.is_match("rtun-"), "{rgx}") ;
-        assert!(rgx.is_match("rtun-1"), "{rgx}") ;
-        assert!(rgx.is_match("rtun-2"), "{rgx}") ;
-        assert!(!rgx.is_match("rtun1"), "{rgx}") ;
-        assert!(!rgx.is_match("home_mini"), "{rgx}") ;
+        assert!(rgx.is_match("rtun-"), "{rgx}");
+        assert!(rgx.is_match("rtun-1"), "{rgx}");
+        assert!(rgx.is_match("rtun-2"), "{rgx}");
+        assert!(!rgx.is_match("rtun1"), "{rgx}");
+        assert!(!rgx.is_match("home_mini"), "{rgx}");
 
         let rgx = regex::Regex::new(".*").unwrap();
-        assert!(rgx.is_match("rtun-"), "{rgx}") ;
-        assert!(rgx.is_match("rtun-1"), "{rgx}") ;
-        assert!(rgx.is_match("rtun-2"), "{rgx}") ;
-        assert!(rgx.is_match("rtun1"), "{rgx}") ;
-        assert!(rgx.is_match("home_mini"), "{rgx}") ;
+        assert!(rgx.is_match("rtun-"), "{rgx}");
+        assert!(rgx.is_match("rtun-1"), "{rgx}");
+        assert!(rgx.is_match("rtun-2"), "{rgx}");
+        assert!(rgx.is_match("rtun1"), "{rgx}");
+        assert!(rgx.is_match("home_mini"), "{rgx}");
     }
 }

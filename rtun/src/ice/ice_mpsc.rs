@@ -1,14 +1,13 @@
-
-
-use anyhow::{Result, anyhow, Context};
-use bytes::{Bytes, BytesMut, Buf};
+use anyhow::{anyhow, Context, Result};
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::sync::mpsc;
 
 use crate::async_rt::spawn_with_name;
 
-use super::{webrtc_ice_peer::{IceConn, IceWriteHalf, IceReadHalf}, mpsc_pair::MpscPair};
-
-
+use super::{
+    mpsc_pair::MpscPair,
+    webrtc_ice_peer::{IceConn, IceReadHalf, IceWriteHalf},
+};
 
 pub trait UpgradeToMpsc {
     fn upgrade_to_mpsc(self, conv: u32) -> Result<IceMpsc>;
@@ -22,7 +21,6 @@ impl UpgradeToMpsc for IceConn {
 }
 
 fn kick_xfer2(conn: IceConn, _conv: u32) -> MpscPair {
-
     let (tx1, rx1) = mpsc::channel(128);
     let (tx2, rx2) = mpsc::channel(128);
     let (rd, wr) = conn.split();
@@ -54,7 +52,7 @@ async fn read_task(mut rd: IceReadHalf, tx: mpsc::Sender<Bytes>) -> Result<()> {
             break;
         }
         let data = conn_rd_buf.split_to(len).freeze();
-        let _r = tx.send(data).await.map_err(|_e|anyhow!("tx failed"))?;
+        let _r = tx.send(data).await.map_err(|_e| anyhow!("tx failed"))?;
     }
     Ok(())
 }
@@ -63,7 +61,7 @@ async fn write_task(mut wr: IceWriteHalf, mut rx: mpsc::Receiver<Bytes>) -> Resu
     let mtu = 1400;
 
     loop {
-        let data = rx.recv().await.with_context(||"rx failed")?;
+        let data = rx.recv().await.with_context(|| "rx failed")?;
         let mut data = &data[..];
         while data.len() > 0 {
             let len = data.len().min(mtu);
@@ -94,14 +92,13 @@ async fn write_task(mut wr: IceWriteHalf, mut rx: mpsc::Receiver<Bytes>) -> Resu
 
 //     let (mut rd, mut wr) = conn.split();
 
-
 //     let mut pending_to_conn: Option<BytesCursor> = None;
 //     let mut pending_to_tx: Option<Bytes> = None;
 
 //     let mut conn_rd_buf = BytesMut::new();
 
 //     loop {
-        
+
 //         if pending_to_tx.is_none() {
 //             conn_rd_buf.resize(1700, 0);
 //         }
@@ -124,9 +121,9 @@ async fn write_task(mut wr: IceWriteHalf, mut rx: mpsc::Receiver<Bytes>) -> Resu
 //                 if len == 0 {
 //                     break;
 //                 }
-                
+
 //                 pending_to_tx = Some(conn_rd_buf.split_to(len).freeze());
-                
+
 //             },
 //             r = tx.reserve(), if pending_to_tx.is_some() => {
 //                 let permit = r?;
@@ -137,14 +134,11 @@ async fn write_task(mut wr: IceWriteHalf, mut rx: mpsc::Receiver<Bytes>) -> Resu
 //         }
 //     }
 
-    
-
 //     Ok(())
 // }
 
-
 // async fn conn_try_send(wr: &mut IceWriteHalf, pending: &mut Option<BytesCursor>, mtu: usize) -> Result<()> {
-//     if let Some(cursor) = pending { 
+//     if let Some(cursor) = pending {
 //         while cursor.remaining() > 0 {
 //             let data = cursor.chunk();
 //             let data = &data[..data.len().min(mtu)];
@@ -156,12 +150,4 @@ async fn write_task(mut wr: IceWriteHalf, mut rx: mpsc::Receiver<Bytes>) -> Resu
 //     Ok(())
 // }
 
-
-
-
-
-
-
 pub type IceMpsc = MpscPair;
-
-

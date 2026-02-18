@@ -1,25 +1,41 @@
-
-
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail, Context};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Local;
 use protobuf::Message;
 
-use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, AsyncHandler, ActorHandle, handle_msg_none, Action}, huid::HUId, channel::{ChId, ChPair}, proto::{OpenChannelResponse, open_channel_response::Open_ch_rsp, OpenShellArgs, C2ARequest, c2arequest::C2a_req_args, OpenSocksArgs, CloseChannelArgs, ResponseStatus, Ping, Pong, KickDownArgs, OpenP2PResponse, P2PArgs}};
+use crate::{
+    actor_service::{
+        handle_first_none, handle_msg_none, start_actor, Action, ActorEntity, ActorHandle,
+        AsyncHandler,
+    },
+    channel::{ChId, ChPair},
+    huid::HUId,
+    proto::{
+        c2arequest::C2a_req_args, open_channel_response::Open_ch_rsp, C2ARequest, CloseChannelArgs,
+        KickDownArgs, OpenChannelResponse, OpenP2PResponse, OpenShellArgs, OpenSocksArgs, P2PArgs,
+        Ping, Pong, ResponseStatus,
+    },
+};
 
-use super::{invoker_ctrl::{CloseChannelResult, OpCloseChannel, CtrlHandler, CtrlInvoker, OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId, entity_watch::{OpWatch, WatchResult, CtrlGuard, CtrlWatch}};
+use super::{
+    entity_watch::{CtrlGuard, CtrlWatch, OpWatch, WatchResult},
+    invoker_ctrl::{
+        CloseChannelResult, CtrlHandler, CtrlInvoker, OpCloseChannel, OpKickDown, OpKickDownResult,
+        OpOpenP2P, OpOpenP2PResult, OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult,
+    },
+    invoker_switch::{SwitchHanlder, SwitchInvoker},
+    next_ch_id::NextChId,
+};
 
 pub type CtrlClientSession<H> = CtrlClient<Entity<H>>;
 pub type CtrlClientInvoker<H> = CtrlInvoker<Entity<H>>;
-
 
 pub struct CtrlClient<H: SwitchHanlder> {
     handle: ActorHandle<Entity<H>>,
 }
 
-impl<H: SwitchHanlder>  CtrlClient<H> { 
-
+impl<H: SwitchHanlder> CtrlClient<H> {
     pub fn clone_invoker(&self) -> CtrlInvoker<Entity<H>> {
         CtrlInvoker::new(self.handle.invoker().clone())
     }
@@ -40,9 +56,12 @@ impl<H: SwitchHanlder>  CtrlClient<H> {
     }
 }
 
-
-pub async fn make_ctrl_client<H: SwitchHanlder>(uid: HUId, pair: ChPair, switch: SwitchInvoker<H>, disable_bridge_ch: bool) -> Result<CtrlClient<H>> {
-
+pub async fn make_ctrl_client<H: SwitchHanlder>(
+    uid: HUId,
+    pair: ChPair,
+    switch: SwitchInvoker<H>,
+    disable_bridge_ch: bool,
+) -> Result<CtrlClient<H>> {
     // let mux_tx = switch.get_mux_tx().await?;
     let switch_watch = switch.watch().await?;
 
@@ -60,22 +79,19 @@ pub async fn make_ctrl_client<H: SwitchHanlder>(uid: HUId, pair: ChPair, switch:
 
     let handle = start_actor(
         format!("ctrl-client-{}", uid),
-        entity, 
+        entity,
         handle_first_none,
-        wait_next, 
-        handle_next, 
+        wait_next,
+        handle_next,
         handle_msg_none,
     );
 
-    Ok(CtrlClient {
-        handle,
-    })
+    Ok(CtrlClient { handle })
 }
-
 
 // #[async_trait::async_trait]
 // impl<H: SwitchHanlder> AsyncHandler<OpOpenChannel> for Entity<H> {
-//     type Response = OpenChannelResult; 
+//     type Response = OpenChannelResult;
 
 //     async fn handle(&mut self, req: OpOpenChannel) -> Self::Response {
 //         let data = OpenChannelRequest {
@@ -90,7 +106,7 @@ pub async fn make_ctrl_client<H: SwitchHanlder>(uid: HUId, pair: ChPair, switch:
 //         let rsp = OpenChannelResponse::parse_from_bytes(&packet.payload)
 //         .with_context(||"parse response failed")?
 //         .open_ch_rsp.with_context(||"has no response")?;
-        
+
 //         let ch_id = match rsp {
 //             Open_ch_rsp::ChId(v) => ChId(v),
 //             Open_ch_rsp::Status(status) => bail!("response status {:?}", status),
@@ -98,24 +114,28 @@ pub async fn make_ctrl_client<H: SwitchHanlder>(uid: HUId, pair: ChPair, switch:
 //         };
 
 //         let tx = self.switch.add_channel(ch_id, req.0).await?;
-        
+
 //         Ok(tx)
 //     }
 // }
 
 #[async_trait::async_trait]
 impl<H: SwitchHanlder> AsyncHandler<OpCloseChannel> for Entity<H> {
-    type Response = CloseChannelResult; 
+    type Response = CloseChannelResult;
 
-    async fn handle(&mut self, req: OpCloseChannel) -> Self::Response { 
+    async fn handle(&mut self, req: OpCloseChannel) -> Self::Response {
         if self.disable_bridge_ch {
             bail!("bridge ch disabled")
         }
 
-        let r = c2a_close_channel(&mut self.pair, CloseChannelArgs {
-            ch_id: req.0.0,
-            ..Default::default()
-        }).await;
+        let r = c2a_close_channel(
+            &mut self.pair,
+            CloseChannelArgs {
+                ch_id: req.0 .0,
+                ..Default::default()
+            },
+        )
+        .await;
 
         // tracing::debug!("close channel result [{r:?}]");
         if let Err(e) = r {
@@ -129,10 +149,9 @@ impl<H: SwitchHanlder> AsyncHandler<OpCloseChannel> for Entity<H> {
 
 #[async_trait::async_trait]
 impl<H: SwitchHanlder> AsyncHandler<OpOpenShell> for Entity<H> {
-    type Response = OpOpenShellResult; 
+    type Response = OpOpenShellResult;
 
     async fn handle(&mut self, mut req: OpOpenShell) -> Self::Response {
-
         if self.disable_bridge_ch {
             bail!("bridge ch disabled")
         }
@@ -158,7 +177,7 @@ impl<H: SwitchHanlder> AsyncHandler<OpOpenShell> for Entity<H> {
 
 #[async_trait::async_trait]
 impl<H: SwitchHanlder> AsyncHandler<OpOpenSocks> for Entity<H> {
-    type Response = OpOpenSocksResult; 
+    type Response = OpOpenSocksResult;
 
     async fn handle(&mut self, mut req: OpOpenSocks) -> Self::Response {
         if self.disable_bridge_ch {
@@ -186,7 +205,7 @@ impl<H: SwitchHanlder> AsyncHandler<OpOpenSocks> for Entity<H> {
 
 #[async_trait::async_trait]
 impl<H: SwitchHanlder> AsyncHandler<OpWatch> for Entity<H> {
-    type Response = WatchResult; 
+    type Response = WatchResult;
 
     async fn handle(&mut self, _req: OpWatch) -> Self::Response {
         Ok(self.guard.watch())
@@ -195,34 +214,26 @@ impl<H: SwitchHanlder> AsyncHandler<OpWatch> for Entity<H> {
 
 #[async_trait::async_trait]
 impl<H: SwitchHanlder> AsyncHandler<OpKickDown> for Entity<H> {
-    type Response = OpKickDownResult; 
+    type Response = OpKickDownResult;
 
     async fn handle(&mut self, req: OpKickDown) -> Self::Response {
         let r = c2a_kick_down(&mut self.pair, req.0).await;
         match r {
-            Ok(_v) => {
-                Ok(())
-            }
-            Err(e) => {
-                Err(e)
-            }
+            Ok(_v) => Ok(()),
+            Err(e) => Err(e),
         }
     }
 }
 
 #[async_trait::async_trait]
 impl<H: SwitchHanlder> AsyncHandler<OpOpenP2P> for Entity<H> {
-    type Response = OpOpenP2PResult; 
+    type Response = OpOpenP2PResult;
 
     async fn handle(&mut self, req: OpOpenP2P) -> Self::Response {
         let r = c2a_open_p2p(&mut self.pair, req.0).await;
         match r {
-            Ok(args) => {
-                Ok(args)
-            }
-            Err(e) => {
-                Err(e)
-            }
+            Ok(args) => Ok(args),
+            Err(e) => Err(e),
         }
     }
 }
@@ -231,7 +242,7 @@ impl<H: SwitchHanlder> AsyncHandler<OpOpenP2P> for Entity<H> {
 
 // #[async_trait::async_trait]
 // impl<H: SwitchHanlder> AsyncHandler<SetNoSocks> for Entity<H> {
-//     type Response = Result<()>; 
+//     type Response = Result<()>;
 
 //     async fn handle(&mut self, req: SetNoSocks) -> Self::Response {
 //         self.disable_bridge_ch = req.0;
@@ -240,8 +251,6 @@ impl<H: SwitchHanlder> AsyncHandler<OpOpenP2P> for Entity<H> {
 // }
 
 impl<H: SwitchHanlder> CtrlHandler for Entity<H> {}
-
-
 
 pub struct Entity<H: SwitchHanlder> {
     // uid: HUId,
@@ -280,25 +289,36 @@ async fn wait_next<H: SwitchHanlder>(entity: &mut Entity<H>) -> Next {
 
 async fn handle_next<H: SwitchHanlder>(entity: &mut Entity<H>, next: Next) -> Result<Action> {
     match next {
-        Next::SwitchGone => { tracing::debug!("switch has gone"); },
-        Next::CtrlChBroken => { tracing::debug!("ctrl channel broken"); },
+        Next::SwitchGone => {
+            tracing::debug!("switch has gone");
+        }
+        Next::CtrlChBroken => {
+            tracing::debug!("ctrl channel broken");
+        }
         Next::Ping => {
-            let timeout = Duration::from_millis(90*1000);
-            let r = tokio::time::timeout(timeout, c2a_ping(&mut entity.pair, Ping {
-                timestamp: Local::now().timestamp_millis(),
-                ..Default::default()
-            })).await;
+            let timeout = Duration::from_millis(90 * 1000);
+            let r = tokio::time::timeout(
+                timeout,
+                c2a_ping(
+                    &mut entity.pair,
+                    Ping {
+                        timestamp: Local::now().timestamp_millis(),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await;
 
             match r {
                 Ok(r) => {
                     let pong = r?;
                     let elapsed = Local::now().timestamp_millis() - pong.timestamp;
                     tracing::debug!("ping/pong latency {elapsed} ms\r");
-                },
+                }
                 Err(_elapsed) => {
                     tracing::warn!("ping/pong timeout {timeout:?}, shutdown switch\r");
                     entity.switch.shutdown().await
-                },
+                }
             }
 
             // let pong = c2a_ping(&mut entity.pair, Ping {
@@ -308,9 +328,8 @@ async fn handle_next<H: SwitchHanlder>(entity: &mut Entity<H>, next: Next) -> Re
             // let elapsed = Local::now().timestamp_millis() - pong.timestamp;
             // tracing::debug!("ping/pong elapsed {elapsed} ms\r");
 
-            
-            return Ok(Action::None)
-        },
+            return Ok(Action::None);
+        }
     }
     Ok(Action::Finished)
 }
@@ -327,21 +346,29 @@ impl<H: SwitchHanlder> ActorEntity for Entity<H> {
     }
 }
 
-
 pub async fn c2a_open_shell(pair: &mut ChPair, args: OpenShellArgs) -> Result<ChId> {
     let data = C2ARequest {
         c2a_req_args: Some(C2a_req_args::OpenSell(args)),
         ..Default::default()
-    }.write_to_bytes()?;
+    }
+    .write_to_bytes()?;
 
-    pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send open shell failed"))?;
+    pair.tx
+        .send_data(data.into())
+        .await
+        .map_err(|_e| anyhow!("send open shell failed"))?;
 
-    let packet = pair.rx.recv_packet().await.with_context(||"recv open shell response failed")?;
+    let packet = pair
+        .rx
+        .recv_packet()
+        .await
+        .with_context(|| "recv open shell response failed")?;
 
     // let rsp = C2AResponse::parse_from_bytes(&data).with_context(||"parse open shell response failed")?;
     let rsp = OpenChannelResponse::parse_from_bytes(&packet.payload)
-    .with_context(||"parse open shell response failed")?
-    .open_ch_rsp.with_context(||"has no response")?;
+        .with_context(|| "parse open shell response failed")?
+        .open_ch_rsp
+        .with_context(|| "has no response")?;
 
     let shell_ch_id = match rsp {
         Open_ch_rsp::ChId(v) => ChId(v),
@@ -357,16 +384,25 @@ pub async fn c2a_open_socks(pair: &mut ChPair, args: OpenSocksArgs) -> Result<Ch
     let data = C2ARequest {
         c2a_req_args: Some(C2a_req_args::OpenSocks(args)),
         ..Default::default()
-    }.write_to_bytes()?;
+    }
+    .write_to_bytes()?;
 
-    pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send open socks failed"))?;
+    pair.tx
+        .send_data(data.into())
+        .await
+        .map_err(|_e| anyhow!("send open socks failed"))?;
 
-    let packet = pair.rx.recv_packet().await.with_context(||"recv open socks response failed")?;
+    let packet = pair
+        .rx
+        .recv_packet()
+        .await
+        .with_context(|| "recv open socks response failed")?;
 
     // let rsp = C2AResponse::parse_from_bytes(&data).with_context(||"parse open socks response failed")?;
     let rsp = OpenChannelResponse::parse_from_bytes(&packet.payload)
-    .with_context(||"parse open socks response failed")?
-    .open_ch_rsp.with_context(||"has no response")?;
+        .with_context(|| "parse open socks response failed")?
+        .open_ch_rsp
+        .with_context(|| "has no response")?;
 
     let opened_ch_id = match rsp {
         Open_ch_rsp::ChId(v) => ChId(v),
@@ -378,76 +414,103 @@ pub async fn c2a_open_socks(pair: &mut ChPair, args: OpenSocksArgs) -> Result<Ch
     Ok(opened_ch_id)
 }
 
-pub async fn c2a_close_channel(pair: &mut ChPair, args: CloseChannelArgs) -> Result<ResponseStatus> {
+pub async fn c2a_close_channel(
+    pair: &mut ChPair,
+    args: CloseChannelArgs,
+) -> Result<ResponseStatus> {
     let ch_id = ChId(args.ch_id);
 
     let data = C2ARequest {
         c2a_req_args: Some(C2a_req_args::CloseChannel(args)),
         ..Default::default()
-    }.write_to_bytes()?;
+    }
+    .write_to_bytes()?;
 
-    pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send close ch failed"))?;
+    pair.tx
+        .send_data(data.into())
+        .await
+        .map_err(|_e| anyhow!("send close ch failed"))?;
 
-    let packet = pair.rx.recv_packet().await
-    .with_context(||format!("recv close ch response failed {:?}", ch_id))?;
+    let packet = pair
+        .rx
+        .recv_packet()
+        .await
+        .with_context(|| format!("recv close ch response failed {:?}", ch_id))?;
 
     // let rsp = C2AResponse::parse_from_bytes(&data).with_context(||"parse close ch response failed")?;
     let status = ResponseStatus::parse_from_bytes(&packet.payload)
-    .with_context(||"parse close ch response failed")?;
+        .with_context(|| "parse close ch response failed")?;
 
     Ok(status)
 }
 
 pub async fn c2a_ping(pair: &mut ChPair, args: Ping) -> Result<Pong> {
-
     let data = C2ARequest {
         c2a_req_args: Some(C2a_req_args::Ping(args)),
         ..Default::default()
-    }.write_to_bytes()?;
+    }
+    .write_to_bytes()?;
 
-    pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send close ch failed"))?;
+    pair.tx
+        .send_data(data.into())
+        .await
+        .map_err(|_e| anyhow!("send close ch failed"))?;
 
-    let packet = pair.rx.recv_packet().await
-    .with_context(||"recv ping failed")?;
+    let packet = pair
+        .rx
+        .recv_packet()
+        .await
+        .with_context(|| "recv ping failed")?;
 
-    let pong = Pong::parse_from_bytes(&packet.payload)
-    .with_context(||"parse pong failed")?;
+    let pong = Pong::parse_from_bytes(&packet.payload).with_context(|| "parse pong failed")?;
 
     Ok(pong)
 }
 
 pub async fn c2a_kick_down(pair: &mut ChPair, args: KickDownArgs) -> Result<ResponseStatus> {
-
     let data = C2ARequest {
         c2a_req_args: Some(C2a_req_args::KickDown(args)),
         ..Default::default()
-    }.write_to_bytes()?;
+    }
+    .write_to_bytes()?;
 
-    pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send close ch failed"))?;
+    pair.tx
+        .send_data(data.into())
+        .await
+        .map_err(|_e| anyhow!("send close ch failed"))?;
 
-    let packet = pair.rx.recv_packet().await
-    .with_context(||"recv ping failed")?;
+    let packet = pair
+        .rx
+        .recv_packet()
+        .await
+        .with_context(|| "recv ping failed")?;
 
     let status = ResponseStatus::parse_from_bytes(&packet.payload)
-    .with_context(||"parse kick down response failed")?;
+        .with_context(|| "parse kick down response failed")?;
 
     Ok(status)
 }
 
 pub async fn c2a_open_p2p(pair: &mut ChPair, args: P2PArgs) -> Result<OpenP2PResponse> {
-
     let data = C2ARequest {
         c2a_req_args: Some(C2a_req_args::OpenP2p(args)),
         ..Default::default()
-    }.write_to_bytes()?;
+    }
+    .write_to_bytes()?;
 
-    pair.tx.send_data(data.into()).await.map_err(|_e|anyhow!("send close ch failed"))?;
+    pair.tx
+        .send_data(data.into())
+        .await
+        .map_err(|_e| anyhow!("send close ch failed"))?;
 
-    let packet = pair.rx.recv_packet().await
-    .with_context(||"recv ping failed")?;
+    let packet = pair
+        .rx
+        .recv_packet()
+        .await
+        .with_context(|| "recv ping failed")?;
 
     let rsp = OpenP2PResponse::parse_from_bytes(&packet.payload)
-    .with_context(||"parse open p2p response failed")?;
+        .with_context(|| "parse open p2p response failed")?;
 
     Ok(rsp)
 }

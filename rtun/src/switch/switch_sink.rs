@@ -1,19 +1,21 @@
-
-
-use anyhow::{Result, bail};
+use crate::{
+    actor_service::{
+        handle_first_none, handle_msg_none, start_actor, Action, ActorEntity, ActorHandle,
+        AsyncHandler,
+    },
+    channel::{ChPacket, CHANNEL_SIZE},
+    huid::HUId,
+};
+use anyhow::{bail, Result};
 use futures::SinkExt;
-use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, Action, AsyncHandler, ActorHandle, handle_msg_none}, huid::HUId, channel::{ChPacket, CHANNEL_SIZE}};
 use tokio::sync::mpsc;
 
 use super::invoker_switch::{ReqGetMuxTx, ReqGetMuxTxResult};
 
-
-
-pub async fn make_switch_sink<S>(uid: HUId, socket: S) -> Result<SwitchSink<S>> 
+pub async fn make_switch_sink<S>(uid: HUId, socket: S) -> Result<SwitchSink<S>>
 where
     S: PacketSink,
 {
-    
     let (outgoing_tx, outgoing_rx) = mpsc::channel(CHANNEL_SIZE);
 
     let entity = Entity {
@@ -25,41 +27,28 @@ where
 
     let handle = start_actor(
         format!("switch-{}", uid),
-        entity, 
+        entity,
         handle_first_none,
-        wait_next, 
-        handle_next, 
+        wait_next,
+        handle_next,
         handle_msg_none,
     );
 
-    Ok(SwitchSink {
-        handle,
-    })
+    Ok(SwitchSink { handle })
 }
-
-
 
 pub type SinkPacket = ChPacket;
 pub type SinkError = anyhow::Error;
 
-
-pub trait PacketSink: 'static 
-+ Send
-+ Unpin
-+ SinkExt<SinkPacket, Error = SinkError> 
-{
-
-}
-
-
+pub trait PacketSink: 'static + Send + Unpin + SinkExt<SinkPacket, Error = SinkError> {}
 
 pub struct SwitchSink<S: 'static + Send> {
     handle: ActorHandle<Entity<S>>,
 }
 
-impl<S>  SwitchSink<S> 
+impl<S> SwitchSink<S>
 where
-    S: PacketSink
+    S: PacketSink,
 {
     // pub fn clone_invoker(&self) -> Invoker<Entity<S>> {
     //     self.handle.invoker().clone()
@@ -82,14 +71,12 @@ where
 
 pub type SwitchSinkResult = EntityResult;
 
-
 #[async_trait::async_trait]
-impl<S> AsyncHandler<ReqGetMuxTx> for Entity<S> 
+impl<S> AsyncHandler<ReqGetMuxTx> for Entity<S>
 where
-    S: PacketSink
-
+    S: PacketSink,
 {
-    type Response = ReqGetMuxTxResult; 
+    type Response = ReqGetMuxTxResult;
 
     async fn handle(&mut self, _req: ReqGetMuxTx) -> Self::Response {
         Ok(self.outgoing_tx.clone())
@@ -97,27 +84,23 @@ where
 }
 
 // #[async_trait::async_trait]
-// impl<S> AsyncHandler<OpWatch> for Entity<S> 
+// impl<S> AsyncHandler<OpWatch> for Entity<S>
 // where
 //     S: PacketSink,
 // {
-//     type Response = WatchResult; 
+//     type Response = WatchResult;
 
 //     async fn handle(&mut self, _req: OpWatch) -> Self::Response {
 //         Ok(self.guard.watch())
 //     }
 // }
 
-
 type Next = Result<ChPacket>;
 
-
 #[inline]
-async fn wait_next<S>(entity: &mut Entity<S>) -> Next 
+async fn wait_next<S>(entity: &mut Entity<S>) -> Next
 where
-    S: 'static 
-        + Send
-        + Unpin,
+    S: 'static + Send + Unpin,
 {
     let r = entity.outgoing_rx.recv().await;
     match r {
@@ -126,12 +109,9 @@ where
     }
 }
 
-async fn handle_next<S>(entity: &mut Entity<S>, next: Next) -> Result<Action> 
+async fn handle_next<S>(entity: &mut Entity<S>, next: Next) -> Result<Action>
 where
-    S: 'static 
-        + Send
-        + SinkExt<SinkPacket, Error = SinkError> 
-        + Unpin,
+    S: 'static + Send + SinkExt<SinkPacket, Error = SinkError> + Unpin,
 {
     let packet = next?;
     entity.socket.send(packet).await?;
@@ -141,21 +121,16 @@ where
         match r {
             Ok(packet) => {
                 entity.socket.send(packet).await?;
-            },
-            Err(e) => {
-                match e {
-                    mpsc::error::TryRecvError::Empty => break,
-                    mpsc::error::TryRecvError::Disconnected => {
-                        return Err(e.into())
-                    },
-                }
+            }
+            Err(e) => match e {
+                mpsc::error::TryRecvError::Empty => break,
+                mpsc::error::TryRecvError::Disconnected => return Err(e.into()),
             },
         }
     }
 
     Ok(Action::None)
 }
-
 
 pub struct Entity<S> {
     socket: S,
@@ -164,12 +139,11 @@ pub struct Entity<S> {
     // guard: CtrlGuard,
 }
 
-
 type Msg = ();
 
 type EntityResult = ();
 
-impl<S> ActorEntity for Entity<S> 
+impl<S> ActorEntity for Entity<S>
 where
     S: 'static + Send,
 {
@@ -183,5 +157,3 @@ where
         ()
     }
 }
-
-

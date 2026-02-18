@@ -1,6 +1,11 @@
-use std::{sync::Arc, net::UdpSocket, os::fd::{AsFd, AsRawFd}, marker::PhantomData};
-use tokio::sync::mpsc;
 use anyhow::Result;
+use std::{
+    marker::PhantomData,
+    net::UdpSocket,
+    os::fd::{AsFd, AsRawFd},
+    sync::Arc,
+};
+use tokio::sync::mpsc;
 
 pub fn unbound<T>() -> (Sender<T>, Receiver<T>) {
     do_unbound::<T>().unwrap()
@@ -11,10 +16,10 @@ type UnboundedReceiver<T> = mpsc::UnboundedReceiver<T>;
 pub type UnboundedSendError<T> = mpsc::error::SendError<T>;
 pub type UnboundedTryRecvError = mpsc::error::TryRecvError;
 
-fn do_unbound<T>() -> Result<(Sender<T>, Receiver<T>)>{
+fn do_unbound<T>() -> Result<(Sender<T>, Receiver<T>)> {
     let server = UdpSocket::bind("127.0.0.1:0")?;
     let client = UdpSocket::bind("127.0.0.1:0")?;
-    
+
     client.connect(server.local_addr()?)?;
     server.set_nonblocking(true)?;
 
@@ -29,15 +34,12 @@ fn do_unbound<T>() -> Result<(Sender<T>, Receiver<T>)>{
     });
 
     Ok((
-        Sender {
-            shared,
-            tx,
-        },
+        Sender { shared, tx },
         Receiver {
             dummy: vec![0_u8; 8],
             rx,
             server,
-        }
+        },
     ))
 }
 
@@ -49,7 +51,10 @@ pub struct Sender<T> {
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
-        Self { shared: self.shared.clone(), tx: self.tx.clone() }
+        Self {
+            shared: self.shared.clone(),
+            tx: self.tx.clone(),
+        }
     }
 }
 
@@ -79,8 +84,7 @@ impl<T> Receiver<T> {
     }
 
     pub fn prepared_recv(&mut self) -> Result<()> {
-        while let Ok(_n) = self.server.recv(&mut self.dummy) {
-        }
+        while let Ok(_n) = self.server.recv(&mut self.dummy) {}
         Ok(())
     }
 

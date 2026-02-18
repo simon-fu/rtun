@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 
 use dialoguer::History;
 
-
 pub struct InputHistory {
     max_entries: Option<usize>,
     deque: VecDeque<String>,

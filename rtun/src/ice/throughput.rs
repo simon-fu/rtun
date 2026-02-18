@@ -1,20 +1,22 @@
-use std::{io::{ErrorKind, self}, time::Duration};
+use std::{
+    io::{self, ErrorKind},
+    time::Duration,
+};
 
-use bytes::{BufMut, Buf};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
-use anyhow::Result;
-use tokio::time::Instant;
 use crate::proto::ThroughputArgs;
+use anyhow::Result;
+use bytes::{Buf, BufMut};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::Instant;
 
-
-pub async fn run_throughput<R, W>(mut rd: R, mut wr: W, args: ThroughputArgs) -> Result<()> 
+pub async fn run_throughput<R, W>(mut rd: R, mut wr: W, args: ThroughputArgs) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut recv_buf = vec![0_u8; args.recv_buf_size as usize];
 
-    let num_words = args.send_buf_size/4;
+    let num_words = args.send_buf_size / 4;
     let mut verifier = Verify::new(num_words);
 
     let send_buf = {
@@ -25,9 +27,9 @@ where
         }
         buf
     };
-    
+
     let mut wdata = &send_buf[..];
-    
+
     let mut total_sent_bytes = 0_u64;
     let mut total_recv_bytes = 0_u64;
 
@@ -72,7 +74,7 @@ where
                 let elapsed = Instant::now() - last_update;
                 last_update = Instant::now();
                 if elapsed > Duration::ZERO {
-                    
+
                     let sent_bytes = total_sent_bytes - last_sent_bytes;
                     let recv_bytes = total_recv_bytes - last_recv_bytes;
 
@@ -113,31 +115,34 @@ impl Verify {
     }
 }
 
-
 #[cfg(test)]
 mod test_tokio_kcp {
     use tokio_kcp::{KcpConfig, KcpListener, KcpStream};
     use tracing::Level;
     // use futures::{AsyncBufReadExt, AsyncWriteExt};
-    use crate::{async_rt::spawn_with_name, ice::throughput::run_throughput, proto::ThroughputArgs};
+    use crate::{
+        async_rt::spawn_with_name, ice::throughput::run_throughput, proto::ThroughputArgs,
+    };
     // use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
     #[tokio::test]
     async fn test_tokio_kcp_throughput() {
         tracing_subscriber::fmt()
-        .with_max_level(Level::DEBUG)
-        .init();
+            .with_max_level(Level::DEBUG)
+            .init();
 
         let args = ThroughputArgs {
-            send_buf_size: 32*1024,
-            recv_buf_size: 32*1024,
+            send_buf_size: 32 * 1024,
+            recv_buf_size: 32 * 1024,
             ..Default::default()
         };
 
         let config = KcpConfig::default();
 
         let args1 = args.clone();
-        let mut listener = KcpListener::bind(config.clone(), "0.0.0.0:11911").await.unwrap();
+        let mut listener = KcpListener::bind(config.clone(), "0.0.0.0:11911")
+            .await
+            .unwrap();
         let task1 = spawn_with_name("server", async move {
             let (stream, addr) = listener.accept().await.unwrap();
             println!("accepted from {}", addr);
@@ -156,7 +161,6 @@ mod test_tokio_kcp {
 
         let _r = task1.await;
         let _r = task2.await;
-
     }
 }
 
@@ -164,29 +168,30 @@ mod test_tokio_kcp {
 mod test_quinn {
     // use std::net::ToSocketAddrs;
 
+    use crate::{
+        async_rt::spawn_with_name, ice::throughput::run_throughput, proto::ThroughputArgs,
+    };
     use tracing::Level;
     use tracing_subscriber::EnvFilter;
-    use crate::{async_rt::spawn_with_name, ice::throughput::run_throughput, proto::ThroughputArgs};
     // use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-    use common::{make_server_endpoint, make_client_endpoint};
-    use tracing::info;
+    use common::{make_client_endpoint, make_server_endpoint};
     use if_watch::tokio::IfWatcher;
+    use tracing::info;
 
     #[tokio::test]
     async fn test_quinn_throughput() {
         // cargo test --release -- --nocapture test_quinn_throughput
 
         tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .with_env_filter(EnvFilter::from("rtun=debug"))
-        .init();
+            .with_max_level(Level::INFO)
+            .with_env_filter(EnvFilter::from("rtun=debug"))
+            .init();
 
         let args = ThroughputArgs {
-            send_buf_size: 32*1024,
-            recv_buf_size: 32*1024,
+            send_buf_size: 32 * 1024,
+            recv_buf_size: 32 * 1024,
             ..Default::default()
         };
-
 
         let server_connect_addr = "127.0.0.1:11911".parse().unwrap();
         let server_listen_addr = "0.0.0.0:11911".parse().unwrap();
@@ -202,9 +207,9 @@ mod test_quinn {
             info!("ifnet list: ==>");
             for (n, ifnet) in watcher.iter().enumerate() {
                 let if_addr = ifnet.addr();
-                let yes = (server_addr.is_ipv4() && if_addr.is_ipv4()) 
-                || (server_addr.is_ipv6() && if_addr.is_ipv6());
-                info!("No.{} ifnet {ifnet:?}, same family {yes}", n+1, );
+                let yes = (server_addr.is_ipv4() && if_addr.is_ipv4())
+                    || (server_addr.is_ipv6() && if_addr.is_ipv6());
+                info!("No.{} ifnet {ifnet:?}, same family {yes}", n + 1,);
             }
             info!("ifnet list: <==");
         }
@@ -226,11 +231,10 @@ mod test_quinn {
             run_throughput(rd, wr, args1).await.unwrap();
         });
 
-
-
         let args2 = args;
         let task2 = spawn_with_name("client", async move {
-            let endpoint = make_client_endpoint("0.0.0.0:0".parse().unwrap(), &[&server_cert]).unwrap();
+            let endpoint =
+                make_client_endpoint("0.0.0.0:0".parse().unwrap(), &[&server_cert]).unwrap();
             info!("client local addr {}", endpoint.local_addr().unwrap());
 
             // connect to server
@@ -240,7 +244,7 @@ mod test_quinn {
                 .await
                 .unwrap();
             info!("[client] connected: addr={}", connection.remote_address());
-        
+
             let (wr, rd) = connection.open_bi().await.unwrap();
             info!("opened stream");
 
@@ -249,13 +253,12 @@ mod test_quinn {
 
         let _r = task1.await;
         let _r = task2.await;
-
     }
 
     mod common {
         use quinn::{ClientConfig, Endpoint, ServerConfig};
         use std::{error::Error, net::SocketAddr, sync::Arc};
-        
+
         /// Constructs a QUIC endpoint configured for use a client only.
         ///
         /// ## Args
@@ -271,7 +274,7 @@ mod test_quinn {
             endpoint.set_default_client_config(client_cfg);
             Ok(endpoint)
         }
-        
+
         /// Constructs a QUIC endpoint configured to listen for incoming connections on a certain address
         /// and port.
         ///
@@ -280,12 +283,14 @@ mod test_quinn {
         /// - a stream of incoming QUIC connections
         /// - server certificate serialized into DER format
         #[allow(unused)]
-        pub fn make_server_endpoint(bind_addr: SocketAddr) -> Result<(Endpoint, Vec<u8>), Box<dyn Error>> {
+        pub fn make_server_endpoint(
+            bind_addr: SocketAddr,
+        ) -> Result<(Endpoint, Vec<u8>), Box<dyn Error>> {
             let (server_config, server_cert) = configure_server()?;
             let endpoint = Endpoint::server(server_config, bind_addr)?;
             Ok((endpoint, server_cert))
         }
-        
+
         /// Builds default quinn client config and trusts given certificates.
         ///
         /// ## Args
@@ -296,11 +301,11 @@ mod test_quinn {
             for cert in server_certs {
                 certs.add(&rustls::Certificate(cert.to_vec()))?;
             }
-        
+
             let client_config = ClientConfig::with_root_certificates(certs);
             Ok(client_config)
         }
-        
+
         /// Returns default server configuration along with its certificate.
         fn configure_server() -> Result<(ServerConfig, Vec<u8>), Box<dyn Error>> {
             let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -308,14 +313,14 @@ mod test_quinn {
             let priv_key = cert.serialize_private_key_der();
             let priv_key = rustls::PrivateKey(priv_key);
             let cert_chain = vec![rustls::Certificate(cert_der.clone())];
-        
+
             let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key)?;
             let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
             transport_config.max_concurrent_uni_streams(0_u8.into());
-        
+
             Ok((server_config, cert_der))
         }
-        
+
         #[allow(unused)]
         pub const ALPN_QUIC_HTTP: &[&[u8]] = &[b"hq-29"];
     }
@@ -324,10 +329,18 @@ mod test_quinn {
 #[cfg(test)]
 mod test_ice_conn {
 
+    use crate::{
+        async_rt::spawn_with_name,
+        ice::{
+            ice_peer::{IceConfig, IcePeer},
+            ice_quic::{QuicIceCert, UpgradeToQuic},
+            throughput::run_throughput,
+        },
+        proto::ThroughputArgs,
+    };
     use anyhow::Result;
     use tracing::Level;
     use tracing_subscriber::EnvFilter;
-    use crate::{async_rt::spawn_with_name, ice::{throughput::run_throughput, ice_peer::{IcePeer, IceConfig}, ice_quic::{UpgradeToQuic, QuicIceCert}}, proto::ThroughputArgs};
     // use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
     use tracing::debug;
 
@@ -336,30 +349,30 @@ mod test_ice_conn {
         // cargo test --release -- --nocapture test_quinn_throughput
 
         tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .with_env_filter(EnvFilter::from("rtun=debug"))
-        .init();
+            .with_max_level(Level::INFO)
+            .with_env_filter(EnvFilter::from("rtun=debug"))
+            .init();
 
         let thr_args = ThroughputArgs {
-            send_buf_size: 32*1024,
-            recv_buf_size: 32*1024,
+            send_buf_size: 32 * 1024,
+            recv_buf_size: 32 * 1024,
             ..Default::default()
         };
 
         let mut peer1 = IcePeer::with_config(IceConfig {
             ..Default::default()
         });
-    
+
         let arg1 = peer1.client_gather().await?;
         debug!("arg1 {arg1:?}");
 
         let mut peer2 = IcePeer::with_config(IceConfig {
             ..Default::default()
         });
-        
+
         let arg2 = peer2.server_gather(arg1).await?;
         debug!("arg2 {arg2:?}");
-    
+
         let cert1 = QuicIceCert::try_new()?;
         let cert2 = QuicIceCert::try_new()?;
 
@@ -368,25 +381,31 @@ mod test_ice_conn {
 
         let thr_args1 = thr_args.clone();
         let task1 = spawn_with_name("client", async move {
-            let conn = peer1.dial(arg2).await?
-            .upgrade_to_quic(&cert1, cert_der2.into()).await?;
+            let conn = peer1
+                .dial(arg2)
+                .await?
+                .upgrade_to_quic(&cert1, cert_der2.into())
+                .await?;
             let (wr, rd) = conn.open_bi().await?;
             run_throughput(rd, wr, thr_args1).await?;
             Result::<()>::Ok(())
         });
-    
+
         let thr_args2 = thr_args.clone();
         let task2 = spawn_with_name("server", async move {
-            let conn = peer2.accept().await?
-            .upgrade_to_quic(&cert2, cert_der1.into()).await?;
+            let conn = peer2
+                .accept()
+                .await?
+                .upgrade_to_quic(&cert2, cert_der1.into())
+                .await?;
             let (wr, rd) = conn.accept_bi().await?;
             run_throughput(rd, wr, thr_args2).await?;
             Result::<()>::Ok(())
         });
-    
+
         let r1 = task1.await?;
         let r2 = task2.await?;
-    
+
         debug!("task1 finished {r1:?}");
         debug!("task2 finished {r2:?}");
 
@@ -394,13 +413,12 @@ mod test_ice_conn {
         r2?;
 
         Ok(())
-
     }
 
     mod common {
         use quinn::{ClientConfig, Endpoint, ServerConfig};
         use std::{error::Error, net::SocketAddr, sync::Arc};
-        
+
         /// Constructs a QUIC endpoint configured for use a client only.
         ///
         /// ## Args
@@ -416,7 +434,7 @@ mod test_ice_conn {
             endpoint.set_default_client_config(client_cfg);
             Ok(endpoint)
         }
-        
+
         /// Constructs a QUIC endpoint configured to listen for incoming connections on a certain address
         /// and port.
         ///
@@ -425,12 +443,14 @@ mod test_ice_conn {
         /// - a stream of incoming QUIC connections
         /// - server certificate serialized into DER format
         #[allow(unused)]
-        pub fn make_server_endpoint(bind_addr: SocketAddr) -> Result<(Endpoint, Vec<u8>), Box<dyn Error>> {
+        pub fn make_server_endpoint(
+            bind_addr: SocketAddr,
+        ) -> Result<(Endpoint, Vec<u8>), Box<dyn Error>> {
             let (server_config, server_cert) = configure_server()?;
             let endpoint = Endpoint::server(server_config, bind_addr)?;
             Ok((endpoint, server_cert))
         }
-        
+
         /// Builds default quinn client config and trusts given certificates.
         ///
         /// ## Args
@@ -441,11 +461,11 @@ mod test_ice_conn {
             for cert in server_certs {
                 certs.add(&rustls::Certificate(cert.to_vec()))?;
             }
-        
+
             let client_config = ClientConfig::with_root_certificates(certs);
             Ok(client_config)
         }
-        
+
         /// Returns default server configuration along with its certificate.
         fn configure_server() -> Result<(ServerConfig, Vec<u8>), Box<dyn Error>> {
             let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -453,16 +473,15 @@ mod test_ice_conn {
             let priv_key = cert.serialize_private_key_der();
             let priv_key = rustls::PrivateKey(priv_key);
             let cert_chain = vec![rustls::Certificate(cert_der.clone())];
-        
+
             let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key)?;
             let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
             transport_config.max_concurrent_uni_streams(0_u8.into());
-        
+
             Ok((server_config, cert_der))
         }
-        
+
         #[allow(unused)]
         pub const ALPN_QUIC_HTTP: &[&[u8]] = &[b"hq-29"];
     }
 }
-

@@ -1,22 +1,24 @@
-use std::{sync::Arc, pin::Pin, task::{Poll, self}};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{self, Poll},
+};
 
 use anyhow::Result;
-use bytes::{BytesMut, Bytes};
+use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
-
-pub fn async_std_in() -> AsyncStdin { 
-
+pub fn async_std_in() -> AsyncStdin {
     let (tx, rx) = broadcast::channel(1);
 
     let shared = Arc::new(Shared {
         tx,
         data: Default::default(),
     });
-    
+
     spawn_read_thread(shared.clone());
 
     AsyncStdin {
@@ -32,12 +34,12 @@ fn spawn_read_thread(shared: Arc<Shared>) {
         let mut fin = std::io::stdin();
         let mut input = vec![0_u8; 1024];
 
-        loop{
+        loop {
             match fin.read(input.as_mut()) {
                 Ok(0) => {
                     shared.data.lock().end_reason = Some(EndReason::EOF);
                     break;
-                },
+                }
                 Ok(n) => {
                     {
                         let mut data = shared.data.lock();
@@ -49,12 +51,12 @@ fn spawn_read_thread(shared: Arc<Shared>) {
                         shared.data.lock().end_reason = Some(EndReason::Dropped);
                         break;
                     }
-                },
+                }
                 Err(e) => {
                     // eprintln!("read stdin error : {}" , e);
                     shared.data.lock().end_reason = Some(EndReason::Error(e.into()));
                     break;
-                },
+                }
             };
         }
     });
@@ -93,11 +95,11 @@ impl AsyncStdin {
     fn try_pull_data(&mut self) -> Option<Result<Bytes, EndReason>> {
         let mut data = self.shared.data.lock();
         if data.buf.len() > 0 {
-            return Some(Ok(data.buf.split().freeze()))
+            return Some(Ok(data.buf.split().freeze()));
         }
 
         if let Some(reason) = data.end_reason.as_ref() {
-            return Some(Err(reason.clone()))
+            return Some(Err(reason.clone()));
         }
 
         None
@@ -105,33 +107,27 @@ impl AsyncStdin {
 }
 
 impl Stream for AsyncStdin {
-    type Item = Result<Bytes, EndReason> ;
+    type Item = Result<Bytes, EndReason>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
         let r = self.rx.poll_next_unpin(cx);
         match r {
-            Poll::Ready(r) => {
-                match r {
-                    Some(_r) => { 
-                        match self.try_pull_data() {
-                            Some(v) => Poll::Ready(Some(v)),
-                            None => Poll::Pending,
-                        }
-                    },
-                    None => Poll::Ready(None),
-                }
+            Poll::Ready(r) => match r {
+                Some(_r) => match self.try_pull_data() {
+                    Some(v) => Poll::Ready(Some(v)),
+                    None => Poll::Pending,
+                },
+                None => Poll::Ready(None),
             },
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
-
 struct Shared {
     tx: Sender,
     data: Mutex<SharedData>,
 }
-
 
 #[derive(Default)]
 struct SharedData {
@@ -152,6 +148,4 @@ impl std::fmt::Display for EndReason {
     }
 }
 
-impl std::error::Error for EndReason {
-    
-}
+impl std::error::Error for EndReason {}

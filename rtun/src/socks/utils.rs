@@ -8,12 +8,8 @@ use std::{
 
 // use tokio::io::{AsyncRead, AsyncReadExt};
 
-
-
-
 use shadowsocks::relay::socks5::Address;
 use tokio::io::{copy_bidirectional, AsyncRead, AsyncWrite};
-
 
 // /// Consumes all data from `reader` and throws away until EOF
 // pub async fn ignore_until_end<R>(reader: &mut R) -> io::Result<()>
@@ -43,7 +39,6 @@ pub(crate) fn to_ipv4_mapped(ipv6: &Ipv6Addr) -> Option<Ipv4Addr> {
     }
 }
 
-
 pub(crate) async fn establish_tcp_tunnel_bypassed<P, S>(
     plain: &mut P,
     shadow: &mut S,
@@ -54,7 +49,11 @@ where
     P: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    trace!("established tcp tunnel {} <-> {} bypassed", peer_addr, target_addr);
+    trace!(
+        "established tcp tunnel {} <-> {} bypassed",
+        peer_addr,
+        target_addr
+    );
 
     match copy_bidirectional(plain, shadow).await {
         Ok((rn, wn)) => {
@@ -78,4 +77,3 @@ where
 
     Ok(())
 }
-

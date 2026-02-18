@@ -1,41 +1,65 @@
-
 /*
     websocket refer: https://github.com/tokio-rs/axum/blob/axum-v0.6.20/examples/websockets/src/main.rs
 */
 
-use anyhow::{Result, Context, bail};
-use axum_server::{Handle, tls_rustls::RustlsConfig};
+use anyhow::{bail, Context, Result};
+use axum::{extract::Query, http::StatusCode, Extension, Json};
+use axum_server::{tls_rustls::RustlsConfig, Handle};
 use chrono::Local;
 use clap::Parser;
-use axum::{Extension, extract::Query, http::StatusCode, Json};
-use futures::{StreamExt, stream::SplitStream};
+use futures::{stream::SplitStream, StreamExt};
 use parking_lot::Mutex;
-use rtun::{huid::{gen_huid::gen_huid, HUId}, channel::{ChId, ChPair}, switch::{ctrl_service::spawn_ctrl_service, agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker}, ctrl_client, invoker_ctrl::{CtrlInvoker, CtrlHandler}, session_stream::make_stream_session, switch_pair::{SwitchPairEntity, make_switch_pair}, switch_sink::PacketSink, switch_source::PacketSource}, ws::server::{WsStreamAxum, WsSource}, async_rt::spawn_with_name, proto::KickDownArgs};
+use rtun::{
+    async_rt::spawn_with_name,
+    channel::{ChId, ChPair},
+    huid::{gen_huid::gen_huid, HUId},
+    proto::KickDownArgs,
+    switch::{
+        agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker},
+        ctrl_client,
+        ctrl_service::spawn_ctrl_service,
+        invoker_ctrl::{CtrlHandler, CtrlInvoker},
+        session_stream::make_stream_session,
+        switch_pair::{make_switch_pair, SwitchPairEntity},
+        switch_sink::PacketSink,
+        switch_source::PacketSource,
+    },
+    ws::server::{WsSource, WsStreamAxum},
+};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
-use std::{sync::Arc, collections::HashMap, path::Path, time::{Duration, Instant}};
-use std::net::SocketAddr;
-use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use axum::{
     extract::{
-        ws::{WebSocket, WebSocketUpgrade},
         connect_info::ConnectInfo,
+        ws::{WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
     routing::get,
     Router,
 };
+use std::net::SocketAddr;
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 
-use crate::{quic_signal::{self, PubResponse, SessionsResponse, SignalRequest, SignalResponse, StatusResponse}, rest_proto::{PUB_WS, SUB_WS, PUB_SESSIONS, PubParams, SubParams, AgentInfo}, secret::token_verify};
+use crate::{
+    quic_signal::{
+        self, PubResponse, SessionsResponse, SignalRequest, SignalResponse, StatusResponse,
+    },
+    rest_proto::{AgentInfo, PubParams, SubParams, PUB_SESSIONS, PUB_WS, SUB_WS},
+    secret::token_verify,
+};
 
 const CERT_RELOAD_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const CERT_RELOAD_DEBOUNCE: Duration = Duration::from_secs(3);
 
-
 pub async fn run(args: CmdArgs) -> Result<()> {
-    let addr_r: Result<SocketAddr> = args.addr.parse()
-    .with_context(||"invalid address");
+    let addr_r: Result<SocketAddr> = args.addr.parse().with_context(|| "invalid address");
 
     if let Ok(addr) = &addr_r {
         return run_http(args, *addr).await;
@@ -43,7 +67,6 @@ pub async fn run(args: CmdArgs) -> Result<()> {
 
     bail!("invalid address [{}]", args.addr)
 }
-
 
 async fn run_http(args: CmdArgs, addr: SocketAddr) -> Result<()> {
     let mut local_agent = if !args.bridge {
@@ -55,30 +78,25 @@ async fn run_http(args: CmdArgs, addr: SocketAddr) -> Result<()> {
     };
 
     let shared = Arc::new(Shared {
-        local: local_agent.as_ref().map(|x|x.clone_ctrl()),
+        local: local_agent.as_ref().map(|x| x.clone_ctrl()),
         secret: args.secret.clone(),
         data: Default::default(),
         disable_bridge_ch: args.disable_bridge_ch,
     });
 
     let app = Router::new()
-    .route(PUB_WS, get(handle_ws_pub))
-    .route(SUB_WS, get(handle_ws_sub))
-    .route(PUB_SESSIONS, get(get_pub_sessions))
-    .route("/echo/ws", get(handle_ws_echo));
+        .route(PUB_WS, get(handle_ws_pub))
+        .route(SUB_WS, get(handle_ws_sub))
+        .route(PUB_SESSIONS, get(get_pub_sessions))
+        .route("/echo/ws", get(handle_ws_echo));
 
-    let router = app
-    .layer(Extension(shared.clone()))
-    .layer(
-        TraceLayer::new_for_http()
-            .make_span_with(DefaultMakeSpan::default().include_headers(true)),
+    let router = app.layer(Extension(shared.clone())).layer(
+        TraceLayer::new_for_http().make_span_with(DefaultMakeSpan::default().include_headers(true)),
     );
 
-    let tls_cfg = try_load_https_cert(
-        args.https_key.as_deref(), 
-        args.https_cert.as_deref(),
-    ).await
-    .with_context(|| "open https key/cert file failed")?;
+    let tls_cfg = try_load_https_cert(args.https_key.as_deref(), args.https_cert.as_deref())
+        .await
+        .with_context(|| "open https key/cert file failed")?;
 
     if let (Some(tls_cfg), Some(key_file), Some(cert_file)) = (
         tls_cfg.clone(),
@@ -105,40 +123,39 @@ async fn run_http(args: CmdArgs, addr: SocketAddr) -> Result<()> {
 
     let is_https = tls_cfg.is_some();
 
-    let listener = TcpListener::bind(addr).await
-    .with_context(||format!("fail to bind [{}]", addr))?
-    .into_std()
-    .with_context(||"tcp listener into std failed")?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("fail to bind [{}]", addr))?
+        .into_std()
+        .with_context(|| "tcp listener into std failed")?;
 
     let server_handle = Handle::new();
-    
+
     let task_name = format!("server");
     let task = spawn_with_name(task_name, async move {
         match tls_cfg {
             Some(tls_cfg) => {
                 axum_server::from_tcp_rustls(listener, tls_cfg)
-                // axum_server::bind_rustls(addr, tls_cfg)
-                .handle(server_handle)
-                .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-            },
+                    // axum_server::bind_rustls(addr, tls_cfg)
+                    .handle(server_handle)
+                    .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+            }
             None => {
                 axum_server::from_tcp(listener)
-                // axum_server::bind(addr)
-                .handle(server_handle)
-                .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-            },
+                    // axum_server::bind(addr)
+                    .handle(server_handle)
+                    .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+            }
         }
-        
     });
-    
+
     if is_https {
         tracing::info!("agent listening on https://{}", addr);
     } else {
         tracing::info!("agent listening on http://{}", addr);
     }
-    
 
     let _r = task.await;
 
@@ -150,24 +167,19 @@ async fn run_http(args: CmdArgs, addr: SocketAddr) -> Result<()> {
         agent.shutdown().await;
         let _r = agent.wait_for_completed().await?;
     }
-    
+
     Ok(())
 }
-
-
 
 async fn handle_ws_echo(
     Extension(_shared): Extension<Arc<Shared>>,
     ws: WebSocketUpgrade,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> impl IntoResponse {
-
     let uid = gen_huid();
     tracing::debug!("[{}] echo connected from {addr}", uid);
-    
 
     ws.on_upgrade(move |socket| async move {
-        
         let r = ws_echo_loop(socket).await;
         tracing::debug!("[{}] echo conn finished with [{:?}]", uid, r);
     })
@@ -176,35 +188,34 @@ async fn handle_ws_echo(
 async fn ws_echo_loop(mut socket: WebSocket) -> Result<()> {
     use axum::extract::ws::Message;
     while let Some(r) = socket.recv().await {
-        let msg = r.with_context(||"recv fail")?;
+        let msg = r.with_context(|| "recv fail")?;
         match msg {
             Message::Text(s) => {
-                socket.send(Message::Text(s)).await
-                .with_context(||"send fail")?;
-            },
+                socket
+                    .send(Message::Text(s))
+                    .await
+                    .with_context(|| "send fail")?;
+            }
             _ => {}
         }
     }
     Ok(())
 }
 
-
-
-async fn try_load_https_cert(key_file: Option<&str>, cert_file: Option<&str>) -> Result<Option<RustlsConfig>> {
+async fn try_load_https_cert(
+    key_file: Option<&str>,
+    cert_file: Option<&str>,
+) -> Result<Option<RustlsConfig>> {
     if let (Some(key_file), Some(cert_file)) = (key_file, cert_file) {
-        let cfg = RustlsConfig::from_pem_file(
-            cert_file,
-            key_file,
-        )
-        .await?;
-        return Ok(Some(cfg))
+        let cfg = RustlsConfig::from_pem_file(cert_file, key_file).await?;
+        return Ok(Some(cfg));
     }
 
     if key_file.is_some() || cert_file.is_some() {
         if key_file.is_none() {
             bail!("no key file")
         }
-        
+
         if cert_file.is_none() {
             bail!("no cert file")
         }
@@ -215,12 +226,12 @@ async fn try_load_https_cert(key_file: Option<&str>, cert_file: Option<&str>) ->
 
 async fn cert_pair_fingerprint(key_file: &str, cert_file: &str) -> Result<String> {
     let raw_key = tokio::fs::read(key_file)
-    .await
-    .with_context(|| format!("read key file failed [{key_file}]"))?;
+        .await
+        .with_context(|| format!("read key file failed [{key_file}]"))?;
 
     let raw_cert = tokio::fs::read(cert_file)
-    .await
-    .with_context(|| format!("read cert file failed [{cert_file}]"))?;
+        .await
+        .with_context(|| format!("read cert file failed [{cert_file}]"))?;
 
     let mut hasher = Sha256::new();
     hasher.update((raw_key.len() as u64).to_le_bytes());
@@ -230,12 +241,20 @@ async fn cert_pair_fingerprint(key_file: &str, cert_file: &str) -> Result<String
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-async fn run_https_cert_reloader(tls_cfg: RustlsConfig, key_file: String, cert_file: String) -> Result<()> {
+async fn run_https_cert_reloader(
+    tls_cfg: RustlsConfig,
+    key_file: String,
+    cert_file: String,
+) -> Result<()> {
     let mut active_fingerprint = cert_pair_fingerprint(&key_file, &cert_file).await?;
     let mut pending_fingerprint: Option<String> = None;
     let mut pending_since = Instant::now();
 
-    tracing::info!("https cert auto-reload enabled, key [{}], cert [{}]", key_file, cert_file);
+    tracing::info!(
+        "https cert auto-reload enabled, key [{}], cert [{}]",
+        key_file,
+        cert_file
+    );
 
     loop {
         tokio::time::sleep(CERT_RELOAD_POLL_INTERVAL).await;
@@ -267,7 +286,11 @@ async fn run_https_cert_reloader(tls_cfg: RustlsConfig, key_file: String, cert_f
 
         match tls_cfg.reload_from_pem_file(&cert_file, &key_file).await {
             Ok(()) => {
-                tracing::info!("https cert reloaded from key [{}], cert [{}]", key_file, cert_file);
+                tracing::info!(
+                    "https cert reloaded from key [{}], cert [{}]",
+                    key_file,
+                    cert_file
+                );
                 active_fingerprint = current_fingerprint;
                 pending_fingerprint = None;
             }
@@ -282,20 +305,28 @@ async fn run_https_cert_reloader(tls_cfg: RustlsConfig, key_file: String, cert_f
 fn make_quic_server_config(server_crypto: rustls::ServerConfig) -> Result<quinn::ServerConfig> {
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
     Arc::get_mut(&mut server_config.transport)
-    .with_context(|| "get quic transport config failed")?
-    .max_concurrent_uni_streams(0_u8.into())
-    .keep_alive_interval(Some(Duration::from_secs(3)))
-    .max_idle_timeout(Some(quinn::VarInt::from_u32(30_000).into()));
+        .with_context(|| "get quic transport config failed")?
+        .max_concurrent_uni_streams(0_u8.into())
+        .keep_alive_interval(Some(Duration::from_secs(3)))
+        .max_idle_timeout(Some(quinn::VarInt::from_u32(30_000).into()));
 
     Ok(server_config)
 }
 
-async fn run_quic_cert_reloader(endpoint: quinn::Endpoint, key_file: String, cert_file: String) -> Result<()> {
+async fn run_quic_cert_reloader(
+    endpoint: quinn::Endpoint,
+    key_file: String,
+    cert_file: String,
+) -> Result<()> {
     let mut active_fingerprint = cert_pair_fingerprint(&key_file, &cert_file).await?;
     let mut pending_fingerprint: Option<String> = None;
     let mut pending_since = Instant::now();
 
-    tracing::info!("quic cert auto-reload enabled, key [{}], cert [{}]", key_file, cert_file);
+    tracing::info!(
+        "quic cert auto-reload enabled, key [{}], cert [{}]",
+        key_file,
+        cert_file
+    );
 
     loop {
         tokio::time::sleep(CERT_RELOAD_POLL_INTERVAL).await;
@@ -349,13 +380,22 @@ async fn run_quic_cert_reloader(endpoint: quinn::Endpoint, key_file: String, cer
         };
 
         endpoint.set_server_config(Some(server_config));
-        tracing::info!("quic cert reloaded from key [{}], cert [{}]", key_file, cert_file);
+        tracing::info!(
+            "quic cert reloaded from key [{}], cert [{}]",
+            key_file,
+            cert_file
+        );
         active_fingerprint = current_fingerprint;
         pending_fingerprint = None;
     }
 }
 
-async fn run_quic_signal(shared: Arc<Shared>, addr: SocketAddr, key_file: Option<String>, cert_file: Option<String>) -> Result<()> {
+async fn run_quic_signal(
+    shared: Arc<Shared>,
+    addr: SocketAddr,
+    key_file: Option<String>,
+    cert_file: Option<String>,
+) -> Result<()> {
     let server_crypto = match try_load_quic_cert(key_file.as_deref(), cert_file.as_deref()).await? {
         Some(v) => v,
         None => {
@@ -367,7 +407,7 @@ async fn run_quic_signal(shared: Arc<Shared>, addr: SocketAddr, key_file: Option
     let server_config = make_quic_server_config(server_crypto)?;
 
     let endpoint = quinn::Endpoint::server(server_config, addr)
-    .with_context(|| format!("failed to bind quic://{}", addr))?;
+        .with_context(|| format!("failed to bind quic://{}", addr))?;
 
     if let (Some(key_file), Some(cert_file)) = (key_file.clone(), cert_file.clone()) {
         let endpoint2 = endpoint.clone();
@@ -397,8 +437,13 @@ async fn handle_quic_signal_conn(shared: Arc<Shared>, conn: quinn::Connecting) -
     let addr = conn.remote_address();
     let uid = gen_huid();
 
-    let (mut tx, mut rx) = conn.accept_bi().await.with_context(|| "accept first stream failed")?;
-    let req = quic_signal::read_request(&mut rx).await.with_context(|| "read quic request failed")?;
+    let (mut tx, mut rx) = conn
+        .accept_bi()
+        .await
+        .with_context(|| "accept first stream failed")?;
+    let req = quic_signal::read_request(&mut rx)
+        .await
+        .with_context(|| "read quic request failed")?;
 
     match req {
         SignalRequest::Pub(mut params) => {
@@ -453,7 +498,9 @@ async fn handle_quic_signal_conn(shared: Arc<Shared>, conn: quinn::Connecting) -
 
                     return match ctrl {
                         CtrlClientAgent::Ws(ctrl) => run_sub_agent_stream(ctrl, uid, stream).await,
-                        CtrlClientAgent::Quic(ctrl) => run_sub_agent_stream(ctrl, uid, stream).await,
+                        CtrlClientAgent::Quic(ctrl) => {
+                            run_sub_agent_stream(ctrl, uid, stream).await
+                        }
                     };
                 }
                 Err(reason) => {
@@ -473,17 +520,27 @@ async fn handle_quic_signal_conn(shared: Arc<Shared>, conn: quinn::Connecting) -
 
 async fn write_response_and_finish(tx: &mut quinn::SendStream, rsp: &SignalResponse) -> Result<()> {
     quic_signal::write_response(tx, rsp).await?;
-    tx.finish().await.with_context(|| "finish quic response failed")?;
+    tx.finish()
+        .await
+        .with_context(|| "finish quic response failed")?;
     Ok(())
 }
 
-async fn try_load_quic_cert(key_file: Option<&str>, cert_file: Option<&str>) -> Result<Option<rustls::ServerConfig>> {
+async fn try_load_quic_cert(
+    key_file: Option<&str>,
+    cert_file: Option<&str>,
+) -> Result<Option<rustls::ServerConfig>> {
     if let (Some(key_path), Some(cert_path)) = (key_file, cert_file) {
         let key_path: &Path = key_path.as_ref();
         let cert_path: &Path = cert_path.as_ref();
 
-        let raw_key = tokio::fs::read(key_path).await.context("failed to read private key")?;
-        let key = if key_path.extension().map_or(false, |x| x.eq_ignore_ascii_case("der")) {
+        let raw_key = tokio::fs::read(key_path)
+            .await
+            .context("failed to read private key")?;
+        let key = if key_path
+            .extension()
+            .map_or(false, |x| x.eq_ignore_ascii_case("der"))
+        {
             rustls::PrivateKey(raw_key)
         } else {
             let mut reader = raw_key.as_slice();
@@ -508,8 +565,13 @@ async fn try_load_quic_cert(key_file: Option<&str>, cert_file: Option<&str>) -> 
             }
         };
 
-        let cert_chain = tokio::fs::read(cert_path).await.context("failed to read certificate chain")?;
-        let cert_chain = if cert_path.extension().map_or(false, |x| x.eq_ignore_ascii_case("der")) {
+        let cert_chain = tokio::fs::read(cert_path)
+            .await
+            .context("failed to read certificate chain")?;
+        let cert_chain = if cert_path
+            .extension()
+            .map_or(false, |x| x.eq_ignore_ascii_case("der"))
+        {
             vec![rustls::Certificate(cert_chain)]
         } else {
             rustls_pemfile::certs(&mut &*cert_chain)
@@ -545,31 +607,29 @@ async fn handle_ws_pub(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(mut params): Query<PubParams>,
 ) -> impl IntoResponse {
-
     if let Err(_e) = token_verify(shared.secret.as_deref(), &params.token) {
-        return StatusCode::UNAUTHORIZED.into_response()
+        return StatusCode::UNAUTHORIZED.into_response();
     }
 
     let uid = gen_huid();
     tracing::debug!("[{}] pub connected from {addr}, {params:?}", uid);
     // instance_id is server generated; ignore any client-provided value.
     params.instance_id = None;
-    
+
     let agent_name = match params.agent.as_deref() {
         Some(v) => v.to_string(),
         None => {
             let agent_name = uid.to_string();
             params.agent = Some(agent_name.clone());
             agent_name
-        },
+        }
     };
 
     let mut rsp = ws.on_upgrade(move |socket| async move {
-        
         let r = handle_pub_conn(shared, uid, socket, addr, params).await;
         tracing::debug!("[{}] pub conn finished with [{:?}]", uid, r);
     });
-    
+
     let value = match agent_name.parse() {
         Ok(v) => v,
         Err(_e) => return StatusCode::BAD_REQUEST.into_response(),
@@ -578,12 +638,18 @@ async fn handle_ws_pub(
     rsp
 }
 
-
-
-
-async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr: SocketAddr, params: PubParams) -> Result<()> {
-
-    let mut session = make_stream_session(WsStreamAxum::new(socket.split()).split(), shared.disable_bridge_ch).await?;
+async fn handle_pub_conn(
+    shared: Arc<Shared>,
+    uid: HUId,
+    socket: WebSocket,
+    addr: SocketAddr,
+    params: PubParams,
+) -> Result<()> {
+    let mut session = make_stream_session(
+        WsStreamAxum::new(socket.split()).split(),
+        shared.disable_bridge_ch,
+    )
+    .await?;
 
     // let mut session = make_stream_switch(uid, WsStreamAxum::new(socket)).await?;
     // let switch = session.clone_invoker();
@@ -594,25 +660,33 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
     // let ctrl_pair = ChPair { tx: ctrl_tx, rx: ctrl_rx };
 
     // let mut ctrl_client = make_ctrl_client(uid, ctrl_pair, switch).await?;
-    
-    let key = params.agent.unwrap_or_else(||uid.to_string());
+
+    let key = params.agent.unwrap_or_else(|| uid.to_string());
     let instance_id = uid.to_string();
     let old = {
         let ctrl_invoker = session.ctrl_client().clone_invoker();
-        shared.data.lock().agent_clients.insert(key.clone(), AgentSession { 
-            uid,
-            instance_id: instance_id.clone(),
-            addr, 
-            ctrl_invoker: CtrlClientAgent::Ws(ctrl_invoker),
-            expire_at: params.expire_in.map(
-                |x|Local::now().timestamp_millis() as u64  + x 
-            ) .unwrap_or(u64::MAX/2),
-            ver: params.ver.clone(),
-        })
+        shared.data.lock().agent_clients.insert(
+            key.clone(),
+            AgentSession {
+                uid,
+                instance_id: instance_id.clone(),
+                addr,
+                ctrl_invoker: CtrlClientAgent::Ws(ctrl_invoker),
+                expire_at: params
+                    .expire_in
+                    .map(|x| Local::now().timestamp_millis() as u64 + x)
+                    .unwrap_or(u64::MAX / 2),
+                ver: params.ver.clone(),
+            },
+        )
     };
-    
+
     if let Some(old) = old {
-        tracing::info!("kick agent session [{key}]-[{}], addr [{}]", old.uid, old.addr);
+        tracing::info!(
+            "kick agent session [{key}]-[{}], addr [{}]",
+            old.uid,
+            old.addr
+        );
         kick_agent_session(
             &old.ctrl_invoker,
             KickDownArgs {
@@ -623,11 +697,15 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
         )
         .await;
     }
-    
-    tracing::info!("add agent session [{key}]-[{}], instance [{instance_id}], addr [{}]", uid, addr);
 
-    let _r = session.wait_for_completed().await; 
-    
+    tracing::info!(
+        "add agent session [{key}]-[{}], instance [{instance_id}], addr [{}]",
+        uid,
+        addr
+    );
+
+    let _r = session.wait_for_completed().await;
+
     let _r = {
         let mut data = shared.data.lock();
         let r = data.agent_clients.remove_entry(&key);
@@ -640,15 +718,16 @@ async fn handle_pub_conn(shared: Arc<Shared>, uid: HUId, socket: WebSocket, addr
                     data.agent_clients.insert(key, value);
                     None
                 }
-            },
+            }
             None => None,
         }
     };
 
     if _r.is_some() {
-        tracing::info!("remove agent session [{key}]-[{uid}], instance [{instance_id}], addr [{addr}]");
+        tracing::info!(
+            "remove agent session [{key}]-[{uid}], instance [{instance_id}], addr [{addr}]"
+        );
     }
-    
 
     // let _r = ctrl_client.wait_for_completed().await?;
 
@@ -685,7 +764,11 @@ async fn handle_pub_conn_quic(
     };
 
     if let Some(old) = old {
-        tracing::info!("kick agent session [{key}]-[{}], addr [{}]", old.uid, old.addr);
+        tracing::info!(
+            "kick agent session [{key}]-[{}], addr [{}]",
+            old.uid,
+            old.addr
+        );
         kick_agent_session(
             &old.ctrl_invoker,
             KickDownArgs {
@@ -697,7 +780,11 @@ async fn handle_pub_conn_quic(
         .await;
     }
 
-    tracing::info!("add agent session [{key}]-[{}], instance [{instance_id}], addr [{}]", uid, addr);
+    tracing::info!(
+        "add agent session [{key}]-[{}], instance [{instance_id}], addr [{}]",
+        uid,
+        addr
+    );
 
     let _r = session.wait_for_completed().await;
 
@@ -718,7 +805,9 @@ async fn handle_pub_conn_quic(
     };
 
     if _r.is_some() {
-        tracing::info!("remove agent session [{key}]-[{uid}], instance [{instance_id}], addr [{addr}]");
+        tracing::info!(
+            "remove agent session [{key}]-[{uid}], instance [{instance_id}], addr [{addr}]"
+        );
     }
 
     Ok(())
@@ -740,11 +829,7 @@ fn collect_pub_sessions(shared: &Arc<Shared>) -> Vec<AgentInfo> {
         .collect()
 }
 
-
-async fn get_pub_sessions (
-    Extension(shared): Extension<Arc<Shared>>,
-) -> impl IntoResponse {
-
+async fn get_pub_sessions(Extension(shared): Extension<Arc<Shared>>) -> impl IntoResponse {
     // if let Err(_e) = token_verify(shared.secret.as_deref(), &params.token) {
     //     return StatusCode::UNAUTHORIZED.into_response()
     // }
@@ -753,19 +838,17 @@ async fn get_pub_sessions (
     Json(sessions)
 }
 
-
 async fn handle_ws_sub(
     Extension(shared): Extension<Arc<Shared>>,
     ws: WebSocketUpgrade,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(params): Query<SubParams>,
 ) -> impl IntoResponse {
-
     if let Err(_e) = token_verify(shared.secret.as_deref(), &params.token) {
-        return StatusCode::UNAUTHORIZED.into_response()
+        return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    tracing::debug!("connected from {addr}, {params:?}", );
+    tracing::debug!("connected from {addr}, {params:?}",);
 
     let agent_name = params.agent.as_deref().unwrap_or("local");
     let req_instance_id = params.instance_id.as_deref();
@@ -774,12 +857,12 @@ async fn handle_ws_sub(
             let uid = gen_huid();
             let ctrl = local.clone();
             tracing::info!("[{uid}] [{addr}] sub local ");
-    
+
             return ws.on_upgrade(move |socket| async move {
                 // let r = handle_local_sub_conn(shared, uid, socket).await;
                 let r = run_sub_agent(ctrl, uid, socket).await;
                 tracing::info!("[{}] sub conn finished with [{:?}]", uid, r);
-            })
+            });
         }
     }
 
@@ -804,8 +887,6 @@ async fn handle_ws_sub(
     }
 }
 
-
-
 // async fn local_sub_ws_handler(
 //     Extension(shared): Extension<Arc<Shared>>,
 //     ws: WebSocketUpgrade,
@@ -827,7 +908,7 @@ async fn handle_ws_sub(
 // }
 
 // async fn handle_local_sub_conn(_shared: Arc<Shared>, uid: HUId, socket: WebSocket) -> Result<()>{
-    
+
 //     let mut agent = make_agent_ctrl(uid)?;
 //     let ctrl = agent.clone_ctrl();
 //     let ctrl = ctrl.clone();
@@ -839,13 +920,19 @@ async fn handle_ws_sub(
 //     run_result
 // }
 
-
-
-async fn run_sub_agent<H1: CtrlHandler>(ctrl: CtrlInvoker<H1>, uid: HUId, socket: WebSocket) -> Result<()> {
+async fn run_sub_agent<H1: CtrlHandler>(
+    ctrl: CtrlInvoker<H1>,
+    uid: HUId,
+    socket: WebSocket,
+) -> Result<()> {
     run_sub_agent_stream(ctrl, uid, WsStreamAxum::new(socket.split()).split()).await
 }
 
-async fn run_sub_agent_stream<H1, S1, S2>(ctrl: CtrlInvoker<H1>, uid: HUId, stream: (S1, S2)) -> Result<()>
+async fn run_sub_agent_stream<H1, S1, S2>(
+    ctrl: CtrlInvoker<H1>,
+    uid: HUId,
+    stream: (S1, S2),
+) -> Result<()>
 where
     H1: CtrlHandler,
     S1: PacketSink,
@@ -858,7 +945,15 @@ where
     let (ctrl_tx, ctrl_rx) = ChPair::new(ctrl_ch_id).split();
     let ctrl_tx = switch.add_channel(ctrl_ch_id, ctrl_tx).await?;
 
-    spawn_ctrl_service(uid, ctrl, switch, ChPair { tx: ctrl_tx, rx: ctrl_rx });
+    spawn_ctrl_service(
+        uid,
+        ctrl,
+        switch,
+        ChPair {
+            tx: ctrl_tx,
+            rx: ctrl_rx,
+        },
+    );
 
     let _r = session.wait_for_completed().await;
     Ok(())
@@ -875,9 +970,6 @@ async fn kick_agent_session(ctrl: &CtrlClientAgent, args: KickDownArgs) {
     }
 }
 
-
-
-
 struct Shared {
     secret: Option<String>,
     local: Option<AgentCtrlInvoker>,
@@ -887,7 +979,7 @@ struct Shared {
 
 #[derive(Default)]
 struct SharedData {
-    agent_clients: HashMap<String,  AgentSession>, 
+    agent_clients: HashMap<String, AgentSession>,
 }
 
 struct AgentSession {
@@ -921,10 +1013,11 @@ fn lookup_agent_ctrl(
     Ok(session.ctrl_invoker.clone())
 }
 
-
 // type WsCtrlClientAgent =  CtrlInvoker<ctrl_client::Entity<StreamSwitchEntity<WsStreamAxum<WebSocket>>>>;
-type WsCtrlClientAgent = CtrlInvoker<ctrl_client::Entity<SwitchPairEntity<WsSource<SplitStream<WebSocket>>>>>;
-type QuicCtrlClientAgent = CtrlInvoker<ctrl_client::Entity<SwitchPairEntity<quic_signal::QuicSource>>>;
+type WsCtrlClientAgent =
+    CtrlInvoker<ctrl_client::Entity<SwitchPairEntity<WsSource<SplitStream<WebSocket>>>>>;
+type QuicCtrlClientAgent =
+    CtrlInvoker<ctrl_client::Entity<SwitchPairEntity<quic_signal::QuicSource>>>;
 
 #[derive(Clone)]
 enum CtrlClientAgent {
@@ -932,48 +1025,28 @@ enum CtrlClientAgent {
     Quic(QuicCtrlClientAgent),
 }
 
-
-
-
-
 #[derive(Parser, Debug)]
 #[clap(name = "agent_listen", author, about, version)]
 pub struct CmdArgs {
     #[clap(
         long = "addr",
         long_help = "listen address",
-        default_value = "0.0.0.0:19888",
+        default_value = "0.0.0.0:19888"
     )]
     addr: String,
 
-    #[clap(
-        short = 'b',
-        long = "bridge",
-        long_help = "run as bridge only",
-    )]
+    #[clap(short = 'b', long = "bridge", long_help = "run as bridge only")]
     bridge: bool,
 
-    #[clap(
-        long = "https-cert",
-        long_help = "https cert file",
-    )]
+    #[clap(long = "https-cert", long_help = "https cert file")]
     https_cert: Option<String>,
 
-    #[clap(
-        long = "https-key",
-        long_help = "http key file",
-    )]
+    #[clap(long = "https-key", long_help = "http key file")]
     https_key: Option<String>,
 
-    #[clap(
-        long = "secret",
-        long_help = "authentication secret",
-    )]
+    #[clap(long = "secret", long_help = "authentication secret")]
     secret: Option<String>,
 
-    #[clap(
-        long = "disable-bridge-ch",
-        long_help = "disable bridge channel",
-    )]
+    #[clap(long = "disable-bridge-ch", long_help = "disable bridge channel")]
     disable_bridge_ch: bool,
 }

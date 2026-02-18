@@ -1,26 +1,23 @@
 /*
-    cargo run --bin rtun --release -- bench -s 127.0.0.1:51080 -a 127.0.0.1 -p 12345 
+    cargo run --bin rtun --release -- bench -s 127.0.0.1:51080 -a 127.0.0.1 -p 12345
 */
 
 use std::time::{Duration, Instant};
 
-use clap::Parser;
 use anyhow::{Context, Result};
+use clap::Parser;
 use fast_socks5::client::{Config, Socks5Stream};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tracing::{info, span, warn, Instrument, Level};
 
 use crate::init_log_and_run;
 
-
-
-pub fn run(args: CmdArgs) -> Result<()> { 
+pub fn run(args: CmdArgs) -> Result<()> {
     init_log_and_run(do_run(args))?
 }
 
 async fn do_run(args: CmdArgs) -> Result<()> {
-
-    let buf_size = args.buffer.unwrap_or(32*1024);
+    let buf_size = args.buffer.unwrap_or(32 * 1024);
     let duration = Duration::from_secs(args.seconds.unwrap_or(30));
 
     info!("buf_size [{buf_size}]");
@@ -30,30 +27,40 @@ async fn do_run(args: CmdArgs) -> Result<()> {
     config.set_skip_auth(false);
 
     // Creating a SOCKS stream to the target address through the socks server
-    let stream = Socks5Stream::connect(&args.socks, args.target_addr.clone(), args.target_port, config).await
-    .with_context(||format!("failed to connect to socks server [{}]", args.socks))?;
-    
-    info!("connected to socks server [{}]", args.socks);
+    let stream = Socks5Stream::connect(
+        &args.socks,
+        args.target_addr.clone(),
+        args.target_port,
+        config,
+    )
+    .await
+    .with_context(|| format!("failed to connect to socks server [{}]", args.socks))?;
 
-    
+    info!("connected to socks server [{}]", args.socks);
 
     let (reader, mut writer) = tokio::io::split(stream);
 
     let read_task = {
         let span = span!(parent: None, Level::DEBUG, "read-half");
-        tokio::spawn(async move {
-            let r = reading_loop(reader, buf_size).await;
-            if let Err(e) = r {
-                warn!("finished error [{e:?}]");
+        tokio::spawn(
+            async move {
+                let r = reading_loop(reader, buf_size).await;
+                if let Err(e) = r {
+                    warn!("finished error [{e:?}]");
+                }
             }
-        }.instrument(span))
+            .instrument(span),
+        )
     };
 
     let buf = vec![0_u8; buf_size];
     let start_time = Instant::now();
 
     while start_time.elapsed() < duration {
-        writer.write_all(&buf[..]).await.with_context(||"write failed")?;
+        writer
+            .write_all(&buf[..])
+            .await
+            .with_context(|| "write failed")?;
     }
 
     read_task.await?;
@@ -61,18 +68,17 @@ async fn do_run(args: CmdArgs) -> Result<()> {
     Ok(())
 }
 
-async fn reading_loop<T: AsyncRead + Unpin>(
-    mut stream: T,
-    buf_size: usize,
-) -> Result<()> {
-    
+async fn reading_loop<T: AsyncRead + Unpin>(mut stream: T, buf_size: usize) -> Result<()> {
     let mut buf = vec![0_u8; buf_size];
     let mut total_bytes = 0_u64;
     let mut last_bytes = 0_u64;
     let mut last_time = Instant::now();
 
     loop {
-        let len = stream.read(&mut buf[..]).await.with_context(||"read failed")?;
+        let len = stream
+            .read(&mut buf[..])
+            .await
+            .with_context(|| "read failed")?;
         if len == 0 {
             info!("read zero");
             break;
@@ -89,12 +95,10 @@ async fn reading_loop<T: AsyncRead + Unpin>(
             last_time = now;
             last_bytes = total_bytes;
         }
-
     }
 
     Ok(())
 }
-
 
 // refer https://github.com/clap-rs/clap/tree/master/clap_derive/examples
 #[derive(Parser, Debug)]
@@ -108,39 +112,22 @@ pub struct CmdArgs {
     )]
     listen: String,
 
-    #[clap(
-        short = 's',
-        long = "socks",
-        long_help = "socks proxy address",
-    )]
+    #[clap(short = 's', long = "socks", long_help = "socks proxy address")]
     socks: String,
 
-    #[clap(
-        short = 'a',
-        long = "addr",
-        long_help = "target domain/ip",
-    )]
+    #[clap(short = 'a', long = "addr", long_help = "target domain/ip")]
     target_addr: String,
 
-    #[clap(
-        short = 'p',
-        long = "port",
-        long_help = "target port",
-    )]
+    #[clap(short = 'p', long = "port", long_help = "target port")]
     target_port: u16,
 
     #[clap(
         short = 'b',
         long = "buffer",
-        long_help = "buffer size in unit of bytes",
+        long_help = "buffer size in unit of bytes"
     )]
     buffer: Option<usize>,
 
-    #[clap(
-        long = "seconds",
-        long_help = "bench duration in seconds",
-    )]
+    #[clap(long = "seconds", long_help = "bench duration in seconds")]
     seconds: Option<u64>,
 }
-
-

@@ -1,19 +1,16 @@
-
-
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 
 use bytes::Bytes;
 use futures::StreamExt;
-use rtun::{channel::{ChSender, ChReceiver, ChPair}, pty::PtyEvent, term::async_input::make_async_input};
+use rtun::{
+    channel::{ChPair, ChReceiver, ChSender},
+    pty::PtyEvent,
+    term::async_input::make_async_input,
+};
 
-
-use crate::client_ch_pty::{PtyChSender, PtyChReceiver, process_recv_result};
-
-
-
+use crate::client_ch_pty::{process_recv_result, PtyChReceiver, PtyChSender};
 
 pub async fn run_term(pair: ChPair) -> Result<()> {
-    
     crossterm::terminal::enable_raw_mode()?;
 
     let result = do_run(pair.tx, pair.rx).await;
@@ -24,7 +21,6 @@ pub async fn run_term(pair: ChPair) -> Result<()> {
 }
 
 pub async fn do_run(ch_tx: ChSender, ch_rx: ChReceiver) -> Result<()> {
-    
     let tx = PtyChSender::new(ch_tx);
     let mut rx = PtyChReceiver::new(ch_rx);
 
@@ -48,7 +44,7 @@ pub async fn do_run(ch_tx: ChSender, ch_rx: ChReceiver) -> Result<()> {
                         bail!("match input pattern, force exit")
                     }
                 }
-                tx.send_event(ev).await.map_err(|_e|anyhow!("send_data fail"))?; 
+                tx.send_event(ev).await.map_err(|_e|anyhow!("send_data fail"))?;
             },
             r = rx.recv_packet() => {
                 if let Some(_shutdown) = process_recv_result(r).await? {
@@ -60,7 +56,7 @@ pub async fn do_run(ch_tx: ChSender, ch_rx: ChReceiver) -> Result<()> {
 
     Ok(())
     // let mut fin = async_std_in();
-    
+
     // loop {
     //     tokio::select! {
     //         r = fin.read() => {
@@ -70,7 +66,7 @@ pub async fn do_run(ch_tx: ChSender, ch_rx: ChReceiver) -> Result<()> {
     //                 if detector.detect(&data) {
     //                     bail!("force exit")
     //                 }
-    //                 tx.send_event(PtyEvent::StdinData(data.to_vec().into())).await.map_err(|_e|anyhow!("send_data fail"))?; 
+    //                 tx.send_event(PtyEvent::StdinData(data.to_vec().into())).await.map_err(|_e|anyhow!("send_data fail"))?;
     //             }
     //         },
     //         r = rx.recv_packet() => {
@@ -86,16 +82,12 @@ struct PatternDetector {
     index: usize,
 }
 
-impl PatternDetector  {
+impl PatternDetector {
     pub fn new(pattern: Bytes) -> Self {
-        Self {
-            pattern,
-            index: 0,
-        }
+        Self { pattern, index: 0 }
     }
 
     pub fn detect(&mut self, data: &[u8]) -> bool {
-
         // const MAGIC: &[u8] = b"zaza";
 
         for item in data.iter() {
@@ -105,7 +97,7 @@ impl PatternDetector  {
                     self.index = 0;
                     return true;
                 } else {
-                    return false
+                    return false;
                 }
             }
         }
@@ -114,7 +106,6 @@ impl PatternDetector  {
         false
     }
 }
-
 
 // use termwiz::{terminal::{ScreenSize, new_terminal, Terminal}, caps::Capabilities};
 // pub async fn get_terminal_size() -> Result<ScreenSize> {

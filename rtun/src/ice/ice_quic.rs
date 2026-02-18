@@ -1,22 +1,37 @@
-use std::{sync::Arc, time::Duration, ops::Deref};
+use std::{ops::Deref, sync::Arc, time::Duration};
 
-use anyhow::{Result, Context, bail};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use bytes::{BufMut, BytesMut, Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use chrono::Local;
 use parking_lot::Mutex;
 use protobuf::Message;
-use quinn::{ServerConfig, default_runtime, Endpoint, ClientConfig, SendStream, RecvStream, Connection, VarInt};
+use quinn::{
+    default_runtime, ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig,
+    VarInt,
+};
 use quinn_proto::ConnectionStats;
 use rcgen::Certificate;
-use tokio::{sync::{mpsc, broadcast::{self, error::{TryRecvError, RecvError}}}, io::{AsyncReadExt, AsyncRead, AsyncWrite}};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
+    sync::{
+        broadcast::{
+            self,
+            error::{RecvError, TryRecvError},
+        },
+        mpsc,
+    },
+};
 use tracing::debug;
 
-use crate::{async_rt::spawn_with_name, proto::{QuicStats, QuicPathStats}};
+use crate::{
+    async_rt::spawn_with_name,
+    proto::{QuicPathStats, QuicStats},
+};
 
-use super::ice_peer::{IceConn, IceArgs};
+use super::ice_peer::{IceArgs, IceConn};
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub struct QuicIceArgs {
@@ -28,10 +43,7 @@ impl QuicIceArgs {
     pub fn try_new(ice: IceArgs) -> Result<(Self, Certificate)> {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
         let cert_der = cert.serialize_der()?.into();
-        Ok((
-            Self { ice, cert_der, }, 
-            cert,
-        ))
+        Ok((Self { ice, cert_der }, cert))
     }
 }
 
@@ -52,14 +64,15 @@ impl QuicIceCert {
     }
 }
 
-
 #[async_trait]
 pub trait UpgradeToQuic {
     // async fn upgrade_to_quic(self) -> Result<QuicConn>;
-    async fn upgrade_to_quic(self, local_cert: &QuicIceCert, remote_cert: Bytes) -> Result<QuicConn>;
+    async fn upgrade_to_quic(
+        self,
+        local_cert: &QuicIceCert,
+        remote_cert: Bytes,
+    ) -> Result<QuicConn>;
 }
-
-
 
 #[async_trait]
 impl UpgradeToQuic for IceConn {
@@ -68,8 +81,11 @@ impl UpgradeToQuic for IceConn {
     //     self.upgrade_to_quic2(&local_cert, None).await
     // }
 
-    async fn upgrade_to_quic(self, local_cert: &QuicIceCert, remote_cert: Bytes) -> Result<QuicConn> {
-
+    async fn upgrade_to_quic(
+        self,
+        local_cert: &QuicIceCert,
+        remote_cert: Bytes,
+    ) -> Result<QuicConn> {
         let uid = self.uid();
         let is_client = self.is_client();
         // let remote_fingerprint = None;
@@ -84,26 +100,25 @@ impl UpgradeToQuic for IceConn {
             let priv_key = cert.serialize_private_key_der();
             let priv_key = rustls::PrivateKey(priv_key);
             let cert_chain = vec![rustls::Certificate(cert_der.clone())];
-        
+
             let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key)?;
-            Arc::get_mut(&mut server_config.transport).with_context(||"get transport config failed")?
-            .max_concurrent_uni_streams(0_u8.into())
-            .max_idle_timeout(Some(VarInt::from_u32(13_000).into()));
-        
+            Arc::get_mut(&mut server_config.transport)
+                .with_context(|| "get transport config failed")?
+                .max_concurrent_uni_streams(0_u8.into())
+                .max_idle_timeout(Some(VarInt::from_u32(13_000).into()));
+
             server_config
         };
 
-
-        let runtime = default_runtime().with_context(||"no quic async runtime")?;
+        let runtime = default_runtime().with_context(|| "no quic async runtime")?;
 
         let mut endpoint = Endpoint::new_with_abstract_socket(
-            Default::default(), 
-            Some(server_config), 
-            socket, 
+            Default::default(),
+            Some(server_config),
+            socket,
             runtime,
         )?;
 
-        
         let (conn, keepalive) = if is_client {
             // let mut crypto = rustls::ClientConfig::builder()
             // .with_safe_defaults()
@@ -130,7 +145,7 @@ impl UpgradeToQuic for IceConn {
             //         ClientConfig::new(Arc::new(crypto))
             //     }
             // };
-            
+
             endpoint.set_default_client_config(client_config);
 
             let conn = endpoint.connect(remote_addr, "localhost")?.await?;
@@ -140,12 +155,14 @@ impl UpgradeToQuic for IceConn {
                 let cert = local_cert.to_bytes()?;
                 send_token(&mut keepalive.0, &cert[..]).await?;
             }
-            
+
             (conn, keepalive)
         } else {
-            let conn = endpoint.accept()
-            .await.with_context(||"accept but enpoint none")?
-            .await?;
+            let conn = endpoint
+                .accept()
+                .await
+                .with_context(|| "accept but enpoint none")?
+                .await?;
             let mut keepalive = conn.accept_bi().await?;
 
             recv_token(&mut keepalive.1, &remote_cert[..]).await?;
@@ -173,7 +190,6 @@ impl UpgradeToQuic for IceConn {
             event_tx: event_tx.clone(),
         };
 
-        
         spawn_with_name(format!("quic-alive-{uid}"), async move {
             let r = keepalive_task(ctx).await;
             debug!("finished {r:?}");
@@ -181,7 +197,12 @@ impl UpgradeToQuic for IceConn {
 
         debug!("upgrade to quic");
 
-        let conn = QuicConn { conn, shared, _guard_tx, event_rx, };
+        let conn = QuicConn {
+            conn,
+            shared,
+            _guard_tx,
+            event_rx,
+        };
         Ok(conn)
     }
 }
@@ -189,7 +210,6 @@ impl UpgradeToQuic for IceConn {
 const TOKEN_FIRST: u8 = 0x58;
 
 async fn send_token(stream: &mut SendStream, cert: &[u8]) -> Result<()> {
-
     let token = make_fingerprint(cert)?;
     let payload = token.as_bytes();
 
@@ -205,7 +225,6 @@ async fn send_token(stream: &mut SendStream, cert: &[u8]) -> Result<()> {
 }
 
 async fn recv_token(stream: &mut RecvStream, cert: &[u8]) -> Result<()> {
-
     let mut header = [0_u8; 3];
     stream.read_exact(&mut header).await?;
 
@@ -250,11 +269,8 @@ impl Deref for QuicConn {
 
 impl QuicConn {
     pub fn get_stats(&self) -> Result<Stats> {
-        
-        let mut stats = {
-            self.shared.stats.lock().clone()
-        };
-        
+        let mut stats = { self.shared.stats.lock().clone() };
+
         let inner = self.conn.stats();
         stats.tx_bytes = inner.udp_tx.bytes;
         stats.rx_bytes = inner.udp_rx.bytes;
@@ -266,17 +282,15 @@ impl QuicConn {
         loop {
             let r = self.event_rx.recv().await;
             match r {
-                Ok(ev) => {
-                    match ev {
-                        QEvent::RemoteStats(stats) => return Ok(stats),
-                    }
+                Ok(ev) => match ev {
+                    QEvent::RemoteStats(stats) => return Ok(stats),
                 },
                 Err(e) => {
                     match e {
                         RecvError::Closed => bail!("Closed"),
-                        RecvError::Lagged(_e) => {}, // try again
+                        RecvError::Lagged(_e) => {} // try again
                     }
-                },
+                }
             }
         }
     }
@@ -285,33 +299,29 @@ impl QuicConn {
         loop {
             let r = self.event_rx.try_recv();
             match r {
-                Ok(ev) => {
-                    match ev {
-                        QEvent::RemoteStats(stats) => return Some(stats),
-                    }
+                Ok(ev) => match ev {
+                    QEvent::RemoteStats(stats) => return Some(stats),
                 },
                 Err(e) => {
                     match e {
                         TryRecvError::Empty => return None,
                         TryRecvError::Closed => return None,
-                        TryRecvError::Lagged(_e) => {}, // try again
+                        TryRecvError::Lagged(_e) => {} // try again
                     }
-                },
+                }
             }
         }
     }
 
     pub fn is_ping_timeout(&self) -> bool {
-        let update_ts = {
-            self.shared.stats.lock().update_ts
-        };
+        let update_ts = { self.shared.stats.lock().update_ts };
 
         let elapsed_ms = Local::now().timestamp_millis() - update_ts;
         Duration::from_millis(elapsed_ms as u64) >= self.get_ping_timeout()
     }
 
     pub fn get_ping_timeout(&self) -> Duration {
-        self.ping_interval() * 5/2
+        self.ping_interval() * 5 / 2
     }
 
     pub fn ping_interval(&self) -> Duration {
@@ -338,11 +348,11 @@ pub struct Stats {
 
 impl Default for Stats {
     fn default() -> Self {
-        Self { 
-            update_ts: Local::now().timestamp_millis(), 
-            latency: Default::default(), 
-            tx_bytes: Default::default(), 
-            rx_bytes: Default::default() 
+        Self {
+            update_ts: Local::now().timestamp_millis(),
+            latency: Default::default(),
+            tx_bytes: Default::default(),
+            rx_bytes: Default::default(),
         }
     }
 }
@@ -351,7 +361,6 @@ impl Default for Stats {
 pub enum QEvent {
     RemoteStats(QuicStats),
 }
-
 
 async fn keepalive_task(mut ctx: AliveContext) -> Result<()> {
     let mut interval = tokio::time::interval(ping_interval());
@@ -371,7 +380,7 @@ async fn keepalive_task(mut ctx: AliveContext) -> Result<()> {
                     ctx.send_buf.clear();
                     let ping = Ping::new();
                     let len = ping.write_to_buf(&mut ctx.send_buf)?;
-    
+
                     ctx.wr.write_all(&ctx.send_buf[..len]).await?;
                     ctx.sending_ping = true;
                     // debug!("sent ping {ping:?}, buf.len {}", ctx.send_buf.len());
@@ -385,14 +394,13 @@ async fn keepalive_task(mut ctx: AliveContext) -> Result<()> {
     }
 }
 
-
 struct AliveContext {
     conn: Connection,
     sending_ping: bool,
     recv_buf: BytesMut,
     send_buf: BytesMut,
     shared: Arc<Shared>,
-    wr: SendStream, 
+    wr: SendStream,
     rd: RecvStream,
     is_client: bool,
     guard_rx: mpsc::Receiver<()>,
@@ -400,19 +408,17 @@ struct AliveContext {
 }
 
 impl AliveContext {
-
     async fn process_packet(&mut self) -> Result<()> {
         // let data = &self.recv_buf[..];
-        
-        while !self.recv_buf.is_empty() {
 
+        while !self.recv_buf.is_empty() {
             let packet = {
                 match Packet::parse_from(&mut self.recv_buf)? {
                     Some(v) => v,
                     None => break,
                 }
             };
-            
+
             match packet {
                 Packet::Ping(ping) => {
                     self.send_buf.clear();
@@ -421,9 +427,9 @@ impl AliveContext {
                     self.wr.write_all(&self.send_buf[..len]).await?;
                     self.send_buf.clear();
                     // debug!("recv {ping:?}, sent {pong:?}, buf.len {}", self.send_buf.len());
-    
+
                     self.send_stats().await?;
-                },
+                }
                 Packet::Pong(pong) => {
                     let now = Local::now().timestamp_millis();
                     let latency = now - pong.req_ts;
@@ -433,13 +439,13 @@ impl AliveContext {
                     let mut stats = self.shared.stats.lock();
                     stats.latency = latency;
                     stats.update_ts = now;
-                },
+                }
                 Packet::Stats(packet) => {
                     let _r = self.event_tx.send(QEvent::RemoteStats(packet.stats));
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -453,10 +459,7 @@ impl AliveContext {
 
         Ok(())
     }
-
 }
-
-
 
 fn to_stats(stats: &ConnectionStats) -> QuicStats {
     QuicStats {
@@ -464,12 +467,11 @@ fn to_stats(stats: &ConnectionStats) -> QuicStats {
             rtt: Some(stats.path.rtt.as_millis() as u32).into(),
             cwnd: Some(stats.path.cwnd).into(),
             ..Default::default()
-        }).into(),
+        })
+        .into(),
         ..Default::default()
     }
 }
-
-
 
 #[derive(Debug)]
 struct PacketStats {
@@ -478,16 +480,14 @@ struct PacketStats {
 
 impl PacketStats {
     fn new(stats: QuicStats) -> Self {
-        Self { 
-            stats,
-        }
+        Self { stats }
     }
 
     fn write_to_buf<B: BufMut>(&self, mut buf: B) -> Result<usize> {
         if buf.remaining_mut() < Self::MIN_LEN {
             bail!("buf too small for stats")
         }
-        
+
         let payload_len = self.stats.compute_size() as u16;
 
         if buf.remaining_mut() < (Self::MIN_LEN + payload_len as usize) {
@@ -503,9 +503,9 @@ impl PacketStats {
 
     fn parse_from(buf: &mut BytesMut) -> Result<Option<Self>> {
         if buf.remaining() < Self::MIN_LEN {
-            return Ok(None)
+            return Ok(None);
         }
-        
+
         let mut data = &buf[..];
         let first = data.get_u8();
         if first != Self::START_BYTE {
@@ -514,13 +514,12 @@ impl PacketStats {
 
         let payload_len = data.get_u16() as usize;
         if buf.remaining() < Self::MIN_LEN + payload_len {
-            return Ok(None)
+            return Ok(None);
         }
 
         let stats = QuicStats::parse_from_bytes(&data[..])?;
 
         buf.advance(Self::MIN_LEN + payload_len);
-
 
         Ok(Some(Self { stats }))
     }
@@ -540,20 +539,13 @@ impl Packet {
     fn parse_from(buf: &mut BytesMut) -> Result<Option<Self>> {
         let first = buf.chunk()[0];
         match first {
-            Ping::START_BYTE => {
-                Ok(Ping::parse_from(buf)?.map(|x|Self::Ping(x)))
-            },
-            Pong::START_BYTE => {
-                Ok(Pong::parse_from(buf)?.map(|x|Self::Pong(x)))
-            },
-            PacketStats::START_BYTE => {
-                Ok(PacketStats::parse_from(buf)?.map(|x|Self::Stats(x)))
-            },
+            Ping::START_BYTE => Ok(Ping::parse_from(buf)?.map(|x| Self::Ping(x))),
+            Pong::START_BYTE => Ok(Pong::parse_from(buf)?.map(|x| Self::Pong(x))),
+            PacketStats::START_BYTE => Ok(PacketStats::parse_from(buf)?.map(|x| Self::Stats(x))),
             _ => {
                 bail!("unknown start byte {first:02x}")
             }
         }
-
     }
 }
 
@@ -564,7 +556,7 @@ struct Ping {
 
 impl Ping {
     fn new() -> Self {
-        Self { 
+        Self {
             req_ts: Local::now().timestamp_millis(),
         }
     }
@@ -582,9 +574,9 @@ impl Ping {
 
     fn parse_from(buf: &mut BytesMut) -> Result<Option<Self>> {
         if buf.remaining() < Self::MIN_LEN {
-            return Ok(None)
+            return Ok(None);
         }
-        
+
         let first = buf.get_u8();
         if first != Self::START_BYTE {
             bail!("invalid start byte")
@@ -606,7 +598,7 @@ struct Pong {
 
 impl Pong {
     fn new(req_ts: i64) -> Self {
-        Self { 
+        Self {
             rsp_ts: Local::now().timestamp_millis(),
             req_ts,
         }
@@ -626,9 +618,9 @@ impl Pong {
 
     fn parse_from(buf: &mut BytesMut) -> Result<Option<Self>> {
         if buf.remaining() < Self::MIN_LEN {
-            return Ok(None)
+            return Ok(None);
         }
-        
+
         let first = buf.get_u8();
         if first != Self::START_BYTE {
             bail!("invalid start byte")
@@ -642,7 +634,6 @@ impl Pong {
     const MIN_LEN: usize = 17;
     const START_BYTE: u8 = 0x97;
 }
-
 
 // struct ServerFingerprintVerification(Option<String>);
 
@@ -679,7 +670,7 @@ impl Pong {
 //         //         debug!("expect fingerprint {expect:?} but {fingerprint:?}");
 //         //         return Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYet))
 //         //     }
-//         // } 
+//         // }
 
 //         Ok(rustls::client::ServerCertVerified::assertion())
 
@@ -700,7 +691,7 @@ fn make_fingerprint2(algorithm: &str, cert_data: &[u8]) -> Result<String> {
     let mut h = Sha256::new();
     h.update(cert_data);
     let hashed = h.finalize();
-    
+
     Ok(FingerprintDisplay(&hashed[..]).to_string())
 }
 
@@ -710,11 +701,11 @@ impl<'a> std::fmt::Display for FingerprintDisplay<'a> {
         let len = self.0.len();
 
         if len > 0 {
-            for b in &self.0[..len-1] {
+            for b in &self.0[..len - 1] {
                 let x = *b;
                 write!(f, "{x:02x}:")?;
             }
-            let x = self.0[len-1];
+            let x = self.0[len - 1];
             write!(f, "{x:02x}")?;
         }
 
@@ -729,14 +720,17 @@ fn test_make_fingerprint() {
     assert_eq!(s1, "59:94:47:1a:bb:01:11:2a:fc:c1:81:59:f6:cc:74:b4:f5:11:b9:98:06:da:59:b3:ca:f5:a9:c1:73:ca:cf:c5")
 }
 
-pub struct QuicStream{
+pub struct QuicStream {
     pub tx: SendStream,
     pub rx: RecvStream,
 }
 
 impl QuicStream {
     pub fn new(pair: (SendStream, RecvStream)) -> Self {
-        Self { tx: pair.0, rx: pair.1 }
+        Self {
+            tx: pair.0,
+            rx: pair.1,
+        }
     }
 }
 
@@ -746,8 +740,7 @@ impl AsyncRead for QuicStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.rx)
-        .poll_read(cx, buf)
+        std::pin::Pin::new(&mut self.rx).poll_read(cx, buf)
     }
 }
 
@@ -757,18 +750,21 @@ impl AsyncWrite for QuicStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
-        std::pin::Pin::new(&mut self.tx)
-        .poll_write(cx, buf)
+        std::pin::Pin::new(&mut self.tx).poll_write(cx, buf)
     }
 
-    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        std::pin::Pin::new(&mut self.tx)
-        .poll_flush(cx)
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.tx).poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        std::pin::Pin::new(&mut self.tx)
-        .poll_shutdown(cx)
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.tx).poll_shutdown(cx)
     }
 
     fn poll_write_vectored(
@@ -776,8 +772,7 @@ impl AsyncWrite for QuicStream {
         cx: &mut std::task::Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
-        std::pin::Pin::new(&mut self.tx)
-        .poll_write_vectored(cx, bufs)
+        std::pin::Pin::new(&mut self.tx).poll_write_vectored(cx, bufs)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -785,20 +780,19 @@ impl AsyncWrite for QuicStream {
     }
 }
 
-
 #[tokio::test]
 async fn manual_test_ice_quic_drop() -> Result<()> {
     use crate::async_rt::spawn_with_name;
-    use crate::ice::ice_peer::{IcePeer, IceConfig};
+    use crate::ice::ice_peer::{IceConfig, IcePeer};
 
     tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::INFO)
-    .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
-    .with_target(false)
-    .init();
+        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
+        .with_target(false)
+        .init();
 
-    let servers = vec![ ];
-    
+    let servers = vec![];
+
     let cert1 = QuicIceCert::try_new()?;
     let cert2 = QuicIceCert::try_new()?;
 
@@ -817,10 +811,9 @@ async fn manual_test_ice_quic_drop() -> Result<()> {
         servers: servers.clone(),
         ..Default::default()
     });
-    
+
     let arg2 = peer2.server_gather(arg1).await?;
     debug!("arg2 {arg2:?}");
-
 
     let task1 = spawn_with_name(format!("client-{}", peer1.uid()), async move {
         let conn = peer1.dial(arg2).await?;
@@ -829,9 +822,11 @@ async fn manual_test_ice_quic_drop() -> Result<()> {
         wr.write_all("I'am conn1".as_bytes()).await?;
         let mut buf = vec![0; 1700];
         loop {
-            let n = rd.read(&mut buf).await
-            .with_context(||"read stream failed")?
-            .with_context(||"stream closed")?;
+            let n = rd
+                .read(&mut buf)
+                .await
+                .with_context(|| "read stream failed")?
+                .with_context(|| "stream closed")?;
             if n == 0 {
                 debug!("recv zero");
                 break;
@@ -864,17 +859,16 @@ async fn manual_test_ice_quic_drop() -> Result<()> {
     Ok(())
 }
 
-
 #[tokio::test]
 async fn manual_test_ice_quic() -> Result<()> {
     use crate::async_rt::spawn_with_name;
-    use crate::ice::ice_peer::{IcePeer, IceConfig};
+    use crate::ice::ice_peer::{IceConfig, IcePeer};
 
     tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::INFO)
-    .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
-    .with_target(false)
-    .init();
+        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
+        .with_target(false)
+        .init();
 
     let servers = vec![
         // "stun:stun1.l.google.com:19302".into(),
@@ -900,10 +894,9 @@ async fn manual_test_ice_quic() -> Result<()> {
         servers: servers.clone(),
         ..Default::default()
     });
-    
+
     let arg2 = peer2.server_gather(arg1).await?;
     debug!("arg2 {arg2:?}");
-
 
     let task1 = spawn_with_name("client", async move {
         let conn = peer1.dial(arg2).await?;
@@ -912,9 +905,11 @@ async fn manual_test_ice_quic() -> Result<()> {
         wr.write_all("I'am conn1".as_bytes()).await?;
         let mut buf = vec![0; 1700];
         loop {
-            let n = rd.read(&mut buf).await
-            .with_context(||"read stream failed")?
-            .with_context(||"stream closed")?;
+            let n = rd
+                .read(&mut buf)
+                .await
+                .with_context(|| "read stream failed")?
+                .with_context(|| "stream closed")?;
             if n == 0 {
                 break;
             }
@@ -933,9 +928,11 @@ async fn manual_test_ice_quic() -> Result<()> {
         let mut buf = vec![0; 1700];
 
         loop {
-            let n = rd.read(&mut buf).await
-            .with_context(||"read stream failed")?
-            .with_context(||"stream closed")?;
+            let n = rd
+                .read(&mut buf)
+                .await
+                .with_context(|| "read stream failed")?
+                .with_context(|| "stream closed")?;
             if n == 0 {
                 break;
             }
@@ -969,4 +966,3 @@ mod test_cert {
         assert_eq!(data1, data2);
     }
 }
-

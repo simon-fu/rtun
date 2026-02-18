@@ -1,15 +1,23 @@
-use anyhow::Result;
 use crate::huid::HUId;
+use anyhow::Result;
 
-use super::{switch_source::{PacketSource, make_switch_source, SwitchSource, SwitchSourceInvoker, SwitchSourceCtrlClient, SwitchSourceEntity}, switch_sink::{PacketSink, SwitchSink, make_switch_sink}};
+use super::{
+    switch_sink::{make_switch_sink, PacketSink, SwitchSink},
+    switch_source::{
+        make_switch_source, PacketSource, SwitchSource, SwitchSourceCtrlClient, SwitchSourceEntity,
+        SwitchSourceInvoker,
+    },
+};
 
-
-pub async fn make_switch_pair<S1, S2>(uid: HUId, (sink, source): (S1,S2)) -> Result<SwitchPair<S1, S2>> 
+pub async fn make_switch_pair<S1, S2>(
+    uid: HUId,
+    (sink, source): (S1, S2),
+) -> Result<SwitchPair<S1, S2>>
 where
     S1: PacketSink,
     S2: PacketSource,
 {
-    let sink =  make_switch_sink(uid, sink).await?;
+    let sink = make_switch_sink(uid, sink).await?;
     let outgoing_tx = sink.get_mux_tx().await?;
 
     Ok(SwitchPair {
@@ -18,7 +26,7 @@ where
     })
 }
 
-pub struct SwitchPair<S1, S2> 
+pub struct SwitchPair<S1, S2>
 where
     S1: PacketSink,
     S2: PacketSource,
@@ -27,8 +35,7 @@ where
     source: SwitchSource<S2>,
 }
 
-
-impl<S1, S2>  SwitchPair<S1, S2>
+impl<S1, S2> SwitchPair<S1, S2>
 where
     S1: PacketSink,
     S2: PacketSource,
@@ -51,7 +58,6 @@ where
         Ok(None)
     }
 }
-
 
 pub type SwitchPairInvoker<S> = SwitchSourceInvoker<S>;
 pub type SwitchPairCtrlClient<S> = SwitchSourceCtrlClient<S>;

@@ -1,4 +1,4 @@
-// 
+//
 // 2179561608 1 udp 2130706431 192.168.1.17 58312 typ host
 
 use std::collections::hash_map::DefaultHasher;
@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 
 // use super::IceError;
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 
 /// ICE candidates are network addresses used to connect to a peer.
 ///
@@ -440,11 +440,7 @@ impl<'a> fmt::Display for CandidateString<'a> {
     }
 }
 
-pub fn server_reflexive(
-    addr: SocketAddr,
-    base: SocketAddr,
-    componet_id: Option<u16>,
-) -> Candidate {
+pub fn server_reflexive(addr: SocketAddr, base: SocketAddr, componet_id: Option<u16>) -> Candidate {
     Candidate::new(
         None,
         componet_id.unwrap_or(1), // default RTP
@@ -531,23 +527,21 @@ where
         )),
         optional((attempt(string(" ufrag ")), not_sp())),
     )
-    .map(
-        |(found, _, comp_id, _, proto, _, prio, _, addr, _, port, _, kind, raddr, ufrag)| {
-            Candidate::parsed(
-                found,
-                comp_id,
-                proto,
-                prio, // remote candidates calculate prio on their side
-                SocketAddr::from((addr, port)),
-                kind,
-                raddr.map(|(_, addr, _, port)| SocketAddr::from((addr, port))),
-                ufrag.map(|(_, u)| u),
-            )
-        },
-    )
-
+        .map(
+            |(found, _, comp_id, _, proto, _, prio, _, addr, _, port, _, kind, raddr, ufrag)| {
+                Candidate::parsed(
+                    found,
+                    comp_id,
+                    proto,
+                    prio, // remote candidates calculate prio on their side
+                    SocketAddr::from((addr, port)),
+                    kind,
+                    raddr.map(|(_, addr, _, port)| SocketAddr::from((addr, port))),
+                    ufrag.map(|(_, u)| u),
+                )
+            },
+        )
 }
-
 
 /// Not SP, \r or \n
 fn not_sp<Input>() -> impl Parser<Input, Output = String>
@@ -557,9 +551,6 @@ where
 {
     many1(satisfy(|c| c != ' ' && c != '\r' && c != '\n'))
 }
-
-
-
 
 #[cfg(test)]
 mod test {

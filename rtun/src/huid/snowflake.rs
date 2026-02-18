@@ -1,6 +1,4 @@
-
 use anyhow::Result;
-
 
 // snowflake revised edition
 // reserved: 1 bit
@@ -91,5 +89,3 @@ impl SnowflakeId {
         mid
     }
 }
-
-

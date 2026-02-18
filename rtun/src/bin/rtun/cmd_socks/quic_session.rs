@@ -6,23 +6,21 @@
 // use tracing::{debug, info};
 // use rtun::{actor_service::{ActorEntity, handle_first_none, Action, AsyncHandler, ActorHandle, handle_msg_none, start_actor}, huid::HUId, switch::invoker_ctrl::{CtrlInvoker, CtrlHandler}, ice::{ice_quic::{QuicConn, UpgradeToQuic, QuicIceCert}, ice_peer::{IcePeer, IceConfig, IceArgs}}, async_rt::spawn_with_inherit, proto::{open_p2presponse::Open_p2p_rsp, P2PArgs, p2pargs::P2p_args, QuicSocksArgs, P2PQuicArgs, QuicStats}};
 
-
-
 // pub fn make_quic_session<H: CtrlHandler>(uid: HUId, ctrl: CtrlInvoker<H>, agent: &str, bar: ProgressBar) -> Result<QuicSession<H>> {
 
 //     let mut entity = Entity {
-//         state: State::Disconnected(Instant::now()), 
+//         state: State::Disconnected(Instant::now()),
 //         ctrl,
 //         bar,
 //     };
 //     update_bar(&mut entity.state, &entity.bar);
-    
+
 //     let handle = start_actor (
 //         format!("quic-{agent}-{uid}", ),
-//         entity, 
+//         entity,
 //         handle_first_none,
-//         wait_next, 
-//         handle_next, 
+//         wait_next,
+//         handle_next,
 //         handle_msg_none,
 //     );
 
@@ -31,15 +29,13 @@
 
 // pub type QuicSession<H> = ActorHandle<Entity<H>>;
 
-
 // pub type StreamPair = (SendStream, RecvStream);
-
 
 // pub struct SetCtrl<H: CtrlHandler>(pub CtrlInvoker<H>);
 
 // #[async_trait::async_trait]
 // impl<H: CtrlHandler> AsyncHandler<SetCtrl<H>> for Entity<H> {
-//     type Response = Result<()>; 
+//     type Response = Result<()>;
 
 //     async fn handle(&mut self, req: SetCtrl<H>) -> Self::Response {
 //         self.ctrl = req.0;
@@ -57,14 +53,12 @@
 //     }
 // }
 
-
 // #[derive(Debug)]
 // pub struct ReqCh;
 
-
 // #[async_trait::async_trait]
 // impl<H: CtrlHandler> AsyncHandler<ReqCh> for Entity<H> {
-//     type Response = Result<StreamPair>; 
+//     type Response = Result<StreamPair>;
 
 //     async fn handle(&mut self, _req: ReqCh) -> Self::Response {
 //         match &mut self.state {
@@ -82,19 +76,16 @@
 //             State::Punching(_) => {}
 //             State::Disconnected(_) => {}
 //         }
-//         bail!("quic NOT connected") 
+//         bail!("quic NOT connected")
 //     }
 // }
-
 
 // fn next_retry() -> Instant {
 //     const RETRY_SECS: u64 = 3;
 //     Instant::now() + Duration::from_secs(RETRY_SECS)
 // }
 
-
 // type Next = Result<()>;
-
 
 // #[inline]
 // async fn wait_next<H: CtrlHandler>(entity: &mut Entity<H>) -> Next {
@@ -201,7 +192,7 @@
 //             let stats = work.conn.stats();
 //             let path = &stats.path;
 //             bar.set_message(format!(
-//                 "rtt {}/{remote_rtt}, cwnd {}/{remote_cwnd}, ev {}, lost {}/{}, sent {}, pl {}/{}, black {}", 
+//                 "rtt {}/{remote_rtt}, cwnd {}/{remote_cwnd}, ev {}, lost {}/{}, sent {}, pl {}/{}, black {}",
 //                 path.rtt.as_millis(),
 //                 path.cwnd,
 //                 // Congestion events on the connection
@@ -260,7 +251,7 @@
 
 //     let local_cert = QuicIceCert::try_new()?;
 //     let cert_der = local_cert.to_bytes()?.into();
-    
+
 //     let rsp = ctrl.open_p2p(P2PArgs {
 //         p2p_args: Some(P2p_args::QuicSocks(QuicSocksArgs {
 //             base: Some(P2PQuicArgs {
@@ -283,7 +274,7 @@
 //             let mut args = remote_args.take_quic_socks()
 //             .base.0.with_context(||"no base in quic socks")?;
 //             let remote_args: IceArgs = args.ice.take().with_context(||"no ice in quic args")?.into();
-            
+
 //             // let local_cert = QuicIceCert::try_new()?;
 //             let server_cert_der = args.cert_der;
 
@@ -291,7 +282,7 @@
 //             let conn = peer.dial(remote_args).await?
 //             .upgrade_to_quic(&local_cert, server_cert_der).await?;
 //             let _r = tx.send(conn).await;
-            
+
 //             return Ok(())
 //         },
 //         Open_p2p_rsp::Status(s) => {
@@ -300,8 +291,8 @@
 //         _ => {
 //             bail!("unknown Open_p2p_rsp {rsp:?}");
 //         }
-//     }     
-    
+//     }
+
 // }
 
 // type Msg = ();

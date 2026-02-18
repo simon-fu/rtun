@@ -1,12 +1,34 @@
-use std::{sync::Arc, time::Duration, fmt, ops::IndexMut};
-use anyhow::{Result, Context, bail};
+use anyhow::{bail, Context, Result};
 use indexmap::IndexMap;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use quinn::{SendStream, RecvStream};
+use quinn::{RecvStream, SendStream};
+use std::{fmt, ops::IndexMut, sync::Arc, time::Duration};
 // use parking_lot::Mutex;
 use quinn_proto::ConnectionStats;
-use rtun::{switch::{invoker_ctrl::{CtrlHandler, CtrlInvoker}, session_stream::make_stream_session}, ice::{ice_quic::{QuicConn, QuicIceCert, UpgradeToQuic}, ice_peer::{IcePeer, IceConfig, IceArgs}}, proto::{QuicStats, P2PArgs, QuicSocksArgs, p2pargs::P2p_args, P2PQuicArgs, open_p2presponse::Open_p2p_rsp}, actor_service::{ActorHandle, start_actor, handle_first_none, handle_msg_none, Action, ActorEntity, AsyncHandler, Invoker}, ws::client::ws_connect_to, async_rt::spawn_with_name};
-use tokio::{time::{MissedTickBehavior, Interval, Instant}, sync::mpsc};
+use rtun::{
+    actor_service::{
+        handle_first_none, handle_msg_none, start_actor, Action, ActorEntity, ActorHandle,
+        AsyncHandler, Invoker,
+    },
+    async_rt::spawn_with_name,
+    ice::{
+        ice_peer::{IceArgs, IceConfig, IcePeer},
+        ice_quic::{QuicConn, QuicIceCert, UpgradeToQuic},
+    },
+    proto::{
+        open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, P2PArgs, P2PQuicArgs, QuicSocksArgs,
+        QuicStats,
+    },
+    switch::{
+        invoker_ctrl::{CtrlHandler, CtrlInvoker},
+        session_stream::make_stream_session,
+    },
+    ws::client::ws_connect_to,
+};
+use tokio::{
+    sync::mpsc,
+    time::{Instant, Interval, MissedTickBehavior},
+};
 
 // use super::quic_session::{QuicSession, make_quic_session, SetCtrl, StreamPair, ReqCh};
 
@@ -20,8 +42,8 @@ pub type StreamPair = (SendStream, RecvStream);
 
 // impl<H: CtrlHandler> Clone for AgentPool<H> {
 //     fn clone(&self) -> Self {
-//         Self { 
-//             shared: self.shared.clone(), 
+//         Self {
+//             shared: self.shared.clone(),
 //             multi: self.multi.clone(),
 //             prefix: self.prefix.clone(),
 //         }
@@ -89,16 +111,10 @@ pub type StreamPair = (SendStream, RecvStream);
 //     }
 // }
 
-
-
-
-
-
 pub type QuicPoolInvoker = Invoker<Entity>;
 pub type QuicPool = ActorHandle<Entity>;
 
 pub fn make_pool(name: String, multi: MultiProgress) -> Result<QuicPool> {
-    
     let mut interval = tokio::time::interval(Duration::from_millis(2000));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -115,13 +131,13 @@ pub fn make_pool(name: String, multi: MultiProgress) -> Result<QuicPool> {
         event_tx,
         last_check_speed: Instant::now(),
     };
-    
+
     let actor = start_actor(
-        name, 
-        entity, 
-        handle_first_none, 
-        wait_next, 
-        handle_next, 
+        name,
+        entity,
+        handle_first_none,
+        wait_next,
+        handle_next,
         handle_msg_none,
     );
 
@@ -139,7 +155,7 @@ async fn wait_next(entity: &mut Entity) -> Next {
     }
 }
 
-async fn handle_next(entity: &mut Entity, _next: Next) -> Result<Action>  {
+async fn handle_next(entity: &mut Entity, _next: Next) -> Result<Action> {
     entity.handle_next()?;
     Ok(Action::None)
 }
@@ -175,7 +191,7 @@ const STYLE_SELECTED_CONN: &str = "{prefix:.bold.dim} {spinner} {wide_msg:.green
 
 #[async_trait::async_trait]
 impl AsyncHandler<AddAgent> for Entity {
-    type Response = Result<()>; 
+    type Response = Result<()>;
 
     async fn handle(&mut self, req: AddAgent) -> Self::Response {
         let name = req.name.clone();
@@ -186,9 +202,8 @@ impl AsyncHandler<AddAgent> for Entity {
         });
 
         let mut conns = Vec::new();
-        
-        for nn in 1..3 {
 
+        for nn in 1..3 {
             let bar = self.multi.add(ProgressBar::new(100));
             bar.set_prefix(format!("{name}-{nn}"));
             let bar = Bar::new(bar);
@@ -201,7 +216,14 @@ impl AsyncHandler<AddAgent> for Entity {
             // bar.set_prefix(format!("{name}-{nn}"));
 
             let check_speed = nn == 1;
-            let tx = kick_connecting(nn, agent.clone(), self.event_tx.clone(), bar, check_speed, "add agent");
+            let tx = kick_connecting(
+                nn,
+                agent.clone(),
+                self.event_tx.clone(),
+                bar,
+                check_speed,
+                "add agent",
+            );
             conns.push(ConnSlot {
                 id: nn,
                 state: ConnState::Connecting(tx),
@@ -211,11 +233,14 @@ impl AsyncHandler<AddAgent> for Entity {
             });
         }
 
-        self.agents.insert(name, AgentSlot {
-            shared: agent,
-            conns,
-            rrobin: 0,
-        });
+        self.agents.insert(
+            name,
+            AgentSlot {
+                shared: agent,
+                conns,
+                rrobin: 0,
+            },
+        );
 
         Ok(())
     }
@@ -226,13 +251,12 @@ pub struct GetCh;
 
 #[async_trait::async_trait]
 impl AsyncHandler<GetCh> for Entity {
-    type Response = Result<Option<StreamPair>>; 
+    type Response = Result<Option<StreamPair>>;
 
     async fn handle(&mut self, _req: GetCh) -> Self::Response {
         self.get_ch().await
     }
 }
-
 
 pub struct Entity {
     agents: IndexMap<String, AgentSlot>,
@@ -254,22 +278,25 @@ impl Entity {
 
         for (_name, agent) in self.agents.iter_mut() {
             for (index, conn) in agent.conns.iter_mut().enumerate() {
-                
                 match &mut conn.state {
                     ConnState::Working(work) => {
                         if work.conn.is_ping_timeout() {
                             conn.kick_connecting(false, "ping timeout");
-                            
-                            if self.selected == Some(ConnIndex { agent: agent.shared.clone(), index, }) {
+
+                            if self.selected
+                                == Some(ConnIndex {
+                                    agent: agent.shared.clone(),
+                                    index,
+                                })
+                            {
                                 unselected = true;
                             }
                         } else {
                             work.update_stats();
                         }
-                    },
-                    ConnState::Connecting(_tx) => { },
+                    }
+                    ConnState::Connecting(_tx) => {}
                 }
-
             }
         }
 
@@ -307,7 +334,6 @@ impl Entity {
     }
 
     fn unselect(&mut self) -> Result<()> {
-        
         let candidate = self.select_rwnd(false)?;
 
         self.select_next(candidate)
@@ -319,13 +345,19 @@ impl Entity {
                 for (index, conn) in agent.conns.iter().enumerate() {
                     if let Some(info) = conn.get_info() {
                         if info.rwnd >= RWND_THRESHOLD {
-                            self.change_selected(Some(ConnIndex { agent: ci.agent.clone(), index, }))?;
-                            return Ok(())
+                            self.change_selected(Some(ConnIndex {
+                                agent: ci.agent.clone(),
+                                index,
+                            }))?;
+                            return Ok(());
                         }
 
                         if candidate.is_none() {
-                            self.change_selected(Some(ConnIndex { agent: ci.agent.clone(), index, }))?;
-                            return Ok(())
+                            self.change_selected(Some(ConnIndex {
+                                agent: ci.agent.clone(),
+                                index,
+                            }))?;
+                            return Ok(());
                         }
                     }
                 }
@@ -337,16 +369,22 @@ impl Entity {
 
     async fn handle_event(&mut self, event: Event) {
         match event {
-            Event::Connected { conn_id, conn, agent, bar, speed } => {
+            Event::Connected {
+                conn_id,
+                conn,
+                agent,
+                bar,
+                speed,
+            } => {
                 if let Some(agent_slot) = self.agents.get_mut(&agent.name) {
                     for (index, slot) in agent_slot.conns.iter_mut().enumerate() {
                         if slot.id == conn_id {
                             // tracing::debug!("do found conn [{}] [{}]", agent.name, conn_id);
                             let speed = speed.unwrap_or(0);
-                            slot.state = ConnState::Working(ConnWork { 
-                                conn, 
-                                bar: Some(bar), 
-                                info: ConnInfo { rwnd: 0, speed, },
+                            slot.state = ConnState::Working(ConnWork {
+                                conn,
+                                bar: Some(bar),
+                                info: ConnInfo { rwnd: 0, speed },
                                 update_time: Instant::now(),
                             });
 
@@ -357,8 +395,8 @@ impl Entity {
                     }
                 }
                 tracing::debug!("NOT found conn [{}] [{}]", agent.name, conn_id);
-            },
-        } 
+            }
+        }
     }
 
     fn check_conn(&mut self) -> Result<()> {
@@ -367,11 +405,11 @@ impl Entity {
             // tracing::debug!("matching rwnd conn [{ci}]");
 
             if self.selected.as_ref() == Some(&ci) {
-                return Ok(())
+                return Ok(());
             }
 
             self.change_selected(Some(ci))?;
-            return Ok(())
+            return Ok(());
         }
 
         self.try_check_speed()?;
@@ -380,12 +418,11 @@ impl Entity {
     }
 
     fn try_check_speed(&mut self) -> Result<()> {
-
         const TIMEOUT_MILLI: u64 = 60_000;
-        const INTERVAL_MILLI: u64 = TIMEOUT_MILLI/2;
+        const INTERVAL_MILLI: u64 = TIMEOUT_MILLI / 2;
 
         if self.last_check_speed.elapsed() < Duration::from_millis(INTERVAL_MILLI) {
-            return Ok(())
+            return Ok(());
         }
 
         // if let Some(ci) = &mut self.selected {
@@ -425,7 +462,7 @@ impl Entity {
         //     }
         // }
 
-        for _ in 0..self.agents.len()*2 {
+        for _ in 0..self.agents.len() * 2 {
             if let Some((conn, ci)) = random_conn_mut(&mut self.agents) {
                 if self.selected.as_ref() != Some(&ci) {
                     match &conn.state {
@@ -433,10 +470,10 @@ impl Entity {
                             if work.update_time.elapsed() >= Duration::from_millis(TIMEOUT_MILLI) {
                                 // tracing::debug!("kick check speed [{ci}]");
                                 conn.kick_connecting(true, "check_speed");
-                                return Ok(())
+                                return Ok(());
                             }
-                        },
-                        ConnState::Connecting(_) => {},
+                        }
+                        ConnState::Connecting(_) => {}
                     }
                 }
             }
@@ -446,7 +483,6 @@ impl Entity {
     }
 
     fn change_selected(&mut self, ci: Option<ConnIndex>) -> Result<()> {
-
         if let Some(old) = self.selected.take() {
             if let Some(agent) = self.agents.get_mut(&old.agent.name) {
                 agent.conns[old.index].update_style(STYLE_GENERAL)?;
@@ -462,17 +498,19 @@ impl Entity {
 
         Ok(())
     }
-    
+
     fn select_rwnd(&self, include_selected: bool) -> Result<Option<ConnIndex>> {
-        
         if let Some(ci) = self.selected.as_ref() {
             if let Some(agent) = self.agents.get(&ci.agent.name) {
                 if let Some(info) = agent.conns[ci.index].get_info() {
                     if info.rwnd >= RWND_THRESHOLD {
                         if include_selected {
-                            return Ok(Some(ConnIndex { agent: agent.shared.clone(), index: ci.index, }))
+                            return Ok(Some(ConnIndex {
+                                agent: agent.shared.clone(),
+                                index: ci.index,
+                            }));
                         } else {
-                            return Ok(None)
+                            return Ok(None);
                         }
                     }
                 }
@@ -480,7 +518,10 @@ impl Entity {
                 for (index, conn) in agent.conns.iter().enumerate() {
                     if let Some(info) = conn.get_info() {
                         if info.rwnd >= RWND_THRESHOLD {
-                            return Ok(Some(ConnIndex { agent: agent.shared.clone(), index, }))
+                            return Ok(Some(ConnIndex {
+                                agent: agent.shared.clone(),
+                                index,
+                            }));
                         }
                     }
                 }
@@ -494,15 +535,16 @@ impl Entity {
             for (index, conn) in agent.conns.iter().enumerate() {
                 if let Some(info) = conn.get_info() {
                     let is_max = match &mut max_rwnd {
-                        Some(max) => {
-                            info.rwnd > max.1
-                        },
+                        Some(max) => info.rwnd > max.1,
                         None => true,
                     };
 
                     if is_max {
                         max_rwnd = Some((
-                            ConnIndex{ agent: agent.shared.clone(), index, },
+                            ConnIndex {
+                                agent: agent.shared.clone(),
+                                index,
+                            },
                             info.rwnd,
                         ));
                     }
@@ -512,10 +554,10 @@ impl Entity {
 
         if let Some(max) = max_rwnd {
             if max.1 >= RWND_THRESHOLD {
-                return Ok(Some(max.0))
+                return Ok(Some(max.0));
             }
         }
-        
+
         // ConnIndex
         Ok(None)
     }
@@ -523,27 +565,25 @@ impl Entity {
     fn select_speed(&mut self, new_ci: ConnIndex, new_speed: u64) -> Result<()> {
         if let Some(ci) = self.selected.as_ref() {
             if let Some(agent) = self.agents.get_mut(&ci.agent.name) {
-
                 if let Some(info) = agent.conns[ci.index].get_info() {
                     if info.rwnd >= RWND_THRESHOLD {
-                        return Ok(())
+                        return Ok(());
                     }
 
                     if new_speed >= SPEED_THRESHOLD {
-                        return self.change_selected(Some(new_ci))
+                        return self.change_selected(Some(new_ci));
                     }
 
                     if info.speed == 0 && new_speed > 0 {
-                        return self.change_selected(Some(new_ci))
+                        return self.change_selected(Some(new_ci));
                     }
                 }
             }
 
             Ok(())
         } else {
-            return self.change_selected(Some(new_ci))
+            return self.change_selected(Some(new_ci));
         }
-
     }
 
     fn clean_selected(&mut self) -> Result<()> {
@@ -563,20 +603,22 @@ impl Entity {
     async fn get_ch(&mut self) -> Result<Option<StreamPair>> {
         let r = self.open_selected().await?;
         if let Some(pair) = r {
-            return Ok(Some(pair))
+            return Ok(Some(pair));
         }
-        
+
         self.clean_selected()?;
 
         for (_name, agent) in self.agents.iter_mut() {
             let r = agent.open_priority().await;
             if let Some((pair, index)) = r {
-
-                let ci = ConnIndex { agent: agent.shared.clone(), index, };
+                let ci = ConnIndex {
+                    agent: agent.shared.clone(),
+                    index,
+                };
                 self.change_selected(Some(ci))?;
 
                 // self.selected = Some(ConnIndex { agent: agent.shared.clone(), index, });
-                
+
                 // for (ci, conn) in agent.conns.iter_mut().enumerate() {
                 //     if ci == index {
                 //         conn.update_style(STYLE_SELECTED_CONN)?;
@@ -585,7 +627,7 @@ impl Entity {
                 //     }
                 // }
 
-                return Ok(Some(pair))
+                return Ok(Some(pair));
             }
         }
 
@@ -595,9 +637,8 @@ impl Entity {
     async fn open_selected(&mut self) -> Result<Option<StreamPair>> {
         while let Some(ci) = &self.selected {
             if let Some(agent) = self.agents.get_mut(&ci.agent.name) {
-
                 if let Some(pair) = agent.conns[ci.index].open_ch().await {
-                    return Ok(Some(pair))
+                    return Ok(Some(pair));
                 }
 
                 self.select_next(None)?;
@@ -617,15 +658,20 @@ impl Entity {
         }
 
         Ok(None)
-
     }
 }
 
 const RWND_THRESHOLD: u64 = 300_000;
 const SPEED_THRESHOLD: u64 = 300_000;
 
-
-fn kick_connecting(conn_id: u64, agent: Arc<AgentShared>, event_tx: mpsc::Sender<Event>, bar: Bar, ck_speed: bool, origin: &str) -> mpsc::Sender<()> {
+fn kick_connecting(
+    conn_id: u64,
+    agent: Arc<AgentShared>,
+    event_tx: mpsc::Sender<Event>,
+    bar: Bar,
+    ck_speed: bool,
+    origin: &str,
+) -> mpsc::Sender<()> {
     tracing::info!("kick connecting [{}-{}] [{origin}]", agent.name, conn_id,);
 
     let (guard_tx, guard_rx) = mpsc::channel(1);
@@ -635,8 +681,14 @@ fn kick_connecting(conn_id: u64, agent: Arc<AgentShared>, event_tx: mpsc::Sender
     guard_tx
 }
 
-async fn connecting_task(conn_id: u64, agent: Arc<AgentShared>, tx: mpsc::Sender<Event>, mut bar: Bar, mut guard_rx: mpsc::Receiver<()>, ck_speed: bool) {
-    
+async fn connecting_task(
+    conn_id: u64,
+    agent: Arc<AgentShared>,
+    tx: mpsc::Sender<Event>,
+    mut bar: Bar,
+    mut guard_rx: mpsc::Receiver<()>,
+    ck_speed: bool,
+) {
     let _r = bar.update_style(STYLE_GENERAL);
 
     loop {
@@ -653,48 +705,58 @@ async fn connecting_task(conn_id: u64, agent: Arc<AgentShared>, tx: mpsc::Sender
 
         match r {
             Ok((conn, speed)) => {
-                let _r = tx.send(Event::Connected { 
-                    conn_id,
-                    conn,
-                    agent, 
-                    bar, 
-                    speed,
-                }).await;
+                let _r = tx
+                    .send(Event::Connected {
+                        conn_id,
+                        conn,
+                        agent,
+                        bar,
+                        speed,
+                    })
+                    .await;
                 return;
-            },
+            }
             Err(e) => {
                 tracing::debug!("connect failed [{e:?}]");
                 bar.update_msg("connect failed, will try next");
-            },
+            }
         }
         tokio::time::sleep(Duration::from_millis(5000)).await;
     }
 }
 
-async fn try_connet(bar: &mut Bar, url_str: &str, ck_speed: bool, quic_insecure: bool) -> Result<(QuicConn, Option<u64>)> {
+async fn try_connet(
+    bar: &mut Bar,
+    url_str: &str,
+    ck_speed: bool,
+    quic_insecure: bool,
+) -> Result<(QuicConn, Option<u64>)> {
     tracing::debug!("connecting to [{url_str}]");
 
     let conn = tokio::time::timeout(Duration::from_secs(10), async {
         let url = url::Url::parse(url_str).with_context(|| format!("invalid url [{}]", url_str))?;
 
         if url.scheme().eq_ignore_ascii_case("quic") {
-            let stream = crate::quic_signal::connect_sub_with_opts(&url, quic_insecure).await
-            .with_context(|| "connect to agent failed")?;
+            let stream = crate::quic_signal::connect_sub_with_opts(&url, quic_insecure)
+                .await
+                .with_context(|| "connect to agent failed")?;
             let session = make_stream_session(stream.split(), false).await?;
             let ctrl = session.ctrl_client().clone_invoker();
             punch(ctrl).await
         } else {
-            let (stream, _r) = ws_connect_to(url_str).await
-            .with_context(|| "connect to agent failed")?;
+            let (stream, _r) = ws_connect_to(url_str)
+                .await
+                .with_context(|| "connect to agent failed")?;
             let session = make_stream_session(stream.split(), false).await?;
             let ctrl = session.ctrl_client().clone_invoker();
             punch(ctrl).await
         }
         // let conn = punch(ctrl).await?;
         // Result::<()>::Ok(())
-    }).await.with_context(||"connect timeout")??;
+    })
+    .await
+    .with_context(|| "connect timeout")??;
 
-    
     tracing::debug!("successfully connected");
     bar.update_msg("connected");
 
@@ -714,8 +776,11 @@ async fn try_connet(bar: &mut Bar, url_str: &str, ck_speed: bool, quic_insecure:
     }
 }
 
-async fn echo_throughput(bar: &mut Bar, mut writer: SendStream, mut reader: RecvStream) -> Result<u64> {
-    
+async fn echo_throughput(
+    bar: &mut Bar,
+    mut writer: SendStream,
+    mut reader: RecvStream,
+) -> Result<u64> {
     let start_time = Instant::now();
 
     writer.write_all(&[0x09, 0x00, 0x00]).await?;
@@ -728,8 +793,8 @@ async fn echo_throughput(bar: &mut Bar, mut writer: SendStream, mut reader: Recv
     let mut recv_bytes = 0;
 
     while recv_bytes < total_bytes {
-        let sbytes = ((total_bytes - sent_bytes)as usize).min(send_buf.len());
-        
+        let sbytes = ((total_bytes - sent_bytes) as usize).min(send_buf.len());
+
         tokio::select! {
             r = writer.write(&send_buf[..sbytes]), if sbytes > 0 => {
                 let n = r?;
@@ -757,7 +822,11 @@ async fn echo_throughput(bar: &mut Bar, mut writer: SendStream, mut reader: Recv
         total_bytes
     };
 
-    let msg = format!("throughput [{}/s], total [{}/{elapsed:?}]", indicatif::HumanBytes(speed), indicatif::HumanBytes(total_bytes));
+    let msg = format!(
+        "throughput [{}/s], total [{}/{elapsed:?}]",
+        indicatif::HumanBytes(speed),
+        indicatif::HumanBytes(total_bytes)
+    );
     tracing::debug!("{msg}");
     bar.update_msg(msg);
 
@@ -769,11 +838,9 @@ async fn punch<H: CtrlHandler>(ctrl: CtrlInvoker<H>) -> Result<QuicConn> {
         "stun:stun.miwifi.com:3478".into(),
         "stun:stun.chat.bilibili.com:3478".into(),
         "stun:stun.cloudflare.com:3478".into(),
-
         "stun:stun1.l.google.com:19302".into(),
         "stun:stun2.l.google.com:19302".into(),
         "stun:stun.qq.com:3478".into(),
-
         // "124.222.49.56:3478".into(), // stun.qq.com:3478 dns
     ];
 
@@ -788,46 +855,59 @@ async fn punch<H: CtrlHandler>(ctrl: CtrlInvoker<H>) -> Result<QuicConn> {
 
     let local_cert = QuicIceCert::try_new()?;
     let cert_der = local_cert.to_bytes()?.into();
-    
-    let rsp = ctrl.open_p2p(P2PArgs {
-        p2p_args: Some(P2p_args::QuicSocks(QuicSocksArgs {
-            base: Some(P2PQuicArgs {
-                ice: Some(local_args.into()).into(),
-                cert_der,
-                ..Default::default()
-            }).into(),
-            ..Default::default()
-        })),
-        ..Default::default()
-    }).await?;
 
-    let rsp = rsp.open_p2p_rsp.with_context(||"no open_p2p_rsp")?;
+    let rsp = ctrl
+        .open_p2p(P2PArgs {
+            p2p_args: Some(P2p_args::QuicSocks(QuicSocksArgs {
+                base: Some(P2PQuicArgs {
+                    ice: Some(local_args.into()).into(),
+                    cert_der,
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+        .await?;
+
+    let rsp = rsp.open_p2p_rsp.with_context(|| "no open_p2p_rsp")?;
     match rsp {
         Open_p2p_rsp::Args(mut remote_args) => {
             if !remote_args.has_quic_socks() {
                 bail!("no quic socks")
             }
 
-            let mut args = remote_args.take_quic_socks()
-            .base.0.with_context(||"no base in quic socks")?;
-            let remote_args: IceArgs = args.ice.take().with_context(||"no ice in quic args")?.into();
-            
+            let mut args = remote_args
+                .take_quic_socks()
+                .base
+                .0
+                .with_context(|| "no base in quic socks")?;
+            let remote_args: IceArgs = args
+                .ice
+                .take()
+                .with_context(|| "no ice in quic args")?
+                .into();
+
             // let local_cert = QuicIceCert::try_new()?;
             let server_cert_der = args.cert_der;
 
             tracing::debug!("remote args {remote_args:?}");
-            let conn = peer.dial(remote_args).await?
-            .upgrade_to_quic(&local_cert, server_cert_der).await?;
-            
-            return Ok(conn)
-        },
+            let conn = peer
+                .dial(remote_args)
+                .await?
+                .upgrade_to_quic(&local_cert, server_cert_der)
+                .await?;
+
+            return Ok(conn);
+        }
         Open_p2p_rsp::Status(s) => {
             bail!("open p2p but {s:?}");
-        },
+        }
         _ => {
             bail!("unknown Open_p2p_rsp {rsp:?}");
         }
-    }  
+    }
 }
 
 struct AgentSlot {
@@ -837,7 +917,6 @@ struct AgentSlot {
 }
 
 impl AgentSlot {
-
     async fn open_priority(&mut self) -> Option<(StreamPair, usize)> {
         // for index in 0..self.conns.len() {
         //     let conn_slot = &mut self.conns[index];
@@ -879,12 +958,11 @@ struct AgentShared {
     quic_insecure: bool,
 }
 
-
 fn random_conn_mut(agents: &mut IndexMap<String, AgentSlot>) -> Option<(&mut ConnSlot, ConnIndex)> {
     use rand::Rng;
 
     if agents.len() == 0 {
-        return None
+        return None;
     }
 
     let agent_index = rand::thread_rng().gen_range(0..agents.len());
@@ -892,10 +970,12 @@ fn random_conn_mut(agents: &mut IndexMap<String, AgentSlot>) -> Option<(&mut Con
     let index = rand::thread_rng().gen_range(0..agent.conns.len());
     Some((
         &mut agent.conns[index],
-        ConnIndex { agent: agent.shared.clone(), index }
+        ConnIndex {
+            agent: agent.shared.clone(),
+            index,
+        },
     ))
 }
-
 
 struct ConnSlot {
     id: u64,
@@ -909,9 +989,16 @@ impl ConnSlot {
     fn kick_connecting(&mut self, ck_speed: bool, origin: &str) {
         let conn = self;
 
-        if let ConnState::Working(work) = &mut conn.state {    
+        if let ConnState::Working(work) = &mut conn.state {
             if let Some(bar) = work.bar.take() {
-                let tx = kick_connecting(conn.id, conn.agent.clone(), conn.event_tx.clone(), bar, ck_speed, origin);
+                let tx = kick_connecting(
+                    conn.id,
+                    conn.agent.clone(),
+                    conn.event_tx.clone(),
+                    bar,
+                    ck_speed,
+                    origin,
+                );
                 conn.state = ConnState::Connecting(tx);
             }
         }
@@ -921,9 +1008,7 @@ impl ConnSlot {
         if let ConnState::Working(work) = &mut self.state {
             let r = work.conn.open_bi().await;
             match r {
-                Ok(pair) => {
-                    return Some(pair)
-                },
+                Ok(pair) => return Some(pair),
                 Err(_e) => {
                     // tracing::info!("kick connecting for open ch failed [{e:?}]");
                     self.kick_connecting(false, "open_bi failed");
@@ -931,7 +1016,7 @@ impl ConnSlot {
                     //     let tx = kick_connecting(self.id, self.agent.clone(), self.event_tx.clone(), bar, true, "open_bi failed");
                     //     self.state = ConnState::Connecting(tx);
                     // }
-                },
+                }
             }
         }
         None
@@ -981,7 +1066,7 @@ enum Event {
         agent: Arc<AgentShared>,
         bar: Bar,
         speed: Option<u64>,
-    }
+    },
 }
 
 struct Bar {
@@ -991,7 +1076,10 @@ struct Bar {
 
 impl Bar {
     pub fn new(bar: ProgressBar) -> Self {
-        Self { bar, msg: "".into(), }
+        Self {
+            bar,
+            msg: "".into(),
+        }
     }
 
     pub fn update_msg<S: Into<String>>(&mut self, msg: S) {
@@ -1001,9 +1089,8 @@ impl Bar {
 
     pub fn update_style(&self, template: &str) -> Result<()> {
         // tracing::debug!("update style {template}");
-    
-        let style = ProgressStyle::with_template(template)?
-        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
+
+        let style = ProgressStyle::with_template(template)?.tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
 
         self.bar.set_style(style);
 
@@ -1021,14 +1108,13 @@ impl Bar {
     //     }
     // }
 
-    fn update_stats(&mut self, local: &ConnectionStats, remote: &QuicStats, ) {
-
+    fn update_stats(&mut self, local: &ConnectionStats, remote: &QuicStats) {
         let remote_rtt = remote.path().rtt();
         let remote_cwnd = remote.path().cwnd();
-    
+
         let path = &local.path;
         self.update_msg(format!(
-            "rtt {}|{}, cwnd {}|{}, bytes {}|{}", 
+            "rtt {}|{}, cwnd {}|{}, bytes {}|{}",
             path.rtt.as_millis(),
             remote_rtt,
             indicatif::HumanBytes(path.cwnd),
@@ -1037,9 +1123,9 @@ impl Bar {
             indicatif::HumanBytes(local.udp_rx.bytes),
         ));
         // tracing::debug!("updated stats");
-    
+
         // bar.set_message(format!(
-        //     "rtt {}/{remote_rtt}, cwnd {}/{remote_cwnd}, ev {}, lost {}/{}, sent {}, pl {}/{}, black {}", 
+        //     "rtt {}/{remote_rtt}, cwnd {}/{remote_cwnd}, ev {}, lost {}/{}, sent {}, pl {}/{}, black {}",
         //     path.rtt.as_millis(),
         //     path.cwnd,
         //     path.congestion_events,
@@ -1051,7 +1137,6 @@ impl Bar {
         //     path.black_holes_detected,
         // ));
     }
-    
 }
 
 struct ConnIndex {
@@ -1068,19 +1153,17 @@ impl PartialEq for ConnIndex {
 impl fmt::Debug for ConnIndex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnIndex")
-        .field("agent", &self.agent.name)
-        .field("index", &self.index)
-        .finish()
+            .field("agent", &self.agent.name)
+            .field("index", &self.index)
+            .finish()
     }
 }
 
 impl fmt::Display for ConnIndex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}-{}", self.agent.name, self.index+1)
+        write!(f, "{}-{}", self.agent.name, self.index + 1)
     }
 }
-
-
 
 struct ConnWork {
     conn: QuicConn,
@@ -1115,7 +1198,6 @@ impl ConnWork {
         // if let Some(bar) = self.bar.as_mut() {
         //     bar.try_update_stats(&mut self.conn);
         // }
-
     }
 }
 
@@ -1126,14 +1208,13 @@ impl ConnWork {
 //     Ok(())
 // }
 
-
 // fn update_bar_stats(bar: &ProgressBar, local: &ConnectionStats, remote: &QuicStats, ) {
 //     let remote_rtt = remote.path().rtt();
 //     let remote_cwnd = remote.path().cwnd();
 
 //     let path = &local.path;
 //     bar.set_message(format!(
-//         "rtt {}/{}, cwnd {}/{}, tx {}, rx {}", 
+//         "rtt {}/{}, cwnd {}/{}, tx {}, rx {}",
 //         path.rtt.as_millis(),
 //         remote_rtt,
 //         indicatif::HumanBytes(path.cwnd),
@@ -1144,7 +1225,7 @@ impl ConnWork {
 //     // tracing::debug!("updated stats");
 
 //     // bar.set_message(format!(
-//     //     "rtt {}/{remote_rtt}, cwnd {}/{remote_cwnd}, ev {}, lost {}/{}, sent {}, pl {}/{}, black {}", 
+//     //     "rtt {}/{remote_rtt}, cwnd {}/{remote_cwnd}, ev {}, lost {}/{}, sent {}, pl {}/{}, black {}",
 //     //     path.rtt.as_millis(),
 //     //     path.cwnd,
 //     //     path.congestion_events,
@@ -1197,8 +1278,6 @@ impl ConnWork {
 //     ch_que: VecDeque<(SendStream, RecvStream)>,
 //     stats: ConnStats,
 // }
-
-
 
 // struct ConnItem {
 //     shared: Arc<ConnShared>,

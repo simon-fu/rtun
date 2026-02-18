@@ -1,8 +1,9 @@
-
-
-
+use crate::{
+    actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker},
+    channel::{ChId, ChSender},
+    proto::{KickDownArgs, OpenP2PResponse, OpenShellArgs, OpenSocksArgs, P2PArgs},
+};
 use anyhow::Result;
-use crate::{channel::{ChId, ChSender}, actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker}, proto::{OpenShellArgs, OpenSocksArgs, KickDownArgs, OpenP2PResponse, P2PArgs}};
 
 use super::entity_watch::{OpWatch, WatchResult};
 
@@ -18,25 +19,24 @@ pub trait CtrlHandler: ActorEntity
 
 }
 
-
 pub struct CtrlInvoker<H: CtrlHandler> {
     invoker: Invoker<H>,
 }
 
 impl<H: CtrlHandler> Clone for CtrlInvoker<H> {
     fn clone(&self) -> Self {
-        Self { invoker: self.invoker.clone() }
+        Self {
+            invoker: self.invoker.clone(),
+        }
     }
 }
 
-impl<H> CtrlInvoker<H> 
+impl<H> CtrlInvoker<H>
 where
     H: CtrlHandler,
 {
     pub fn new(invoker: Invoker<H>) -> Self {
-        Self {
-            invoker,
-        }
+        Self { invoker }
     }
 
     pub fn downgrade(&self) -> CtrlWeak<H> {
@@ -88,18 +88,17 @@ pub struct CtrlWeak<H: CtrlHandler> {
 
 impl<H: CtrlHandler> Clone for CtrlWeak<H> {
     fn clone(&self) -> Self {
-        Self { weak: self.weak.clone() }
+        Self {
+            weak: self.weak.clone(),
+        }
     }
 }
 
-impl <H: CtrlHandler> CtrlWeak<H> {
+impl<H: CtrlHandler> CtrlWeak<H> {
     pub fn upgrade(&self) -> Option<CtrlInvoker<H>> {
-        self.weak.upgrade().map(|invoker| CtrlInvoker {
-            invoker,
-        })
+        self.weak.upgrade().map(|invoker| CtrlInvoker { invoker })
     }
 }
-
 
 // #[derive(Debug)]
 // pub struct OpOpenChannel(pub ChSender);
@@ -121,12 +120,10 @@ pub struct OpOpenSocks(pub ChSender, pub OpenSocksArgs);
 
 pub type OpOpenSocksResult = Result<ChSender>;
 
-
 #[derive(Debug)]
 pub struct OpKickDown(pub KickDownArgs);
 
 pub type OpKickDownResult = Result<()>;
-
 
 #[derive(Debug)]
 pub struct OpOpenP2P(pub P2PArgs);

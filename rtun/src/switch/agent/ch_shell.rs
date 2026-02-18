@@ -1,50 +1,61 @@
-use std::{ops::Deref, collections::HashMap};
+use std::{collections::HashMap, ops::Deref};
 
-use anyhow::{Result, anyhow, Context};
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use protobuf::Message;
 
-use crate::{proto::{OpenShellArgs, PtyOutputPacket, pty_output_packet::Pty_output_args, PtyInputPacket, pty_input_packet::Pty_input_args, ShutdownArgs}, channel::{ChSender, ChReceiver}, async_pty_process::{Sender as PtySender, Receiver as PtyRecver, make_async_pty_process}, term::get_shell_program};
-
+use crate::{
+    async_pty_process::{make_async_pty_process, Receiver as PtyRecver, Sender as PtySender},
+    channel::{ChReceiver, ChSender},
+    proto::{
+        pty_input_packet::Pty_input_args, pty_output_packet::Pty_output_args, OpenShellArgs,
+        PtyInputPacket, PtyOutputPacket, ShutdownArgs,
+    },
+    term::get_shell_program,
+};
 
 pub async fn open_shell(args: OpenShellArgs) -> Result<ChShell> {
     let program = get_shell_program();
-    
+
     let (pty_sender, pty_recver) = match args.program_args.0 {
         Some(v) => {
             // v.env_vars.iter()
             // .map(|x|(x.0.deref(), x.1.deref()));
             make_async_pty_process(
-                &program, &["-i"], 
-                v.rows as u16, 
+                &program,
+                &["-i"],
+                v.rows as u16,
                 v.cols as u16,
-                v.env_vars.iter().map(|x|(x.0.deref(), x.1.deref())),
-            ).await?
-        },
+                v.env_vars.iter().map(|x| (x.0.deref(), x.1.deref())),
+            )
+            .await?
+        }
         None => {
             make_async_pty_process(
-                &program, &["-i"], 
-                args.rows as u16, 
+                &program,
+                &["-i"],
+                args.rows as u16,
                 args.cols as u16,
                 HashMap::<String, String>::new().iter(),
-            ).await?
-        },
+            )
+            .await?
+        }
     };
-                
+
     // let (pty_sender, pty_recver) = make_async_pty_process(
-    //     &program, &["-i"], 
-    //     args.rows as u16, 
+    //     &program, &["-i"],
+    //     args.rows as u16,
     //     args.cols as u16,
     // ).await?;
 
     // let uid = gen_huid();
     // tracing::debug!("open shell [{}]", uid);
-    
+
     Ok(ChShell {
         // uid,
         pty_sender,
         pty_recver,
-    } )
+    })
 }
 
 pub struct ChShell {
@@ -54,8 +65,8 @@ pub struct ChShell {
 }
 
 impl ChShell {
-    pub async fn run(self, tx: ChSender, rx: ChReceiver ) -> Result<()> {
-        copy_pty_channel(self,  tx, rx).await
+    pub async fn run(self, tx: ChSender, rx: ChReceiver) -> Result<()> {
+        copy_pty_channel(self, tx, rx).await
     }
 
     // pub fn spawn<H: CtrlHandler>(self, name: Option<String>, tx: ChSender, rx: ChReceiver, weak: Option<CtrlWeak<H>>, local_ch_id: ChId)  {
@@ -111,23 +122,28 @@ async fn copy_pty_channel(
     Ok(())
 }
 
-async fn process_pty_input_packet(pty_sender: &PtySender, data: Bytes) -> Result<Option<ShutdownArgs>> {
-
+async fn process_pty_input_packet(
+    pty_sender: &PtySender,
+    data: Bytes,
+) -> Result<Option<ShutdownArgs>> {
     let args = PtyInputPacket::parse_from_tokio_bytes(&data)?
-    .pty_input_args.with_context(||"empty pty_input_args")?;
+        .pty_input_args
+        .with_context(|| "empty pty_input_args")?;
 
     match args {
         Pty_input_args::StdinData(data) => {
             // use rtun::hex::BinStrLine;
             // tracing::debug!("stdin data {}", data.dump_bin());
             pty_sender.send_data(data).await?;
-        },
+        }
         Pty_input_args::Resize(args) => {
-            pty_sender.send_resize(args.cols as u16, args.rows as u16).await?;
-        },
+            pty_sender
+                .send_resize(args.cols as u16, args.rows as u16)
+                .await?;
+        }
         Pty_input_args::Shutdown(args) => {
             tracing::debug!("recv shutdown {}", args);
-            return Ok(Some(args))
+            return Ok(Some(args));
         }
     }
 
@@ -145,13 +161,12 @@ fn se_pty_stdout_packet(data: Bytes) -> Result<Bytes> {
 
 fn se_shutdown_packet() -> Result<Bytes> {
     Ok(PtyOutputPacket {
-        pty_output_args: Some(Pty_output_args::Shutdown(ShutdownArgs{ 
+        pty_output_args: Some(Pty_output_args::Shutdown(ShutdownArgs {
             code: 0,
-            ..Default::default() 
+            ..Default::default()
         })),
         ..Default::default()
     }
     .write_to_bytes()?
     .into())
 }
-

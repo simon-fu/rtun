@@ -1,4 +1,3 @@
-
 pub mod footer;
 
 pub mod history;

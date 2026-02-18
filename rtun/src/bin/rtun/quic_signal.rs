@@ -7,11 +7,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use futures::{
-    channel::mpsc as fmpsc,
-    stream::StreamExt,
-    Sink, SinkExt, Stream,
-};
+use futures::{channel::mpsc as fmpsc, stream::StreamExt, Sink, SinkExt, Stream};
 use protobuf::Message as PbMessage;
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use rtun::{
@@ -134,10 +130,16 @@ pub async fn connect_pub(url: &url::Url) -> Result<(String, QuicSignalStream)> {
     connect_pub_with_opts(url, false).await
 }
 
-pub async fn connect_pub_with_opts(url: &url::Url, insecure: bool) -> Result<(String, QuicSignalStream)> {
+pub async fn connect_pub_with_opts(
+    url: &url::Url,
+    insecure: bool,
+) -> Result<(String, QuicSignalStream)> {
     let params = parse_pub_params(url)?;
     let (endpoint, conn) = connect(url, insecure).await?;
-    let (mut tx, mut rx) = conn.open_bi().await.with_context(|| "open bi stream failed")?;
+    let (mut tx, mut rx) = conn
+        .open_bi()
+        .await
+        .with_context(|| "open bi stream failed")?;
 
     write_json(&mut tx, &SignalRequest::Pub(params.clone())).await?;
 
@@ -164,7 +166,10 @@ pub async fn connect_sub(url: &url::Url) -> Result<QuicSignalStream> {
 pub async fn connect_sub_with_opts(url: &url::Url, insecure: bool) -> Result<QuicSignalStream> {
     let params = parse_sub_params(url)?;
     let (endpoint, conn) = connect(url, insecure).await?;
-    let (mut tx, mut rx) = conn.open_bi().await.with_context(|| "open bi stream failed")?;
+    let (mut tx, mut rx) = conn
+        .open_bi()
+        .await
+        .with_context(|| "open bi stream failed")?;
 
     write_json(&mut tx, &SignalRequest::Sub(params)).await?;
 
@@ -186,7 +191,10 @@ pub async fn query_sessions(url: &url::Url) -> Result<Vec<AgentInfo>> {
 
 pub async fn query_sessions_with_opts(url: &url::Url, insecure: bool) -> Result<Vec<AgentInfo>> {
     let (_endpoint, conn) = connect(url, insecure).await?;
-    let (mut tx, mut rx) = conn.open_bi().await.with_context(|| "open bi stream failed")?;
+    let (mut tx, mut rx) = conn
+        .open_bi()
+        .await
+        .with_context(|| "open bi stream failed")?;
 
     write_json(&mut tx, &SignalRequest::Sessions).await?;
 
@@ -214,8 +222,8 @@ async fn connect(url: &url::Url, insecure: bool) -> Result<(Endpoint, Connection
         IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
 
-    let mut endpoint =
-        Endpoint::client(bind_addr).with_context(|| format!("bind client udp [{}] failed", bind_addr))?;
+    let mut endpoint = Endpoint::client(bind_addr)
+        .with_context(|| format!("bind client udp [{}] failed", bind_addr))?;
     endpoint.set_default_client_config(configure_client(insecure));
 
     let conn = endpoint
@@ -277,7 +285,9 @@ async fn resolve_remote(url: &url::Url) -> Result<(SocketAddr, String)> {
     let mut addrs = tokio::net::lookup_host((host, port))
         .await
         .with_context(|| format!("resolve [{host}:{port}] failed"))?;
-    let remote = addrs.next().with_context(|| "resolved empty address list")?;
+    let remote = addrs
+        .next()
+        .with_context(|| "resolved empty address list")?;
     Ok((remote, host.to_string()))
 }
 
@@ -476,7 +486,10 @@ pub struct QuicSink {
 impl Sink<ChPacket> for QuicSink {
     type Error = SinkError;
 
-    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
         self.tx.poll_ready_unpin(cx).map_err(|e| e.into())
     }
 
@@ -484,11 +497,17 @@ impl Sink<ChPacket> for QuicSink {
         self.tx.start_send_unpin(item).map_err(|e| e.into())
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
         self.tx.poll_flush_unpin(cx).map_err(|e| e.into())
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
         self.tx.poll_close_unpin(cx).map_err(|e| e.into())
     }
 }
@@ -501,10 +520,8 @@ mod tests {
 
     #[test]
     fn parse_sub_params_with_instance_id() {
-        let url = url::Url::parse(
-            "quic://127.0.0.1:8888?agent=rtun&instance_id=i-123&token=t-abc",
-        )
-        .unwrap();
+        let url = url::Url::parse("quic://127.0.0.1:8888?agent=rtun&instance_id=i-123&token=t-abc")
+            .unwrap();
 
         let params = parse_sub_params(&url).unwrap();
         assert_eq!(params.agent.as_deref(), Some("rtun"));

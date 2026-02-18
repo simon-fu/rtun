@@ -1,34 +1,45 @@
-
-
-
-use std::{task::Poll, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::Poll,
+};
 
 use futures::Future;
 
-use anyhow::{Result, anyhow, Context as AnyhowContext};
-use tokio::{ task::JoinHandle, sync::{mpsc::{self, error::{TrySendError, TryRecvError}}, oneshot}};
+use anyhow::{anyhow, Context as AnyhowContext, Result};
+use tokio::{
+    sync::{
+        mpsc::{
+            self,
+            error::{TryRecvError, TrySendError},
+        },
+        oneshot,
+    },
+    task::JoinHandle,
+};
 
 use crate::async_rt::spawn_with_name;
 
 use tracing::debug;
 
 macro_rules! dbgd {
-    ($($arg:tt)* ) => (
+    ($($arg:tt)* ) => {
         // tracing::debug!($($arg)*)
-    );
+    };
 }
-
 
 pub fn start_actor<E, F0, F1, F2, F3>(
     name: String,
-    entity: E, 
-    handle_first: F0,   // async fn handle_first(&mut E) -> ActionRes
-    wait_next: F1,      // async fn wait_next(&mut E) -> E::Next
-    handle_next: F2,    // async fn handle_next(&mut E, E::Next) -> ActionRes
-    handle_msg: F3,     // async fn handle_msg(&mut E, E::Msg) -> ActionRes
+    entity: E,
+    handle_first: F0, // async fn handle_first(&mut E) -> ActionRes
+    wait_next: F1,    // async fn wait_next(&mut E) -> E::Next
+    handle_next: F2,  // async fn handle_next(&mut E, E::Next) -> ActionRes
+    handle_msg: F3,   // async fn handle_msg(&mut E, E::Msg) -> ActionRes
 ) -> ActorHandle<E>
 where
-    E: ActorEntity ,
+    E: ActorEntity,
 
     for<'a> F0: XFn1<'a, &'a mut E, ActionRes> + Send + Sync + 'static + Copy,
     for<'a> <F0 as XFn1<'a, &'a mut E, ActionRes>>::Output: 'a,
@@ -41,13 +52,19 @@ where
 
     for<'a> F3: XFn2<'a, &'a mut E, E::Msg, ActionRes> + Send + Sync + 'static + Copy,
     for<'a> <F3 as XFn2<'a, &'a mut E, E::Msg, ActionRes>>::Output: 'a,
-
     // O1: Send + 'static,
     // M: Send + 'static,
     // Req: Send + 'static,
     // Rsp: Send + 'static,
 {
-    ActorBuilder::new().build(name, entity, handle_first, wait_next, handle_next, handle_msg)
+    ActorBuilder::new().build(
+        name,
+        entity,
+        handle_first,
+        wait_next,
+        handle_next,
+        handle_msg,
+    )
 }
 
 pub struct ActorBuilder<E: ActorEntity> {
@@ -58,41 +75,44 @@ pub struct ActorBuilder<E: ActorEntity> {
 impl<E: ActorEntity> ActorBuilder<E> {
     pub fn new() -> Self {
         let (op_tx, op_rx) = mpsc::channel(128);
-        Self { op_tx, op_rx, }
+        Self { op_tx, op_rx }
     }
 
     pub fn weak_invoker(&self) -> WeakInvoker<E> {
-        WeakInvoker { op_tx: self.op_tx.downgrade() }
+        WeakInvoker {
+            op_tx: self.op_tx.downgrade(),
+        }
     }
 
     pub fn build_invoker(&self) -> Invoker<E> {
-        Invoker { op_tx: self.op_tx.clone() }
+        Invoker {
+            op_tx: self.op_tx.clone(),
+        }
     }
 
     pub fn build<F0, F1, F2, F3>(
         self,
         name: String,
-        entity: E, 
-        handle_first: F0,   // async fn handle_first(&mut E) -> ActionRes
-        wait_next: F1,      // async fn wait_next(&mut E) -> E::Next
-        handle_next: F2,    // async fn handle_next(&mut E, E::Next) -> ActionRes
-        handle_msg: F3,     // async fn handle_msg(&mut E, E::Msg) -> ActionRes
+        entity: E,
+        handle_first: F0, // async fn handle_first(&mut E) -> ActionRes
+        wait_next: F1,    // async fn wait_next(&mut E) -> E::Next
+        handle_next: F2,  // async fn handle_next(&mut E, E::Next) -> ActionRes
+        handle_msg: F3,   // async fn handle_msg(&mut E, E::Msg) -> ActionRes
     ) -> ActorHandle<E>
     where
-        E: ActorEntity ,
-    
+        E: ActorEntity,
+
         for<'a> F0: XFn1<'a, &'a mut E, ActionRes> + Send + Sync + 'static + Copy,
         for<'a> <F0 as XFn1<'a, &'a mut E, ActionRes>>::Output: 'a,
-    
+
         for<'a> F1: XFn1<'a, &'a mut E, E::Next> + Send + Sync + 'static + Copy,
         for<'a> <F1 as XFn1<'a, &'a mut E, E::Next>>::Output: 'a,
-    
+
         for<'a> F2: XFn2<'a, &'a mut E, E::Next, ActionRes> + Send + Sync + 'static + Copy,
         for<'a> <F2 as XFn2<'a, &'a mut E, E::Next, ActionRes>>::Output: 'a,
-    
+
         for<'a> F3: XFn2<'a, &'a mut E, E::Msg, ActionRes> + Send + Sync + 'static + Copy,
         for<'a> <F3 as XFn2<'a, &'a mut E, E::Msg, ActionRes>>::Output: 'a,
-    
         // O1: Send + 'static,
         // M: Send + 'static,
         // Req: Send + 'static,
@@ -114,7 +134,7 @@ impl<E: ActorEntity> ActorBuilder<E> {
                 handle_msg,
             },
         };
-        
+
         let task_handle = spawn_with_name(name, async move {
             let r = run_actor(&mut task).await;
             if let Err(e) = &r {
@@ -122,10 +142,10 @@ impl<E: ActorEntity> ActorBuilder<E> {
             }
             task.actor.entity.into_result(r)
         });
-        
+
         ActorHandle {
-            invoker: Invoker { op_tx},
-            wait4completed: Some(Wait4Completed{ task_handle }),
+            invoker: Invoker { op_tx },
+            wait4completed: Some(Wait4Completed { task_handle }),
             is_drop,
         }
     }
@@ -169,18 +189,14 @@ impl<E: ActorEntity> Drop for ActorHandle<E> {
     }
 }
 
-
-
 pub trait ActorEntity: Send + 'static {
-    
-    type Next: Send + 'static; 
-    
+    type Next: Send + 'static;
+
     type Msg: Send + 'static;
 
     type Result: Send + 'static;
 
     fn into_result(self, result: Result<()>) -> Self::Result;
-
 }
 
 pub struct Wait4Completed<E: ActorEntity> {
@@ -194,7 +210,6 @@ impl<E: ActorEntity> Wait4Completed<E> {
     }
 }
 
-
 pub struct Invoker<E: ActorEntity> {
     op_tx: mpsc::Sender<Op<E>>,
     // none: PhantomData<A>,
@@ -202,68 +217,83 @@ pub struct Invoker<E: ActorEntity> {
 
 impl<E: ActorEntity> Clone for Invoker<E> {
     fn clone(&self) -> Self {
-        Self { op_tx: self.op_tx.clone() }
+        Self {
+            op_tx: self.op_tx.clone(),
+        }
     }
 }
 
 impl<E: ActorEntity> Invoker<E> {
-
     pub fn downgrade(&self) -> WeakInvoker<E> {
-        WeakInvoker{op_tx: self.op_tx.downgrade()}
+        WeakInvoker {
+            op_tx: self.op_tx.downgrade(),
+        }
     }
 
-    pub async fn invoke<Request, Response>(&self, req: Request) -> Result<Response> 
+    pub async fn invoke<Request, Response>(&self, req: Request) -> Result<Response>
     where
         Request: Send + 'static,
         Response: Send + 'static,
         E: AsyncHandler<Request, Response = Response> + Send,
     {
         let (tx, rx) = oneshot::channel();
-        self.op_tx.send(Op::Invoke(AsyncEnvelope::new(req, tx))).await
-        .map_err(|_x|anyhow!("send request error"))?;
-        let rsp = rx.await.with_context(||"recv response but error")?;
+        self.op_tx
+            .send(Op::Invoke(AsyncEnvelope::new(req, tx)))
+            .await
+            .map_err(|_x| anyhow!("send request error"))?;
+        let rsp = rx.await.with_context(|| "recv response but error")?;
         Ok(rsp)
     }
 
-    pub fn blocking_invoke<Request, Response>(&self, req: Request) -> Result<Response> 
+    pub fn blocking_invoke<Request, Response>(&self, req: Request) -> Result<Response>
     where
         Request: Send + 'static,
         Response: Send + 'static,
         E: AsyncHandler<Request, Response = Response> + Send,
     {
         let (tx, rx) = oneshot::channel();
-        self.op_tx.blocking_send(Op::Invoke(AsyncEnvelope::new(req, tx)))
-        .map_err(|_x|anyhow!("send request error"))?;
-        let rsp = rx.blocking_recv().with_context(||"recv response but error")?;
+        self.op_tx
+            .blocking_send(Op::Invoke(AsyncEnvelope::new(req, tx)))
+            .map_err(|_x| anyhow!("send request error"))?;
+        let rsp = rx
+            .blocking_recv()
+            .with_context(|| "recv response but error")?;
         Ok(rsp)
     }
 
     pub async fn send_msg(&self, msg: E::Msg) -> Result<()> {
-        self.op_tx.send(Op::Msg(msg)).await
-        .map_err(|_x|anyhow!("send msg error"))?;
+        self.op_tx
+            .send(Op::Msg(msg))
+            .await
+            .map_err(|_x| anyhow!("send msg error"))?;
         Ok(())
     }
 
-    pub fn try_send_msg(&self, msg: E::Msg) -> Result<(), (E::Msg, TrySendError<()>) > {
+    pub fn try_send_msg(&self, msg: E::Msg) -> Result<(), (E::Msg, TrySendError<()>)> {
         let r = self.op_tx.try_send(Op::Msg(msg));
 
         if let Err(e) = r {
             let e = match e {
-                TrySendError::Full(op) => op.try_into_msg().map(|x|(x, TrySendError::Full(())) ),
-                TrySendError::Closed(op) =>  op.try_into_msg().map(|x|(x, TrySendError::Closed(()))),
+                TrySendError::Full(op) => op.try_into_msg().map(|x| (x, TrySendError::Full(()))),
+                TrySendError::Closed(op) => {
+                    op.try_into_msg().map(|x| (x, TrySendError::Closed(())))
+                }
             };
 
             if let Some(e) = e {
-                return Err(e)
+                return Err(e);
             }
         }
-        
+
         Ok(())
     }
 
     pub async fn shutdown(&self) {
-        let _r = self.op_tx.send(Op::Shutdown).await
-        .map_err(|_x|anyhow!("send request error"));
+        let _r = self
+            .op_tx
+            .send(Op::Shutdown)
+            .await
+            .map_err(|_x| anyhow!("send request error"));
     }
 }
 
@@ -273,20 +303,21 @@ pub struct WeakInvoker<E: ActorEntity> {
 
 impl<E: ActorEntity> Clone for WeakInvoker<E> {
     fn clone(&self) -> Self {
-        Self { op_tx: self.op_tx.clone() }
+        Self {
+            op_tx: self.op_tx.clone(),
+        }
     }
 }
 
 impl<E: ActorEntity> WeakInvoker<E> {
     pub fn upgrade(&self) -> Option<Invoker<E>> {
-        self.op_tx.upgrade().map(|op_tx| Invoker{op_tx})
+        self.op_tx.upgrade().map(|op_tx| Invoker { op_tx })
     }
 }
 
-
 async fn run_actor<E, F0, F1, F2, F3>(task: &mut ActorTask<E, F0, F1, F2, F3>) -> Result<()>
 where
-    E: ActorEntity ,
+    E: ActorEntity,
 
     for<'a> F0: XFn1<'a, &'a mut E, ActionRes> + Send + Sync + 'static + Copy,
     for<'a> <F0 as XFn1<'a, &'a mut E, ActionRes>>::Output: 'a,
@@ -299,16 +330,19 @@ where
 
     for<'a> F3: XFn2<'a, &'a mut E, E::Msg, ActionRes> + Send + Sync + 'static + Copy,
     for<'a> <F3 as XFn2<'a, &'a mut E, E::Msg, ActionRes>>::Output: 'a,
-
     // O1: Send + 'static,
     // M: Send + 'static,
     // Rsp: Send + 'static,
 {
-    let r = task.actor.handle_first.call_me(&mut task.actor.entity).await?;
+    let r = task
+        .actor
+        .handle_first
+        .call_me(&mut task.actor.entity)
+        .await?;
     if let Action::Finished = r {
         dbgd!("handle first and finished");
         return Ok(());
-    }    
+    }
 
     loop {
         tokio::select! {
@@ -331,7 +365,7 @@ where
                         break;
                     }
                 }
-                
+
                 let r = handle_more_op(task).await?;
                 if let Action::Finished = r {
                     break;
@@ -343,9 +377,11 @@ where
     Ok(())
 }
 
-async fn handle_more_op<E, F0, F1, F2, F3>(task: &mut ActorTask<E, F0, F1, F2, F3>) -> Result<Action>
+async fn handle_more_op<E, F0, F1, F2, F3>(
+    task: &mut ActorTask<E, F0, F1, F2, F3>,
+) -> Result<Action>
 where
-    E: ActorEntity ,
+    E: ActorEntity,
 
     for<'a> F0: XFn1<'a, &'a mut E, ActionRes> + Send + Sync + 'static + Copy,
     for<'a> <F0 as XFn1<'a, &'a mut E, ActionRes>>::Output: 'a,
@@ -365,19 +401,17 @@ where
             Ok(op) => {
                 let r = handle_op(&mut task.actor.entity, op, task.actor.handle_msg).await?;
                 if let Action::Finished = r {
-                    return Ok(r)
+                    return Ok(r);
+                }
+            }
+            Err(e) => match e {
+                TryRecvError::Empty => break,
+                TryRecvError::Disconnected => {
+                    dbgd!("recv more but got disconnected");
+                    return Ok(Action::Finished);
                 }
             },
-            Err(e) => {
-                match e {
-                    TryRecvError::Empty => break,
-                    TryRecvError::Disconnected => {
-                        dbgd!("recv more but got disconnected");
-                        return Ok(Action::Finished)
-                    },
-                }
-            },
-        }     
+        }
     }
 
     let is_drop = task.is_drop.load(Ordering::Acquire);
@@ -391,27 +425,23 @@ where
 
 async fn handle_op<E, F3>(entity: &mut E, op: Op<E>, func: F3) -> Result<Action>
 where
-    E: ActorEntity ,
+    E: ActorEntity,
 
     for<'a> F3: XFn2<'a, &'a mut E, E::Msg, ActionRes> + Send + Sync + 'static + Copy,
     for<'a> <F3 as XFn2<'a, &'a mut E, E::Msg, ActionRes>>::Output: 'a,
-
 {
     match op {
         Op::Shutdown => {
             dbgd!("got shutdown");
-            return Ok(Action::Finished)
-        },
+            return Ok(Action::Finished);
+        }
         Op::Invoke(mut envelope) => {
             let _r = envelope.handle(entity).await;
-            return Ok(Action::None)
+            return Ok(Action::None);
         }
-        Op::Msg(msg) => {
-            return func.call_me(entity, msg).await
-        },
+        Op::Msg(msg) => return func.call_me(entity, msg).await,
     }
 }
-
 
 struct ActorHandlers<E, F0, F1, F2, F3> {
     entity: E,
@@ -421,7 +451,7 @@ struct ActorHandlers<E, F0, F1, F2, F3> {
     handle_msg: F3,
 }
 
-struct ActorTask<E, F0, F1, F2, F3> 
+struct ActorTask<E, F0, F1, F2, F3>
 where
     E: ActorEntity,
 {
@@ -429,7 +459,6 @@ where
     actor: ActorHandlers<E, F0, F1, F2, F3>,
     is_drop: Arc<AtomicBool>,
 }
-
 
 enum Op<E: ActorEntity> {
     Shutdown,
@@ -441,26 +470,22 @@ impl<E: ActorEntity> Op<E> {
     fn try_into_msg(self) -> Option<E::Msg> {
         match self {
             Op::Msg(msg) => Some(msg),
-            _ => None
+            _ => None,
         }
     }
 }
 
-
 #[async_trait::async_trait]
-pub trait AsyncHandler<M>
-{
+pub trait AsyncHandler<M> {
     type Response: Send; //: MessageResponse<Self, M>;
 
     async fn handle(&mut self, msg: M) -> Self::Response;
 }
 
-
 #[async_trait::async_trait]
 pub trait AsyncEnvelopeProxy<A> {
     async fn handle(&mut self, act: &mut A);
 }
-
 
 pub struct AsyncEnvelope<A>(Box<dyn AsyncEnvelopeProxy<A> + Send>);
 
@@ -471,9 +496,11 @@ impl<A> AsyncEnvelope<A> {
         A::Response: 'static,
         // A::Context: AsyncContext<A>,
         M: Send + 'static, // + Message ,
-        // M::Result: Send,
+                           // M::Result: Send,
     {
-        AsyncEnvelope(Box::new(AsyncEnvelopeReal { msg: Some((msg, tx)) }))
+        AsyncEnvelope(Box::new(AsyncEnvelopeReal {
+            msg: Some((msg, tx)),
+        }))
     }
 
     pub fn with_proxy(proxy: Box<dyn AsyncEnvelopeProxy<A> + Send>) -> Self {
@@ -482,7 +509,7 @@ impl<A> AsyncEnvelope<A> {
 }
 
 #[async_trait::async_trait]
-impl<A> AsyncEnvelopeProxy<A> for AsyncEnvelope<A> 
+impl<A> AsyncEnvelopeProxy<A> for AsyncEnvelope<A>
 where
     A: Send,
 {
@@ -491,13 +518,11 @@ where
     }
 }
 
-
-
 pub struct AsyncEnvelopeReal<M, Rsp>
 where
-    M: Send, 
+    M: Send,
 {
-    msg: Option<(M, oneshot::Sender<Rsp>)>
+    msg: Option<(M, oneshot::Sender<Rsp>)>,
 }
 
 #[async_trait::async_trait]
@@ -509,29 +534,25 @@ where
     // A::Context: AsyncContext<A>,
 {
     async fn handle(&mut self, act: &mut A) {
-
         if let Some((msg, tx)) = self.msg.take() {
             if tx.is_closed() {
                 return;
             }
-            
+
             let rsp = <A as AsyncHandler<M>>::handle(act, msg).await;
             let _r = tx.send(rsp);
         }
     }
 }
 
-
-
-
 // refer from https://stackoverflow.com/questions/70746671/how-to-bind-lifetimes-of-futures-to-fn-arguments-in-rust
 pub trait XFn1<'a, I: 'a, O> {
     type Output: Future<Output = O> + 'a + Send;
     fn call_me(&self, session: I) -> Self::Output;
-  }
-  
+}
+
 impl<'a, I: 'a, O, F, Fut> XFn1<'a, I, O> for F
-    where
+where
     F: Fn(I) -> Fut,
     Fut: Future<Output = O> + 'a + Send,
 {
@@ -544,10 +565,10 @@ impl<'a, I: 'a, O, F, Fut> XFn1<'a, I, O> for F
 pub trait XFn2<'a, I1: 'a, I2: 'a, O> {
     type Output: Future<Output = O> + 'a + Send;
     fn call_me(&self, x1: I1, x2: I2) -> Self::Output;
-  }
-  
+}
+
 impl<'a, I1: 'a, I2: 'a, O, F, Fut> XFn2<'a, I1, I2, O> for F
-    where
+where
     F: Fn(I1, I2) -> Fut,
     Fut: Future<Output = O> + 'a + Send,
 {
@@ -579,13 +600,10 @@ pub struct Forever;
 impl Future for Forever {
     type Output = ();
 
-    fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
         Poll::Pending
     }
 }
-
-
-
-
-
-

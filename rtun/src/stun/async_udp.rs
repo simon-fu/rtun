@@ -1,8 +1,15 @@
-use std::{sync::Arc, net::SocketAddr, io::{self, IoSliceMut}, task::{Poll, self}, pin::Pin, fmt};
+use std::{
+    fmt,
+    io::{self, IoSliceMut},
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{self, Poll},
+};
 
 use bytes::Bytes;
 use futures::{ready, Future};
-use quinn::udp::{UdpState, RecvMeta, Transmit, UdpSocketState};
+use quinn::udp::{RecvMeta, Transmit, UdpSocketState, UdpState};
 pub use quinn::AsyncUdpSocket as AsyncUdpSocketOps;
 use tokio::io::Interest;
 
@@ -12,11 +19,11 @@ use crate::async_rt::dummy;
 
 // }
 
-// impl<T: AsyncUdpSocketOps> AsyncUdpSocket for T 
+// impl<T: AsyncUdpSocketOps> AsyncUdpSocket for T
 // {
 // }
 
-// impl<T: AsyncUdpSocket> AsyncUdpSocket for Box<T> 
+// impl<T: AsyncUdpSocket> AsyncUdpSocket for Box<T>
 // {
 // }
 
@@ -50,11 +57,9 @@ pub trait AsyncUdpSocket: Send + fmt::Debug + 'static {
     }
 
     fn set_ttl(&self, ttl: u32) -> io::Result<()>;
-    
 }
 
-impl<T: AsyncUdpSocketOps> AsyncUdpSocket for T 
-{
+impl<T: AsyncUdpSocketOps> AsyncUdpSocket for T {
     #[inline]
     fn poll_send(
         &self,
@@ -89,8 +94,6 @@ impl<T: AsyncUdpSocketOps> AsyncUdpSocket for T
         Err(io::ErrorKind::Unsupported.into())
     }
 }
-
-
 
 impl AsyncUdpSocket for Box<dyn AsyncUdpSocket> {
     #[inline]
@@ -128,11 +131,10 @@ impl AsyncUdpSocket for Box<dyn AsyncUdpSocket> {
     }
 }
 
-
 #[derive(Debug)]
 pub struct DummyUdpSocket;
 
-impl AsyncUdpSocket  for DummyUdpSocket {
+impl AsyncUdpSocket for DummyUdpSocket {
     fn poll_send(
         &self,
         _state: &UdpState,
@@ -166,7 +168,7 @@ impl AsyncUdpSocket  for DummyUdpSocket {
 // struct DummyWaker;
 // impl task::Wake for DummyWaker {
 //     fn wake(self: Arc<Self>) {
-        
+
 //     }
 //     // // Required method
 //     // fn wake(self: Arc<Self>);
@@ -182,7 +184,6 @@ pub fn udp_state() -> &'static Arc<UdpState> {
     }
     &*UDP_STATE
 }
-
 
 pub trait AsUdpSocket<T> {
     fn as_socket<'a>(&'a self) -> UdpSocketWrapper<T>;
@@ -207,7 +208,6 @@ impl<'a, U> UdpSocketWrapper<'a, U> {
 }
 
 impl<'a, U: AsyncUdpSocket + Unpin> UdpSocketWrapper<'a, U> {
-
     pub fn try_send_to(&self, data: Bytes, destination: SocketAddr) -> io::Result<usize> {
         let thiz = Pin::new(self);
         let waker = dummy::waker();
@@ -224,9 +224,9 @@ impl<'a, U: AsyncUdpSocket + Unpin> UdpSocketWrapper<'a, U> {
         }];
 
         let r = thiz.0.poll_send(udp_state(), &mut cx, &transmits);
-        
+
         match r {
-            Poll::Ready(r) => r.map(|_x|transmits[0].contents.len()),
+            Poll::Ready(r) => r.map(|_x| transmits[0].contents.len()),
             Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
         }
     }
@@ -237,16 +237,17 @@ impl<'a, U: AsyncUdpSocket + Unpin> UdpSocketWrapper<'a, U> {
             state: udp_state(),
             data,
             destination,
-        }.await
+        }
+        .await
     }
-
 
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         // tokio::net::UdpSocket::recv_from(&self, buf);
         RecvFromFut {
             socket: self.0,
             buf,
-        }.await
+        }
+        .await
     }
 
     pub fn poll_recv_from(
@@ -263,7 +264,7 @@ impl<'a, U: AsyncUdpSocket + Unpin> UdpSocketWrapper<'a, U> {
                 let len = meta[0].len;
                 buf.set_filled(len);
                 Poll::Ready(Ok(meta[0].addr))
-            },
+            }
             Err(e) => Poll::Ready(Err(e)),
         }
     }
@@ -282,21 +283,16 @@ impl<'a, U: AsyncUdpSocket> Future for RecvFromFut<'a, U> {
         let mut bufs = [IoSliceMut::new(self0.buf)];
         let mut meta = [RecvMeta::default()];
 
-        let r = self0.socket.poll_recv(
-            cx, 
-            &mut bufs, 
-            &mut meta,
-        );
+        let r = self0.socket.poll_recv(cx, &mut bufs, &mut meta);
 
         let r = ready!(r);
         match r {
             Ok(_n) => {
                 let len = meta[0].len;
                 Poll::Ready(Ok((len, meta[0].addr)))
-            },
+            }
             Err(e) => Poll::Ready(Err(e)),
         }
-        
     }
 }
 
@@ -304,20 +300,24 @@ struct SendToFut<'a, U> {
     socket: &'a U,
     state: &'a UdpState,
     data: Bytes,
-    destination: SocketAddr
+    destination: SocketAddr,
 }
 
 impl<'a, U: AsyncUdpSocket> Future for SendToFut<'a, U> {
     type Output = io::Result<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-        self.socket.poll_send(self.state, cx, &[Transmit {
-            destination: self.destination,
-            ecn: None,
-            contents: self.data.clone(),
-            segment_size: None,
-            src_ip: None,
-        }])
+        self.socket.poll_send(
+            self.state,
+            cx,
+            &[Transmit {
+                destination: self.destination,
+                ecn: None,
+                contents: self.data.clone(),
+                segment_size: None,
+                src_ip: None,
+            }],
+        )
     }
 }
 
@@ -330,7 +330,6 @@ impl std::fmt::Debug for BoxUdpSocket {
 }
 
 impl AsyncUdpSocket for BoxUdpSocket {
-
     #[inline]
     fn poll_send(
         &self,
@@ -366,7 +365,6 @@ impl AsyncUdpSocket for BoxUdpSocket {
     }
 }
 
-
 // pub type BoxUdpSocket = UdpSocketBridge<Box<dyn AsyncUdpSocketOps>>;
 
 pub struct UdpSocketBridge<U>(pub U);
@@ -378,7 +376,6 @@ impl<U: AsyncUdpSocket> std::fmt::Debug for UdpSocketBridge<U> {
 }
 
 impl<U: AsyncUdpSocket> AsyncUdpSocketOps for UdpSocketBridge<U> {
-
     #[inline]
     fn poll_send(
         &self,
@@ -410,8 +407,7 @@ impl<U: AsyncUdpSocket> AsyncUdpSocketOps for UdpSocketBridge<U> {
     }
 }
 
-
-// pub async fn tokio_socket_bind<A>(addr: A) -> io::Result<BoxUdpSocket> 
+// pub async fn tokio_socket_bind<A>(addr: A) -> io::Result<BoxUdpSocket>
 // where
 //     A: tokio::net::ToSocketAddrs,
 // {
@@ -420,20 +416,27 @@ impl<U: AsyncUdpSocket> AsyncUdpSocketOps for UdpSocketBridge<U> {
 //     Ok(BoxUdpSocket(socket))
 // }
 
-pub async fn tokio_socket_bind<A>(addr: A) -> anyhow::Result<TokioUdpSocket> 
+pub async fn tokio_socket_bind<A>(addr: A) -> anyhow::Result<TokioUdpSocket>
 where
     A: tokio::net::ToSocketAddrs,
 {
     use anyhow::Context;
-    let socket = tokio::net::UdpSocket::bind(addr).await.with_context(||"bind socket failed")?;
-    let socket = socket.into_std().with_context(||"into std socket failed")?;
-    let r = UdpSocketState::configure((&socket).into()).with_context(||"config socket state failed");
+    let socket = tokio::net::UdpSocket::bind(addr)
+        .await
+        .with_context(|| "bind socket failed")?;
+    let socket = socket
+        .into_std()
+        .with_context(|| "into std socket failed")?;
+    let r =
+        UdpSocketState::configure((&socket).into()).with_context(|| "config socket state failed");
     if r.is_err() {
-        socket.set_nonblocking(true).with_context(||"set socket nonblocking failed")?;
+        socket
+            .set_nonblocking(true)
+            .with_context(|| "set socket nonblocking failed")?;
     }
-    
+
     Ok(TokioUdpSocket {
-        io: tokio::net::UdpSocket::from_std(socket).with_context(||"from std socket failed")?,
+        io: tokio::net::UdpSocket::from_std(socket).with_context(|| "from std socket failed")?,
         inner: UdpSocketState::new(),
     })
 }
@@ -476,7 +479,7 @@ impl AsyncUdpSocket for TokioUdpSocket {
                 tracing::warn!("poll_send_ready fail [{e:?}]");
             }
             r?;
-            
+
             if let Ok(res) = io.try_io(Interest::WRITABLE, || {
                 inner.send(io.into(), state, transmits)
             }) {
@@ -513,7 +516,6 @@ impl AsyncUdpSocket for TokioUdpSocket {
         self.io.set_ttl(ttl)
     }
 }
-
 
 // pub async fn send_udp<U: AsyncUdpSocket>(socket: &U, tokio_socket: tokio::net::UdpSocket) -> io::Result<()> {
 //     // tokio_socket.send_to(buf, target)

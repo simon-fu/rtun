@@ -118,7 +118,6 @@ where
     }
 }
 
-
 pub trait ToHex {
     type Item: std::fmt::Debug + std::fmt::Display;
     fn to_hex(&self) -> Self::Item;

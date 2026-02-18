@@ -1,22 +1,24 @@
-use anyhow::{Result, Context};
-use serde::{Serialize, Deserialize};
-use bytes::{BytesMut, BufMut, Buf};
+use anyhow::{Context, Result};
+use bytes::{Buf, BufMut, BytesMut};
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
-pub async fn read_short_json<R, T>(rx: &mut R, buf: &mut BytesMut) -> Result<T> 
+pub async fn read_short_json<R, T>(rx: &mut R, buf: &mut BytesMut) -> Result<T>
 where
     R: AsyncReadExt + Unpin,
     T: for<'a> Deserialize<'a>,
 {
     let packet_len = read_short_packet(rx, buf).await?;
     let obj: T = serde_json::from_slice(&buf[..packet_len])
-    .with_context(||"can't parsed bridge request")?;
+        .with_context(|| "can't parsed bridge request")?;
     buf.advance(packet_len);
     Ok(obj)
 }
 
-
-pub async fn read_short_packet<R: AsyncReadExt + Unpin, B: BufMut>(rx: &mut R, buf: &mut B) -> Result<usize> {
+pub async fn read_short_packet<R: AsyncReadExt + Unpin, B: BufMut>(
+    rx: &mut R,
+    buf: &mut B,
+) -> Result<usize> {
     let len = rx.read_u16().await? as usize;
     let mut nread = 0;
     while nread < len {
@@ -25,8 +27,6 @@ pub async fn read_short_packet<R: AsyncReadExt + Unpin, B: BufMut>(rx: &mut R, b
     }
     Ok(nread)
 }
-
-
 
 pub fn ser_short_json<T>(buf: &mut BytesMut, value: &T) -> Result<usize>
 where
@@ -47,15 +47,11 @@ pub struct ResponseStatus {
 }
 
 impl ResponseStatus {
-    pub fn new(code: i32, msg: String ) -> Self {
-        Self {
-            code,
-            msg,
-        }
+    pub fn new(code: i32, msg: String) -> Self {
+        Self { code, msg }
     }
 
     pub fn ok() -> Self {
         Self::new(0, "".into())
     }
 }
-

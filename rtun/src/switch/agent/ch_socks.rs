@@ -1,15 +1,28 @@
-use std::{io::{ErrorKind, self}, net::{SocketAddr, Ipv4Addr, SocketAddrV4}, sync::Arc};
+use std::{
+    io::{self, ErrorKind},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    sync::Arc,
+};
 
-use crate::{channel::{ChSender, ChReceiver, ch_stream::ChStream}, proto::OpenSocksArgs};
+use crate::{
+    channel::{ch_stream::ChStream, ChReceiver, ChSender},
+    proto::OpenSocksArgs,
+};
 
-use anyhow::{anyhow, Result, bail, Context};
+use crate::socks::server::{socks4::Socks4TcpHandler, socks5::Socks5TcpHandler};
+use anyhow::{anyhow, bail, Context, Result};
 use bytes::Buf;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncBufRead, AsyncBufReadExt, BufReader, AsyncWriteExt};
-use crate::socks::server::{socks5::Socks5TcpHandler, socks4::Socks4TcpHandler};
-use shadowsocks::{config::Mode, ServerAddr, relay::socks5};
-use shadowsocks_service::local::{loadbalancing::{PingBalancerBuilder, PingBalancer}, context::ServiceContext, socks::config::Socks5AuthConfig, socks::socks4};
+use shadowsocks::{config::Mode, relay::socks5, ServerAddr};
+use shadowsocks_service::local::{
+    context::ServiceContext,
+    loadbalancing::{PingBalancer, PingBalancerBuilder},
+    socks::config::Socks5AuthConfig,
+    socks::socks4,
+};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tracing::error;
-
 
 pub struct ChSocks {
     peer_addr: SocketAddr,
@@ -22,7 +35,7 @@ impl ChSocks {
         })
     }
 
-    pub async fn run(self, server: Server, tx: ChSender, rx: ChReceiver ) -> Result<()> {
+    pub async fn run(self, server: Server, tx: ChSender, rx: ChReceiver) -> Result<()> {
         let stream = ChStream::new2(tx, rx);
 
         // let mut version_buffer = [0u8; 1];
@@ -31,15 +44,14 @@ impl ChSocks {
         // if n == 0 {
         //     return Err(io::Error::from(ErrorKind::UnexpectedEof).into());
         // }
-        
+
         // run_socks_conn(&version_buffer[..], stream, self.peer_addr, server).await?;
         run_socks_conn(stream, self.peer_addr, server).await?;
         Result::<()>::Ok(())
     }
-
 }
 
-pub async fn run_socks_conn<S>(mut stream: S, peer_addr: SocketAddr, server: Server) -> Result<()> 
+pub async fn run_socks_conn<S>(mut stream: S, peer_addr: SocketAddr, server: Server) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -50,17 +62,12 @@ where
         return Err(io::Error::from(ErrorKind::UnexpectedEof).into());
     }
 
-
     match version_buffer[0] {
         0x04 => {
             let mut stream = BufReader::new(stream);
             let req = read_socks4_handshake(&mut stream).await?;
             // tracing::info!("[{peer_addr}] handle socks4");
-            let handler = Socks4TcpHandler::new(
-                server.context, 
-                server.balancer, 
-                server.mode
-            );
+            let handler = Socks4TcpHandler::new(server.context, server.balancer, server.mode);
             handler.handle_socks4_req(req, stream, peer_addr).await?;
             Ok(())
         }
@@ -69,11 +76,11 @@ where
             let req = read_socks5_handshake(&mut stream).await?;
             // tracing::info!("[{peer_addr}] handle socks5");
             let handler = Socks5TcpHandler::new(
-                server.context, 
-                server.udp_bind_addr, 
-                server.balancer, 
-                server.mode, 
-                server.socks5_auth
+                server.context,
+                server.udp_bind_addr,
+                server.balancer,
+                server.mode,
+                server.socks5_auth,
             );
             handler.handle_socks5_req(req, stream, peer_addr).await?;
             Ok(())
@@ -81,7 +88,9 @@ where
 
         0x09 => {
             // tracing::debug!("handle_custom ...");
-            let r = handle_custom(&mut stream).await.with_context(||"handle_custom");
+            let r = handle_custom(&mut stream)
+                .await
+                .with_context(|| "handle_custom");
             // tracing::debug!("handle_custom finished [{r:?}]");
             r
         }
@@ -114,25 +123,24 @@ where
     Ok(socks5::HandshakeRequest { methods })
 }
 
-async fn read_socks4_handshake<R>(r: &mut R) -> Result<socks4::HandshakeRequest,>
+async fn read_socks4_handshake<R>(r: &mut R) -> Result<socks4::HandshakeRequest>
 where
     R: AsyncBufRead + Unpin,
 {
-    use socks4::Command;
     use socks4::Address;
+    use socks4::Command;
 
     mod consts {
-        pub const SOCKS4_VERSION:                                  u8 = 4;
-    
-        pub const SOCKS4_COMMAND_CONNECT:                          u8 = 1;
-        pub const SOCKS4_COMMAND_BIND:                             u8 = 2;
-    
+        pub const SOCKS4_VERSION: u8 = 4;
+
+        pub const SOCKS4_COMMAND_CONNECT: u8 = 1;
+        pub const SOCKS4_COMMAND_BIND: u8 = 2;
+
         // pub const SOCKS4_RESULT_REQUEST_GRANTED:                   u8 = 90;
         // pub const SOCKS4_RESULT_REQUEST_REJECTED_OR_FAILED:        u8 = 91;
         // pub const SOCKS4_RESULT_REQUEST_REJECTED_CANNOT_CONNECT:   u8 = 92;
         // pub const SOCKS4_RESULT_REQUEST_REJECTED_DIFFERENT_USER_ID: u8 = 93;
     }
-
 
     let mut buf = [consts::SOCKS4_VERSION; 8];
     let _ = r.read_exact(&mut buf[1..]).await?;
@@ -195,7 +203,7 @@ where
     })
 }
 
-// pub async fn run_socks_conn<S>(version_buffer: &[u8], stream: S, peer_addr: SocketAddr, server: Server) -> io::Result<()> 
+// pub async fn run_socks_conn<S>(version_buffer: &[u8], stream: S, peer_addr: SocketAddr, server: Server) -> io::Result<()>
 // where
 //     S: AsyncRead + AsyncWrite + Unpin,
 // {
@@ -212,8 +220,8 @@ where
 //         0x04 => {
 //             // tracing::info!("[{peer_addr}] handle socks4");
 //             let handler = Socks4TcpHandler::new(
-//                 server.context, 
-//                 server.balancer, 
+//                 server.context,
+//                 server.balancer,
 //                 server.mode
 //             );
 //             handler.handle_socks4_client(stream, peer_addr).await
@@ -222,10 +230,10 @@ where
 //         0x05 => {
 //             // tracing::info!("[{peer_addr}] handle socks5");
 //             let handler = Socks5TcpHandler::new(
-//                 server.context, 
-//                 server.udp_bind_addr, 
-//                 server.balancer, 
-//                 server.mode, 
+//                 server.context,
+//                 server.udp_bind_addr,
+//                 server.balancer,
+//                 server.mode,
 //                 server.socks5_auth
 //             );
 //             handler.handle_socks5_client(stream, peer_addr).await
@@ -243,7 +251,6 @@ async fn handle_custom<S>(stream: &mut S) -> Result<(), io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-
     let cmd = stream.read_u8().await?;
     match cmd {
         0 => handle_echo(stream).await,
@@ -259,7 +266,7 @@ async fn handle_echo<S>(stream: &mut S) -> Result<(), io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut buf = vec![0_u8; 16*1024];
+    let mut buf = vec![0_u8; 16 * 1024];
     loop {
         let n = stream.read(&mut buf).await?;
         if n == 0 {
@@ -270,7 +277,6 @@ where
     }
     Ok(())
 }
-
 
 #[derive(Clone)]
 pub struct Server {
@@ -287,11 +293,10 @@ impl Server {
         let mode = Mode::TcpOnly;
 
         Ok(Self {
-            udp_bind_addr: Arc::new(
-                bind_addr.parse()
-                .map_err(|e|anyhow!("{:?}", e))?
-            ),
-            balancer: PingBalancerBuilder::new(context.clone(), mode).build().await?,
+            udp_bind_addr: Arc::new(bind_addr.parse().map_err(|e| anyhow!("{:?}", e))?),
+            balancer: PingBalancerBuilder::new(context.clone(), mode)
+                .build()
+                .await?,
             socks5_auth: Arc::new(Socks5AuthConfig::new()),
             mode,
             context,
@@ -302,47 +307,51 @@ impl Server {
 pub use socks_bridge::run_socks5_conn_bridge;
 
 mod socks_bridge {
-    use std::{io::{self, ErrorKind}, sync::Arc};
-    use shadowsocks::relay::socks5::{self, HandshakeRequest, HandshakeResponse, PasswdAuthRequest, PasswdAuthResponse};
+    use anyhow::{bail, Result};
+    use shadowsocks::relay::socks5::{
+        self, HandshakeRequest, HandshakeResponse, PasswdAuthRequest, PasswdAuthResponse,
+    };
     use shadowsocks_service::local::socks::config::Socks5AuthConfig;
-    use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt};
-    use anyhow::{Result, bail};
-    use tracing::{trace, error};
+    use std::{
+        io::{self, ErrorKind},
+        sync::Arc,
+    };
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+    use tracing::{error, trace};
 
     use super::read_socks5_handshake;
 
     pub async fn run_socks5_conn_bridge<R1, W1, R2, W2>(
-        src_rd: &mut R1, src_wr: &mut W1,
-        dst_rd: &mut R2, dst_wr: &mut W2,
-        auth: &Arc<Socks5AuthConfig>, 
-        // peer_addr: SocketAddr, 
-    ) -> Result<()> 
+        src_rd: &mut R1,
+        src_wr: &mut W1,
+        dst_rd: &mut R2,
+        dst_wr: &mut W2,
+        auth: &Arc<Socks5AuthConfig>,
+        // peer_addr: SocketAddr,
+    ) -> Result<()>
     where
         R1: AsyncRead + Unpin,
         W1: AsyncWrite + Unpin,
         R2: AsyncRead + Unpin,
         W2: AsyncWrite + Unpin,
     {
-    
         let mut version_buffer = [0u8; 1];
-    
+
         let n = src_rd.read(&mut version_buffer).await?;
         if n == 0 {
             return Err(io::Error::from(ErrorKind::UnexpectedEof).into());
         }
-    
-    
+
         match version_buffer[0] {
-    
-            0x05 => { }
-    
+            0x05 => {}
+
             version => {
                 error!("unsupported socks version {:x}", version);
                 let err = io::Error::new(ErrorKind::Other, "unsupported socks version");
-                return Err(err.into())
+                return Err(err.into());
             }
         }
-    
+
         let req = read_socks5_handshake(src_rd).await?;
         check_auth(src_rd, src_wr, &req, auth).await?;
 
@@ -359,11 +368,16 @@ mod socks_bridge {
             r = tokio::io::copy(dst_rd, src_wr) => {r?;},
             r = tokio::io::copy(src_rd, dst_wr) => {r?;},
         }
-        
+
         Ok(())
     }
 
-    async fn check_auth<R, W>(rd: &mut R, wr: &mut W, handshake_req: &HandshakeRequest, auth: &Arc<Socks5AuthConfig>) -> io::Result<()> 
+    async fn check_auth<R, W>(
+        rd: &mut R,
+        wr: &mut W,
+        handshake_req: &HandshakeRequest,
+        auth: &Arc<Socks5AuthConfig>,
+    ) -> io::Result<()>
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
@@ -409,7 +423,11 @@ mod socks_bridge {
         ))
     }
 
-    async fn check_auth_password<R, W>(rd: &mut R, wr: &mut W, auth: &Arc<Socks5AuthConfig>) -> io::Result<()> 
+    async fn check_auth_password<R, W>(
+        rd: &mut R,
+        wr: &mut W,
+        auth: &Arc<Socks5AuthConfig>,
+    ) -> io::Result<()>
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
@@ -486,4 +504,3 @@ mod socks_bridge {
         }
     }
 }
-

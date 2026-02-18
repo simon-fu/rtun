@@ -6,12 +6,12 @@ use std::{
     sync::Arc,
 };
 
-use tracing::{debug, trace, warn};
 use shadowsocks::config::Mode;
 use tokio::{
-    io::{AsyncWriteExt, BufReader, AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     // net::TcpStream,
 };
+use tracing::{debug, trace, warn};
 
 use shadowsocks_service::local::{
     context::ServiceContext,
@@ -21,12 +21,7 @@ use shadowsocks_service::local::{
 };
 
 use shadowsocks_service::local::socks::socks4::{
-    Address,
-    Command,
-    Error as Socks4Error,
-    HandshakeRequest,
-    HandshakeResponse,
-    ResultCode,
+    Address, Command, Error as Socks4Error, HandshakeRequest, HandshakeResponse, ResultCode,
 };
 
 use crate::socks::utils::establish_tcp_tunnel_bypassed;
@@ -38,7 +33,11 @@ pub struct Socks4TcpHandler {
 }
 
 impl Socks4TcpHandler {
-    pub fn new(context: Arc<ServiceContext>, balancer: PingBalancer, mode: Mode) -> Socks4TcpHandler {
+    pub fn new(
+        context: Arc<ServiceContext>,
+        balancer: PingBalancer,
+        mode: Mode,
+    ) -> Socks4TcpHandler {
         Socks4TcpHandler {
             context,
             balancer,
@@ -46,7 +45,7 @@ impl Socks4TcpHandler {
         }
     }
 
-    pub async fn handle_socks4_client<S>(self, stream: S, peer_addr: SocketAddr) -> io::Result<()> 
+    pub async fn handle_socks4_client<S>(self, stream: S, peer_addr: SocketAddr) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -66,7 +65,12 @@ impl Socks4TcpHandler {
         self.handle_socks4_req(handshake_req, s, peer_addr).await
     }
 
-    pub async fn handle_socks4_req<S>(self, handshake_req: HandshakeRequest, mut s: BufReader<S>, peer_addr: SocketAddr) -> io::Result<()> 
+    pub async fn handle_socks4_req<S>(
+        self,
+        handshake_req: HandshakeRequest,
+        mut s: BufReader<S>,
+        peer_addr: SocketAddr,
+    ) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -78,7 +82,8 @@ impl Socks4TcpHandler {
             Command::Connect => {
                 trace!("CONNECT {}", handshake_req.dst);
 
-                self.handle_socks4_connect(s, peer_addr, handshake_req.dst).await
+                self.handle_socks4_connect(s, peer_addr, handshake_req.dst)
+                    .await
             }
             Command::Bind => {
                 warn!("BIND is not supported");
@@ -96,7 +101,7 @@ impl Socks4TcpHandler {
         mut stream: BufReader<S>,
         peer_addr: SocketAddr,
         target_addr: Address,
-    ) -> io::Result<()> 
+    ) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -155,7 +160,7 @@ impl Socks4TcpHandler {
         // UNWRAP.
         let mut stream = stream.into_inner();
 
-        // // by simon => 
+        // // by simon =>
 
         // match server_opt {
         //     Some(server) => {
@@ -165,7 +170,6 @@ impl Socks4TcpHandler {
         //     None => establish_tcp_tunnel_bypassed(&mut stream, &mut remote, peer_addr, &target_addr).await,
         // }
 
-        
         let _server_opt = server_opt;
         establish_tcp_tunnel_bypassed(&mut stream, &mut remote, peer_addr, &target_addr).await
 

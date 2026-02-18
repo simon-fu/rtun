@@ -1,6 +1,5 @@
 use bytes::Bytes;
 
-
 #[derive(Debug, Clone)]
 pub enum PtyEvent {
     StdinData(Bytes),
@@ -9,6 +8,6 @@ pub enum PtyEvent {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PtySize {
-    pub cols: u16, 
+    pub cols: u16,
     pub rows: u16,
 }

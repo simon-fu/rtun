@@ -1,8 +1,8 @@
+use crate::init_log_and_run;
 use anyhow::Result;
 use clap::Parser;
-use crate::init_log_and_run;
 
-use super::{agent_pub, agent_listen};
+use super::{agent_listen, agent_pub};
 
 // refer https://github.com/clap-rs/clap/tree/master/clap_derive/examples
 #[derive(Parser, Debug)]
@@ -18,7 +18,7 @@ pub enum SubCmd {
     Listen(agent_listen::CmdArgs),
 }
 
-pub fn run(args: CmdArgs) -> Result<()> { 
+pub fn run(args: CmdArgs) -> Result<()> {
     init_log_and_run(do_run(args))?
 }
 
@@ -28,4 +28,3 @@ async fn do_run(args: CmdArgs) -> Result<()> {
         SubCmd::Listen(args) => agent_listen::run(args).await,
     }
 }
-

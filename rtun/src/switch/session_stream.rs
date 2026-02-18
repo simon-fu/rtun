@@ -1,18 +1,26 @@
-
-
+use crate::{
+    channel::{ChId, ChPair},
+    huid::gen_huid::gen_huid,
+};
 use anyhow::Result;
-use crate::{huid::gen_huid::gen_huid, channel::{ChId, ChPair}};
 
-use super::{ctrl_client::make_ctrl_client, switch_pair::{SwitchPair, make_switch_pair, SwitchPairCtrlClient}, switch_sink::PacketSink, switch_source::PacketSource};
+use super::{
+    ctrl_client::make_ctrl_client,
+    switch_pair::{make_switch_pair, SwitchPair, SwitchPairCtrlClient},
+    switch_sink::PacketSink,
+    switch_source::PacketSource,
+};
 
-
-pub async fn make_stream_session<S1, S2>(stream: (S1, S2), disable_bridge_ch: bool) -> Result<StreamSession<S1, S2>> 
+pub async fn make_stream_session<S1, S2>(
+    stream: (S1, S2),
+    disable_bridge_ch: bool,
+) -> Result<StreamSession<S1, S2>>
 where
     S1: PacketSink,
     S2: PacketSource,
 {
     let uid = gen_huid();
-            
+
     let switch_session = make_switch_pair(uid, stream).await?;
     let switch = switch_session.clone_invoker();
 
@@ -20,16 +28,21 @@ where
 
     let (ctrl_tx, ctrl_rx) = ChPair::new(ctrl_ch_id).split();
     let ctrl_tx = switch.add_channel(ctrl_ch_id, ctrl_tx).await?;
-    
-    let pair = ChPair { tx: ctrl_tx, rx: ctrl_rx };
+
+    let pair = ChPair {
+        tx: ctrl_tx,
+        rx: ctrl_rx,
+    };
 
     let ctrl_session = make_ctrl_client(uid, pair, switch, disable_bridge_ch).await?;
 
-    Ok(StreamSession{switch_session, ctrl_session})
+    Ok(StreamSession {
+        switch_session,
+        ctrl_session,
+    })
 }
 
-
-pub struct StreamSession<S1, S2> 
+pub struct StreamSession<S1, S2>
 where
     S1: PacketSink,
     S2: PacketSource,
@@ -38,7 +51,7 @@ where
     ctrl_session: SwitchPairCtrlClient<S2>,
 }
 
-impl<S1, S2> StreamSession<S1, S2> 
+impl<S1, S2> StreamSession<S1, S2>
 where
     S1: PacketSink,
     S2: PacketSource,
@@ -62,18 +75,14 @@ where
     }
 }
 
-
-
-
 // use anyhow::Result;
 // use crate::{huid::gen_huid::gen_huid, channel::{ChId, ChPair}};
 
 // use super::{switch_stream::{PacketStream, make_stream_switch, StreamSwitch, StreamSwitchCtrlClient}, ctrl_client::make_ctrl_client};
 
-
 // pub async fn make_stream_session<S: PacketStream>(stream: S) -> Result<StreamSession<S>> {
 //     let uid = gen_huid();
-            
+
 //     let switch_session = make_stream_switch(uid, stream).await?;
 //     let switch = switch_session.clone_invoker();
 
@@ -81,14 +90,13 @@ where
 
 //     let (ctrl_tx, ctrl_rx) = ChPair::new(ctrl_ch_id).split();
 //     let ctrl_tx = switch.add_channel(ctrl_ch_id, ctrl_tx).await?;
-    
+
 //     let pair = ChPair { tx: ctrl_tx, rx: ctrl_rx };
 
 //     let ctrl_session = make_ctrl_client(uid, pair, switch).await?;
 
 //     Ok(StreamSession{switch_session, ctrl_session})
 // }
-
 
 // pub struct StreamSession<S: PacketStream> {
 //     switch_session: StreamSwitch<S>,
@@ -105,7 +113,7 @@ where
 //     }
 
 //     pub async fn wait_for_completed(&mut self) -> Result<()> {
-        
+
 //         let switch_r = self.switch_session.wait_for_completed().await;
 //         let ctrl_r = self.ctrl_session.wait_for_completed().await;
 
@@ -115,4 +123,3 @@ where
 //         Ok(())
 //     }
 // }
-

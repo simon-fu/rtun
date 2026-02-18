@@ -10,7 +10,7 @@ use bytes::{Buf, BufMut, BytesMut};
 
 use super::error::Error;
 use super::KcpResult;
-use tracing::{trace, debug};
+use tracing::{debug, trace};
 
 const KCP_RTO_NDL: u32 = 30; // no delay min rto
 const KCP_RTO_MIN: u32 = 100; // normal min rto
@@ -131,11 +131,11 @@ impl KcpSegment {
     }
 }
 
-
-
 pub trait KcpWrite {
-    type Buf<'a>: BufMut where Self: 'a;
-    
+    type Buf<'a>: BufMut
+    where
+        Self: 'a;
+
     fn begin_segment<'a>(&'a mut self) -> Self::Buf<'a>;
 
     fn len(&self) -> usize; // sum of all of segments's len
@@ -148,24 +148,23 @@ pub trait KcpWrite {
 
     fn capacity(&self) -> usize;
 
-    fn reserve(&mut self, additional: usize) ;
+    fn reserve(&mut self, additional: usize);
 
     fn flush_packet(&mut self);
-
 }
 
 pub trait KcpBufOps {
-    fn on_begin_packet(&mut self, buf: &mut BytesMut) ;
-    fn on_end_packet(&mut self, buf: &mut BytesMut) ;
+    fn on_begin_packet(&mut self, buf: &mut BytesMut);
+    fn on_end_packet(&mut self, buf: &mut BytesMut);
 }
 
 impl KcpBufOps for () {
-    fn on_begin_packet(&mut self, _buf: &mut BytesMut)  { }
+    fn on_begin_packet(&mut self, _buf: &mut BytesMut) {}
 
-    fn on_end_packet(&mut self, _buf: &mut BytesMut)  { }
+    fn on_end_packet(&mut self, _buf: &mut BytesMut) {}
 }
 
-pub struct KcpWriteBuf<O=()> {
+pub struct KcpWriteBuf<O = ()> {
     buf: BytesMut,
     que: VecDeque<bytes::Bytes>,
     ops: O,
@@ -196,7 +195,10 @@ impl<O> KcpWriteBuf<O> {
 }
 
 impl<O: KcpBufOps> KcpWrite for KcpWriteBuf<O> {
-    type Buf<'a> = &'a mut BytesMut  where O: 'a;
+    type Buf<'a>
+        = &'a mut BytesMut
+    where
+        O: 'a;
 
     fn begin_segment<'a>(&'a mut self) -> Self::Buf<'a> {
         if self.buf.len() == 0 {
@@ -215,21 +217,20 @@ impl<O: KcpBufOps> KcpWrite for KcpWriteBuf<O> {
         self.buf.capacity()
     }
 
-    fn reserve(&mut self, additional: usize)  {
+    fn reserve(&mut self, additional: usize) {
         self.buf.reserve(additional)
     }
 
     fn flush_packet(&mut self) {
         if self.buf.len() > 0 {
             self.ops.on_end_packet(&mut self.buf);
-            self.que.push_back(self.buf.split().freeze()); 
+            self.que.push_back(self.buf.split().freeze());
         }
     }
 }
 
 #[derive(Default)]
 struct KcpOutput<O>(O);
-
 
 // pub struct KcpBuf(BytesMut);
 

@@ -3,19 +3,22 @@ TODO:
     - impl kill_on_drop by fork pty_process::blocking::Pty
 */
 
-use std::{collections::HashMap, os::fd::{AsFd, AsRawFd}, io::{Read, Write}};
+use crate::async_mpsc_fd;
+use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
+use std::{
+    collections::HashMap,
+    io::{Read, Write},
+    os::fd::{AsFd, AsRawFd},
+};
 use tokio::sync::mpsc;
 use tracing::debug;
-use crate::async_mpsc_fd;
-use anyhow::{Result, Context, bail};
-
 
 pub async fn make_async_pty_process<S1, S2, I, K, V, I3>(
-    program: S1, 
+    program: S1,
     args: I,
-    row: u16, 
+    row: u16,
     col: u16,
     env_vars: I3,
 ) -> Result<(Sender, Receiver)>
@@ -41,29 +44,21 @@ where
 
     let session = make_pty_session(program, args, tx, row, col, env_vars)?;
 
-    let mut msg_tx = {
-        MSG_TX.lock().clone()
-    };
+    let mut msg_tx = { MSG_TX.lock().clone() };
 
     let pty_id = {
         let (tx, rx) = futures::channel::oneshot::channel();
-        msg_tx = tokio::task::spawn_blocking(move ||
-            msg_tx.blocking_send(Msg::AddSession(session, tx))
-            .map(|_x|msg_tx)
-        ).await??;
+        msg_tx = tokio::task::spawn_blocking(move || {
+            msg_tx
+                .blocking_send(Msg::AddSession(session, tx))
+                .map(|_x| msg_tx)
+        })
+        .await??;
         // msg_tx.blocking_send(Msg::AddSession(session, tx))?;
         rx.await?
     };
-    
-    Ok((
-        Sender {
-            tx: msg_tx,
-            pty_id,
-        },
-        Receiver {
-            rx,
-        }
-    ))
+
+    Ok((Sender { tx: msg_tx, pty_id }, Receiver { rx }))
 }
 
 pub struct Sender {
@@ -74,7 +69,9 @@ pub struct Sender {
 impl Drop for Sender {
     fn drop(&mut self) {
         // TODO: blocking_send may block async task
-        let _r = self.tx.blocking_send(Msg::RemoveSession(self.pty_id.clone()));
+        let _r = self
+            .tx
+            .blocking_send(Msg::RemoveSession(self.pty_id.clone()));
     }
 }
 
@@ -82,34 +79,31 @@ impl Sender {
     pub async fn send_data(&self, value: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
         let tx = self.tx.clone();
         let pty_id = self.pty_id.clone();
-        tokio::task::spawn_blocking(
-            move ||tx.blocking_send(Msg::StdinBytes(pty_id, value)))
-        .await
-        .unwrap()
-        .map_err(|e| {
-            match e.0 {
+        tokio::task::spawn_blocking(move || tx.blocking_send(Msg::StdinBytes(pty_id, value)))
+            .await
+            .unwrap()
+            .map_err(|e| match e.0 {
                 Msg::StdinBytes(_ptye_id, d) => mpsc::error::SendError(d),
                 _ => panic!("never send error"),
-            }
-        })
+            })
     }
 
-    pub async fn send_resize(&self, cols: u16, rows: u16) -> Result<(), mpsc::error::SendError<Bytes>> {
+    pub async fn send_resize(
+        &self,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), mpsc::error::SendError<Bytes>> {
         let tx = self.tx.clone();
         let pty_id = self.pty_id.clone();
         let size = pty_process::Size::new(rows, cols);
-        
-        tokio::task::spawn_blocking(
-            move ||tx.blocking_send(Msg::PtyResize(pty_id, size))
-        )
-        .await
-        .unwrap()
-        .map_err(|e| {
-            match e.0 {
+
+        tokio::task::spawn_blocking(move || tx.blocking_send(Msg::PtyResize(pty_id, size)))
+            .await
+            .unwrap()
+            .map_err(|e| match e.0 {
                 Msg::StdinBytes(_ptye_id, d) => mpsc::error::SendError(d),
                 _ => panic!("never send error"),
-            }
-        })
+            })
     }
 }
 
@@ -124,7 +118,6 @@ impl Receiver {
 }
 
 fn work_loop(mut rx: async_mpsc_fd::Receiver<Msg>) -> Result<()> {
-
     let socket_fd = rx.fd();
     // let mut alloc_pty_id = 0_u64;
     // let mut pty_map = PtyMap::new();
@@ -134,22 +127,16 @@ fn work_loop(mut rx: async_mpsc_fd::Receiver<Msg>) -> Result<()> {
     };
 
     'outer: loop {
-
         let mut set = nix::sys::select::FdSet::new();
-        
+
         set.insert(socket_fd);
 
         for (_k, session) in ctx.pty_map.iter() {
             set.insert(session.fd);
         }
 
-        let n = nix::sys::select::select(
-            None,
-            Some(&mut set),
-            None,
-            None,
-            None,
-        ).with_context(||"select failed")?;
+        let n = nix::sys::select::select(None, Some(&mut set), None, None, None)
+            .with_context(|| "select failed")?;
 
         if n == 0 {
             continue;
@@ -161,7 +148,7 @@ fn work_loop(mut rx: async_mpsc_fd::Receiver<Msg>) -> Result<()> {
                 if let Err(e) = r {
                     let _r = session.try_wait_child();
                     debug!("remove pty by read failed: {key:?} {e:?}");
-                    return false
+                    return false;
                 }
             }
 
@@ -174,10 +161,12 @@ fn work_loop(mut rx: async_mpsc_fd::Receiver<Msg>) -> Result<()> {
                 match rx.try_recv() {
                     Ok(msg) => {
                         if let Some((pty_id, session, op_r)) = process_msg(&mut ctx, msg) {
-
                             let mut removed = false;
                             if let Some(reason) = session.try_wait_child() {
-                                debug!("process msg but exit pty {:?}, reason[{:?}]", pty_id, reason);
+                                debug!(
+                                    "process msg but exit pty {:?}, reason[{:?}]",
+                                    pty_id, reason
+                                );
                                 ctx.pty_map.remove(&pty_id);
                                 removed = true;
                             }
@@ -192,7 +181,7 @@ fn work_loop(mut rx: async_mpsc_fd::Receiver<Msg>) -> Result<()> {
                         //     Msg::StdinBytes(pty_id, data) => {
                         //         if let Some(session) = pty_map.get_mut(&pty_id)  {
                         //             let op_r = session.pty.write_all(&data[..]);
-                                    
+
                         //             if let Some(reason) = session.try_wait_child() {
                         //                 debug!("write pty but exit [{:?}]", reason)
                         //             }
@@ -208,7 +197,6 @@ fn work_loop(mut rx: async_mpsc_fd::Receiver<Msg>) -> Result<()> {
                         //         if let Some(session) = pty_map.get_mut(&pty_id)  {
                         //             let op_r = session.pty.resize(args);
 
-                                    
                         //         }
                         //     },
                         //     Msg::AddSession(session, tx) => {
@@ -226,14 +214,14 @@ fn work_loop(mut rx: async_mpsc_fd::Receiver<Msg>) -> Result<()> {
                         //         }
                         //     },
                         // }
-                    },
+                    }
                     Err(e) => {
                         use async_mpsc_fd::UnboundedTryRecvError;
                         match e {
                             UnboundedTryRecvError::Empty => break,
                             UnboundedTryRecvError::Disconnected => break 'outer,
                         }
-                    },
+                    }
                 }
             }
         }
@@ -242,7 +230,7 @@ fn work_loop(mut rx: async_mpsc_fd::Receiver<Msg>) -> Result<()> {
     Ok(())
 }
 
-type PtyMap = HashMap::<PtyId, PtySession>;
+type PtyMap = HashMap<PtyId, PtySession>;
 struct WorkContext {
     alloc_pty_id: u64,
     pty_map: PtyMap,
@@ -251,36 +239,37 @@ struct WorkContext {
 fn process_msg(ctx: &mut WorkContext, msg: Msg) -> Option<(PtyId, &mut PtySession, Result<()>)> {
     match msg {
         Msg::StdinBytes(pty_id, data) => {
-            if let Some(session) = ctx.pty_map.get_mut(&pty_id)  {
-                let op_r = session.pty.write_all(&data[..])
-                .with_context(||"write_all failed");
-                return Some((pty_id, session, op_r))
-            } 
-        },
+            if let Some(session) = ctx.pty_map.get_mut(&pty_id) {
+                let op_r = session
+                    .pty
+                    .write_all(&data[..])
+                    .with_context(|| "write_all failed");
+                return Some((pty_id, session, op_r));
+            }
+        }
         Msg::PtyResize(pty_id, args) => {
             if let Some(session) = ctx.pty_map.get_mut(&pty_id) {
                 // tracing::debug!("pty resize {:?}, args {:?}", pty_id, args);
-                let op_r = session.pty.resize(args)
-                .with_context(||"resize failed");
-                return Some((pty_id, session, op_r))
+                let op_r = session.pty.resize(args).with_context(|| "resize failed");
+                return Some((pty_id, session, op_r));
             }
-        },
+        }
         Msg::AddSession(session, tx) => {
             ctx.alloc_pty_id += 1;
             let pty_id = PtyId(ctx.alloc_pty_id);
             ctx.pty_map.insert(pty_id.clone(), session);
             let _r = tx.send(pty_id.clone());
             debug!("added pty {:?}", pty_id);
-        },
+        }
         Msg::RemoveSession(pty_id) => {
             if let Some(mut session) = ctx.pty_map.remove(&pty_id) {
                 let _r = session.child.kill();
                 let _r = session.try_wait_child();
                 debug!("normal removed pty {:?}", pty_id);
             }
-        },
+        }
     }
-    return None
+    return None;
 }
 
 // #[derive(Clone)]
@@ -291,9 +280,8 @@ enum Msg {
     RemoveSession(PtyId),
 }
 
-
 struct PtySession {
-    pty: pty_process::blocking::Pty, 
+    pty: pty_process::blocking::Pty,
     child: std::process::Child,
     fd: std::os::fd::RawFd,
     tx: mpsc::Sender<Bytes>,
@@ -304,7 +292,7 @@ impl PtySession {
     pub fn read_and_send(&mut self) -> Result<()> {
         if self.buf.len() == 0 {
             if self.buf.capacity() == 0 {
-                self.buf = BytesMut::with_capacity(4*1024);
+                self.buf = BytesMut::with_capacity(4 * 1024);
             }
 
             self.buf.resize(self.buf.capacity(), 0);
@@ -313,8 +301,9 @@ impl PtySession {
         let n = self.pty.read(&mut self.buf[..])?;
         // buf.resize(n, 0);
         let packet = self.buf.split_to(n).freeze();
-        self.tx.blocking_send(packet)
-        .map_err(|_e| anyhow::anyhow!("send pty bytes fail"))?;
+        self.tx
+            .blocking_send(packet)
+            .map_err(|_e| anyhow::anyhow!("send pty bytes fail"))?;
         if n == 0 {
             bail!("pty reach eof")
         }
@@ -332,23 +321,20 @@ impl PtySession {
             Ok(Some(v)) => {
                 // bail!("read pty but exit {:?}", v)
                 Some(format!("{v:?}"))
-            },
-            Err(e) => {
-                Some(format!("try_wait failed {e:?}"))
             }
+            Err(e) => Some(format!("try_wait failed {e:?}")),
         }
     }
 }
 
-#[derive(Debug, Clone)]
-#[derive(Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 struct PtyId(u64);
 
 fn make_pty_session<S1, S2, I2, K, V, I3>(
-    program: S1, 
-    args: I2, 
+    program: S1,
+    args: I2,
     tx: mpsc::Sender<Bytes>,
-    row: u16, 
+    row: u16,
     col: u16,
     env_vars: I3,
 ) -> Result<PtySession>
@@ -360,15 +346,13 @@ where
     V: AsRef<str>,
     I3: Iterator<Item = (K, V)>,
 {
-    let pty = pty_process::blocking::Pty::new()
-        .with_context(||"new pty fail")?;
+    let pty = pty_process::blocking::Pty::new().with_context(|| "new pty fail")?;
 
-    let pts = pty.pts()
-        .with_context(||"new pts fail")?;
+    let pts = pty.pts().with_context(|| "new pts fail")?;
 
     // pty.resize(pty_process::Size::new(24, 80))
     pty.resize(pty_process::Size::new(row, col))
-        .with_context(||"resize pty fail")?;
+        .with_context(|| "resize pty fail")?;
 
     let child = {
         let mut command = pty_process::blocking::Command::new(program);
@@ -378,8 +362,8 @@ where
         for (k, v) in env_vars {
             command.env(k.as_ref(), v.as_ref());
         }
-        
-        command.spawn(&pts).with_context(||"spawn command fail")?
+
+        command.spawn(&pts).with_context(|| "spawn command fail")?
     };
 
     // unsafe {

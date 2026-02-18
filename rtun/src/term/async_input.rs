@@ -1,24 +1,27 @@
-use anyhow::{Result, Context};
-use std::{task::{self, Poll}, pin::Pin};
+use anyhow::{Context, Result};
 use futures::{Stream, StreamExt};
+use std::{
+    pin::Pin,
+    task::{self, Poll},
+};
 use tokio::signal::unix::Signal;
 
-use crate::{pty::{PtyEvent, PtySize}, async_stdin::{AsyncStdin, async_std_in}};
-
+use crate::{
+    async_stdin::{async_std_in, AsyncStdin},
+    pty::{PtyEvent, PtySize},
+};
 
 pub fn make_async_input() -> Result<AsynInput> {
-    Ok(AsynInput { 
+    Ok(AsynInput {
         size_signal: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?,
         stdin: async_std_in(),
-     })
+    })
 }
-
 
 pub struct AsynInput {
     size_signal: Signal,
     stdin: AsyncStdin,
 }
-
 
 impl Stream for AsynInput {
     type Item = Result<PtyEvent>;
@@ -30,50 +33,41 @@ impl Stream for AsynInput {
             // tracing::debug!("aaa AsynInput::poll has resize event\r");
 
             let mut size = get_term_size();
-            
+
             while let Poll::Ready(Some(_r)) = self.size_signal.poll_recv(cx) {
                 size = get_term_size();
             }
 
             let r = size
-            .map(|x|PtyEvent::Resize(x))
-            .with_context(||"can't get terminal size");
+                .map(|x| PtyEvent::Resize(x))
+                .with_context(|| "can't get terminal size");
 
             // tracing::debug!("aaa AsynInput::poll return resize {:?}\r", r);
-            return Poll::Ready(Some(r))
+            return Poll::Ready(Some(r));
         }
 
         let r = self.stdin.poll_next_unpin(cx);
         // tracing::debug!("aaa AsynInput::poll stdin result {:?}\r", r);
         match r {
             Poll::Ready(r) => {
-                let r = r.map(|
-                    x|x.map(|y|PtyEvent::StdinData(y))
-                    .map_err(|e|e.into())
-                );
+                let r = r.map(|x| x.map(|y| PtyEvent::StdinData(y)).map_err(|e| e.into()));
                 // tracing::debug!("aaa AsynInput::poll return stdin {:?}\r", r);
-                return Poll::Ready(r)
-            },
+                return Poll::Ready(r);
+            }
             Poll::Pending => {
                 // tracing::debug!("aaa AsynInput::poll return Pending\r");
-                return Poll::Pending
-            },
+                return Poll::Pending;
+            }
         }
     }
 }
 
-
 pub fn get_term_size() -> Option<PtySize> {
-    term_size::dimensions().map(|x|PtySize {
+    term_size::dimensions().map(|x| PtySize {
         cols: x.0 as u16,
         rows: x.1 as u16,
     })
 }
-
-
-
-
-
 
 // use anyhow::{Result, Context};
 // use bytes::BytesMut;
@@ -83,17 +77,13 @@ pub fn get_term_size() -> Option<PtySize> {
 
 // use crate::pty::{PtyEvent, PtySize};
 
-
-
 // pub fn make_async_input() -> Result<AsynInput> {
-//     Ok(AsynInput { 
+//     Ok(AsynInput {
 //         size_signal: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?,
 //         stdin: tokio::io::stdin(),
 //         buf: BytesMut::new(),
 //      })
 // }
-
-
 
 // pub struct AsynInput {
 //     size_signal: Signal,
@@ -107,9 +97,9 @@ pub fn get_term_size() -> Option<PtySize> {
 //     fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
 
 //         if let Poll::Ready(Some(_r)) = self.size_signal.poll_recv(cx) {
-            
+
 //             let mut size = get_term_size();
-            
+
 //             while let Poll::Ready(Some(_r)) = self.size_signal.poll_recv(cx) {
 //                 size = get_term_size();
 //             }
@@ -135,7 +125,7 @@ pub fn get_term_size() -> Option<PtySize> {
 //         let buf = &mut self0.buf;
 
 //         let mut rbuf = tokio::io::ReadBuf::new(buf);
-        
+
 //         let r = Pin::new(stdin).poll_read(cx, &mut rbuf);
 //         match r {
 //             Poll::Ready(r) => {
@@ -150,11 +140,9 @@ pub fn get_term_size() -> Option<PtySize> {
 //             },
 //             Poll::Pending => Poll::Pending,
 //         }
-        
 
 //     }
 // }
-
 
 // pub fn get_term_size() -> Option<PtySize> {
 //     term_size::dimensions().map(|x|PtySize {

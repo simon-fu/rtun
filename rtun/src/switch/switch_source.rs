@@ -1,20 +1,35 @@
 use std::collections::HashMap;
 
-use anyhow::{Result, Context};
+use crate::{
+    actor_service::{
+        handle_first_none, start_actor, Action, ActorEntity, ActorHandle, AsyncHandler,
+    },
+    channel::{ChId, ChPacket, ChSender},
+    huid::HUId,
+    proto::RawPacket,
+};
+use anyhow::{Context, Result};
 use futures::StreamExt;
 use protobuf::Message;
-use crate::{actor_service::{ActorEntity, start_actor, handle_first_none, Action, AsyncHandler, ActorHandle}, huid::HUId, channel::{ChId, ChSender, ChPacket}, proto::RawPacket};
 use tokio::sync::mpsc;
 
-use super::{invoker_switch::{SwitchHanlder, SwitchInvoker, ReqAddChannel, AddChannelResult, ReqRemoveChannel, RemoveChannelResult, ReqGetMuxTx, ReqGetMuxTxResult}, entity_watch::{OpWatch, WatchResult, CtrlGuard}, ctrl_client::CtrlClient};
+use super::{
+    ctrl_client::CtrlClient,
+    entity_watch::{CtrlGuard, OpWatch, WatchResult},
+    invoker_switch::{
+        AddChannelResult, RemoveChannelResult, ReqAddChannel, ReqGetMuxTx, ReqGetMuxTxResult,
+        ReqRemoveChannel, SwitchHanlder, SwitchInvoker,
+    },
+};
 
-
-
-pub async fn make_switch_source<S>(uid: HUId, socket: S, outgoing_tx: mpsc::Sender<ChPacket>) -> Result<SwitchSource<S>> 
+pub async fn make_switch_source<S>(
+    uid: HUId,
+    socket: S,
+    outgoing_tx: mpsc::Sender<ChPacket>,
+) -> Result<SwitchSource<S>>
 where
     S: PacketSource,
 {
-
     let entity = Entity {
         socket,
         // invoker: None,
@@ -27,33 +42,25 @@ where
 
     let handle = start_actor(
         format!("switch-{}", uid),
-        entity, 
+        entity,
         handle_first_none,
-        wait_next, 
-        handle_next, 
+        wait_next,
+        handle_next,
         handle_msg,
     );
 
-    Ok(SwitchSource {
-        handle,
-    })
+    Ok(SwitchSource { handle })
 }
-
 
 pub type StreamPacket = Vec<u8>;
 pub type StreamError = anyhow::Error;
 // pub type SinkPacket = ChPacket;
 // pub type SinkError = anyhow::Error;
 
-pub trait PacketSource: 'static 
-+ Send
-+ Unpin
-+ StreamExt<Item = Result<StreamPacket, StreamError>> 
+pub trait PacketSource:
+    'static + Send + Unpin + StreamExt<Item = Result<StreamPacket, StreamError>>
 {
-
 }
-
-
 
 // pub trait SwitchOps {
 
@@ -63,16 +70,13 @@ pub trait PacketSource: 'static
 //     handle: ActorHandle<E>,
 // }
 
-
-
-
 pub struct SwitchSource<S: 'static + Send> {
     handle: ActorHandle<Entity<S>>,
 }
 
-impl<S>  SwitchSource<S> 
+impl<S> SwitchSource<S>
 where
-    S: 'static + Send
+    S: 'static + Send,
 {
     pub async fn shutdown_and_waitfor(&mut self) -> Result<()> {
         self.handle.invoker().shutdown().await;
@@ -85,9 +89,9 @@ where
     }
 }
 
-impl<S>  SwitchSource<S> 
+impl<S> SwitchSource<S>
 where
-    S: PacketSource
+    S: PacketSource,
 {
     pub fn clone_invoker(&self) -> SwitchSourceInvoker<S> {
         SwitchInvoker::new(self.handle.invoker().clone())
@@ -98,17 +102,12 @@ pub type SwitchSourceInvoker<S> = SwitchInvoker<Entity<S>>;
 pub type SwitchSourceCtrlClient<S> = CtrlClient<Entity<S>>;
 pub type SwitchSourceEntity<S> = Entity<S>;
 
-
 #[async_trait::async_trait]
-impl<S> AsyncHandler<ReqAddChannel> for Entity<S> 
+impl<S> AsyncHandler<ReqAddChannel> for Entity<S>
 where
-    S: 'static 
-        + Send
-        + StreamExt<Item = Result<StreamPacket, StreamError>> 
-        + Unpin,
-
+    S: 'static + Send + StreamExt<Item = Result<StreamPacket, StreamError>> + Unpin,
 {
-    type Response = AddChannelResult; 
+    type Response = AddChannelResult;
 
     async fn handle(&mut self, req: ReqAddChannel) -> Self::Response {
         let ch_id = req.0;
@@ -123,19 +122,15 @@ where
 }
 
 #[async_trait::async_trait]
-impl<S> AsyncHandler<ReqRemoveChannel> for Entity<S> 
+impl<S> AsyncHandler<ReqRemoveChannel> for Entity<S>
 where
-    S: 'static 
-        + Send
-        + StreamExt<Item = Result<StreamPacket, StreamError>> 
-        + Unpin,
-
+    S: 'static + Send + StreamExt<Item = Result<StreamPacket, StreamError>> + Unpin,
 {
-    type Response = RemoveChannelResult; 
+    type Response = RemoveChannelResult;
 
     async fn handle(&mut self, req: ReqRemoveChannel) -> Self::Response {
         let ch_id = req.0;
-        
+
         let old = self.channels.remove(&ch_id);
 
         if let Some(old) = &old {
@@ -148,15 +143,11 @@ where
 }
 
 #[async_trait::async_trait]
-impl<S> AsyncHandler<ReqGetMuxTx> for Entity<S> 
+impl<S> AsyncHandler<ReqGetMuxTx> for Entity<S>
 where
-    S: 'static 
-        + Send
-        + StreamExt<Item = Result<StreamPacket, StreamError>> 
-        + Unpin,
-
+    S: 'static + Send + StreamExt<Item = Result<StreamPacket, StreamError>> + Unpin,
 {
-    type Response = ReqGetMuxTxResult; 
+    type Response = ReqGetMuxTxResult;
 
     async fn handle(&mut self, _req: ReqGetMuxTx) -> Self::Response {
         Ok(self.outgoing_tx.clone())
@@ -164,37 +155,29 @@ where
 }
 
 #[async_trait::async_trait]
-impl<S> AsyncHandler<OpWatch> for Entity<S> 
+impl<S> AsyncHandler<OpWatch> for Entity<S>
 where
-    S: 'static 
-        + Send
-        + StreamExt<Item = Result<StreamPacket, StreamError>> 
-        + Unpin,
+    S: 'static + Send + StreamExt<Item = Result<StreamPacket, StreamError>> + Unpin,
 {
-    type Response = WatchResult; 
+    type Response = WatchResult;
 
     async fn handle(&mut self, _req: OpWatch) -> Self::Response {
         Ok(self.guard.watch())
     }
 }
 
-impl<S> SwitchHanlder for Entity<S> 
-where
-    S: 'static 
-        + Send
-        + StreamExt<Item = Result<StreamPacket, StreamError>> 
-        + Unpin,
-{}
-
+impl<S> SwitchHanlder for Entity<S> where
+    S: 'static + Send + StreamExt<Item = Result<StreamPacket, StreamError>> + Unpin
+{
+}
 
 type Next = Result<Vec<u8>>;
 
-
-// async fn recv_next<S>(stream: &mut S) -> Next 
+// async fn recv_next<S>(stream: &mut S) -> Next
 // where
-//     S: 'static 
+//     S: 'static
 //         + Send
-//         + StreamExt<Item = Result<StreamPacket, StreamError>> 
+//         + StreamExt<Item = Result<StreamPacket, StreamError>>
 //         + Unpin,
 // {
 //     stream.next().await
@@ -203,37 +186,32 @@ type Next = Result<Vec<u8>>;
 // }
 
 #[inline]
-async fn wait_next<S>(entity: &mut Entity<S>) -> Next 
+async fn wait_next<S>(entity: &mut Entity<S>) -> Next
 where
-    S: PacketSource
+    S: PacketSource,
 {
-    entity.socket.next().await
-    .with_context(||"reach eof")?
+    entity.socket.next().await.with_context(|| "reach eof")?
 }
 
-async fn handle_next<S>(entity: &mut Entity<S>, next: Next) -> Result<Action> 
+async fn handle_next<S>(entity: &mut Entity<S>, next: Next) -> Result<Action>
 where
-    S: PacketSource
+    S: PacketSource,
 {
     let data = next?;
 
-    let raw = RawPacket::parse_from_bytes(&data)
-    .with_context(||"invalid raw packet")?;
+    let raw = RawPacket::parse_from_bytes(&data).with_context(|| "invalid raw packet")?;
     let packet = ChPacket {
         ch_id: ChId(raw.ch_id),
         payload: raw.payload,
     };
-    
+
     if let Some(item) = entity.channels.get(&packet.ch_id) {
-        let _r = item.tx.send_data(packet.payload).await; 
+        let _r = item.tx.send_data(packet.payload).await;
         // TODO: remove channel if fail
     }
 
     Ok(Action::None)
 }
-
-
-
 
 struct ChannelItem {
     tx: ChSender,
@@ -248,8 +226,6 @@ impl Drop for ChannelItem {
 async fn handle_msg<S>(_entity: &mut Entity<S>, _msg: Msg) -> Result<Action> {
     Ok(Action::None)
 }
-
-
 
 pub struct Entity<S> {
     socket: S,
@@ -275,13 +251,11 @@ impl<S> Entity<S> {
     // }
 }
 
-pub enum Msg {
-
-}
+pub enum Msg {}
 
 type EntityResult = ();
 
-impl<S> ActorEntity for Entity<S> 
+impl<S> ActorEntity for Entity<S>
 where
     S: 'static + Send,
 {
@@ -295,5 +269,3 @@ where
         ()
     }
 }
-
-

@@ -1,28 +1,27 @@
+use std::{collections::VecDeque, io};
 
-use std::{io, collections::VecDeque};
+use anyhow::{bail, Result};
 
-use anyhow::{Result, bail};
-
-use bytes::{Bytes, BytesMut, BufMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
 
 use console::Term;
 
 use rtun::async_rt;
-use tokio::sync::{oneshot, mpsc};
+use tokio::sync::{mpsc, oneshot};
 
-use super::{tui::footer::{Event, FooterInput}, app::make_app};
+use super::{
+    app::make_app,
+    tui::footer::{Event, FooterInput},
+};
 
-
-pub fn run(args: CmdArgs) -> Result<()> { 
-    
+pub fn run(args: CmdArgs) -> Result<()> {
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(128);
-    
+
     {
         let event_tx = event_tx.clone();
         crate::init_log2(move || LogWriter::new(event_tx.clone()));
     }
-    
 
     let (app1, app2) = make_app(event_tx.clone())?;
     let listen = args.listen.clone();
@@ -38,34 +37,28 @@ pub fn run(args: CmdArgs) -> Result<()> {
         })
     });
 
-
     let event_tx1 = event_tx.clone();
     std::thread::spawn(move || -> io::Result<()> {
         let term = Term::stdout();
         loop {
-            let key = term.read_key()?; 
+            let key = term.read_key()?;
             let r = event_tx1.blocking_send(Event::Key(key));
             if r.is_err() {
-                return Ok(())
+                return Ok(());
             }
         }
-        
     });
-
 
     // kick_slow_log(event_tx);
 
-
-    FooterInput::new(event_rx)
-    .run_app(app1)?;
-
+    FooterInput::new(event_rx).run_app(app1)?;
 
     let _r = async_tx.send(());
     println!("send result {_r:?}");
 
     let _r = thread.join();
     println!("join result {_r:?}");
-    
+
     Ok(())
 }
 
@@ -85,10 +78,8 @@ pub fn run(args: CmdArgs) -> Result<()> {
 //     });
 // }
 
-
-
 // struct RwBuf {
-    
+
 // }
 
 struct LogWriter {
@@ -97,13 +88,12 @@ struct LogWriter {
     que: VecDeque<Bytes>,
 }
 
-
 impl LogWriter {
     pub fn new(tx: mpsc::Sender<Event>) -> Self {
-        Self { 
+        Self {
             buf: make_buf(),
             que: Default::default(),
-            tx 
+            tx,
         }
     }
 }
@@ -111,7 +101,7 @@ impl LogWriter {
 impl io::Write for LogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if buf.len() == 0 {
-            return Ok(0)
+            return Ok(0);
         }
 
         // if !self.buf.has_remaining_mut() {
@@ -152,24 +142,16 @@ impl io::Write for LogWriter {
 }
 
 fn make_buf() -> BytesMut {
-    const BUF_CAP: usize = 8*1024;
+    const BUF_CAP: usize = 8 * 1024;
     BytesMut::with_capacity(BUF_CAP)
 }
-
-
-
 
 #[derive(Parser, Debug)]
 #[clap(name = "udp", author, about, version)]
 pub struct CmdArgs {
-    #[clap(
-        short = 'l',
-        long = "listen",
-        long_help = "listen address",
-    )]
+    #[clap(short = 'l', long = "listen", long_help = "listen address")]
     listen: Option<String>,
 }
-
 
 #[cfg(test)]
 mod test_udp {
@@ -181,10 +163,10 @@ mod test_udp {
     #[ignore = "manual long-running UDP debug test"]
     async fn test_udp() {
         tracing_subscriber::fmt()
-        .with_max_level(tracing::metadata::LevelFilter::DEBUG)
-        .with_target(false)
-        .with_ansi(true)
-        .init();
+            .with_max_level(tracing::metadata::LevelFilter::DEBUG)
+            .with_target(false)
+            .with_ansi(true)
+            .init();
 
         let span = tracing::span!(parent: None, tracing::Level::DEBUG, "", s="root");
         udp_loop().instrument(span).await;
@@ -212,18 +194,25 @@ mod test_udp {
 
             peer_socket.connect(from).await.unwrap();
             let root_socket = socket.clone();
-            
+
             let sid = format!("{from}");
             let span = tracing::span!(parent: None, tracing::Level::DEBUG, "", s=&sid);
 
-            let _task = tokio::spawn(async move {
-                peer_loop(peer_socket, from, root_socket).await;
-            }.instrument(span));
+            let _task = tokio::spawn(
+                async move {
+                    peer_loop(peer_socket, from, root_socket).await;
+                }
+                .instrument(span),
+            );
             // let _r = _task.await;
         }
     }
 
-    async fn peer_loop(socket: Arc<UdpSocket>, _peer_addr: SocketAddr, _root_socket: Arc<UdpSocket>) {
+    async fn peer_loop(
+        socket: Arc<UdpSocket>,
+        _peer_addr: SocketAddr,
+        _root_socket: Arc<UdpSocket>,
+    ) {
         let mut buf = vec![0; 1700];
         // let mut num = 0_u64;
         loop {
@@ -252,7 +241,6 @@ mod test_udp {
                 }
             }
             debug!(" <=== ");
-
         }
     }
 
@@ -276,5 +264,4 @@ mod test_udp {
         let udp_sock: std::net::UdpSocket = udp_sock.into();
         udp_sock.try_into().unwrap()
     }
-    
 }

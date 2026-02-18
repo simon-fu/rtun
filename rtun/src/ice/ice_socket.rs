@@ -1,23 +1,42 @@
-
-use std::{net::{SocketAddr, IpAddr, Ipv4Addr}, time::Duration, collections::{HashMap, VecDeque, HashSet}, borrow::Borrow, hash::Hash, task::{Poll, self}, io};
-use anyhow::{Result, Context, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
-use futures::{stream::FuturesUnordered, StreamExt, ready};
+use futures::{ready, stream::FuturesUnordered, StreamExt};
+use std::{
+    borrow::Borrow,
+    collections::{HashMap, HashSet, VecDeque},
+    hash::Hash,
+    io,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    task::{self, Poll},
+    time::Duration,
+};
 
 use crate::ice::ice_candidate::Candidate;
 
-use crate::stun::async_udp::{AsyncUdpSocket, AsUdpSocket, udp_state};
+use crate::stun::async_udp::{udp_state, AsUdpSocket, AsyncUdpSocket};
+use bytecodec::{DecodeExt, EncodeExt};
 use rand::Rng;
-use stun_codec::{Message, MessageClass, rfc5389::{methods::BINDING, attributes::{Software, XorMappedAddress, MappedAddress, Username, MessageIntegrity, Fingerprint}}, TransactionId, MessageEncoder, MessageDecoder, Method, rfc5245::{attributes::{IceControlling, IceControlled, Priority, UseCandidate}, errors::RoleConflict}};
-use bytecodec::{EncodeExt, DecodeExt};
-use tokio::{time::Instant, net::{ToSocketAddrs, lookup_host}};
+use stun_codec::{
+    rfc5245::{
+        attributes::{IceControlled, IceControlling, Priority, UseCandidate},
+        errors::RoleConflict,
+    },
+    rfc5389::{
+        attributes::{
+            Fingerprint, MappedAddress, MessageIntegrity, Software, Username, XorMappedAddress,
+        },
+        methods::BINDING,
+    },
+    Message, MessageClass, MessageDecoder, MessageEncoder, Method, TransactionId,
+};
+use tokio::{
+    net::{lookup_host, ToSocketAddrs},
+    time::Instant,
+};
 
 use super::{ice_attribute::Attribute, ice_candidate::CandidateKind};
 
-
-
-
-pub async fn udp_run_until_done<U, O>(socket: &U, ops: &mut O) -> Result<()> 
+pub async fn udp_run_until_done<U, O>(socket: &U, ops: &mut O) -> Result<()>
 where
     U: AsyncUdpSocket + Unpin,
     O: UdpOps,
@@ -32,7 +51,7 @@ where
     Ok(())
 }
 
-pub async fn udp_run_one<U, O>(socket: &U, ops: &mut O, buf: &mut [u8]) -> Result<()> 
+pub async fn udp_run_one<U, O>(socket: &U, ops: &mut O, buf: &mut [u8]) -> Result<()>
 where
     U: AsyncUdpSocket + Unpin,
     O: UdpOps,
@@ -55,7 +74,7 @@ where
     Ok(())
 }
 
-pub async fn udp_flush<U, O>(socket: &U, ops: &mut O) -> Result<()> 
+pub async fn udp_flush<U, O>(socket: &U, ops: &mut O) -> Result<()>
 where
     U: AsyncUdpSocket + Unpin,
     O: UdpOps,
@@ -66,11 +85,11 @@ where
             UdpTx::Tx(packet) => {
                 // tracing::debug!("send to {} bytes {}", packet.addr, packet.data.len());
                 socket.as_socket().send_to(packet.data, packet.addr).await?;
-            },
+            }
             UdpTx::SetTtl(ttl) => {
                 // tracing::debug!("set ttl {ttl}");
                 socket.set_ttl(ttl)?;
-            },
+            }
         };
         ops.tx_que().pop_front();
     }
@@ -78,18 +97,16 @@ where
 }
 
 pub trait UdpOps {
-    fn is_done(&self) -> bool ;
+    fn is_done(&self) -> bool;
 
     fn tx_que(&mut self) -> &mut UdpTxQue;
 
-    fn next_tick_time(&mut self, now: Instant) -> Instant ;
+    fn next_tick_time(&mut self, now: Instant) -> Instant;
 
-    fn process_tick(&mut self, now: Instant) -> Result<()> ;
+    fn process_tick(&mut self, now: Instant) -> Result<()>;
 
-    fn input_data(&mut self, data: &[u8], from_addr: SocketAddr, now: Instant) -> Result<()> ;
+    fn input_data(&mut self, data: &[u8], from_addr: SocketAddr, now: Instant) -> Result<()>;
 }
-
-
 
 #[derive(Default)]
 pub struct StunResolver {
@@ -134,7 +151,7 @@ impl StunResolver {
         self.inflight.is_empty() && self.tx_que.is_empty()
     }
 
-    pub fn kick_targets<I>(&mut self, iter: I, now: Instant, host: Option<&'_ str>) -> Result<()> 
+    pub fn kick_targets<I>(&mut self, iter: I, now: Instant, host: Option<&'_ str>) -> Result<()>
     where
         I: Iterator<Item = SocketAddr>,
     {
@@ -148,24 +165,26 @@ impl StunResolver {
     pub fn kick_target(&mut self, target: SocketAddr, now: Instant) -> Result<()> {
         // tracing::debug!("kick resolve target {target}");
         let req = self.make_req()?;
-        
+
         let tsx_id = req.transaction_id();
 
         let data = encode_message(req)?;
 
         let tsx = UdpTsx {
             deadline: now + self.get_tsx_timeout(),
-            packet: UdpPacket { addr: target, data: data.into(), },
+            packet: UdpPacket {
+                addr: target,
+                data: data.into(),
+            },
             _ext: (),
         };
-        
+
         self.tx_que.push_back(UdpTx::Tx(tsx.packet.clone()));
         self.inflight.insert(tsx_id, tsx);
         // tracing::debug!("kick resolve target {target}, tx_que {}", self.tx_que.len());
 
         Ok(())
     }
-
 
     fn make_req(&mut self) -> Result<Message<Attribute>> {
         let mut req: Message<Attribute> = gen_request(BINDING);
@@ -178,31 +197,31 @@ impl StunResolver {
     }
 
     fn process_success_rsp(
-        &mut self, 
+        &mut self,
         rsp: Message<Attribute>,
         from_addr: SocketAddr,
         _now: Instant,
     ) -> Result<()> {
-
         let tsx_id = rsp.transaction_id();
-        
+
         let tsx = match self.inflight.remove(&tsx_id) {
             Some(v) => v,
             None => return Ok(()),
         };
 
-        let mapped = get_mapped_addr(&rsp).with_context(||"no mapped addr")?;
-        
-        self.mapped_addrs.insert_unique(mapped, from_addr, tsx.packet.addr);
-        
+        let mapped = get_mapped_addr(&rsp).with_context(|| "no mapped addr")?;
+
+        self.mapped_addrs
+            .insert_unique(mapped, from_addr, tsx.packet.addr);
+
         Ok(())
     }
 
     fn get_tsx_timeout(&self) -> Duration {
-        self.tsx_timeout.unwrap_or_else(||Duration::from_secs(10))
+        self.tsx_timeout.unwrap_or_else(|| Duration::from_secs(10))
     }
 
-    pub async fn resolve<U, I, A>(&mut self, socket: &U, servers: I) -> Result<()> 
+    pub async fn resolve<U, I, A>(&mut self, socket: &U, servers: I) -> Result<()>
     where
         U: AsyncUdpSocket + Unpin,
         I: Iterator<Item = A>,
@@ -214,8 +233,9 @@ impl StunResolver {
         for host in servers {
             lookup_futures.push(async {
                 let addr = host.to_string();
-                let r = lookup_host(host).await
-                    .with_context(||format!("failed to lookup host [{}]", addr))?;
+                let r = lookup_host(host)
+                    .await
+                    .with_context(|| format!("failed to lookup host [{}]", addr))?;
                 Result::<_>::Ok((r, addr))
             });
             resolver.num_servers += 1;
@@ -283,9 +303,11 @@ impl UdpOps for StunResolver {
 
         let min_response = self.min_success_response.unwrap_or(1);
         let done = self.mapped_addrs.num_success >= min_response;
-        println!("aaa check final, num_success {}, min_response {}, done {}", self.mapped_addrs.num_success, min_response, done);
+        println!(
+            "aaa check final, num_success {}, min_response {}, done {}",
+            self.mapped_addrs.num_success, min_response, done
+        );
         done
-        
 
         // println!("aaa check final");
         // self.mapped_addrs.num_success >= self.min_success_response.unwrap_or(1)
@@ -295,12 +317,14 @@ impl UdpOps for StunResolver {
         &mut self.tx_que
     }
 
-    fn next_tick_time(&mut self, _now: Instant) -> Instant  {
+    fn next_tick_time(&mut self, _now: Instant) -> Instant {
         self.inflight.next_tick_time()
     }
 
-    fn process_tick(&mut self, now: Instant) -> Result<()>  {
-        let r = self.inflight.process_tick(now, &mut self.tx_que, &mut self.timeouts);
+    fn process_tick(&mut self, now: Instant) -> Result<()> {
+        let r = self
+            .inflight
+            .process_tick(now, &mut self.tx_que, &mut self.timeouts);
         if let Err(e) = r {
             tracing::debug!("process_tick failed [{e:?}]");
         }
@@ -308,16 +332,15 @@ impl UdpOps for StunResolver {
         Ok(())
     }
 
-    fn input_data(&mut self, data: &[u8], from_addr: SocketAddr, now: Instant) -> Result<()>  {
+    fn input_data(&mut self, data: &[u8], from_addr: SocketAddr, now: Instant) -> Result<()> {
         let mut func = move || -> Result<()> {
-            let msg = decode_message(data).with_context(||"decode stun msg failed")?;
+            let msg = decode_message(data).with_context(|| "decode stun msg failed")?;
 
             match (msg.class(), msg.method()) {
                 (MessageClass::SuccessResponse, BINDING) => {
                     // tracing::debug!("is binding success response");
                     self.process_success_rsp(msg, from_addr, now)?;
-    
-                },
+                }
                 r => {
                     tracing::debug!("unknown recv msg {r:?}");
                 }
@@ -343,10 +366,10 @@ pub enum NatType {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RAddr {
     Srflx(SocketAddr),
-    Peerflx{
+    Peerflx {
         target: SocketAddr,
         from: SocketAddr,
-    }
+    },
 }
 
 impl RAddr {
@@ -354,12 +377,10 @@ impl RAddr {
         if target == from {
             Self::Srflx(target)
         } else {
-            Self::Peerflx { target, from, }
+            Self::Peerflx { target, from }
         }
     }
 }
-
-
 
 #[derive(Debug, Clone, Default)]
 pub struct MappedAddrs {
@@ -385,16 +406,16 @@ impl MappedAddrs {
         }
     }
 
-
-    pub fn mapped_iter<'a>(&'a self) -> impl Iterator<Item = SocketAddr> + 'a  {
-        self.mapped.iter().map(|x|x.0.clone())
+    pub fn mapped_iter<'a>(&'a self) -> impl Iterator<Item = SocketAddr> + 'a {
+        self.mapped.iter().map(|x| x.0.clone())
     }
 
-    pub fn select_first_mapped<'a>(&'a self) -> Result<SocketAddr>  {
-        self.mapped.iter()
-        .next()
-        .map(|x|x.0.clone())
-        .with_context(||"empty mapped")
+    pub fn select_first_mapped<'a>(&'a self) -> Result<SocketAddr> {
+        self.mapped
+            .iter()
+            .next()
+            .map(|x| x.0.clone())
+            .with_context(|| "empty mapped")
     }
 
     fn insert_unique(&mut self, mapped: SocketAddr, from: SocketAddr, target: SocketAddr) {
@@ -408,8 +429,6 @@ impl MappedAddrs {
         self.num_success += 1;
     }
 }
-
-
 
 #[derive(Debug, Default)]
 pub struct CheckerConfig {
@@ -477,7 +496,8 @@ impl CheckerConfig {
     }
 
     fn base(&self) -> SocketAddr {
-        self.base.unwrap_or_else(||SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0))
+        self.base
+            .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0))
     }
 
     fn make_req(&self, cand: &Candidate, use_cand: bool) -> Result<Message<Attribute>> {
@@ -489,7 +509,6 @@ impl CheckerConfig {
 
         let creds = &self.local_creds;
         // tracing::debug!("make req, {:?}, {creds:?}, target {:?}, use_cand {use_cand}", req.transaction_id(), cand.addr());
-        
 
         if let Some(creds) = creds {
             let username = Username::new(creds.username.clone())?;
@@ -503,7 +522,7 @@ impl CheckerConfig {
             Attribute::IceControlled(IceControlled::new(self.tie_breaker))
         };
         req.add_attribute(attr);
-        
+
         if use_cand {
             let attr = Attribute::UseCandidate(UseCandidate::new());
             req.add_attribute(attr);
@@ -514,7 +533,6 @@ impl CheckerConfig {
             let attr = Attribute::Priority(Priority::new(prio));
             req.add_attribute(attr);
         }
-        
 
         if let Some(creds) = creds {
             let integrity = MessageIntegrity::new_short_term_credential(&req, &creds.password)?;
@@ -524,86 +542,114 @@ impl CheckerConfig {
         Ok(req)
     }
 
-    fn make_rsp(&self, req: &Message<Attribute>, from_addr: SocketAddr) -> Result<Message<Attribute>> {
+    fn make_rsp(
+        &self,
+        req: &Message<Attribute>,
+        from_addr: SocketAddr,
+    ) -> Result<Message<Attribute>> {
         let creds = &self.remote_creds;
 
         let mut rsp = Message::new(MessageClass::SuccessResponse, BINDING, req.transaction_id());
         // tracing::debug!("make rsp, {:?}, {creds:?}, {:?}", rsp.transaction_id(), from_addr);
-        
-        rsp.add_attribute(Attribute::XorMappedAddress(XorMappedAddress::new(from_addr)));
+
+        rsp.add_attribute(Attribute::XorMappedAddress(XorMappedAddress::new(
+            from_addr,
+        )));
 
         if let Some(creds) = creds {
             let integrity = MessageIntegrity::new_short_term_credential(&rsp, &creds.password)?;
             rsp.add_attribute(integrity.into());
         }
-        
+
         rsp.add_attribute(Attribute::Fingerprint(Fingerprint::new(&rsp)?));
 
         Ok(rsp)
     }
 
-    fn try_make_rsp_if_req(&self, msg: Message<Attribute>, from_addr: &SocketAddr) -> Result<Vec<u8>> {
-
+    fn try_make_rsp_if_req(
+        &self,
+        msg: Message<Attribute>,
+        from_addr: &SocketAddr,
+    ) -> Result<Vec<u8>> {
         match (msg.class(), msg.method()) {
             (MessageClass::Request, BINDING) => {
                 let rsp = self.make_rsp(&msg, *from_addr)?;
                 let data = encode_message(rsp)?;
-                return Ok(data)
-            },
+                return Ok(data);
+            }
             _ => {
                 bail!("NOT binding req")
-            },
+            }
         }
     }
 
-    fn make_role_conflict_rsp(&self, req: &Message<Attribute>, from_addr: SocketAddr) -> Result<Message<Attribute>> {
+    fn make_role_conflict_rsp(
+        &self,
+        req: &Message<Attribute>,
+        from_addr: SocketAddr,
+    ) -> Result<Message<Attribute>> {
         let creds = &self.local_creds;
         // tracing::debug!("make role conflict with creds {creds:?}");
 
         let mut rsp = Message::new(MessageClass::ErrorResponse, BINDING, req.transaction_id());
-        
-        
+
         rsp.add_attribute(Attribute::ErrorCode(RoleConflict.into()));
-        rsp.add_attribute(Attribute::XorMappedAddress(XorMappedAddress::new(from_addr)));
+        rsp.add_attribute(Attribute::XorMappedAddress(XorMappedAddress::new(
+            from_addr,
+        )));
 
         if let Some(creds) = creds {
             let integrity = MessageIntegrity::new_short_term_credential(&req, &creds.password)?;
             rsp.add_attribute(integrity.into());
         }
-        
+
         rsp.add_attribute(Attribute::Fingerprint(Fingerprint::new(&rsp)?));
 
         Ok(rsp)
     }
 
-    fn make_req_tsx(&self, cand: &Candidate, use_cand: bool, now: Instant) -> Result<(TransactionId, UdpTsx<()>)> {
+    fn make_req_tsx(
+        &self,
+        cand: &Candidate,
+        use_cand: bool,
+        now: Instant,
+    ) -> Result<(TransactionId, UdpTsx<()>)> {
         let req = self.make_req(&cand, use_cand)?;
-        
+
         let tsx_id = req.transaction_id();
 
         let data = encode_message(req)?;
 
         let tsx = UdpTsx {
             deadline: now + self.get_tsx_timeout(),
-            packet: UdpPacket { addr: cand.addr(), data: data.into(), },
+            packet: UdpPacket {
+                addr: cand.addr(),
+                data: data.into(),
+            },
             _ext: (),
         };
 
         Ok((tsx_id, tsx))
     }
 
-    fn kick_req(&self, cand: &Candidate, use_cand: bool, now: Instant, tx_que: &mut UdpTxQue, inflight: &mut UdpTsxMap<TransactionId, ()>) -> Result<()> {
-
+    fn kick_req(
+        &self,
+        cand: &Candidate,
+        use_cand: bool,
+        now: Instant,
+        tx_que: &mut UdpTxQue,
+        inflight: &mut UdpTsxMap<TransactionId, ()>,
+    ) -> Result<()> {
         let (tsx_id, tsx) = self.make_req_tsx(cand, use_cand, now)?;
-        
+
         tx_que.push_back(UdpTx::Tx(tsx.packet.clone()));
         inflight.insert(tsx_id, tsx);
 
         Ok(())
     }
-    
+
     fn get_tsx_timeout(&self) -> Duration {
-        self.tsx_timeout.unwrap_or_else(||Duration::from_secs(10))
+        self.tsx_timeout.unwrap_or_else(|| Duration::from_secs(10))
     }
 
     fn check_req_integrity(&self, msg: &Message<Attribute>) -> Result<()> {
@@ -633,7 +679,6 @@ pub struct IceChecker {
     remote_candidates: HashMap<SocketAddr, Candidate>,
     success_candidates: HashSet<SocketAddr>, // recv success
     // local_candidates: HashMap<SocketAddr, Candidate>,
-
     tx_que: UdpTxQue,
     inflight: UdpTsxMap<TransactionId, ()>,
     timeouts: VecDeque<UdpTsx<()>>,
@@ -648,7 +693,7 @@ pub struct IceChecker {
 }
 
 impl UdpOps for IceChecker {
-    fn is_done(&self) -> bool  {
+    fn is_done(&self) -> bool {
         self.result.is_some()
     }
 
@@ -656,13 +701,14 @@ impl UdpOps for IceChecker {
         &mut self.tx_que
     }
 
-    fn next_tick_time(&mut self, _now: Instant) -> Instant  {
+    fn next_tick_time(&mut self, _now: Instant) -> Instant {
         self.inflight.next_tick_time()
     }
 
-    fn process_tick(&mut self, now: Instant) -> Result<()>  {
-
-        let r = self.inflight.process_tick(now, &mut self.tx_que, &mut self.timeouts);
+    fn process_tick(&mut self, now: Instant) -> Result<()> {
+        let r = self
+            .inflight
+            .process_tick(now, &mut self.tx_que, &mut self.timeouts);
         if let Err(e) = r {
             tracing::debug!("process_tick faild [{e:?}]");
         }
@@ -677,7 +723,7 @@ impl UdpOps for IceChecker {
         Ok(())
     }
 
-    fn input_data(&mut self, data: &[u8], from_addr: SocketAddr, now: Instant) -> Result<()>  {
+    fn input_data(&mut self, data: &[u8], from_addr: SocketAddr, now: Instant) -> Result<()> {
         let r = self.do_input_data(data, from_addr, now);
         if let Err(e) = r {
             // some remains messages from stun server
@@ -689,8 +735,7 @@ impl UdpOps for IceChecker {
 }
 
 impl IceChecker {
-
-    pub fn into_socket<U>(self, socket: U, ) -> IceSocket<U> {
+    pub fn into_socket<U>(self, socket: U) -> IceSocket<U> {
         IceSocket {
             socket,
             config: self.config,
@@ -701,8 +746,8 @@ impl IceChecker {
         &self.config
     }
 
-    pub fn set_local_candidates<'a, I>(&mut self, iter: I) 
-    where 
+    pub fn set_local_candidates<'a, I>(&mut self, iter: I)
+    where
         I: Iterator<Item = &'a Candidate> + 'a,
     {
         self.local_nat4 = Nat4::from_iter(iter);
@@ -726,9 +771,9 @@ impl IceChecker {
                 for (_addr, cand) in self.remote_candidates.iter() {
                     let req = self.config.make_req(cand, false)?;
                     let data = encode_message(req)?;
-                    self.tx_que.push_back(UdpTx::Tx(UdpPacket { 
+                    self.tx_que.push_back(UdpTx::Tx(UdpPacket {
                         addr: cand.addr(),
-                        data: data.into(), 
+                        data: data.into(),
                     }));
                 }
             }
@@ -739,34 +784,31 @@ impl IceChecker {
     pub fn kick_checking(&mut self, now: Instant) -> Result<()> {
         self.start_at = Some(now);
         for (_addr, cand) in self.remote_candidates.iter() {
-            self.config.kick_req(cand, false, now, &mut self.tx_que, &mut self.inflight)?;
+            self.config
+                .kick_req(cand, false, now, &mut self.tx_que, &mut self.inflight)?;
         }
 
-        self.remote_nat4 = Nat4::from_iter(self.remote_candidates.iter().map(|x|x.1));
+        self.remote_nat4 = Nat4::from_iter(self.remote_candidates.iter().map(|x| x.1));
 
-        if let Some(nat4) = &mut self.remote_nat4 {
-
-        }
+        if let Some(nat4) = &mut self.remote_nat4 {}
 
         Ok(())
     }
 
     fn do_input_data(&mut self, data: &[u8], from_addr: SocketAddr, now: Instant) -> Result<()> {
-        let msg = decode_message(data).with_context(||"decode ice packet failed")?;
+        let msg = decode_message(data).with_context(|| "decode ice packet failed")?;
 
         match (msg.class(), msg.method()) {
             (MessageClass::Request, BINDING) => {
                 // tracing::debug!("is binding request");
                 self.config.check_req_integrity(&msg)?;
                 self.process_req(msg, from_addr, now)?;
-
-            },
+            }
             (MessageClass::SuccessResponse, BINDING) => {
                 // tracing::debug!("is binding success response");
                 self.config.check_rsp_integrity(&msg)?;
                 self.process_success_rsp(msg, from_addr, now)?;
-
-            },
+            }
             // (MessageClass::ErrorResponse, BINDING) => {
             //     tracing::debug!("is binding error response");
             //     self.config.check_rsp_integrity(&msg)?;
@@ -775,28 +817,25 @@ impl IceChecker {
             // },
             r => {
                 tracing::debug!("unknown recv msg {r:?}");
-
             }
         }
 
         Ok(())
     }
 
-
     fn process_req(
-        &mut self, 
+        &mut self,
         req: Message<Attribute>,
         from_addr: SocketAddr,
         now: Instant,
     ) -> Result<()> {
-        
         if !self.upgraded_ttl {
             self.upgraded_ttl = true;
             self.tx_que.push_back(UdpTx::SetTtl(64));
         }
 
         if !self.config.controlled {
-            /* 
+            /*
             o  If the agent is in the controlling role, and the ICE-CONTROLLING
                attribute is present in the request:
                 *  If the agent's tie-breaker is larger than or equal to the
@@ -809,23 +848,22 @@ impl IceChecker {
                    role.
             */
 
-            let r = req.get_attribute::<IceControlling>().map(|x|x.prio());
+            let r = req.get_attribute::<IceControlling>().map(|x| x.prio());
             if let Some(remote_tie_breaker) = r {
                 if self.config.tie_breaker >= remote_tie_breaker {
                     tracing::warn!("conflict role controllig, local {}, remote {remote_tie_breaker}, local win", self.config.tie_breaker);
                     let rsp = self.config.make_role_conflict_rsp(&req, from_addr)?;
                     let data = encode_message(rsp)?;
-                    self.tx_que.push_back(UdpTx::Tx(UdpPacket { 
-                        addr: from_addr, 
-                        data: data.into() 
+                    self.tx_que.push_back(UdpTx::Tx(UdpPacket {
+                        addr: from_addr,
+                        data: data.into(),
                     }));
-                    return Ok(())
+                    return Ok(());
                 } else {
                     tracing::warn!("conflict role controllig, local {}, remote {remote_tie_breaker}, remote win", self.config.tie_breaker);
                     self.config.controlled = true;
                 }
             }
-            
         } else {
             /*
             o  If the agent is in the controlled role, and the ICE-CONTROLLED
@@ -841,34 +879,36 @@ impl IceChecker {
                     487 (Role Conflict) but retains its role.
             */
 
-            let r = req.get_attribute::<IceControlled>().map(|x|x.prio());
+            let r = req.get_attribute::<IceControlled>().map(|x| x.prio());
             if let Some(remote_tie_breaker) = r {
                 if self.config.tie_breaker >= remote_tie_breaker {
                     self.config.controlled = false;
                     tracing::warn!("conflict role controlled, local {}, remote {remote_tie_breaker}, local win", self.config.tie_breaker);
                     let rsp = self.config.make_role_conflict_rsp(&req, from_addr)?;
                     let data = encode_message(rsp)?;
-                    self.tx_que.push_back(UdpTx::Tx(UdpPacket { 
-                        addr: from_addr, 
-                        data: data.into() 
+                    self.tx_que.push_back(UdpTx::Tx(UdpPacket {
+                        addr: from_addr,
+                        data: data.into(),
                     }));
-                    return Ok(())
+                    return Ok(());
                 } else {
                     tracing::warn!("conflict role controlled, local {}, remote {remote_tie_breaker}, remote win", self.config.tie_breaker);
                 }
             }
-
         }
 
-        let prio = req.get_attribute::<Priority>().with_context(||"no priority in req")?.prio();
+        let prio = req
+            .get_attribute::<Priority>()
+            .with_context(|| "no priority in req")?
+            .prio();
 
         let use_cand = req.get_attribute::<UseCandidate>();
 
-        if self.config.controlled {            
+        if self.config.controlled {
             if use_cand.is_some() {
                 if !self.success_candidates.contains(&from_addr) {
                     // ignore nominated until recv response
-                    return Ok(())
+                    return Ok(());
                 } else {
                     // tracing::debug!("got use_cand, selected {from_addr}");
                     self.result = Some(CheckResult::Selected(from_addr));
@@ -878,19 +918,20 @@ impl IceChecker {
 
         let rsp = self.config.make_rsp(&req, from_addr)?;
         let data = encode_message(rsp)?;
-        self.tx_que.push_back(UdpTx::Tx(UdpPacket { 
-            addr: from_addr, 
-            data: data.into() 
+        self.tx_que.push_back(UdpTx::Tx(UdpPacket {
+            addr: from_addr,
+            data: data.into(),
         }));
 
         if let Some(_cand) = self.remote_candidates.get(&from_addr) {
-
         } else {
-            let new_cand = Candidate::peer_reflexive(from_addr, self.config.base(), prio, None, None);
-        
+            let new_cand =
+                Candidate::peer_reflexive(from_addr, self.config.base(), prio, None, None);
+
             // self.kick_req(&new_cand, false, now)?;
-            self.config.kick_req(&new_cand, false, now, &mut self.tx_que, &mut self.inflight)?;
-    
+            self.config
+                .kick_req(&new_cand, false, now, &mut self.tx_que, &mut self.inflight)?;
+
             self.remote_candidates.insert(new_cand.addr(), new_cand);
         }
 
@@ -898,26 +939,22 @@ impl IceChecker {
     }
 
     fn process_success_rsp(
-        &mut self, 
+        &mut self,
         rsp: Message<Attribute>,
         from_addr: SocketAddr,
         now: Instant,
     ) -> Result<()> {
-
-
         let tsx_id = rsp.transaction_id();
-        
+
         let tsx = match self.inflight.remove(&tsx_id) {
             Some(v) => v,
             None => return Ok(()),
         };
 
-
-        let _mapped = get_mapped_addr(&rsp).with_context(||"no mapped addr");
+        let _mapped = get_mapped_addr(&rsp).with_context(|| "no mapped addr");
         // let prio = req.get_attribute::<Priority>().with_context(||"no priority in req")?.prio();
 
         if let Some(cand) = self.remote_candidates.get(&from_addr) {
-            
             self.success_candidates.insert(from_addr);
 
             if !self.config.controlled {
@@ -927,33 +964,33 @@ impl IceChecker {
                             // tracing::debug!("recv nominate reponse, addr {from_addr}, {tsx_id:?}");
                             self.result = Some(CheckResult::Selected(from_addr));
                         }
-                    },
+                    }
                     None => {
                         let (tsx_id, tsx) = self.config.make_req_tsx(cand, true, now)?;
                         // tracing::debug!("nominate addr {from_addr}, {tsx_id:?}");
                         self.nominated_tsx_id = Some(tsx_id);
-        
+
                         self.tx_que.push_back(UdpTx::Tx(tsx.packet.clone()));
                         self.inflight.insert(tsx_id, tsx);
-                    },
+                    }
                 }
             }
-            return Ok(())
+            return Ok(());
         }
 
         if let Some(cand) = self.remote_candidates.get(&tsx.packet.addr) {
-            let new_cand = Candidate::peer_reflexive(from_addr, self.config.base(), cand.prio(), None, None);
-        
+            let new_cand =
+                Candidate::peer_reflexive(from_addr, self.config.base(), cand.prio(), None, None);
+
             // self.kick_req(&new_cand, false, now)?;
-            self.config.kick_req(&new_cand, false, now, &mut self.tx_que, &mut self.inflight)?;
-    
+            self.config
+                .kick_req(&new_cand, false, now, &mut self.tx_que, &mut self.inflight)?;
+
             self.remote_candidates.insert(new_cand.addr(), new_cand);
-            
         }
-        
+
         Ok(())
     }
-
 }
 
 // struct Nat4 {
@@ -984,18 +1021,16 @@ impl IceChecker {
 //     }
 // }
 
-
-
 struct Nat4 {
     targets: HashMap<SocketAddr, Vec<SocketAddr>>, // raddr -> targets
 }
 
 impl Nat4 {
-    fn from_iter<'a, I>(iter: I) -> Option<Self> 
-    where 
+    fn from_iter<'a, I>(iter: I) -> Option<Self>
+    where
         I: Iterator<Item = &'a Candidate> + 'a,
     {
-        let  mut first: Option<&'a Candidate> = None;
+        let mut first: Option<&'a Candidate> = None;
 
         let mut targets = HashMap::new();
 
@@ -1008,7 +1043,7 @@ impl Nat4 {
                 continue;
             };
 
-            let Some(first) = first else  {
+            let Some(first) = first else {
                 first = Some(cand);
                 continue;
             };
@@ -1023,24 +1058,20 @@ impl Nat4 {
             match targets.get_mut(&raddr) {
                 Some(exist) => {
                     exist.push(cand.addr());
-                },
+                }
                 None => {
                     targets.insert(raddr, vec![cand.addr()]);
-                },
+                }
             }
         }
 
         if targets.len() > 0 {
-            Some(Self {
-                targets,
-            })
+            Some(Self { targets })
         } else {
             None
         }
     }
 }
-
-
 
 #[derive(Debug)]
 pub struct IceSocket<U> {
@@ -1050,8 +1081,8 @@ pub struct IceSocket<U> {
 
 impl<U> IceSocket<U> {
     // pub fn new(socket: U) -> Self {
-    //     Self { 
-    //         socket, 
+    //     Self {
+    //         socket,
     //     }
     // }
 
@@ -1077,7 +1108,6 @@ impl<U: AsyncUdpSocket> AsyncUdpSocket for IceSocket<U> {
         bufs: &mut [io::IoSliceMut<'_>],
         meta: &mut [quinn::udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
-
         loop {
             let r = ready!(self.socket.poll_recv(cx, bufs, meta));
             if let Ok(num) = &r {
@@ -1086,7 +1116,7 @@ impl<U: AsyncUdpSocket> AsyncUdpSocket for IceSocket<U> {
                     let len = meta[n].len;
                     let data = &bufs[n][..len];
                     let addr = &meta[n].addr;
-                    
+
                     let r = try_parse_message(data);
                     match r {
                         Some(msg) => {
@@ -1103,24 +1133,23 @@ impl<U: AsyncUdpSocket> AsyncUdpSocket for IceSocket<U> {
                                 let r = self.poll_send(udp_state(), cx, &transmits);
                                 let _r = ready!(r);
                             }
-                        },
+                        }
                         None => {
                             if index != n {
                                 meta.swap(index, n);
                                 bufs.swap(index, n);
                             }
                             index += 1;
-                        },
+                        }
                     }
                 }
                 if index > 0 {
-                    return Poll::Ready(Ok(index))
+                    return Poll::Ready(Ok(index));
                 }
             } else {
-                return Poll::Ready(r)
+                return Poll::Ready(r);
             }
         }
-        
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -1132,21 +1161,17 @@ impl<U: AsyncUdpSocket> AsyncUdpSocket for IceSocket<U> {
     }
 }
 
-
-
 #[derive(Debug)]
 pub struct IceCreds {
     pub username: String,
     pub password: String,
 }
 
-
 struct UdpTsx<V> {
     deadline: Instant,
     packet: UdpPacket,
     _ext: V,
 }
-
 
 struct UdpTsxMap<K, V> {
     next_tick_time: Instant,
@@ -1155,53 +1180,56 @@ struct UdpTsxMap<K, V> {
 
 impl<K, V> Default for UdpTsxMap<K, V> {
     fn default() -> Self {
-        Self { next_tick_time: Instant::now(), map: Default::default() }
+        Self {
+            next_tick_time: Instant::now(),
+            map: Default::default(),
+        }
     }
 }
 
 impl<K, V> UdpTsxMap<K, V> {
-
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 
-    pub fn insert(&mut self, k: K, tsx: UdpTsx<V> ) -> Option<UdpTsx<V>> 
+    pub fn insert(&mut self, k: K, tsx: UdpTsx<V>) -> Option<UdpTsx<V>>
     where
         K: Eq + Hash,
     {
-        
         match self.map.insert(k, Some(tsx)) {
             Some(old) => old,
             None => None,
         }
     }
 
-    pub fn remove<Q>(&mut self, k: &Q) -> Option<UdpTsx<V>> 
+    pub fn remove<Q>(&mut self, k: &Q) -> Option<UdpTsx<V>>
     where
         K: Eq + Hash,
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        
         self.map.remove(k).unwrap_or(None)
     }
 
-    pub fn process_tick(&mut self, now: Instant, io_que: &mut UdpTxQue, timeouts: &mut VecDeque<UdpTsx<V>>,) -> Result<()> {
-
+    pub fn process_tick(
+        &mut self,
+        now: Instant,
+        io_que: &mut UdpTxQue,
+        timeouts: &mut VecDeque<UdpTsx<V>>,
+    ) -> Result<()> {
         self.map.retain(|_k, tsx| {
             if let Some(tsx) = tsx {
                 if now < tsx.deadline {
                     io_que.push_back(UdpTx::Tx(tsx.packet.clone()));
-                    return true
-                } 
+                    return true;
+                }
             }
-            
+
             if let Some(tsx) = tsx.take() {
-                timeouts.push_back(tsx); 
+                timeouts.push_back(tsx);
             }
 
             false
-
         });
 
         self.update_next_tick_time(now);
@@ -1214,10 +1242,9 @@ impl<K, V> UdpTsxMap<K, V> {
     }
 
     fn update_next_tick_time(&mut self, now: Instant) {
-        self.next_tick_time =  now + Duration::from_millis(200);
+        self.next_tick_time = now + Duration::from_millis(200);
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub enum UdpTx {
@@ -1227,16 +1254,17 @@ pub enum UdpTx {
 
 pub type UdpTxQue = VecDeque<UdpTx>;
 
-
 #[derive(Debug, Clone)]
 pub struct UdpPacket {
     addr: SocketAddr,
     data: Bytes,
 }
 
-
-
-fn check_integrity(msg: &Message<Attribute>, username: Option<&str>, password: Option<&str>) -> Result<()> {
+fn check_integrity(
+    msg: &Message<Attribute>,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<()> {
     // tracing::debug!("check_integrity: {:?}, user {username:?}, pass {password:?}", msg.transaction_id());
     if let Some(username) = username {
         if let Some(attr) = msg.get_attribute::<Username>() {
@@ -1250,7 +1278,9 @@ fn check_integrity(msg: &Message<Attribute>, username: Option<&str>, password: O
 
     if let Some(password) = password {
         if let Some(integrity) = msg.get_attribute::<MessageIntegrity>() {
-            integrity.check_short_term_credential(password).map_err(|e|anyhow!("integrity failed: [{e:?}]"))?;
+            integrity
+                .check_short_term_credential(password)
+                .map_err(|e| anyhow!("integrity failed: [{e:?}]"))?;
         } else {
             bail!("no integrity")
         }
@@ -1260,8 +1290,8 @@ fn check_integrity(msg: &Message<Attribute>, username: Option<&str>, password: O
 }
 
 fn get_mapped_addr(rsp: &Message<Attribute>) -> Option<SocketAddr> {
-    let map_addr1 = rsp.get_attribute::<XorMappedAddress>().map(|x|x.address());
-    let map_addr3 = rsp.get_attribute::<MappedAddress>().map(|x|x.address());
+    let map_addr1 = rsp.get_attribute::<XorMappedAddress>().map(|x| x.address());
+    let map_addr3 = rsp.get_attribute::<MappedAddress>().map(|x| x.address());
     let map_addr = map_addr1.or(map_addr3);
     // mapp_addr.with_context(||"no mapped addr in rsp")?;
     map_addr
@@ -1282,10 +1312,10 @@ fn encode_message(msg: Message<Attribute>) -> Result<Vec<u8>> {
 pub fn decode_message(data: &[u8]) -> Result<Message<Attribute>> {
     let mut decoder = MessageDecoder::<Attribute>::new();
 
-    decoder.decode_from_bytes(data)?
-    .map_err(|e|anyhow!("{e:?}"))
+    decoder
+        .decode_from_bytes(data)?
+        .map_err(|e| anyhow!("{e:?}"))
 }
-
 
 fn try_parse_message(data: &[u8]) -> Option<Message<Attribute>> {
     if data.len() == 0 {
@@ -1298,12 +1328,11 @@ fn try_parse_message(data: &[u8]) -> Option<Message<Attribute>> {
     // > |0 0|     STUN Message Type     |         Message Length        |
     // > +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
     if data[0] & 0xC0 != 0 {
-        return None
+        return None;
     }
 
     decode_message(data).ok()
 }
-
 
 #[cfg(test)]
 mod test {
@@ -1314,54 +1343,65 @@ mod test {
     #[tokio::test]
     async fn test_resolve_basic() {
         tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
-        .with_target(false)
-        .init();
+            .with_max_level(tracing::Level::INFO)
+            .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
+            .with_target(false)
+            .init();
 
         let socket = tokio_socket_bind("0.0.0.0:0").await.unwrap();
 
         let mut resolver = StunResolver::default();
-        resolver.resolve(&socket, [
-            // "100.110.119.120:3478", // none exist ip:port
-            "none-exist-host-zytYad132.com:3478", // none exist domain
-            "stun1.l.google.com:19302",
-            "stun2.l.google.com:19302",
-            "stun.qq.com:3478",
-
-            "stun.miwifi.com:3478",
-            "stun.chat.bilibili.com:3478",
-            "stun.cloudflare.com:3478",
-            
-            // "124.222.49.56:3478", // stun.qq.com:3478 dns
-        ].into_iter()).await.unwrap();
+        resolver
+            .resolve(
+                &socket,
+                [
+                    // "100.110.119.120:3478", // none exist ip:port
+                    "none-exist-host-zytYad132.com:3478", // none exist domain
+                    "stun1.l.google.com:19302",
+                    "stun2.l.google.com:19302",
+                    "stun.qq.com:3478",
+                    "stun.miwifi.com:3478",
+                    "stun.chat.bilibili.com:3478",
+                    "stun.cloudflare.com:3478",
+                    // "124.222.49.56:3478", // stun.qq.com:3478 dns
+                ]
+                .into_iter(),
+            )
+            .await
+            .unwrap();
 
         let mapped = resolver.into_mapped_addrs();
-        
+
         tracing::debug!("{mapped:?}");
     }
 
     #[tokio::test]
     async fn test_resolve_nat() {
         tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
-        .with_target(false)
-        .init();
+            .with_max_level(tracing::Level::INFO)
+            .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
+            .with_target(false)
+            .init();
 
         let socket = tokio_socket_bind("0.0.0.0:0").await.unwrap();
 
-        let mut resolver = StunResolver::default()
-        .with_min_success(2);
+        let mut resolver = StunResolver::default().with_min_success(2);
 
-        resolver.resolve(&socket, [
-            // "100.110.119.120:3478", // none exist ip:port
-            "none-exist-host-zytYad132.com:3478", // none exist domain
-            "stun1.l.google.com:19302",
-            "stun2.l.google.com:19302",
-            "stun.qq.com:3478",
-            // "124.222.49.56:3478", // stun.qq.com:3478 dns
-        ].into_iter()).await.unwrap();
+        resolver
+            .resolve(
+                &socket,
+                [
+                    // "100.110.119.120:3478", // none exist ip:port
+                    "none-exist-host-zytYad132.com:3478", // none exist domain
+                    "stun1.l.google.com:19302",
+                    "stun2.l.google.com:19302",
+                    "stun.qq.com:3478",
+                    // "124.222.49.56:3478", // stun.qq.com:3478 dns
+                ]
+                .into_iter(),
+            )
+            .await
+            .unwrap();
 
         let mapped = resolver.into_mapped_addrs();
         tracing::debug!("{mapped:?}");
@@ -1369,26 +1409,37 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_resolve_inexist() {    
+    async fn test_resolve_inexist() {
         tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
-        .with_target(false)
-        .init();
+            .with_max_level(tracing::Level::INFO)
+            .with_env_filter(tracing_subscriber::EnvFilter::from("rtun=debug"))
+            .with_target(false)
+            .init();
 
         let start = Instant::now();
-    
+
         let socket = tokio_socket_bind("0.0.0.0:0").await.unwrap();
 
         let mut resolver = StunResolver::default();
-        
-        resolver.resolve(&socket, ["111.222.111.222:11111"].into_iter()).await.unwrap();
+
+        resolver
+            .resolve(&socket, ["111.222.111.222:11111"].into_iter())
+            .await
+            .unwrap();
 
         // let e = BindingConfig::default()
         // .resolve_mapped_addr(["111.222.111.222:11111"].into_iter()).await.unwrap_err();
 
-        assert!(resolver.mapped_addrs().is_empty(), "{:?}", resolver.mapped_addrs());
-        assert!(start.elapsed() > Duration::from_secs(8), "elapsed {:?}", start.elapsed());
+        assert!(
+            resolver.mapped_addrs().is_empty(),
+            "{:?}",
+            resolver.mapped_addrs()
+        );
+        assert!(
+            start.elapsed() > Duration::from_secs(8),
+            "elapsed {:?}",
+            start.elapsed()
+        );
     }
 
     // #[tokio::test]
@@ -1410,9 +1461,9 @@ mod test {
     // }
 
     // #[tokio::test]
-    // async fn test_binding_inexist() {    
+    // async fn test_binding_inexist() {
     //     let start = Instant::now();
-    
+
     //     let e = BindingConfig::default()
     //     .resolve_mapped_addr(["111.222.111.222:11111"].into_iter()).await.unwrap_err();
 
@@ -1421,7 +1472,7 @@ mod test {
     // }
 
     // #[tokio::test]
-    // async fn test_binding_empty() {    
+    // async fn test_binding_empty() {
     //     let empty: [SocketAddr; 0] = [];
     //     let (_socket, output) = BindingConfig::default()
     //     .resolve_mapped_addr(empty.into_iter()).await.unwrap();
@@ -1429,5 +1480,3 @@ mod test {
     //     assert!(output.is_empty(), "{output:?}");
     // }
 }
-
-

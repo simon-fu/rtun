@@ -1,6 +1,5 @@
 use crate::channel::ChId;
 
-
 #[derive(Debug, Clone)]
 pub struct NextChId {
     next_id: ChId,

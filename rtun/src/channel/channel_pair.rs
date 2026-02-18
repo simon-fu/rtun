@@ -1,8 +1,10 @@
-use std::{io, task::{self, Poll}};
+use std::{
+    io,
+    task::{self, Poll},
+};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChId(pub u64);
@@ -26,8 +28,8 @@ pub struct ChPair {
 impl ChPair {
     pub fn new(ch_id: ChId) -> Self {
         let (tx, rx) = mpsc::channel(CHANNEL_SIZE);
-        Self { 
-            tx: ChSender::new(ch_id, tx), 
+        Self {
+            tx: ChSender::new(ch_id, tx),
             rx: ChReceiver::new(rx),
         }
     }
@@ -44,7 +46,6 @@ pub type ChTx = mpsc::Sender<ChPacket>;
 pub type ChRx = mpsc::Receiver<ChPacket>;
 pub type ChTxWeak = mpsc::WeakSender<ChPacket>;
 
-
 #[derive(Debug)]
 pub struct ChSender {
     pub(super) ch_id: ChId,
@@ -53,35 +54,38 @@ pub struct ChSender {
 
 impl ChSender {
     pub fn new(ch_id: ChId, outgoing_tx: ChTx) -> Self {
-        Self {
-            ch_id,
-            outgoing_tx,
-        }
+        Self { ch_id, outgoing_tx }
     }
 
     pub fn ch_id(&self) -> ChId {
         self.ch_id
     }
 
-    pub fn downgrade(&self) -> ChSenderWeak{
+    pub fn downgrade(&self) -> ChSenderWeak {
         let tx = self.outgoing_tx.downgrade();
-        ChSenderWeak { ch_id: self.ch_id, outgoing_tx: tx }
+        ChSenderWeak {
+            ch_id: self.ch_id,
+            outgoing_tx: tx,
+        }
     }
 
     pub async fn send_data(&self, data: Bytes) -> Result<(), Bytes> {
-        self.outgoing_tx.send(ChPacket { 
-            ch_id: self.ch_id, 
-            payload: data, 
-        }).await
-        .map_err(|x|x.0.payload)
+        self.outgoing_tx
+            .send(ChPacket {
+                ch_id: self.ch_id,
+                payload: data,
+            })
+            .await
+            .map_err(|x| x.0.payload)
     }
 
     pub fn try_send_zero(&self) -> Result<(), ()> {
-        self.outgoing_tx.try_send(ChPacket { 
-            ch_id: self.ch_id, 
-            payload: Bytes::new(), 
-        })
-        .map_err(|_x|())
+        self.outgoing_tx
+            .try_send(ChPacket {
+                ch_id: self.ch_id,
+                payload: Bytes::new(),
+            })
+            .map_err(|_x| ())
     }
 }
 
@@ -93,8 +97,7 @@ pub struct ChSenderWeak {
 
 impl ChSenderWeak {
     pub fn upgrade(&self) -> Option<ChSender> {
-        self.outgoing_tx.upgrade()
-        .map(|x|ChSender {
+        self.outgoing_tx.upgrade().map(|x| ChSender {
             ch_id: self.ch_id,
             outgoing_tx: x,
         })
@@ -107,9 +110,7 @@ pub struct ChReceiver {
 
 impl ChReceiver {
     pub fn new(rx: ChRx) -> Self {
-        Self {
-            rx,
-        }
+        Self { rx }
     }
 
     // pub async fn recv_data(&mut self) -> Option<ChPacket> {
@@ -127,31 +128,27 @@ impl ChReceiver {
                 } else {
                     Err(RecvError::ZeroClosed)
                 }
-            },
+            }
             None => Err(RecvError::ChClosed),
         }
     }
 
-
     pub fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<ChPacket, RecvError>> {
         match self.rx.poll_recv(cx) {
-            Poll::Ready(r) => {
-                match r {
-                    Some(packet) => {
-                        if packet.payload.len() > 0 {
-                            Poll::Ready(Ok(packet))
-                        } else {
-                            Poll::Ready(Err(RecvError::ZeroClosed))
-                        }
-                    },
-                    None => Poll::Ready(Err(RecvError::ChClosed)),
+            Poll::Ready(r) => match r {
+                Some(packet) => {
+                    if packet.payload.len() > 0 {
+                        Poll::Ready(Ok(packet))
+                    } else {
+                        Poll::Ready(Err(RecvError::ZeroClosed))
+                    }
                 }
+                None => Poll::Ready(Err(RecvError::ChClosed)),
             },
             Poll::Pending => Poll::Pending,
         }
     }
 }
-
 
 use thiserror::Error;
 
@@ -159,7 +156,6 @@ use thiserror::Error;
 pub enum RecvError {
     // #[error("channel closed")]
     // Closed(#[from] io::Error),
-
     #[error("channel closed")]
     ChClosed,
 
@@ -170,14 +166,8 @@ pub enum RecvError {
 impl From<RecvError> for io::Error {
     fn from(v: RecvError) -> io::Error {
         match v {
-            RecvError::ChClosed => io::Error::new(
-                io::ErrorKind::UnexpectedEof, 
-                "ChClosed",
-            ),
-            RecvError::ZeroClosed => io::Error::new(
-                io::ErrorKind::UnexpectedEof, 
-                "ZeroClosed",
-            ),
+            RecvError::ChClosed => io::Error::new(io::ErrorKind::UnexpectedEof, "ChClosed"),
+            RecvError::ZeroClosed => io::Error::new(io::ErrorKind::UnexpectedEof, "ZeroClosed"),
         }
     }
 }
@@ -186,18 +176,15 @@ impl From<RecvError> for io::Error {
 //     fn into(self) -> io::Error {
 //         match self {
 //             RecvError::ChClosed => io::Error::new(
-//                 io::ErrorKind::UnexpectedEof, 
+//                 io::ErrorKind::UnexpectedEof,
 //                 "ChClosed",
 //             ),
 //             RecvError::ZeroClosed => io::Error::new(
-//                 io::ErrorKind::UnexpectedEof, 
+//                 io::ErrorKind::UnexpectedEof,
 //                 "ZeroClosed",
 //             ),
 //         }
 //     }
 // }
 
-
 pub const CHANNEL_SIZE: usize = 256;
-
-

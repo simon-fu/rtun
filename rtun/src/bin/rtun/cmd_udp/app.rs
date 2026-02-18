@@ -1,15 +1,20 @@
-use std::{time::Duration, sync::Arc, net::SocketAddr, fmt::Write};
+use super::tui::footer::{Action as FooterAction, Event, FooterApp};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
-use anyhow::{Result, bail, Context};
 use console::Term;
 use parking_lot::Mutex;
-use tokio::{sync::mpsc, net::UdpSocket};
+use rtun::{
+    actor_service::{
+        handle_first_none, handle_msg_none, Action, ActorBuilder, ActorEntity, ActorHandle,
+        AsyncHandler, Invoker,
+    },
+    hex::BinStrLine,
+};
+use std::{fmt::Write, net::SocketAddr, sync::Arc, time::Duration};
+use tokio::{net::UdpSocket, sync::mpsc};
 use tracing::{error, info};
-use super::tui::footer::{FooterApp, Action as FooterAction, Event};
-use rtun::{actor_service::{ActorEntity, handle_first_none, Action, AsyncHandler, ActorHandle, handle_msg_none, ActorBuilder, Invoker}, hex::BinStrLine};
 
 pub fn make_app(event_tx: mpsc::Sender<Event>) -> Result<(AppSync, AppAsync)> {
-
     let shared = Arc::new(Shared {
         state: Default::default(),
         event_tx,
@@ -22,10 +27,7 @@ pub fn make_app(event_tx: mpsc::Sender<Event>) -> Result<(AppSync, AppAsync)> {
             shared: shared.clone(),
             invoker: builder.build_invoker(),
         },
-        AppAsync{ 
-            shared,
-            builder,
-        },
+        AppAsync { shared, builder },
     ))
 }
 
@@ -36,38 +38,38 @@ pub struct AppAsync {
 
 impl AppAsync {
     pub async fn run(self, listen: Option<String>) -> Result<()> {
-
         let socket = match &listen {
             Some(listen) => {
                 let socket = UdpSocket::bind(listen).await?;
                 {
-                    self.shared.state.lock().set_local(Some(socket.local_addr()?));
+                    self.shared
+                        .state
+                        .lock()
+                        .set_local(Some(socket.local_addr()?));
                 }
                 let _r = self.shared.event_tx.send(Event::PaintApp).await;
                 Some(socket)
-            },
+            }
             None => None,
         };
         // let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
         let entity = Entity {
-            buf: vec![0;1700],
+            buf: vec![0; 1700],
             socket,
             shared: self.shared,
         };
-    
+
         let handle = self.builder.builder.build(
             "udp".into(), // format!("udp"),
-            entity, 
+            entity,
             handle_first_none,
-            wait_next, 
-            handle_next, 
+            wait_next,
+            handle_next,
             handle_msg_none,
         );
 
-        let mut session = UdpSession {
-            handle,
-        };
+        let mut session = UdpSession { handle };
 
         // tokio::spawn(async move {
         //     for _n in 0..100 {
@@ -75,7 +77,7 @@ impl AppAsync {
         //         tracing::debug!("async log {_n}");
         //     }
         // });
-        
+
         let _r = session.handle.wait_for_completed().await?;
         Ok(())
     }
@@ -85,7 +87,6 @@ pub struct AppSync {
     shared: Arc<Shared>,
     invoker: UdpSessionInvoker,
 }
-
 
 impl FooterApp for AppSync {
     fn on_paint(&mut self, term: &Term) -> Result<usize> {
@@ -98,7 +99,7 @@ impl FooterApp for AppSync {
                 s
             };
         }
-        
+
         let (_h, w) = term.size();
         let w = (w as usize).min(LONG_DIV.len());
         let div = &(*LONG_DIV)[..w];
@@ -106,7 +107,7 @@ impl FooterApp for AppSync {
         let mut lines = 0;
 
         term.clear_line()?;
-        
+
         term.write_line(div)?;
         lines += 1;
 
@@ -117,12 +118,10 @@ impl FooterApp for AppSync {
             if let Some(ttl) = state.ttl {
                 write!(s, "    ttl: {ttl}")?;
             }
-            term.write_line(
-                s.as_str(),
-            )?;
-            lines += 1;    
+            term.write_line(s.as_str())?;
+            lines += 1;
         }
-        
+
         term.clear_line()?;
         term.write_line(div)?;
         lines += 1;
@@ -162,15 +161,11 @@ impl State {
     }
 }
 
-
-
-
 pub struct UdpSessionInvoker {
     invoker: Invoker<Entity>,
 }
 
-impl  UdpSessionInvoker {
-
+impl UdpSessionInvoker {
     pub async fn shutdown(&mut self) {
         self.invoker.shutdown().await;
     }
@@ -198,8 +193,7 @@ pub struct UdpSession {
     handle: ActorHandle<Entity>,
 }
 
-impl  UdpSession {
-
+impl UdpSession {
     pub async fn shutdown_and_waitfor(&mut self) -> Result<()> {
         self.handle.invoker().shutdown().await;
         self.handle.wait_for_completed().await?;
@@ -211,7 +205,6 @@ impl  UdpSession {
     }
 }
 
-
 #[derive(Debug)]
 struct ReqCommand(String);
 
@@ -219,14 +212,14 @@ type ReqCommandResult = Result<()>;
 
 #[async_trait::async_trait]
 impl AsyncHandler<ReqCommand> for Entity {
-    type Response = ReqCommandResult; 
+    type Response = ReqCommandResult;
 
     async fn handle(&mut self, req: ReqCommand) -> Self::Response {
         let r = self.exec_cmd(req.0.as_str()).await;
         match r {
             Ok(_r) => {
                 let _r = self.shared.event_tx.send(Event::PaintApp).await;
-            },
+            }
             Err(e) => {
                 error!("{e:?}");
             }
@@ -235,10 +228,7 @@ impl AsyncHandler<ReqCommand> for Entity {
     }
 }
 
-
-
 type Next = Result<()>;
-
 
 #[inline]
 async fn wait_next(entity: &mut Entity) -> Next {
@@ -261,31 +251,29 @@ async fn wait_next(entity: &mut Entity) -> Next {
                 let _r = entity.shared.event_tx.send(Event::PaintApp).await;
             }
 
-            
             if let Ok(s) = std::str::from_utf8(data) {
                 info!("<= [{addr}, {len}]: [{s}]");
             } else {
                 info!("<= [{addr}, {len}]: {}", data.dump_bin());
             }
-        },
+        }
         None => {
-            tokio::time::sleep(Duration::MAX/2).await;
-        },
+            tokio::time::sleep(Duration::MAX / 2).await;
+        }
     }
-    
+
     Ok(())
 }
 
-async fn handle_next(entity: &mut Entity, next: Next) -> Result<Action>  {
+async fn handle_next(entity: &mut Entity, next: Next) -> Result<Action> {
     match next {
         Ok(_r) => Ok(Action::None),
         Err(e) => {
             let _r = entity.shared.event_tx.send(Event::Exit).await;
             Err(e)
-        },
+        }
     }
 }
-
 
 pub struct Entity {
     socket: Option<UdpSocket>,
@@ -295,9 +283,8 @@ pub struct Entity {
 
 impl Entity {
     async fn exec_cmd(&mut self, cmd: &str) -> Result<()> {
-
-        let iter1 = Some("udp").iter().map(|x|*x);
-        let iter2 = cmd.trim().split(" ").map(|x|x.trim());
+        let iter1 = Some("udp").iter().map(|x| *x);
+        let iter2 = cmd.trim().split(" ").map(|x| x.trim());
 
         let r = CmdArgs::try_parse_from(iter1.chain(iter2))?;
         match r.cmd {
@@ -305,16 +292,20 @@ impl Entity {
                 if self.socket.is_some() {
                     bail!("already bind")
                 }
-                
-                let socket = UdpSocket::bind(&args.listen).await
-                .with_context(||format!("failed to bind socket addr [{}]", args.listen))?;
-                
+
+                let socket = UdpSocket::bind(&args.listen)
+                    .await
+                    .with_context(|| format!("failed to bind socket addr [{}]", args.listen))?;
+
                 {
-                    self.shared.state.lock().set_local(Some(socket.local_addr()?));
+                    self.shared
+                        .state
+                        .lock()
+                        .set_local(Some(socket.local_addr()?));
                 }
-                
+
                 self.socket = Some(socket);
-            },
+            }
             SubCmd::Close(_args) => {
                 let socket = self.socket.take();
                 get_socket(&socket)?;
@@ -323,48 +314,55 @@ impl Entity {
                     self.shared.state.lock().set_local(None);
                 }
                 info!("closed socket")
-            },
+            }
             SubCmd::Send(args) => {
                 let socket = get_socket(&self.socket)?;
-                
+
                 let target = match args.target.as_ref() {
                     Some(target) => {
-                        let target: SocketAddr = target.parse().with_context(||"parse target addr failed")?;
+                        let target: SocketAddr =
+                            target.parse().with_context(|| "parse target addr failed")?;
                         target
-                    },
-                    None => {
-                        self.shared.state.lock().target.with_context(||"no target addr")?
-                    },
+                    }
+                    None => self
+                        .shared
+                        .state
+                        .lock()
+                        .target
+                        .with_context(|| "no target addr")?,
                 };
-                
+
                 let text = args.content.as_str();
                 let bytes = text.as_bytes();
-                let n = socket.send_to(bytes, target).await
-                .with_context(||"send failed")?;
+                let n = socket
+                    .send_to(bytes, target)
+                    .await
+                    .with_context(|| "send failed")?;
                 info!("sent bytes {n}");
                 if n == bytes.len() {
                     info!("=> [{target}, {n}]: [{text}]");
                 } else {
                     error!("sent partial {n} < {}", bytes.len());
                 }
-                
-            },
-            SubCmd::Set(args) => {
-                match args.key.as_str() {
-                    "target" => {
-                        let target: SocketAddr = args.value.parse()
-                        .with_context(||format!("failed to parse target addr [{}]", args.value))?;
+            }
+            SubCmd::Set(args) => match args.key.as_str() {
+                "target" => {
+                    let target: SocketAddr = args
+                        .value
+                        .parse()
+                        .with_context(|| format!("failed to parse target addr [{}]", args.value))?;
 
-                        self.shared.state.lock().set_target(Some(target));
-                    },
-                    "ttl" => {
-                        let ttl: u32 = args.value.parse()
-                        .with_context(||format!("failed to parse ttl [{}]", args.value))?;
-                        self.set_socket_ttl(ttl)?;
-                    }
-                    _ => {
-                        bail!("unknown key [{}]", args.key)
-                    }
+                    self.shared.state.lock().set_target(Some(target));
+                }
+                "ttl" => {
+                    let ttl: u32 = args
+                        .value
+                        .parse()
+                        .with_context(|| format!("failed to parse ttl [{}]", args.value))?;
+                    self.set_socket_ttl(ttl)?;
+                }
+                _ => {
+                    bail!("unknown key [{}]", args.key)
                 }
             },
             SubCmd::Exit(_args) => {
@@ -376,7 +374,9 @@ impl Entity {
 
     fn set_socket_ttl(&mut self, ttl: u32) -> Result<()> {
         let socket = get_socket(&self.socket)?;
-        socket.set_ttl(ttl).with_context(||"failed to set socket ttl")?;
+        socket
+            .set_ttl(ttl)
+            .with_context(|| "failed to set socket ttl")?;
         {
             self.shared.state.lock().ttl = Some(ttl);
         }
@@ -387,7 +387,7 @@ impl Entity {
 
 #[inline]
 fn get_socket(socket: &Option<UdpSocket>) -> Result<&UdpSocket> {
-    socket.as_ref().with_context(||"NOT bind socket yet")
+    socket.as_ref().with_context(|| "NOT bind socket yet")
 }
 
 type Msg = ();
@@ -406,8 +406,6 @@ impl ActorEntity for Entity {
     }
 }
 
-
-
 // refer https://github.com/clap-rs/clap/tree/master/clap_derive/examples
 #[derive(Parser, Debug)]
 #[clap(name = "udp")]
@@ -425,7 +423,6 @@ enum SubCmd {
     Exit(ExitCmdArgs),
 }
 
-
 #[derive(Parser, Debug)]
 #[clap(name = "bind")]
 pub struct BindCmdArgs {
@@ -440,40 +437,28 @@ pub struct BindCmdArgs {
 
 #[derive(Parser, Debug)]
 #[clap(name = "close")]
-pub struct CloseCmdArgs {
-}
+pub struct CloseCmdArgs {}
 
 #[derive(Parser, Debug)]
 #[clap(name = "send")]
 pub struct SendCmdArgs {
-    #[clap(
-        long_help = "content for sending",
-    )]
+    #[clap(long_help = "content for sending")]
     content: String,
 
-    #[clap(
-        short = 't',
-        long = "target",
-        long_help = "target address",
-    )]
+    #[clap(short = 't', long = "target", long_help = "target address")]
     target: Option<String>,
 }
 
 #[derive(Parser, Debug)]
 #[clap(name = "set")]
 pub struct SetCmdArgs {
-    #[clap(
-        long_help = "key, supported keys: [target, ttl]",
-    )]
+    #[clap(long_help = "key, supported keys: [target, ttl]")]
     key: String,
 
-    #[clap(
-        long_help = "value",
-    )]
+    #[clap(long_help = "value")]
     value: String,
 }
 
 #[derive(Parser, Debug)]
 #[clap(name = "exit")]
-pub struct ExitCmdArgs {
-}
+pub struct ExitCmdArgs {}

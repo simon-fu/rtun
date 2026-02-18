@@ -1,22 +1,32 @@
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, Context, bail};
+use anyhow::{anyhow, bail, Context, Result};
 
+use crate::{
+    async_rt::spawn_with_name,
+    channel::{ChId, ChPair, ChSender},
+    huid::HUId,
+    proto::{
+        c2arequest::C2a_req_args, make_open_p2p_response_error, make_open_shell_response_error,
+        make_open_shell_response_ok, make_response_status_ok, C2ARequest, KickDownArgs, Pong,
+    },
+};
 use bytes::Bytes;
 use protobuf::Message;
 use tokio::task::JoinHandle;
-use crate::{async_rt::spawn_with_name, huid::HUId, proto::{C2ARequest, c2arequest::C2a_req_args, make_open_shell_response_ok, make_open_shell_response_error, make_response_status_ok, Pong, KickDownArgs, make_open_p2p_response_error}, channel::{ChPair, ChId, ChSender}};
 
-use super::{invoker_ctrl::{CtrlHandler, CtrlInvoker}, invoker_switch::{SwitchInvoker, SwitchHanlder}, next_ch_id::NextChId};
-
+use super::{
+    invoker_ctrl::{CtrlHandler, CtrlInvoker},
+    invoker_switch::{SwitchHanlder, SwitchInvoker},
+    next_ch_id::NextChId,
+};
 
 pub fn spawn_ctrl_service<H1: CtrlHandler, H2: SwitchHanlder>(
-    uid: HUId, 
-    agent: CtrlInvoker<H1>, 
-    switch: SwitchInvoker<H2>, 
+    uid: HUId,
+    agent: CtrlInvoker<H1>,
+    switch: SwitchInvoker<H2>,
     mut chpair: ChPair,
-) -> JoinHandle<Result<ExitReason>>
-{
+) -> JoinHandle<Result<ExitReason>> {
     let task = spawn_with_name(format!("ctrl-service-{}", uid), async move {
         let r = ctrl_loop_full(&agent, &switch, &mut chpair).await;
         tracing::debug!("finished with [{:?}]", r);
@@ -31,16 +41,14 @@ pub enum ExitReason {
     KickDown(KickDownArgs),
 }
 
-
 async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
-    agent: &CtrlInvoker<H1>, 
-    switch: &SwitchInvoker<H2>, 
+    agent: &CtrlInvoker<H1>,
+    switch: &SwitchInvoker<H2>,
     ctrl_pair: &mut ChPair,
 ) -> Result<ExitReason> {
-    
     let ctrl_tx = &mut ctrl_pair.tx;
     let ctrl_rx = &mut ctrl_pair.rx;
-    
+
     let mux_tx = switch.get_mux_tx().await?;
     let mut agent_watch = agent.watch().await?;
 
@@ -59,14 +67,15 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
         };
 
         let cmd = C2ARequest::parse_from_bytes(&packet.payload)?
-        .c2a_req_args
-        .with_context(||"no c2a_req_args")?;
+            .c2a_req_args
+            .with_context(|| "no c2a_req_args")?;
         match cmd {
             C2a_req_args::OpenSell(args) => {
-                let ch_id = args.ch_id
-                .map(|x|ChId(x))
-                .unwrap_or_else(||next_ch_id.next_ch_id());
-  
+                let ch_id = args
+                    .ch_id
+                    .map(|x| ChId(x))
+                    .unwrap_or_else(|| next_ch_id.next_ch_id());
+
                 let r = {
                     let mux_tx = ChSender::new(ch_id, mux_tx.clone());
                     agent.open_shell(mux_tx, args).await
@@ -77,19 +86,22 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                     Err(e) => (make_open_shell_response_error(e), None),
                 };
 
-                ctrl_tx.send_data(rsp.write_to_bytes()?.into()).await
-                .map_err(|_x|anyhow!("send data fail"))?;
+                ctrl_tx
+                    .send_data(rsp.write_to_bytes()?.into())
+                    .await
+                    .map_err(|_x| anyhow!("send data fail"))?;
 
                 if let Some(ch_tx) = ch_tx {
                     switch.add_channel(ch_id, ch_tx).await?;
                 }
-            },
+            }
 
             C2a_req_args::OpenSocks(args) => {
-                let ch_id = args.ch_id
-                .map(|x|ChId(x))
-                .unwrap_or_else(||next_ch_id.next_ch_id());
-  
+                let ch_id = args
+                    .ch_id
+                    .map(|x| ChId(x))
+                    .unwrap_or_else(|| next_ch_id.next_ch_id());
+
                 let r = {
                     let mux_tx = ChSender::new(ch_id, mux_tx.clone());
                     agent.open_socks(mux_tx, args).await
@@ -100,13 +112,15 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                     Err(e) => (make_open_shell_response_error(e), None),
                 };
 
-                ctrl_tx.send_data(rsp.write_to_bytes()?.into()).await
-                .map_err(|_x|anyhow!("send data fail"))?;
+                ctrl_tx
+                    .send_data(rsp.write_to_bytes()?.into())
+                    .await
+                    .map_err(|_x| anyhow!("send data fail"))?;
 
                 if let Some(ch_tx) = ch_tx {
                     switch.add_channel(ch_id, ch_tx).await?;
                 }
-            }, 
+            }
 
             C2a_req_args::CloseChannel(args) => {
                 // tracing::debug!("recv closing ch req {}", args);
@@ -117,10 +131,12 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                 let data: Bytes = rsp.write_to_bytes()?.into();
                 // tracing::debug!("send closing ch rsp len {}", data.len());
 
-                ctrl_tx.send_data(data).await
-                .map_err(|_x|anyhow!("send data fail"))?;
+                ctrl_tx
+                    .send_data(data)
+                    .await
+                    .map_err(|_x| anyhow!("send data fail"))?;
                 // tracing::debug!("send closing ch ok");
-            },
+            }
 
             C2a_req_args::Ping(args) => {
                 let rsp = Pong {
@@ -129,35 +145,38 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                 };
 
                 let data: Bytes = rsp.write_to_bytes()?.into();
-                ctrl_tx.send_data(data).await
-                .map_err(|_x|anyhow!("send data fail"))?;
-            },
+                ctrl_tx
+                    .send_data(data)
+                    .await
+                    .map_err(|_x| anyhow!("send data fail"))?;
+            }
 
             C2a_req_args::KickDown(args) => {
-                
                 let rsp = make_response_status_ok();
                 let data: Bytes = rsp.write_to_bytes()?.into();
-                ctrl_tx.send_data(data).await
-                .map_err(|_x|anyhow!("send data fail"))?;
-                
+                ctrl_tx
+                    .send_data(data)
+                    .await
+                    .map_err(|_x| anyhow!("send data fail"))?;
+
                 tracing::warn!("recv kick down {args}");
                 return Ok(ExitReason::KickDown(args));
-            }, 
+            }
 
             C2a_req_args::OpenP2p(args) => {
                 let r = agent.open_p2p(args).await;
 
                 // let r = handle_open_p2p(args).await;
                 let rsp = match r {
-                    Ok(rsp) => {
-                        rsp
-                    },
+                    Ok(rsp) => rsp,
                     Err(e) => make_open_p2p_response_error(e),
                 };
 
                 let data: Bytes = rsp.write_to_bytes()?.into();
-                ctrl_tx.send_data(data).await
-                .map_err(|_x|anyhow!("send data fail"))?;
+                ctrl_tx
+                    .send_data(data)
+                    .await
+                    .map_err(|_x| anyhow!("send data fail"))?;
             }
         }
     }
@@ -178,7 +197,7 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
 //     let mapped = nat.into_mapped().with_context(||"empty mapped address")?;
 
 //     let args = args.args.take().with_context(||"no p2p args")?;
-    
+
 //     let mut tun = launch_tun_peer(peer, args.ufrag.into(), args.addr.parse()?, false);
 //     spawn_with_name("", async move {
 //         tun.wait_for_completed().await
@@ -189,11 +208,11 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
 // }
 
 // async fn ctrl_loop_pure_ch<H1: CtrlHandler, H2: SwitchHanlder>(
-//     agent: &CtrlInvoker<H1>, 
-//     switch: &SwitchInvoker<H2>, 
+//     agent: &CtrlInvoker<H1>,
+//     switch: &SwitchInvoker<H2>,
 //     ctrl_pair: ChPair,
 // ) -> Result<()> {
-    
+
 //     let tx = ctrl_pair.tx;
 //     let mut rx = ctrl_pair.rx;
 //     let mut next_ch_id = NextChId::default();
@@ -235,10 +254,7 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
 //         if let Some(ch_tx) = ch_tx {
 //             switch.add_channel(ch_id, ch_tx).await?;
 //         }
-        
+
 //     }
 //     Ok(())
 // }
-
-
-
