@@ -59,7 +59,50 @@ rtun relay \
 
 - [x] 建立 P2P 连接后，`relay` 数据面当前没有心跳包；长时间空闲时可能被 NAT 回收映射，导致 P2P 中断（已实现保活心跳）
 - [x] UDP relay 数据面已支持 `obfs-v1` 帧编码（`obfs_seed + nonce` 混淆头部元数据），不再使用固定明文 `flow_id + len` 包头特征（保留 `obfs_seed=0` 的 legacy 兼容模式）
-- [ ] 当前未支持 Hysteria2 的端口跳跃能力
+- [ ] 当前未支持“多 p2p 通道智能路由”能力（当前为单 p2p tunnel）
+
+### 多通道智能路由方案草案（待实现）
+
+背景澄清：
+
+- 目标是缓解“单通道 UDP 限速/阻断”风险，提高可用性与稳定性
+- 对 `rtun relay` 来说，仅增加本地/目标端口规则收益有限
+- 需要在 `relay <-> agent` 之间维持多条并行 p2p tunnel，并在 tunnel 间切换
+
+方案要点：
+
+- `relay` 侧维护一个 p2p tunnel 池（而不是单 tunnel）
+- 同一个 `relay` 控制会话内，多条 tunnel 共享同一张 flow map
+- 同一 `flow_id` 在 agent 侧始终复用同一个目标 UDP socket（不因 tunnel 切换重建）
+- 不引入 `relay_session_id`，作用域按“单 relay 控制会话”隔离
+- tunnel 选路不固定，基于“通畅度”做动态分配
+- 通畅度指标包括：心跳丢失率、RTT(EWMA)、连续发送失败、近期吞吐
+- 使用 `flow` 级迁移：新 flow 选更优 tunnel，已有 flow 在当前 tunnel 退化时迁移
+- 回包可走任意可用 tunnel，由 flow 选路策略决定
+- UDP 乱序/丢包按协议本身特性处理，上层业务需容忍
+
+通道生命周期与容量规则：
+
+- 每条通道绑定过期时间 `expire_at`
+- 到期时触发创建新的替换通道
+- 只有替换通道创建成功后，旧通道才停止分配新 flow（进入排空）
+- 若替换通道持续创建失败，旧通道保持可分配状态并继续工作
+- 旧通道进入排空后，flow 数降为 `0` 时再关闭通道
+- 通道池支持最小/最大值：`--p2p-min-channels`、`--p2p-max-channels`
+- 当 `active_flows == 0` 时，仅维持最小通道数
+- 当 `active_flows > 0` 时，扩容至最大通道数
+- v1 先要求 `--p2p-min-channels >= 1`，暂不支持 `min=0` 的按需建链模式
+- flow 需按固定周期重选通道；到期通道在重选过程中会逐步排空
+
+可观测性与运维界面（TUI）：
+
+- `relay` 增加终端界面模式（`--tui`），用于实时展示运行状态
+- Agents 视图：`name`、`instance_id`、`signal addr`、`expire_at`、当前选中状态
+- Tunnels 视图：`tunnel_id`、本地/远端地址、状态、RTT、带宽、flow 数
+- Flows 视图：`flow_id`、源地址、目标地址、所属通道、最近活跃时间、收发统计
+- `--tui` 模式下不输出控制台滚动日志，避免界面被污染
+- 仅当显式提供 `--log-file <path>` 时写日志文件；未提供时不落盘日志
+- 非 `--tui` 模式保持现有控制台日志行为
 
 ## Manual Release Workflow
 
