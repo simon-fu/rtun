@@ -25,7 +25,7 @@ use rtun::{
 };
 use tokio::{
     net::UdpSocket,
-    sync::{mpsc, oneshot},
+    sync::{broadcast, mpsc, oneshot},
     task::JoinHandle,
     time::{self, MissedTickBehavior},
 };
@@ -123,6 +123,265 @@ impl io::Write for RelayLogWriter {
     }
 }
 
+fn now_millis_u64() -> u64 {
+    Local::now().timestamp_millis() as u64
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+enum RelayLifecycleEvent {
+    AgentSelected {
+        name: String,
+        instance_id: Option<String>,
+        addr: String,
+        expire_at: u64,
+    },
+    AgentSwitched {
+        old_name: String,
+        old_instance_id: Option<String>,
+        new_name: String,
+        new_instance_id: Option<String>,
+    },
+    AgentSessionConnected {
+        name: String,
+        instance_id: Option<String>,
+    },
+    AgentSessionClosed {
+        name: String,
+        instance_id: Option<String>,
+        reason: String,
+    },
+    TunnelOpened {
+        tunnel_idx: usize,
+        mode: String,
+        source: &'static str,
+    },
+    TunnelRotated {
+        old_tunnel_idx: usize,
+        new_tunnel_idx: usize,
+    },
+    TunnelClosed {
+        tunnel_idx: usize,
+        reason: String,
+    },
+    FlowCreated {
+        flow_id: u64,
+        src: SocketAddr,
+        target: SocketAddr,
+        tunnel_idx: usize,
+    },
+    FlowMigrated {
+        flow_id: u64,
+        src: SocketAddr,
+        old_tunnel_idx: usize,
+        new_tunnel_idx: usize,
+        reason: &'static str,
+    },
+    FlowClosed {
+        flow_id: u64,
+        src: SocketAddr,
+        tunnel_idx: usize,
+        reason: String,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct RelayAgentSnapshot {
+    name: String,
+    instance_id: Option<String>,
+    addr: String,
+    expire_at: u64,
+    connected: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct RelayTunnelSnapshot {
+    tunnel_idx: usize,
+    alive: bool,
+    allocatable: bool,
+    mode: Option<String>,
+    flow_count: usize,
+    last_active_ago_ms: Option<u64>,
+    expires_in_ms: Option<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct RelayFlowSnapshot {
+    flow_id: u64,
+    src: SocketAddr,
+    target: SocketAddr,
+    tunnel_idx: usize,
+    idle_for_ms: u64,
+    route_age_ms: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct RelayStateSnapshot {
+    listen: SocketAddr,
+    target: SocketAddr,
+    updated_at_ms: u64,
+    selected_agent: Option<RelayAgentSnapshot>,
+    tunnels: Vec<RelayTunnelSnapshot>,
+    flows: Vec<RelayFlowSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct RelayStateHub {
+    event_tx: broadcast::Sender<RelayLifecycleEvent>,
+    snapshot: Arc<std::sync::RwLock<RelayStateSnapshot>>,
+}
+
+impl RelayStateHub {
+    fn new(listen: SocketAddr, target: SocketAddr) -> Self {
+        let (event_tx, _) = broadcast::channel(1024);
+        let snapshot = RelayStateSnapshot {
+            listen,
+            target,
+            updated_at_ms: now_millis_u64(),
+            selected_agent: None,
+            tunnels: vec![],
+            flows: vec![],
+        };
+        Self {
+            event_tx,
+            snapshot: Arc::new(std::sync::RwLock::new(snapshot)),
+        }
+    }
+
+    fn emit(&self, event: RelayLifecycleEvent) {
+        let _ = self.event_tx.send(event);
+    }
+
+    fn set_selected_agent(&self, agent: &AgentInfo, connected: bool) {
+        self.with_snapshot_mut(|snapshot| {
+            snapshot.selected_agent = Some(RelayAgentSnapshot {
+                name: agent.name.clone(),
+                instance_id: agent.instance_id.clone(),
+                addr: agent.addr.clone(),
+                expire_at: agent.expire_at,
+                connected,
+            });
+            snapshot.updated_at_ms = now_millis_u64();
+        });
+    }
+
+    fn set_agent_connected(&self, agent: &AgentInfo, connected: bool) {
+        self.with_snapshot_mut(|snapshot| {
+            let Some(selected) = snapshot.selected_agent.as_mut() else {
+                return;
+            };
+            if selected.name != agent.name || selected.instance_id != agent.instance_id {
+                return;
+            }
+            selected.connected = connected;
+            selected.expire_at = agent.expire_at;
+            selected.addr = agent.addr.clone();
+            snapshot.updated_at_ms = now_millis_u64();
+        });
+    }
+
+    fn clear_session_runtime(&self) {
+        self.with_snapshot_mut(|snapshot| {
+            snapshot.tunnels.clear();
+            snapshot.flows.clear();
+            snapshot.updated_at_ms = now_millis_u64();
+        });
+    }
+
+    fn refresh_runtime(
+        &self,
+        target: SocketAddr,
+        tunnels: &[Option<RelayTunnel>],
+        tunnel_states: &[Option<RelayTunnelState>],
+        tunnel_activity: &[Option<Instant>],
+        src_to_flow: &HashMap<SocketAddr, ClientFlow>,
+    ) {
+        let now = Instant::now();
+        let flow_loads = build_tunnel_flow_loads(tunnels.len(), src_to_flow);
+        let mut tunnel_snaps = Vec::new();
+        for tunnel_idx in 0..tunnels.len() {
+            let alive = tunnels.get(tunnel_idx).and_then(|x| x.as_ref()).is_some();
+            let state = tunnel_states.get(tunnel_idx).and_then(|x| x.as_ref());
+            let activity = tunnel_activity.get(tunnel_idx).and_then(|x| *x);
+            if !alive && state.is_none() && activity.is_none() {
+                continue;
+            }
+
+            let allocatable = state.is_some_and(|x| x.allocatable);
+            let expires_in_ms = state.map(|x| x.expire_at.saturating_duration_since(now).as_millis() as u64);
+            let last_active_ago_ms = activity.map(|x| now.saturating_duration_since(x).as_millis() as u64);
+            let mode = tunnels
+                .get(tunnel_idx)
+                .and_then(|x| x.as_ref())
+                .map(|x| x.codec.mode_name().to_string());
+            let flow_count = flow_loads.get(tunnel_idx).copied().unwrap_or(0);
+
+            tunnel_snaps.push(RelayTunnelSnapshot {
+                tunnel_idx,
+                alive,
+                allocatable,
+                mode,
+                flow_count,
+                last_active_ago_ms,
+                expires_in_ms,
+            });
+        }
+
+        let mut flow_snaps = Vec::with_capacity(src_to_flow.len());
+        for (src, flow) in src_to_flow.iter() {
+            flow_snaps.push(RelayFlowSnapshot {
+                flow_id: flow.flow_id,
+                src: *src,
+                target,
+                tunnel_idx: flow.tunnel_idx,
+                idle_for_ms: now.saturating_duration_since(flow.updated_at).as_millis() as u64,
+                route_age_ms: now
+                    .saturating_duration_since(flow.route_updated_at)
+                    .as_millis() as u64,
+            });
+        }
+        flow_snaps.sort_by_key(|x| x.flow_id);
+        tunnel_snaps.sort_by_key(|x| x.tunnel_idx);
+
+        self.with_snapshot_mut(|snapshot| {
+            snapshot.target = target;
+            snapshot.tunnels = tunnel_snaps;
+            snapshot.flows = flow_snaps;
+            snapshot.updated_at_ms = now_millis_u64();
+        });
+    }
+
+    #[allow(dead_code)]
+    fn snapshot(&self) -> RelayStateSnapshot {
+        match self.snapshot.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn subscribe(&self) -> broadcast::Receiver<RelayLifecycleEvent> {
+        self.event_tx.subscribe()
+    }
+
+    fn with_snapshot_mut<F>(&self, f: F)
+    where
+        F: FnOnce(&mut RelayStateSnapshot),
+    {
+        match self.snapshot.write() {
+            Ok(mut guard) => f(&mut guard),
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                f(&mut guard);
+            }
+        }
+    }
+}
+
 async fn do_run(args: CmdArgs) -> Result<()> {
     let signal_url = url::Url::parse(&args.url).with_context(|| "invalid url")?;
     if !signal_url.scheme().eq_ignore_ascii_case("http")
@@ -167,6 +426,7 @@ async fn do_run(args: CmdArgs) -> Result<()> {
     );
 
     for (idx, rule) in rules.into_iter().enumerate() {
+        let state_hub = RelayStateHub::new(rule.listen, rule.target);
         let worker = RelayWorker {
             signal_url: signal_url.clone(),
             secret: args.secret.clone(),
@@ -177,6 +437,7 @@ async fn do_run(args: CmdArgs) -> Result<()> {
             channel_pool,
             p2p_channel_lifetime,
             rule,
+            state_hub,
         };
 
         let task_name = format!("relay-udp-{idx}");
@@ -239,6 +500,13 @@ async fn run_worker(worker: RelayWorker) -> Result<()> {
             selected.instance_id,
             selected.expire_at
         );
+        worker.state_hub.set_selected_agent(&selected, false);
+        worker.state_hub.emit(RelayLifecycleEvent::AgentSelected {
+            name: selected.name.clone(),
+            instance_id: selected.instance_id.clone(),
+            addr: selected.addr.clone(),
+            expire_at: selected.expire_at,
+        });
 
         let (stop_tx, mut session_task) =
             spawn_relay_session_task(worker.clone(), local.clone(), selected.clone());
@@ -246,7 +514,7 @@ async fn run_worker(worker: RelayWorker) -> Result<()> {
 
         tokio::select! {
             r = &mut session_task => {
-                log_session_task_result(r);
+                handle_session_task_result(&worker.state_hub, &selected, r);
             }
             _ = time::sleep(expire_wait) => {
                 tracing::info!(
@@ -264,14 +532,20 @@ async fn run_worker(worker: RelayWorker) -> Result<()> {
                             next_agent.name,
                             next_agent.instance_id
                         );
+                        worker.state_hub.emit(RelayLifecycleEvent::AgentSwitched {
+                            old_name: selected.name.clone(),
+                            old_instance_id: selected.instance_id.clone(),
+                            new_name: next_agent.name.clone(),
+                            new_instance_id: next_agent.instance_id.clone(),
+                        });
                         let _ = stop_tx.send(());
                         let r = session_task.await;
-                        log_session_task_result(r);
+                        handle_session_task_result(&worker.state_hub, &selected, r);
                         next_agent_hint = Some(next_agent);
                     }
                     None => {
                         let r = session_task.await;
-                        log_session_task_result(r);
+                        handle_session_task_result(&worker.state_hub, &selected, r);
                     }
                 }
             }
@@ -386,7 +660,16 @@ fn duration_until_expire(expire_at: u64) -> Duration {
     Duration::from_millis(expire_at.saturating_sub(now_ms))
 }
 
-fn log_session_task_result(r: Result<Result<()>, tokio::task::JoinError>) {
+fn handle_session_task_result(
+    state_hub: &RelayStateHub,
+    selected: &AgentInfo,
+    r: Result<Result<()>, tokio::task::JoinError>,
+) {
+    let reason = match &r {
+        Ok(Ok(())) => "closed".to_string(),
+        Ok(Err(e)) => format!("failed [{e}]"),
+        Err(e) => format!("panicked [{e}]"),
+    };
     match r {
         Ok(Ok(())) => {
             tracing::warn!("relay session closed");
@@ -398,6 +681,13 @@ fn log_session_task_result(r: Result<Result<()>, tokio::task::JoinError>) {
             tracing::warn!("relay session task panicked [{e}]");
         }
     }
+    state_hub.set_agent_connected(selected, false);
+    state_hub.clear_session_runtime();
+    state_hub.emit(RelayLifecycleEvent::AgentSessionClosed {
+        name: selected.name.clone(),
+        instance_id: selected.instance_id.clone(),
+        reason,
+    });
 }
 
 async fn run_with_ws_signal(
@@ -412,12 +702,21 @@ async fn run_with_ws_signal(
         .with_context(|| format!("connect to agent failed [{}]", sub_url))?;
     let mut session = make_stream_session(stream.split(), false).await?;
     tracing::info!("relay session connected, agent [{}]", selected.name);
+    worker.state_hub.set_agent_connected(selected, true);
+    worker
+        .state_hub
+        .emit(RelayLifecycleEvent::AgentSessionConnected {
+            name: selected.name.clone(),
+            instance_id: selected.instance_id.clone(),
+        });
 
     let ctrl = session.ctrl_client().clone_invoker();
     tokio::select! {
         r = run_relay_session(
             ctrl,
             local,
+            selected,
+            &worker.state_hub,
             worker.rule.target,
             worker.idle_timeout,
             worker.max_payload,
@@ -451,12 +750,21 @@ async fn run_with_quic_signal(
         .with_context(|| format!("connect to agent failed [{}]", sub_url))?;
     let mut session = make_stream_session(stream.split(), false).await?;
     tracing::info!("relay session connected, agent [{}]", selected.name);
+    worker.state_hub.set_agent_connected(selected, true);
+    worker
+        .state_hub
+        .emit(RelayLifecycleEvent::AgentSessionConnected {
+            name: selected.name.clone(),
+            instance_id: selected.instance_id.clone(),
+        });
 
     let ctrl = session.ctrl_client().clone_invoker();
     tokio::select! {
         r = run_relay_session(
             ctrl,
             local,
+            selected,
+            &worker.state_hub,
             worker.rule.target,
             worker.idle_timeout,
             worker.max_payload,
@@ -481,6 +789,8 @@ async fn run_with_quic_signal(
 async fn run_relay_session<H: CtrlHandler>(
     ctrl: CtrlInvoker<H>,
     local: &UdpSocket,
+    selected: &AgentInfo,
+    state_hub: &RelayStateHub,
     target: SocketAddr,
     idle_timeout: Duration,
     max_payload: usize,
@@ -517,11 +827,22 @@ async fn run_relay_session<H: CtrlHandler>(
             p2p_channel_lifetime,
         )));
         tunnel_activity.push(Some(Instant::now()));
+        state_hub.emit(RelayLifecycleEvent::TunnelOpened {
+            tunnel_idx,
+            mode: tunnels[tunnel_idx]
+                .as_ref()
+                .map(|x| x.codec.mode_name().to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            source: "bootstrap",
+        });
     }
+    state_hub.refresh_runtime(target, &tunnels, &tunnel_states, &tunnel_activity, &HashMap::new());
 
     relay_loop(
         ctrl,
         local,
+        selected,
+        state_hub,
         target,
         idle_timeout,
         max_payload,
@@ -680,6 +1001,7 @@ fn spawn_tunnel_recv_task(
 
 async fn try_expand_tunnels<H: CtrlHandler>(
     ctrl: &CtrlInvoker<H>,
+    state_hub: &RelayStateHub,
     target: SocketAddr,
     idle_timeout_secs: u32,
     max_payload: usize,
@@ -703,10 +1025,11 @@ async fn try_expand_tunnels<H: CtrlHandler>(
         .await
         {
             Ok(Ok(tunnel)) => {
+                let mode = tunnel.codec.mode_name().to_string();
                 tracing::info!(
                     "relay tunnel connected(scale-up): idx [{}], codec [{}], active={}",
                     tunnel_idx,
-                    tunnel.codec.mode_name(),
+                    mode,
                     active_tunnel_count(tunnels) + 1
                 );
                 let recv_task = spawn_tunnel_recv_task(
@@ -733,6 +1056,11 @@ async fn try_expand_tunnels<H: CtrlHandler>(
                     ));
                     tunnel_activity[tunnel_idx] = Some(Instant::now());
                 }
+                state_hub.emit(RelayLifecycleEvent::TunnelOpened {
+                    tunnel_idx,
+                    mode,
+                    source: "scale-up",
+                });
             }
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -757,6 +1085,7 @@ async fn try_expand_tunnels<H: CtrlHandler>(
 }
 
 fn shrink_tunnels(
+    state_hub: &RelayStateHub,
     desired: usize,
     tunnels: &mut Vec<Option<RelayTunnel>>,
     recv_tasks: &mut Vec<Option<JoinHandle<()>>>,
@@ -778,6 +1107,10 @@ fn shrink_tunnels(
             tunnel_idx,
             active_tunnel_count(tunnels)
         );
+        state_hub.emit(RelayLifecycleEvent::TunnelClosed {
+            tunnel_idx,
+            reason: "scale-down".to_string(),
+        });
     }
     compact_tunnel_slots(tunnels, recv_tasks, tunnel_states, tunnel_activity);
 }
@@ -922,6 +1255,7 @@ fn compact_tunnel_slots(
 }
 
 fn rebalance_client_flows(
+    state_hub: &RelayStateHub,
     src_to_flow: &mut HashMap<SocketAddr, ClientFlow>,
     tunnels: &[Option<RelayTunnel>],
     tunnel_states: &[Option<RelayTunnelState>],
@@ -992,6 +1326,13 @@ fn rebalance_client_flows(
                 current_load,
                 best_load
             );
+            state_hub.emit(RelayLifecycleEvent::FlowMigrated {
+                flow_id: flow.flow_id,
+                src: *src,
+                old_tunnel_idx: current_idx,
+                new_tunnel_idx: best_idx,
+                reason: "rebalance",
+            });
             flow.tunnel_idx = best_idx;
             migrated += 1;
         }
@@ -1009,6 +1350,7 @@ fn rebalance_client_flows(
 
 async fn try_rotate_expired_tunnels<H: CtrlHandler>(
     ctrl: &CtrlInvoker<H>,
+    state_hub: &RelayStateHub,
     target: SocketAddr,
     idle_timeout_secs: u32,
     max_payload: usize,
@@ -1038,6 +1380,7 @@ async fn try_rotate_expired_tunnels<H: CtrlHandler>(
         .await
         {
             Ok(Ok(new_tunnel)) => {
+                let mode = new_tunnel.codec.mode_name().to_string();
                 let new_idx = match first_inactive_tunnel_idx(tunnels) {
                     Some(idx) => idx,
                     None => tunnels.len(),
@@ -1070,6 +1413,15 @@ async fn try_rotate_expired_tunnels<H: CtrlHandler>(
                     old_idx,
                     new_idx
                 );
+                state_hub.emit(RelayLifecycleEvent::TunnelOpened {
+                    tunnel_idx: new_idx,
+                    mode,
+                    source: "rotate",
+                });
+                state_hub.emit(RelayLifecycleEvent::TunnelRotated {
+                    old_tunnel_idx: old_idx,
+                    new_tunnel_idx: new_idx,
+                });
             }
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -1090,6 +1442,7 @@ async fn try_rotate_expired_tunnels<H: CtrlHandler>(
 }
 
 fn close_drained_tunnels(
+    state_hub: &RelayStateHub,
     src_to_flow: &HashMap<SocketAddr, ClientFlow>,
     tunnels: &mut [Option<RelayTunnel>],
     recv_tasks: &mut [Option<JoinHandle<()>>],
@@ -1118,12 +1471,18 @@ fn close_drained_tunnels(
         tunnel_states[tunnel_idx] = None;
         tunnel_activity[tunnel_idx] = None;
         tracing::info!("relay tunnel closed(drained): idx [{}]", tunnel_idx);
+        state_hub.emit(RelayLifecycleEvent::TunnelClosed {
+            tunnel_idx,
+            reason: "drained".to_string(),
+        });
     }
 }
 
 async fn relay_loop<H: CtrlHandler>(
     ctrl: CtrlInvoker<H>,
     local: &UdpSocket,
+    selected: &AgentInfo,
+    state_hub: &RelayStateHub,
     target: SocketAddr,
     idle_timeout: Duration,
     max_payload: usize,
@@ -1139,6 +1498,7 @@ async fn relay_loop<H: CtrlHandler>(
     if active_tunnel_count(&tunnels) == 0 {
         bail!("no relay tunnel available");
     }
+    state_hub.set_selected_agent(selected, true);
     let idle_timeout_secs = u32::try_from(idle_timeout.as_secs())
         .with_context(|| format!("udp idle timeout too large [{}s]", idle_timeout.as_secs()))?;
 
@@ -1208,6 +1568,13 @@ async fn relay_loop<H: CtrlHandler>(
                             flow.tunnel_idx,
                             new_idx
                         );
+                        state_hub.emit(RelayLifecycleEvent::FlowMigrated {
+                            flow_id: flow.flow_id,
+                            src: from,
+                            old_tunnel_idx: flow.tunnel_idx,
+                            new_tunnel_idx: new_idx,
+                            reason: "rebound",
+                        });
                         flow.tunnel_idx = new_idx;
                         flow.route_updated_at = now;
                     }
@@ -1255,6 +1622,12 @@ async fn relay_loop<H: CtrlHandler>(
                         target,
                         tunnel_idx
                     );
+                    state_hub.emit(RelayLifecycleEvent::FlowCreated {
+                        flow_id,
+                        src: from,
+                        target,
+                        tunnel_idx,
+                    });
                     (flow_id, tunnel_idx)
                 };
 
@@ -1346,6 +1719,10 @@ async fn relay_loop<H: CtrlHandler>(
                             reason,
                             active_tunnel_count(&tunnels)
                         );
+                        state_hub.emit(RelayLifecycleEvent::TunnelClosed {
+                            tunnel_idx,
+                            reason: reason.clone(),
+                        });
 
                         let mut removed = Vec::new();
                         for (src, flow) in src_to_flow.iter() {
@@ -1362,11 +1739,18 @@ async fn relay_loop<H: CtrlHandler>(
                                 src,
                                 tunnel_idx
                             );
+                            state_hub.emit(RelayLifecycleEvent::FlowClosed {
+                                flow_id,
+                                src,
+                                tunnel_idx,
+                                reason: "tunnel-lost".to_string(),
+                            });
                         }
 
                         let desired = channel_pool.desired_channels(src_to_flow.len());
                         try_expand_tunnels(
                             &ctrl,
+                            state_hub,
                             target,
                             idle_timeout_secs,
                             max_payload,
@@ -1397,11 +1781,12 @@ async fn relay_loop<H: CtrlHandler>(
                 }
             }
             _ = cleanup.tick() => {
-                cleanup_client_flows(&mut src_to_flow, &mut flow_to_src, idle_timeout);
+                cleanup_client_flows(state_hub, &mut src_to_flow, &mut flow_to_src, idle_timeout);
                 let desired = channel_pool.desired_channels(src_to_flow.len());
                 if active_tunnel_count(&tunnels) < desired {
                     try_expand_tunnels(
                         &ctrl,
+                        state_hub,
                         target,
                         idle_timeout_secs,
                         max_payload,
@@ -1417,6 +1802,7 @@ async fn relay_loop<H: CtrlHandler>(
                 }
                 try_rotate_expired_tunnels(
                     &ctrl,
+                    state_hub,
                     target,
                     idle_timeout_secs,
                     max_payload,
@@ -1429,6 +1815,7 @@ async fn relay_loop<H: CtrlHandler>(
                 )
                 .await;
                 rebalance_client_flows(
+                    state_hub,
                     &mut src_to_flow,
                     &tunnels,
                     &tunnel_states,
@@ -1437,6 +1824,7 @@ async fn relay_loop<H: CtrlHandler>(
                     Instant::now(),
                 );
                 close_drained_tunnels(
+                    state_hub,
                     &src_to_flow,
                     &mut tunnels,
                     &mut recv_tasks,
@@ -1451,6 +1839,7 @@ async fn relay_loop<H: CtrlHandler>(
                 );
                 if src_to_flow.is_empty() {
                     shrink_tunnels(
+                        state_hub,
                         desired,
                         &mut tunnels,
                         &mut recv_tasks,
@@ -1461,6 +1850,13 @@ async fn relay_loop<H: CtrlHandler>(
                         next_tunnel_for_new_flow = 0;
                     }
                 }
+                state_hub.refresh_runtime(
+                    target,
+                    &tunnels,
+                    &tunnel_states,
+                    &tunnel_activity,
+                    &src_to_flow,
+                );
             }
             _ = heartbeat.tick() => {
                 let mut failed_tunnels = Vec::new();
@@ -1504,6 +1900,13 @@ async fn relay_loop<H: CtrlHandler>(
         }
     };
 
+    state_hub.refresh_runtime(
+        target,
+        &tunnels,
+        &tunnel_states,
+        &tunnel_activity,
+        &src_to_flow,
+    );
     for task in recv_tasks.into_iter().flatten() {
         task.abort();
     }
@@ -1546,6 +1949,7 @@ enum TunnelRecvEvent {
 }
 
 fn cleanup_client_flows(
+    state_hub: &RelayStateHub,
     src_to_flow: &mut HashMap<SocketAddr, ClientFlow>,
     flow_to_src: &mut HashMap<u64, SocketAddr>,
     idle_timeout: Duration,
@@ -1565,6 +1969,14 @@ fn cleanup_client_flows(
             src,
             idle_elapsed.as_secs()
         );
+        if let Some(flow) = src_to_flow.get(&src) {
+            state_hub.emit(RelayLifecycleEvent::FlowClosed {
+                flow_id,
+                src,
+                tunnel_idx: flow.tunnel_idx,
+                reason: format!("idle-timeout {}s", idle_elapsed.as_secs()),
+            });
+        }
         src_to_flow.remove(&src);
         flow_to_src.remove(&flow_id);
     }
@@ -1858,6 +2270,7 @@ struct RelayWorker {
     channel_pool: ChannelPoolConfig,
     p2p_channel_lifetime: Duration,
     rule: RelayRule,
+    state_hub: RelayStateHub,
 }
 
 #[derive(Debug, Clone, Copy)]

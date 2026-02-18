@@ -125,26 +125,26 @@ rtun relay \
 
 阶段步骤（建议按顺序）：
 
-- S1 参数与日志输出面
+- [x] S1 参数与日志输出面
   - 增加 `relay` 参数：`--tui`、`--log-file <path>`
   - `--tui` 开启时关闭控制台滚动日志；未开启时保持当前行为
   - 仅当显式提供 `--log-file` 时写日志文件；未提供时不落盘
   - 验收：`rtun relay --help` 可见参数；三种组合（普通 / `--tui` / `--tui --log-file`）行为符合预期
-- S2 事件总线与状态快照（最小侵入）
+- [x] S2 事件总线与状态快照（最小侵入）
   - 在 relay 内部增加轻量事件通道（Agent/Tunnel/Flow 生命周期事件）
   - 维护只读状态快照结构，供 TUI 刷新读取
   - 不改变既有转发决策和数据包处理逻辑
   - 验收：关闭 TUI 时功能与现状一致；开启 TUI 时可持续刷新且无 panic
-- S3 TUI 最小可用版（MVP）
+- [ ] S3 TUI 最小可用版（MVP）
   - 实现三块视图：Agents / Tunnels / Flows
   - 支持基本操作：退出、刷新节流、窗口尺寸变化处理
   - 默认按关键字段排序（如 `expire_at`、活跃 flow 数、最近活跃时间）
   - 验收：单机场景可稳定展示；flow 创建/迁移/关闭可在界面中可见
-- S4 关键事件日志收敛
+- [ ] S4 关键事件日志收敛
   - 统一关键事件模板：`agent selected/switched`、`tunnel opened/rotated/closed`、`flow created/migrated/closed`
   - 降噪：高频 debug 事件采样/限频，默认保留关键 lifecycle 事件
   - 验收：问题复盘时仅靠日志可还原一次 agent 切换和一次通道轮换过程
-- S5 回归与文档
+- [ ] S5 回归与文档
   - 为参数行为补单测（参数解析、日志开关逻辑）
   - 集成测试补一条“`--tui` 进程可启动并稳定运行”的最小用例（可默认忽略）
   - README 补充使用示例与排障建议
