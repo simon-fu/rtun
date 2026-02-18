@@ -55,13 +55,21 @@ const UDP_RELAY_HEARTBEAT_FLOW_ID: u64 = 0;
 const DEFAULT_P2P_MIN_CHANNELS: usize = 1;
 const DEFAULT_P2P_MAX_CHANNELS: usize = 1;
 const DEFAULT_P2P_CHANNEL_LIFETIME_SECS: u64 = 120;
-const P2P_EXPAND_CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
+const P2P_EXPAND_CONNECT_TIMEOUT_INITIAL: Duration = Duration::from_secs(5);
+const P2P_EXPAND_CONNECT_TIMEOUT_MAX: Duration = Duration::from_secs(30);
 const FLOW_ROUTE_RESELECT_INTERVAL: Duration = Duration::from_secs(5);
 const FLOW_MIGRATE_STALE_GAP: Duration = Duration::from_secs(6);
 const FLOW_MIGRATE_LOAD_GAP: usize = 2;
 const TUNNEL_STALE_THRESHOLD: Duration = Duration::from_secs(12);
 const RELAY_TUI_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
 const RELAY_TUI_MAX_EVENT_LINES: usize = 8;
+
+fn next_expand_connect_timeout(curr: Duration) -> Duration {
+    let doubled_ms = curr.as_millis().saturating_mul(2);
+    let max_ms = P2P_EXPAND_CONNECT_TIMEOUT_MAX.as_millis();
+    let next_ms = doubled_ms.min(max_ms);
+    Duration::from_millis(next_ms as u64)
+}
 
 pub fn run(args: CmdArgs) -> Result<()> {
     init_relay_log(&args)?;
@@ -1478,19 +1486,19 @@ async fn try_expand_tunnels<H: CtrlHandler>(
     tunnel_states: &mut Vec<Option<RelayTunnelState>>,
     tunnel_activity: &mut Vec<Option<Instant>>,
     inbound_tx: &mpsc::Sender<TunnelRecvEvent>,
+    connect_timeout: &mut Duration,
 ) {
     while active_tunnel_count(tunnels) < desired {
         let tunnel_idx = match first_inactive_tunnel_idx(tunnels) {
             Some(idx) => idx,
             None => tunnels.len(),
         };
-        match time::timeout(
-            P2P_EXPAND_CONNECT_TIMEOUT,
-            open_udp_relay_tunnel(ctrl, target, idle_timeout_secs, max_payload),
-        )
+        let timeout = *connect_timeout;
+        match time::timeout(timeout, open_udp_relay_tunnel(ctrl, target, idle_timeout_secs, max_payload))
         .await
         {
             Ok(Ok(tunnel)) => {
+                *connect_timeout = P2P_EXPAND_CONNECT_TIMEOUT_INITIAL;
                 let mode = tunnel.codec.mode_name().to_string();
                 tracing::info!(
                     "relay tunnel connected(scale-up): idx [{}], codec [{}], active={}",
@@ -1527,21 +1535,28 @@ async fn try_expand_tunnels<H: CtrlHandler>(
                 });
             }
             Ok(Err(e)) => {
+                let next_timeout = next_expand_connect_timeout(*connect_timeout);
                 tracing::warn!(
-                    "relay tunnel scale-up failed: idx [{}], desired [{}], err [{}]",
+                    "relay tunnel scale-up failed: idx [{}], desired [{}], timeout={}ms, next_timeout={}ms, err [{}]",
                     tunnel_idx,
                     desired,
+                    timeout.as_millis(),
+                    next_timeout.as_millis(),
                     e
                 );
+                *connect_timeout = next_timeout;
                 break;
             }
             Err(_) => {
+                let next_timeout = next_expand_connect_timeout(*connect_timeout);
                 tracing::debug!(
-                    "relay tunnel scale-up timeout: idx [{}], desired [{}], timeout={}ms",
+                    "relay tunnel scale-up timeout: idx [{}], desired [{}], timeout={}ms, next_timeout={}ms",
                     tunnel_idx,
                     desired,
-                    P2P_EXPAND_CONNECT_TIMEOUT.as_millis()
+                    timeout.as_millis(),
+                    next_timeout.as_millis()
                 );
+                *connect_timeout = next_timeout;
                 break;
             }
         }
@@ -1824,6 +1839,7 @@ async fn try_rotate_expired_tunnels<H: CtrlHandler>(
     tunnel_states: &mut Vec<Option<RelayTunnelState>>,
     tunnel_activity: &mut Vec<Option<Instant>>,
     inbound_tx: &mpsc::Sender<TunnelRecvEvent>,
+    connect_timeout: &mut Duration,
 ) {
     let now = Instant::now();
     for old_idx in 0..tunnels.len() {
@@ -1837,13 +1853,12 @@ async fn try_rotate_expired_tunnels<H: CtrlHandler>(
             continue;
         }
 
-        match time::timeout(
-            P2P_EXPAND_CONNECT_TIMEOUT,
-            open_udp_relay_tunnel(ctrl, target, idle_timeout_secs, max_payload),
-        )
+        let timeout = *connect_timeout;
+        match time::timeout(timeout, open_udp_relay_tunnel(ctrl, target, idle_timeout_secs, max_payload))
         .await
         {
             Ok(Ok(new_tunnel)) => {
+                *connect_timeout = P2P_EXPAND_CONNECT_TIMEOUT_INITIAL;
                 let mode = new_tunnel.codec.mode_name().to_string();
                 let new_idx = match first_inactive_tunnel_idx(tunnels) {
                     Some(idx) => idx,
@@ -1888,18 +1903,25 @@ async fn try_rotate_expired_tunnels<H: CtrlHandler>(
                 });
             }
             Ok(Err(e)) => {
+                let next_timeout = next_expand_connect_timeout(*connect_timeout);
                 tracing::warn!(
-                    "relay tunnel rotate failed(open replacement): old_idx [{}], err [{}]",
+                    "relay tunnel rotate failed(open replacement): old_idx [{}], timeout={}ms, next_timeout={}ms, err [{}]",
                     old_idx,
+                    timeout.as_millis(),
+                    next_timeout.as_millis(),
                     e
                 );
+                *connect_timeout = next_timeout;
             }
             Err(_) => {
+                let next_timeout = next_expand_connect_timeout(*connect_timeout);
                 tracing::debug!(
-                    "relay tunnel rotate timeout(open replacement): old_idx [{}], timeout={}ms",
+                    "relay tunnel rotate timeout(open replacement): old_idx [{}], timeout={}ms, next_timeout={}ms",
                     old_idx,
-                    P2P_EXPAND_CONNECT_TIMEOUT.as_millis()
+                    timeout.as_millis(),
+                    next_timeout.as_millis()
                 );
+                *connect_timeout = next_timeout;
             }
         }
     }
@@ -1972,6 +1994,7 @@ async fn relay_loop<H: CtrlHandler>(
     let mut flow_to_src: HashMap<u64, SocketAddr> = HashMap::new();
     let mut next_flow = 1_u64;
     let mut next_tunnel_for_new_flow = 0_usize;
+    let mut p2p_expand_connect_timeout = P2P_EXPAND_CONNECT_TIMEOUT_INITIAL;
 
     let mut cleanup = time::interval(FLOW_CLEANUP_INTERVAL);
     cleanup.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -2225,6 +2248,7 @@ async fn relay_loop<H: CtrlHandler>(
                             &mut tunnel_states,
                             &mut tunnel_activity,
                             &inbound_tx,
+                            &mut p2p_expand_connect_timeout,
                         )
                         .await;
 
@@ -2261,6 +2285,7 @@ async fn relay_loop<H: CtrlHandler>(
                         &mut tunnel_states,
                         &mut tunnel_activity,
                         &inbound_tx,
+                        &mut p2p_expand_connect_timeout,
                     )
                     .await;
                 }
@@ -2276,6 +2301,7 @@ async fn relay_loop<H: CtrlHandler>(
                     &mut tunnel_states,
                     &mut tunnel_activity,
                     &inbound_tx,
+                    &mut p2p_expand_connect_timeout,
                 )
                 .await;
                 rebalance_client_flows(
