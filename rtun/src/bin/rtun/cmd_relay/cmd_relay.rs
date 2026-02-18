@@ -22,7 +22,7 @@ use rtun::{
 };
 use tokio::{
     net::UdpSocket,
-    sync::oneshot,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
     time::{self, MissedTickBehavior},
 };
@@ -68,7 +68,6 @@ async fn do_run(args: CmdArgs) -> Result<()> {
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
     let max_payload = resolve_udp_max_payload(args.udp_max_payload)?;
     let channel_pool = ChannelPoolConfig::new(args.p2p_min_channels, args.p2p_max_channels)?;
-    channel_pool.ensure_phase0_single_channel()?;
 
     let mut rules = Vec::with_capacity(args.local_rules.len());
     for rule in args.local_rules {
@@ -335,7 +334,14 @@ async fn run_with_ws_signal(
 
     let ctrl = session.ctrl_client().clone_invoker();
     tokio::select! {
-        r = run_relay_session(ctrl, local, worker.rule.target, worker.idle_timeout, worker.max_payload) => r,
+        r = run_relay_session(
+            ctrl,
+            local,
+            worker.rule.target,
+            worker.idle_timeout,
+            worker.max_payload,
+            worker.channel_pool,
+        ) => r,
         r = session.wait_for_completed() => {
             r?;
             bail!("signal session closed")
@@ -366,7 +372,14 @@ async fn run_with_quic_signal(
 
     let ctrl = session.ctrl_client().clone_invoker();
     tokio::select! {
-        r = run_relay_session(ctrl, local, worker.rule.target, worker.idle_timeout, worker.max_payload) => r,
+        r = run_relay_session(
+            ctrl,
+            local,
+            worker.rule.target,
+            worker.idle_timeout,
+            worker.max_payload,
+            worker.channel_pool,
+        ) => r,
         r = session.wait_for_completed() => {
             r?;
             bail!("signal session closed")
@@ -388,16 +401,60 @@ async fn run_relay_session<H: CtrlHandler>(
     target: SocketAddr,
     idle_timeout: Duration,
     max_payload: usize,
+    channel_pool: ChannelPoolConfig,
 ) -> Result<()> {
+    let idle_timeout_secs = u32::try_from(idle_timeout.as_secs())
+        .with_context(|| format!("udp idle timeout too large [{}s]", idle_timeout.as_secs()))?;
+    let desired = channel_pool.desired_channels(0);
+    let mut tunnels = Vec::with_capacity(desired);
+    let mut recv_tasks = Vec::with_capacity(desired);
+    let (inbound_tx, inbound_rx) = mpsc::channel::<TunnelRecvEvent>(1024);
+    for _ in 0..desired {
+        let tunnel_idx = tunnels.len();
+        let tunnel = open_udp_relay_tunnel(&ctrl, target, idle_timeout_secs, max_payload).await?;
+        tracing::info!(
+            "relay tunnel connected: idx [{}], codec [{}]",
+            tunnel_idx,
+            tunnel.codec.mode_name()
+        );
+        let recv_task = spawn_tunnel_recv_task(
+            tunnel_idx,
+            tunnel.socket.clone(),
+            tunnel.codec,
+            max_payload,
+            inbound_tx.clone(),
+        );
+        recv_tasks.push(recv_task);
+        tunnels.push(tunnel);
+    }
+
+    relay_loop(
+        ctrl,
+        local,
+        target,
+        idle_timeout,
+        max_payload,
+        channel_pool,
+        tunnels,
+        recv_tasks,
+        inbound_tx,
+        inbound_rx,
+    )
+    .await
+}
+
+async fn open_udp_relay_tunnel<H: CtrlHandler>(
+    ctrl: &CtrlInvoker<H>,
+    target: SocketAddr,
+    idle_timeout_secs: u32,
+    max_payload: usize,
+) -> Result<RelayTunnel> {
     let mut peer = IcePeer::with_config(IceConfig {
         servers: default_ice_servers(),
         ..Default::default()
     });
 
     let local_ice = peer.client_gather().await?;
-    let idle_timeout_secs = u32::try_from(idle_timeout.as_secs())
-        .with_context(|| format!("udp idle timeout too large [{}s]", idle_timeout.as_secs()))?;
-
     let local_codec = UdpRelayCodec::new(gen_udp_relay_obfs_seed());
     let rsp = ctrl
         .open_p2p(P2PArgs {
@@ -439,31 +496,180 @@ async fn run_relay_session<H: CtrlHandler>(
     let conn = peer.dial(remote_ice).await?;
     let (socket, _cfg, remote_addr) = conn.into_parts();
     socket.connect(remote_addr).await?;
-    tracing::info!("relay udp codec mode [{}]", codec.mode_name());
-    relay_loop(local, socket, target, idle_timeout, max_payload, codec).await
+    Ok(RelayTunnel {
+        socket: Arc::new(socket),
+        codec,
+    })
 }
 
-async fn relay_loop(
+fn spawn_tunnel_recv_task(
+    tunnel_idx: usize,
+    socket: Arc<UdpSocket>,
+    codec: UdpRelayCodec,
+    max_payload: usize,
+    inbound_tx: mpsc::Sender<TunnelRecvEvent>,
+) -> JoinHandle<()> {
+    let task_name = format!("relay-tunnel-rx-{tunnel_idx}");
+    spawn_with_name(task_name, async move {
+        let mut tun_buf = vec![0_u8; 64 * 1024];
+        loop {
+            let n = match socket.recv(&mut tun_buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = inbound_tx
+                        .send(TunnelRecvEvent::Closed {
+                            tunnel_idx,
+                            reason: e.to_string(),
+                        })
+                        .await;
+                    break;
+                }
+            };
+            if n == 0 {
+                let _ = inbound_tx
+                    .send(TunnelRecvEvent::Closed {
+                        tunnel_idx,
+                        reason: "recv 0".to_string(),
+                    })
+                    .await;
+                break;
+            }
+
+            let (flow_id, payload) = match decode_udp_relay_packet(&tun_buf[..n], codec) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = inbound_tx
+                        .send(TunnelRecvEvent::Closed {
+                            tunnel_idx,
+                            reason: format!("decode failed [{e}]"),
+                        })
+                        .await;
+                    break;
+                }
+            };
+
+            if flow_id == UDP_RELAY_HEARTBEAT_FLOW_ID && payload.is_empty() {
+                continue;
+            }
+            if payload.len() > max_payload {
+                tracing::warn!(
+                    "drop oversized tunnel udp packet: tunnel [{}], flow [{}], size [{}], max [{}]",
+                    tunnel_idx,
+                    flow_id,
+                    payload.len(),
+                    max_payload
+                );
+                continue;
+            }
+
+            if inbound_tx
+                .send(TunnelRecvEvent::Packet(TunnelInboundPacket {
+                    tunnel_idx,
+                    flow_id,
+                    payload: payload.to_vec(),
+                }))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
+async fn try_expand_tunnels<H: CtrlHandler>(
+    ctrl: &CtrlInvoker<H>,
+    target: SocketAddr,
+    idle_timeout_secs: u32,
+    max_payload: usize,
+    desired: usize,
+    tunnels: &mut Vec<RelayTunnel>,
+    recv_tasks: &mut Vec<JoinHandle<()>>,
+    inbound_tx: &mpsc::Sender<TunnelRecvEvent>,
+) {
+    while tunnels.len() < desired {
+        let tunnel_idx = tunnels.len();
+        match open_udp_relay_tunnel(ctrl, target, idle_timeout_secs, max_payload).await {
+            Ok(tunnel) => {
+                tracing::info!(
+                    "relay tunnel connected(scale-up): idx [{}], codec [{}], total={}",
+                    tunnel_idx,
+                    tunnel.codec.mode_name(),
+                    tunnel_idx + 1
+                );
+                let recv_task = spawn_tunnel_recv_task(
+                    tunnel_idx,
+                    tunnel.socket.clone(),
+                    tunnel.codec,
+                    max_payload,
+                    inbound_tx.clone(),
+                );
+                recv_tasks.push(recv_task);
+                tunnels.push(tunnel);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "relay tunnel scale-up failed: idx [{}], desired [{}], err [{}]",
+                    tunnel_idx,
+                    desired,
+                    e
+                );
+                break;
+            }
+        }
+    }
+}
+
+fn shrink_tunnels(
+    desired: usize,
+    tunnels: &mut Vec<RelayTunnel>,
+    recv_tasks: &mut Vec<JoinHandle<()>>,
+) {
+    while tunnels.len() > desired {
+        let tunnel_idx = tunnels.len() - 1;
+        if let Some(task) = recv_tasks.pop() {
+            task.abort();
+        }
+        tunnels.pop();
+        tracing::info!(
+            "relay tunnel closed(scale-down): idx [{}], total={}",
+            tunnel_idx,
+            tunnels.len()
+        );
+    }
+}
+
+async fn relay_loop<H: CtrlHandler>(
+    ctrl: CtrlInvoker<H>,
     local: &UdpSocket,
-    tunnel: UdpSocket,
     target: SocketAddr,
     idle_timeout: Duration,
     max_payload: usize,
-    codec: UdpRelayCodec,
+    channel_pool: ChannelPoolConfig,
+    mut tunnels: Vec<RelayTunnel>,
+    mut recv_tasks: Vec<JoinHandle<()>>,
+    inbound_tx: mpsc::Sender<TunnelRecvEvent>,
+    mut inbound_rx: mpsc::Receiver<TunnelRecvEvent>,
 ) -> Result<()> {
+    if tunnels.is_empty() {
+        bail!("no relay tunnel available");
+    }
+    let idle_timeout_secs = u32::try_from(idle_timeout.as_secs())
+        .with_context(|| format!("udp idle timeout too large [{}s]", idle_timeout.as_secs()))?;
+
     let mut local_buf = vec![0_u8; 64 * 1024];
-    let mut tun_buf = vec![0_u8; 64 * 1024];
-    let mut tunnel_send_buf = vec![0_u8; codec.header_len() + max_payload];
+    let mut tunnel_send_buf = vec![0_u8; UDP_RELAY_META_LEN_OBFS + max_payload];
     let mut src_to_flow: HashMap<SocketAddr, ClientFlow> = HashMap::new();
     let mut flow_to_src: HashMap<u64, SocketAddr> = HashMap::new();
     let mut next_flow = 1_u64;
+    let mut next_tunnel_for_new_flow = 0_usize;
 
     let mut cleanup = time::interval(FLOW_CLEANUP_INTERVAL);
     cleanup.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut heartbeat = time::interval(UDP_RELAY_HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    loop {
+    let result: Result<()> = loop {
         tokio::select! {
             r = local.recv_from(&mut local_buf) => {
                 let (n, from) = r?;
@@ -476,87 +682,161 @@ async fn relay_loop(
                 }
 
                 let now = Instant::now();
-                let flow_id = if let Some(flow) = src_to_flow.get_mut(&from) {
+                let (flow_id, tunnel_idx) = if let Some(flow) = src_to_flow.get_mut(&from) {
                     flow.updated_at = now;
-                    flow.flow_id
+                    (flow.flow_id, flow.tunnel_idx)
                 } else {
+                    if src_to_flow.is_empty() {
+                        let desired = channel_pool.desired_channels(1);
+                        try_expand_tunnels(
+                            &ctrl,
+                            target,
+                            idle_timeout_secs,
+                            max_payload,
+                            desired,
+                            &mut tunnels,
+                            &mut recv_tasks,
+                            &inbound_tx,
+                        )
+                        .await;
+                    }
+                    if tunnels.is_empty() {
+                        break Err(anyhow::anyhow!("no relay tunnel available"));
+                    }
                     let flow_id = next_flow;
                     next_flow = next_nonzero_flow_id(next_flow);
+                    let tunnel_idx = next_tunnel_for_new_flow % tunnels.len();
+                    next_tunnel_for_new_flow = (next_tunnel_for_new_flow + 1) % tunnels.len();
                     src_to_flow.insert(from, ClientFlow {
                         flow_id,
                         updated_at: now,
+                        tunnel_idx,
                     });
                     flow_to_src.insert(flow_id, from);
                     tracing::debug!(
-                        "relay flow created: id [{}], src [{}], target [{}]",
+                        "relay flow created: id [{}], src [{}], target [{}], tunnel [{}]",
                         flow_id,
                         from,
-                        target
+                        target,
+                        tunnel_idx
                     );
-                    flow_id
+                    (flow_id, tunnel_idx)
                 };
 
+                let Some(tunnel) = tunnels.get(tunnel_idx) else {
+                    break Err(anyhow::anyhow!("relay flow has invalid tunnel index [{}]", tunnel_idx));
+                };
                 let packet_len = encode_udp_relay_packet(
                     &mut tunnel_send_buf,
                     flow_id,
                     &local_buf[..n],
-                    codec,
+                    tunnel.codec,
                 )?;
-                if let Err(e) = tunnel.send(&tunnel_send_buf[..packet_len]).await {
+                if let Err(e) = tunnel.socket.send(&tunnel_send_buf[..packet_len]).await {
                     tracing::warn!(
-                        "relay flow closed(error): id [{}], src [{}], reason [{}]",
+                        "relay flow closed(error): id [{}], src [{}], tunnel [{}], reason [{}]",
                         flow_id,
                         from,
+                        tunnel_idx,
                         e
                     );
-                    return Err(e.into());
+                    break Err(e.into());
                 }
             }
-            r = tunnel.recv(&mut tun_buf) => {
-                let n = r?;
-                if n == 0 {
-                    bail!("relay tunnel closed");
-                }
-
-                let (flow_id, payload) = decode_udp_relay_packet(&tun_buf[..n], codec)?;
-                if flow_id == UDP_RELAY_HEARTBEAT_FLOW_ID && payload.is_empty() {
-                    continue;
-                }
-                if payload.len() > max_payload {
-                    tracing::warn!("drop oversized tunnel udp packet: flow [{}], size [{}], max [{}]", flow_id, payload.len(), max_payload);
-                    continue;
-                }
-
-                if let Some(from) = flow_to_src.get(&flow_id).copied() {
+            evt = inbound_rx.recv() => {
+                let Some(evt) = evt else {
+                    break Err(anyhow::anyhow!("relay tunnel recv loop channel closed"));
+                };
+                match evt {
+                    TunnelRecvEvent::Packet(pkt) => {
+                        if let Some(from) = flow_to_src.get(&pkt.flow_id).copied() {
                     if let Some(flow) = src_to_flow.get_mut(&from) {
                         flow.updated_at = Instant::now();
                     }
-                    if let Err(e) = local.send_to(payload, from).await {
+                            if let Err(e) = local.send_to(&pkt.payload, from).await {
                         tracing::warn!(
-                            "relay flow closed(error): id [{}], src [{}], reason [{}]",
-                            flow_id,
+                                    "relay flow closed(error): id [{}], src [{}], tunnel [{}], reason [{}]",
+                                    pkt.flow_id,
                             from,
+                                    pkt.tunnel_idx,
                             e
                         );
                     }
                 } else {
-                    tracing::debug!("drop tunnel packet for unknown flow [{}]", flow_id);
+                            tracing::debug!(
+                                "drop tunnel packet for unknown flow [{}], tunnel [{}]",
+                                pkt.flow_id,
+                                pkt.tunnel_idx
+                            );
+                        }
+                    }
+                    TunnelRecvEvent::Closed { tunnel_idx, reason } => {
+                        break Err(anyhow::anyhow!(
+                            "relay tunnel closed: idx [{}], reason [{}]",
+                            tunnel_idx,
+                            reason
+                        ));
+                    }
                 }
             }
             _ = cleanup.tick() => {
                 cleanup_client_flows(&mut src_to_flow, &mut flow_to_src, idle_timeout);
+                if src_to_flow.is_empty() {
+                    let desired = channel_pool.desired_channels(0);
+                    shrink_tunnels(desired, &mut tunnels, &mut recv_tasks);
+                    if next_tunnel_for_new_flow >= tunnels.len() {
+                        next_tunnel_for_new_flow = 0;
+                    }
+                }
             }
             _ = heartbeat.tick() => {
-                let packet_len = encode_udp_relay_packet(
-                    &mut tunnel_send_buf,
-                    UDP_RELAY_HEARTBEAT_FLOW_ID,
-                    &[],
-                    codec,
-                )?;
-                tunnel.send(&tunnel_send_buf[..packet_len]).await?;
+                let mut heartbeat_error = None;
+                for (tunnel_idx, tunnel) in tunnels.iter().enumerate() {
+                    let packet_len = encode_udp_relay_packet(
+                        &mut tunnel_send_buf,
+                        UDP_RELAY_HEARTBEAT_FLOW_ID,
+                        &[],
+                        tunnel.codec,
+                    )?;
+                    if let Err(e) = tunnel.socket.send(&tunnel_send_buf[..packet_len]).await {
+                        heartbeat_error = Some(anyhow::anyhow!(
+                            "relay heartbeat failed: tunnel [{}], err [{}]",
+                            tunnel_idx,
+                            e
+                        ));
+                        break;
+                    }
+                }
+                if let Some(e) = heartbeat_error {
+                    break Err(e);
+                }
             }
         }
+    };
+
+    for task in recv_tasks {
+        task.abort();
     }
+    result
+}
+
+#[derive(Debug)]
+struct RelayTunnel {
+    socket: Arc<UdpSocket>,
+    codec: UdpRelayCodec,
+}
+
+#[derive(Debug)]
+struct TunnelInboundPacket {
+    tunnel_idx: usize,
+    flow_id: u64,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum TunnelRecvEvent {
+    Packet(TunnelInboundPacket),
+    Closed { tunnel_idx: usize, reason: String },
 }
 
 fn cleanup_client_flows(
@@ -907,15 +1187,6 @@ impl ChannelPoolConfig {
             self.max_channels
         }
     }
-
-    fn ensure_phase0_single_channel(self) -> Result<()> {
-        if self.min_channels == 1 && self.max_channels == 1 {
-            return Ok(());
-        }
-        bail!(
-            "multi-channel pool is not enabled in this phase, please set --p2p-min-channels=1 --p2p-max-channels=1"
-        );
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -982,6 +1253,7 @@ impl RelayRule {
 struct ClientFlow {
     flow_id: u64,
     updated_at: Instant,
+    tunnel_idx: usize,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -1030,14 +1302,14 @@ pub struct CmdArgs {
 
     #[clap(
         long = "p2p-min-channels",
-        long_help = "min relay p2p channels (phase0 currently only supports 1)",
+        long_help = "min relay p2p channels",
         default_value_t = DEFAULT_P2P_MIN_CHANNELS
     )]
     p2p_min_channels: usize,
 
     #[clap(
         long = "p2p-max-channels",
-        long_help = "max relay p2p channels (phase0 currently only supports 1)",
+        long_help = "max relay p2p channels",
         default_value_t = DEFAULT_P2P_MAX_CHANNELS
     )]
     p2p_max_channels: usize,
@@ -1157,11 +1429,10 @@ mod tests {
     }
 
     #[test]
-    fn channel_pool_phase0_single_channel_only() {
-        let cfg = ChannelPoolConfig::new(1, 1).unwrap();
-        assert!(cfg.ensure_phase0_single_channel().is_ok());
-        let cfg = ChannelPoolConfig::new(1, 2).unwrap();
-        assert!(cfg.ensure_phase0_single_channel().is_err());
+    fn channel_pool_desired_respects_min_max() {
+        let cfg = ChannelPoolConfig::new(2, 4).unwrap();
+        assert_eq!(cfg.desired_channels(0), 2);
+        assert_eq!(cfg.desired_channels(10), 4);
     }
 
     fn test_agent(name: &str, addr: &str, expire_at: u64, instance_id: Option<&str>) -> AgentInfo {
