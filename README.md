@@ -61,7 +61,8 @@ rtun relay \
 
 - [x] 建立 P2P 连接后，`relay` 数据面当前没有心跳包；长时间空闲时可能被 NAT 回收映射，导致 P2P 中断（已实现保活心跳）
 - [x] UDP relay 数据面已支持 `obfs-v1` 帧编码（`obfs_seed + nonce` 混淆头部元数据），不再使用固定明文 `flow_id + len` 包头特征（保留 `obfs_seed=0` 的 legacy 兼容模式）
-- [ ] 当前未支持“多 p2p 通道智能路由”能力（当前为单 p2p tunnel）
+- [~] 已支持基础多 p2p 通道池能力（`--p2p-min-channels/--p2p-max-channels`、新 flow 轮询分配、空闲缩容）
+- [ ] 尚未实现“智能路由”能力（质量评分、周期迁移、按通道健康度分流）
 
 ### 多通道智能路由方案草案（待实现）
 
@@ -140,6 +141,8 @@ rtun relay \
   - 启动 `agent listen`、`agent pub`、`relay`
   - 使用本地 UDP echo 服务验证端到端转发正确性
   - 信令路径：`quic://`
+- 默认用例：`relay_quic_smoke_multi_tunnel_e2e`
+  - 覆盖 `--p2p-min-channels=1 --p2p-max-channels=2` 的基础多通道路径
 - 慢速用例（默认忽略）：`relay_quic_agent_switch_e2e`
   - 覆盖基于 `expire_in` 的 agent 切换连续性（`expire_in` 当前是分钟粒度）
 
