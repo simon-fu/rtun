@@ -16,6 +16,7 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers},
     execute,
+    style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use regex::Regex;
@@ -61,8 +62,9 @@ const FLOW_ROUTE_RESELECT_INTERVAL: Duration = Duration::from_secs(5);
 const FLOW_MIGRATE_STALE_GAP: Duration = Duration::from_secs(6);
 const FLOW_MIGRATE_LOAD_GAP: usize = 2;
 const TUNNEL_STALE_THRESHOLD: Duration = Duration::from_secs(12);
+const RELAY_TUNNEL_DOWN_TTL: Duration = Duration::from_secs(10);
 const RELAY_TUI_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
-const RELAY_TUI_MAX_EVENT_LINES: usize = 8;
+const RELAY_TUI_MAX_EVENT_BUFFER: usize = 256;
 
 fn next_expand_connect_timeout(curr: Duration) -> Duration {
     let doubled_ms = curr.as_millis().saturating_mul(2);
@@ -169,15 +171,19 @@ enum RelayLifecycleEvent {
     },
     TunnelOpened {
         tunnel_idx: usize,
+        tunnel_id: u64,
         mode: String,
         source: &'static str,
     },
     TunnelRotated {
         old_tunnel_idx: usize,
+        old_tunnel_id: u64,
         new_tunnel_idx: usize,
+        new_tunnel_id: u64,
     },
     TunnelClosed {
         tunnel_idx: usize,
+        tunnel_id: Option<u64>,
         reason: String,
     },
     FlowCreated {
@@ -185,18 +191,22 @@ enum RelayLifecycleEvent {
         src: SocketAddr,
         target: SocketAddr,
         tunnel_idx: usize,
+        tunnel_id: Option<u64>,
     },
     FlowMigrated {
         flow_id: u64,
         src: SocketAddr,
         old_tunnel_idx: usize,
+        old_tunnel_id: Option<u64>,
         new_tunnel_idx: usize,
+        new_tunnel_id: Option<u64>,
         reason: &'static str,
     },
     FlowClosed {
         flow_id: u64,
         src: SocketAddr,
         tunnel_idx: usize,
+        tunnel_id: Option<u64>,
         reason: String,
     },
 }
@@ -215,6 +225,7 @@ struct RelayAgentSnapshot {
 #[derive(Debug, Clone)]
 struct RelayTunnelSnapshot {
     tunnel_idx: usize,
+    tunnel_id: u64,
     alive: bool,
     allocatable: bool,
     mode: Option<String>,
@@ -230,6 +241,7 @@ struct RelayFlowSnapshot {
     src: SocketAddr,
     target: SocketAddr,
     tunnel_idx: usize,
+    tunnel_id: Option<u64>,
     idle_for_ms: u64,
     route_age_ms: u64,
 }
@@ -239,6 +251,7 @@ struct RelayFlowSnapshot {
 struct RelayStateSnapshot {
     listen: SocketAddr,
     target: SocketAddr,
+    flow_idle_timeout_ms: u64,
     updated_at_ms: u64,
     selected_agent: Option<RelayAgentSnapshot>,
     tunnels: Vec<RelayTunnelSnapshot>,
@@ -252,11 +265,12 @@ struct RelayStateHub {
 }
 
 impl RelayStateHub {
-    fn new(listen: SocketAddr, target: SocketAddr) -> Self {
+    fn new(listen: SocketAddr, target: SocketAddr, flow_idle_timeout: Duration) -> Self {
         let (event_tx, _) = broadcast::channel(1024);
         let snapshot = RelayStateSnapshot {
             listen,
             target,
+            flow_idle_timeout_ms: flow_idle_timeout.as_millis() as u64,
             updated_at_ms: now_millis_u64(),
             selected_agent: None,
             tunnels: vec![],
@@ -323,13 +337,24 @@ impl RelayStateHub {
             let alive = tunnels.get(tunnel_idx).and_then(|x| x.as_ref()).is_some();
             let state = tunnel_states.get(tunnel_idx).and_then(|x| x.as_ref());
             let activity = tunnel_activity.get(tunnel_idx).and_then(|x| *x);
-            if !alive && state.is_none() && activity.is_none() {
+            if !alive
+                && !state.is_some_and(|x| {
+                    x.down_until
+                        .is_some_and(|until| until.saturating_duration_since(now).as_millis() > 0)
+                })
+            {
                 continue;
             }
 
             let allocatable = state.is_some_and(|x| x.allocatable);
-            let expires_in_ms =
-                state.map(|x| x.expire_at.saturating_duration_since(now).as_millis() as u64);
+            let expires_in_ms = if alive {
+                state.map(|x| x.expire_at.saturating_duration_since(now).as_millis() as u64)
+            } else {
+                state.and_then(|x| {
+                    x.down_until
+                        .map(|until| until.saturating_duration_since(now).as_millis() as u64)
+                })
+            };
             let last_active_ago_ms =
                 activity.map(|x| now.saturating_duration_since(x).as_millis() as u64);
             let mode = tunnels
@@ -337,9 +362,13 @@ impl RelayStateHub {
                 .and_then(|x| x.as_ref())
                 .map(|x| x.codec.mode_name().to_string());
             let flow_count = flow_loads.get(tunnel_idx).copied().unwrap_or(0);
+            let tunnel_id = state
+                .map(|x| x.tunnel_id)
+                .unwrap_or_else(|| (tunnel_idx as u64).saturating_add(1));
 
             tunnel_snaps.push(RelayTunnelSnapshot {
                 tunnel_idx,
+                tunnel_id,
                 alive,
                 allocatable,
                 mode,
@@ -356,6 +385,10 @@ impl RelayStateHub {
                 src: *src,
                 target,
                 tunnel_idx: flow.tunnel_idx,
+                tunnel_id: tunnel_states
+                    .get(flow.tunnel_idx)
+                    .and_then(|x| x.as_ref())
+                    .map(|x| x.tunnel_id),
                 idle_for_ms: now.saturating_duration_since(flow.updated_at).as_millis() as u64,
                 route_age_ms: now
                     .saturating_duration_since(flow.route_updated_at)
@@ -439,9 +472,16 @@ struct RelayTuiAgentRow {
 }
 
 #[derive(Debug)]
+struct RelayTuiRuleRow {
+    rule_idx: usize,
+    listen: SocketAddr,
+    target: SocketAddr,
+}
+
+#[derive(Debug)]
 struct RelayTuiTunnelRow {
     rule_idx: usize,
-    tunnel_idx: usize,
+    tunnel_label: String,
     mode: String,
     state: &'static str,
     flow_count: usize,
@@ -455,9 +495,32 @@ struct RelayTuiFlowRow {
     flow_id: u64,
     src: SocketAddr,
     target: SocketAddr,
-    tunnel_idx: usize,
-    idle_for_ms: u64,
-    route_age_ms: u64,
+    tunnel_label: String,
+    expire_in_ms: u64,
+    route_in_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayTuiLineKind {
+    Title,
+    Summary,
+    SectionRules,
+    SectionAgents,
+    SectionTunnels,
+    SectionFlows,
+    SectionEvents,
+    Header,
+    Normal,
+    Good,
+    Warn,
+    Bad,
+    Event,
+}
+
+#[derive(Debug, Clone)]
+struct RelayTuiRenderedLine {
+    text: String,
+    kind: RelayTuiLineKind,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -477,60 +540,72 @@ fn compute_relay_tui_row_budgets(
     flows_total: usize,
     events_total: usize,
 ) -> RelayTuiRowBudgets {
-    fn cap(total: usize, guess: usize) -> usize {
-        if total == 0 {
-            0
-        } else {
-            total.min(guess.max(1))
-        }
-    }
-
-    // header + summary + per-section title/header lines.
-    let reserved = 10;
+    // title + summary + non-event section/header lines + section gaps.
+    let reserved = 13;
     let available = height.saturating_sub(reserved);
 
     let mut b = RelayTuiRowBudgets {
-        rules: cap(rules_total, available / 8),
-        agents: cap(agents_total, available / 6),
-        tunnels: cap(tunnels_total, available / 3),
-        flows: cap(flows_total, available / 3),
-        events: cap(events_total, available / 8),
+        rules: usize::from(rules_total > 0),
+        agents: usize::from(agents_total > 0),
+        tunnels: usize::from(tunnels_total > 0),
+        flows: usize::from(flows_total > 0),
+        events: 0,
     };
 
-    let min_rules = usize::from(rules_total > 0);
-    let min_agents = usize::from(agents_total > 0);
-    let min_tunnels = usize::from(tunnels_total > 0);
-    let min_flows = usize::from(flows_total > 0);
-    let min_events = usize::from(events_total > 0);
-    let mut used = b.rules + b.agents + b.tunnels + b.flows + b.events;
-
+    let mut used = b.rules + b.agents + b.tunnels + b.flows;
     while used > available {
-        if b.events > min_events {
-            b.events -= 1;
-            used -= 1;
-            continue;
-        }
-        if b.flows > min_flows {
+        if b.flows > 0 {
             b.flows -= 1;
             used -= 1;
             continue;
         }
-        if b.tunnels > min_tunnels {
+        if b.tunnels > 0 {
             b.tunnels -= 1;
             used -= 1;
             continue;
         }
-        if b.agents > min_agents {
+        if b.agents > 0 {
             b.agents -= 1;
             used -= 1;
             continue;
         }
-        if b.rules > min_rules {
+        if b.rules > 0 {
             b.rules -= 1;
             used -= 1;
             continue;
         }
+        return b;
+    }
+
+    let mut remaining = available.saturating_sub(used);
+    while remaining > 0 {
+        if b.flows < flows_total {
+            b.flows += 1;
+            remaining -= 1;
+            continue;
+        }
+        if b.tunnels < tunnels_total {
+            b.tunnels += 1;
+            remaining -= 1;
+            continue;
+        }
+        if b.agents < agents_total {
+            b.agents += 1;
+            remaining -= 1;
+            continue;
+        }
+        if b.rules < rules_total {
+            b.rules += 1;
+            remaining -= 1;
+            continue;
+        }
         break;
+    }
+
+    // Events is lowest priority: only use leftover lines from other sections.
+    // Event block needs 2 fixed lines (blank + section title), plus at least 1 row.
+    if events_total > 0 && remaining > 2 {
+        b.events = events_total.min(remaining - 2);
     }
 
     b
@@ -615,7 +690,7 @@ fn drain_relay_tui_events(
 
 fn push_relay_tui_event(recent_events: &mut Vec<String>, line: String) {
     recent_events.push(format!("{} {line}", Local::now().format("%H:%M:%S")));
-    while recent_events.len() > RELAY_TUI_MAX_EVENT_LINES {
+    while recent_events.len() > RELAY_TUI_MAX_EVENT_BUFFER {
         recent_events.remove(0);
     }
 }
@@ -652,46 +727,80 @@ fn format_relay_lifecycle_event(event: RelayLifecycleEvent) -> String {
         }
         RelayLifecycleEvent::TunnelOpened {
             tunnel_idx,
+            tunnel_id,
             mode,
             source,
         } => {
-            format!("tunnel opened: idx={tunnel_idx} mode={mode} source={source}")
+            format!("tunnel opened: idx={tunnel_idx} tid=T{tunnel_id} mode={mode} source={source}")
         }
         RelayLifecycleEvent::TunnelRotated {
             old_tunnel_idx,
+            old_tunnel_id,
             new_tunnel_idx,
+            new_tunnel_id,
         } => {
-            format!("tunnel rotated: {old_tunnel_idx} -> {new_tunnel_idx}")
+            format!(
+                "tunnel rotated: idx={old_tunnel_idx}(T{old_tunnel_id}) -> idx={new_tunnel_idx}(T{new_tunnel_id})"
+            )
         }
-        RelayLifecycleEvent::TunnelClosed { tunnel_idx, reason } => {
-            format!("tunnel closed: idx={tunnel_idx} reason={reason}")
+        RelayLifecycleEvent::TunnelClosed {
+            tunnel_idx,
+            tunnel_id,
+            reason,
+        } => {
+            format!(
+                "tunnel closed: idx={tunnel_idx} tid={} reason={reason}",
+                tunnel_id
+                    .map(|x| format!("T{x}"))
+                    .unwrap_or_else(|| "-".to_string())
+            )
         }
         RelayLifecycleEvent::FlowCreated {
             flow_id,
             src,
             target,
             tunnel_idx,
+            tunnel_id,
         } => {
-            format!("flow created: id={flow_id} src={src} target={target} tunnel={tunnel_idx}")
+            format!(
+                "flow created: id={flow_id} src={src} target={target} tunnel=idx={tunnel_idx} tid={}",
+                tunnel_id
+                    .map(|x| format!("T{x}"))
+                    .unwrap_or_else(|| "-".to_string())
+            )
         }
         RelayLifecycleEvent::FlowMigrated {
             flow_id,
             src,
             old_tunnel_idx,
+            old_tunnel_id,
             new_tunnel_idx,
+            new_tunnel_id,
             reason,
         } => {
             format!(
-                "flow migrated: id={flow_id} src={src} tunnel={old_tunnel_idx}->{new_tunnel_idx} reason={reason}"
+                "flow migrated: id={flow_id} src={src} tunnel=idx={old_tunnel_idx}/{} -> idx={new_tunnel_idx}/{} reason={reason}",
+                old_tunnel_id
+                    .map(|x| format!("T{x}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                new_tunnel_id
+                    .map(|x| format!("T{x}"))
+                    .unwrap_or_else(|| "-".to_string()),
             )
         }
         RelayLifecycleEvent::FlowClosed {
             flow_id,
             src,
             tunnel_idx,
+            tunnel_id,
             reason,
         } => {
-            format!("flow closed: id={flow_id} src={src} tunnel={tunnel_idx} reason={reason}")
+            format!(
+                "flow closed: id={flow_id} src={src} tunnel=idx={tunnel_idx} tid={} reason={reason}",
+                tunnel_id
+                    .map(|x| format!("T{x}"))
+                    .unwrap_or_else(|| "-".to_string())
+            )
         }
     }
 }
@@ -707,11 +816,18 @@ fn render_relay_tui(
     let snapshots = state_hubs.iter().map(|x| x.snapshot()).collect::<Vec<_>>();
     let now_ms = now_millis_u64();
 
+    let mut rule_rows = Vec::<RelayTuiRuleRow>::new();
     let mut agent_rows = Vec::<RelayTuiAgentRow>::new();
     let mut tunnel_rows = Vec::<RelayTuiTunnelRow>::new();
     let mut flow_rows = Vec::<RelayTuiFlowRow>::new();
 
     for (rule_idx, snapshot) in snapshots.iter().enumerate() {
+        rule_rows.push(RelayTuiRuleRow {
+            rule_idx,
+            listen: snapshot.listen,
+            target: snapshot.target,
+        });
+
         if let Some(agent) = snapshot.selected_agent.as_ref() {
             agent_rows.push(RelayTuiAgentRow {
                 rule_idx,
@@ -733,7 +849,7 @@ fn render_relay_tui(
             };
             tunnel_rows.push(RelayTuiTunnelRow {
                 rule_idx,
-                tunnel_idx: tunnel.tunnel_idx,
+                tunnel_label: format!("{}/T{}", tunnel.tunnel_idx, tunnel.tunnel_id),
                 mode: tunnel.mode.clone().unwrap_or_else(|| "-".to_string()),
                 state,
                 flow_count: tunnel.flow_count,
@@ -743,14 +859,31 @@ fn render_relay_tui(
         }
 
         for flow in snapshot.flows.iter() {
+            let route_window_ms = FLOW_ROUTE_RESELECT_INTERVAL.as_millis() as u64;
+            let route_elapsed_in_window = if route_window_ms == 0 {
+                0
+            } else {
+                flow.route_age_ms % route_window_ms
+            };
+            let route_in_ms = if route_elapsed_in_window == 0 {
+                0
+            } else {
+                route_window_ms.saturating_sub(route_elapsed_in_window)
+            };
             flow_rows.push(RelayTuiFlowRow {
                 rule_idx,
                 flow_id: flow.flow_id,
                 src: flow.src,
                 target: flow.target,
-                tunnel_idx: flow.tunnel_idx,
-                idle_for_ms: flow.idle_for_ms,
-                route_age_ms: flow.route_age_ms,
+                tunnel_label: format!(
+                    "{}/{}",
+                    flow.tunnel_idx,
+                    flow.tunnel_id
+                        .map(|x| format!("T{x}"))
+                        .unwrap_or_else(|| "-".to_string())
+                ),
+                expire_in_ms: snapshot.flow_idle_timeout_ms.saturating_sub(flow.idle_for_ms),
+                route_in_ms,
             });
         }
     }
@@ -766,12 +899,12 @@ fn render_relay_tui(
         b.flow_count
             .cmp(&a.flow_count)
             .then_with(|| a.rule_idx.cmp(&b.rule_idx))
-            .then_with(|| a.tunnel_idx.cmp(&b.tunnel_idx))
+            .then_with(|| a.tunnel_label.cmp(&b.tunnel_label))
     });
     flow_rows.sort_by(|a, b| {
-        b.route_age_ms
-            .cmp(&a.route_age_ms)
-            .then_with(|| b.idle_for_ms.cmp(&a.idle_for_ms))
+        a.route_in_ms
+            .cmp(&b.route_in_ms)
+            .then_with(|| a.expire_in_ms.cmp(&b.expire_in_ms))
             .then_with(|| a.rule_idx.cmp(&b.rule_idx))
             .then_with(|| a.flow_id.cmp(&b.flow_id))
     });
@@ -784,14 +917,20 @@ fn render_relay_tui(
         flow_rows.len(),
         recent_events.len(),
     );
-    let compact_mode = width < 120;
+    let compact_mode = width < 132 || height < 34;
 
-    let mut lines = Vec::<String>::new();
-    lines.push(format!(
+    let mut lines = Vec::<RelayTuiRenderedLine>::new();
+    relay_tui_push_line(
+        &mut lines,
+        format!(
         "rtun relay tui {}  q/esc:quit  r:refresh",
         Local::now().format("%H:%M:%S"),
-    ));
-    lines.push(format!(
+        ),
+        RelayTuiLineKind::Title,
+    );
+    relay_tui_push_line(
+        &mut lines,
+        format!(
         "screen:{}x{}  rules:{} agents:{} tunnels:{} flows:{} events:{}",
         width,
         height,
@@ -800,129 +939,267 @@ fn render_relay_tui(
         tunnel_rows.len(),
         flow_rows.len(),
         recent_events.len(),
-    ));
-    lines.push("[Rules]".to_string());
+        ),
+        RelayTuiLineKind::Summary,
+    );
+    relay_tui_push_line(&mut lines, "[Rules]", RelayTuiLineKind::SectionRules);
+    relay_tui_push_line(
+        &mut lines,
+        format_relay_tui_rule_header(width, compact_mode),
+        RelayTuiLineKind::Header,
+    );
     let rule_limit = budgets.rules.max(1);
-    for (rule_idx, snapshot) in snapshots.iter().take(rule_limit).enumerate() {
-        let agent_text = match snapshot.selected_agent.as_ref() {
-            Some(agent) => {
-                let expire_in = agent.expire_at.saturating_sub(now_ms) / 1000;
-                format!(
-                    "agent={} inst={} conn={} exp={}s",
-                    agent.name,
-                    agent.instance_id.as_deref().unwrap_or("-"),
-                    if agent.connected { "up" } else { "down" },
-                    expire_in
-                )
-            }
-            None => "agent=-".to_string(),
-        };
-        lines.push(format!(
-            "R{rule_idx} {} -> {}  {agent_text}",
-            snapshot.listen, snapshot.target
-        ));
+    for row in rule_rows.iter().take(rule_limit) {
+        relay_tui_push_line(
+            &mut lines,
+            format_relay_tui_rule_row(row, width, compact_mode),
+            RelayTuiLineKind::Normal,
+        );
     }
-    if snapshots.len() > rule_limit {
-        lines.push(format!("... {} more rules", snapshots.len() - rule_limit));
+    if rule_rows.len() > rule_limit {
+        relay_tui_push_line(
+            &mut lines,
+            format!("... {} more rules", rule_rows.len() - rule_limit),
+            RelayTuiLineKind::Summary,
+        );
     }
 
-    lines.push("[Agents]".to_string());
-    lines.push(format_relay_tui_agent_header(width, compact_mode));
+    relay_tui_push_line(&mut lines, "", RelayTuiLineKind::Summary);
+    relay_tui_push_line(&mut lines, "[Agents]", RelayTuiLineKind::SectionAgents);
+    relay_tui_push_line(
+        &mut lines,
+        format_relay_tui_agent_header(width, compact_mode),
+        RelayTuiLineKind::Header,
+    );
     if agent_rows.is_empty() {
-        lines.push("-".to_string());
+        relay_tui_push_line(&mut lines, "-", RelayTuiLineKind::Summary);
     } else {
         for row in agent_rows.iter().take(budgets.agents.max(1)) {
-            lines.push(format_relay_tui_agent_row(
-                row,
-                now_ms,
-                width,
-                compact_mode,
-            ));
+            relay_tui_push_line(
+                &mut lines,
+                format_relay_tui_agent_row(row, now_ms, width, compact_mode),
+                if row.connected {
+                    RelayTuiLineKind::Good
+                } else {
+                    RelayTuiLineKind::Bad
+                },
+            );
         }
         if agent_rows.len() > budgets.agents.max(1) {
-            lines.push(format!(
-                "... {} more agents",
-                agent_rows.len() - budgets.agents.max(1)
-            ));
+            relay_tui_push_line(
+                &mut lines,
+                format!("... {} more agents", agent_rows.len() - budgets.agents.max(1)),
+                RelayTuiLineKind::Summary,
+            );
         }
     }
 
-    lines.push("[Tunnels]".to_string());
-    lines.push(format_relay_tui_tunnel_header(width, compact_mode));
+    relay_tui_push_line(&mut lines, "", RelayTuiLineKind::Summary);
+    relay_tui_push_line(&mut lines, "[Tunnels]", RelayTuiLineKind::SectionTunnels);
+    relay_tui_push_line(
+        &mut lines,
+        format_relay_tui_tunnel_header(width, compact_mode),
+        RelayTuiLineKind::Header,
+    );
     if tunnel_rows.is_empty() {
-        lines.push("-".to_string());
+        relay_tui_push_line(&mut lines, "-", RelayTuiLineKind::Summary);
     } else {
         for row in tunnel_rows.iter().take(budgets.tunnels.max(1)) {
-            lines.push(format_relay_tui_tunnel_row(row, width, compact_mode));
+            let row_kind = match row.state {
+                "active" => RelayTuiLineKind::Good,
+                "drain" => RelayTuiLineKind::Warn,
+                _ => RelayTuiLineKind::Bad,
+            };
+            relay_tui_push_line(
+                &mut lines,
+                format_relay_tui_tunnel_row(row, width, compact_mode),
+                row_kind,
+            );
         }
         if tunnel_rows.len() > budgets.tunnels.max(1) {
-            lines.push(format!(
-                "... {} more tunnels",
-                tunnel_rows.len() - budgets.tunnels.max(1)
-            ));
+            relay_tui_push_line(
+                &mut lines,
+                format!("... {} more tunnels", tunnel_rows.len() - budgets.tunnels.max(1)),
+                RelayTuiLineKind::Summary,
+            );
         }
     }
 
-    lines.push("[Flows]".to_string());
-    lines.push(format_relay_tui_flow_header(width, compact_mode));
+    relay_tui_push_line(&mut lines, "", RelayTuiLineKind::Summary);
+    relay_tui_push_line(&mut lines, "[Flows]", RelayTuiLineKind::SectionFlows);
+    relay_tui_push_line(
+        &mut lines,
+        format_relay_tui_flow_header(width, compact_mode),
+        RelayTuiLineKind::Header,
+    );
     if flow_rows.is_empty() {
-        lines.push("-".to_string());
+        relay_tui_push_line(&mut lines, "-", RelayTuiLineKind::Summary);
     } else {
         for row in flow_rows.iter().take(budgets.flows.max(1)) {
-            lines.push(format_relay_tui_flow_row(row, width, compact_mode));
+            relay_tui_push_line(
+                &mut lines,
+                format_relay_tui_flow_row(row, width, compact_mode),
+                RelayTuiLineKind::Normal,
+            );
         }
         if flow_rows.len() > budgets.flows.max(1) {
-            lines.push(format!(
-                "... {} more flows",
-                flow_rows.len() - budgets.flows.max(1)
-            ));
+            relay_tui_push_line(
+                &mut lines,
+                format!("... {} more flows", flow_rows.len() - budgets.flows.max(1)),
+                RelayTuiLineKind::Summary,
+            );
         }
     }
 
-    if !recent_events.is_empty() {
-        lines.push("[Recent Events]".to_string());
-        let event_limit = budgets.events.max(1);
+    if !recent_events.is_empty() && budgets.events > 0 {
+        relay_tui_push_line(&mut lines, "", RelayTuiLineKind::Summary);
+        relay_tui_push_line(&mut lines, "[Recent Events]", RelayTuiLineKind::SectionEvents);
+        let event_limit = budgets.events;
         let start = recent_events.len().saturating_sub(event_limit);
-        for line in recent_events.iter().skip(start) {
-            lines.push(line.clone());
+        for line in recent_events.iter().skip(start).rev() {
+            relay_tui_push_line(
+                &mut lines,
+                line.clone(),
+                relay_tui_event_line_kind(line.as_str()),
+            );
         }
         if recent_events.len() > event_limit {
-            lines.push(format!(
-                "... {} older events",
-                recent_events.len() - event_limit
-            ));
+            relay_tui_push_line(
+                &mut lines,
+                format!("... {} older events", recent_events.len() - event_limit),
+                RelayTuiLineKind::Summary,
+            );
         }
     }
 
     let mut render_lines = lines;
     if height > 0 && render_lines.len() > height {
         render_lines.truncate(height.saturating_sub(1));
-        render_lines.push("...".to_string());
+        relay_tui_push_line(&mut render_lines, "...", RelayTuiLineKind::Summary);
     }
 
     execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
     for line in render_lines.iter() {
-        write!(stdout, "{}\r\n", clip_line_width(line, width))?;
+        let clipped = clip_line_width(line.text.as_str(), width);
+        if let Some(color) = relay_tui_color_of_line(line.kind) {
+            execute!(
+                stdout,
+                SetForegroundColor(color),
+                Print(clipped),
+                ResetColor,
+                Print("\r\n")
+            )?;
+        } else {
+            write!(stdout, "{clipped}\r\n")?;
+        }
     }
     stdout.flush()?;
     Ok(())
 }
 
-fn format_relay_tui_agent_header(width: usize, compact: bool) -> String {
-    if compact {
-        return "R name conn exp addr inst".to_string();
+fn relay_tui_push_line(
+    lines: &mut Vec<RelayTuiRenderedLine>,
+    text: impl Into<String>,
+    kind: RelayTuiLineKind,
+) {
+    lines.push(RelayTuiRenderedLine {
+        text: text.into(),
+        kind,
+    });
+}
+
+fn relay_tui_color_of_line(kind: RelayTuiLineKind) -> Option<Color> {
+    match kind {
+        RelayTuiLineKind::Title => Some(Color::Cyan),
+        RelayTuiLineKind::Summary => Some(Color::DarkGrey),
+        RelayTuiLineKind::SectionRules => Some(Color::Blue),
+        RelayTuiLineKind::SectionAgents => Some(Color::Green),
+        RelayTuiLineKind::SectionTunnels => Some(Color::Magenta),
+        RelayTuiLineKind::SectionFlows => Some(Color::Cyan),
+        RelayTuiLineKind::SectionEvents => Some(Color::Yellow),
+        RelayTuiLineKind::Header => Some(Color::DarkCyan),
+        RelayTuiLineKind::Good => Some(Color::Green),
+        RelayTuiLineKind::Warn => Some(Color::Yellow),
+        RelayTuiLineKind::Bad => Some(Color::Red),
+        RelayTuiLineKind::Event => Some(Color::Grey),
+        RelayTuiLineKind::Normal => None,
     }
-    let addr_w = width.saturating_sub(3 + 1 + 12 + 1 + 14 + 1 + 5 + 1 + 8 + 1);
+}
+
+fn relay_tui_event_line_kind(line: &str) -> RelayTuiLineKind {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("failed")
+        || lower.contains("closed")
+        || lower.contains("timeout")
+        || lower.contains("down")
+        || lower.contains("lagged")
+    {
+        RelayTuiLineKind::Warn
+    } else if lower.contains("connected")
+        || lower.contains("created")
+        || lower.contains("opened")
+        || lower.contains("selected")
+    {
+        RelayTuiLineKind::Good
+    } else {
+        RelayTuiLineKind::Event
+    }
+}
+
+fn format_relay_tui_rule_header(width: usize, compact: bool) -> String {
+    if compact {
+        return "rule listen target".to_string();
+    }
+    let target_w = width.saturating_sub(4 + 1 + 21 + 1);
+    if target_w < 8 {
+        return "rule listen target".to_string();
+    }
+    format!(
+        "{} {} {}",
+        relay_tui_cell("rule", 4),
+        relay_tui_cell("listen", 21),
+        relay_tui_cell("target", target_w),
+    )
+}
+
+fn format_relay_tui_rule_row(row: &RelayTuiRuleRow, width: usize, compact: bool) -> String {
+    if compact {
+        return format!("R{} {} {}", row.rule_idx, row.listen, row.target);
+    }
+    let target_w = width.saturating_sub(4 + 1 + 21 + 1);
+    if target_w < 8 {
+        return format!("R{} {} {}", row.rule_idx, row.listen, row.target);
+    }
+    format!(
+        "{} {} {}",
+        relay_tui_cell(format!("R{}", row.rule_idx).as_str(), 4),
+        relay_tui_cell(row.listen.to_string().as_str(), 21),
+        relay_tui_cell(row.target.to_string().as_str(), target_w),
+    )
+}
+
+fn format_relay_tui_agent_header(width: usize, compact: bool) -> String {
+    let rule_w = 4;
+    let name_w = 12;
+    let inst_w = 14;
+    let conn_w = 5;
+    let expire_w = 12;
+    if compact {
+        return "rule name conn expire addr inst".to_string();
+    }
+    let addr_w = width.saturating_sub(
+        rule_w + 1 + name_w + 1 + inst_w + 1 + conn_w + 1 + expire_w + 1,
+    );
     if addr_w < 12 {
-        return "R name conn exp addr inst".to_string();
+        return "rule name conn expire addr inst".to_string();
     }
     format!(
         "{} {} {} {} {} {}",
-        relay_tui_cell("R", 3),
-        relay_tui_cell("name", 12),
-        relay_tui_cell("instance", 14),
-        relay_tui_cell("conn", 5),
-        relay_tui_cell("expire", 8),
+        relay_tui_cell("rule", rule_w),
+        relay_tui_cell("name", name_w),
+        relay_tui_cell("instance", inst_w),
+        relay_tui_cell("conn", conn_w),
+        relay_tui_cell("expire", expire_w),
         relay_tui_cell("addr", addr_w),
     )
 }
@@ -933,51 +1210,58 @@ fn format_relay_tui_agent_row(
     width: usize,
     compact: bool,
 ) -> String {
-    let expire_in = row.expire_at.saturating_sub(now_ms) / 1000;
+    let rule_w = 4;
+    let name_w = 12;
+    let inst_w = 14;
+    let conn_w = 5;
+    let expire_w = 12;
+    let expire_human = format_millis(row.expire_at.saturating_sub(now_ms));
     if compact {
         return format!(
-            "R{} {} {} exp={}s {} inst={}",
+            "R{} {} {} {} {} {}",
             row.rule_idx,
             row.name,
             if row.connected { "up" } else { "down" },
-            expire_in,
+            expire_human,
             row.addr,
-            row.instance_id
+            row.instance_id,
         );
     }
 
-    let addr_w = width.saturating_sub(3 + 1 + 12 + 1 + 14 + 1 + 5 + 1 + 8 + 1);
+    let addr_w = width.saturating_sub(
+        rule_w + 1 + name_w + 1 + inst_w + 1 + conn_w + 1 + expire_w + 1,
+    );
     if addr_w < 12 {
         return format!(
-            "R{} {} {} exp={}s {} inst={}",
+            "R{} {} {} {} {} {}",
             row.rule_idx,
             row.name,
             if row.connected { "up" } else { "down" },
-            expire_in,
+            expire_human,
             row.addr,
-            row.instance_id
+            row.instance_id,
         );
     }
 
     format!(
         "{} {} {} {} {} {}",
-        relay_tui_cell(&format!("R{}", row.rule_idx), 3),
-        relay_tui_cell(&row.name, 12),
-        relay_tui_cell(&row.instance_id, 14),
-        relay_tui_cell(if row.connected { "up" } else { "down" }, 5),
-        relay_tui_cell(format!("{expire_in}s").as_str(), 8),
+        relay_tui_cell(format!("R{}", row.rule_idx).as_str(), rule_w),
+        relay_tui_cell(&row.name, name_w),
+        relay_tui_cell(&row.instance_id, inst_w),
+        relay_tui_cell(if row.connected { "up" } else { "down" }, conn_w),
+        relay_tui_cell(&expire_human, expire_w),
         relay_tui_cell(&row.addr, addr_w),
     )
 }
 
 fn format_relay_tui_tunnel_header(width: usize, compact: bool) -> String {
-    if compact || width < 76 {
-        return "R idx st mode flows active exp".to_string();
+    if compact || width < 84 {
+        return "rule idx/tid st mode flows active exp".to_string();
     }
     format!(
         "{} {} {} {} {} {} {}",
-        relay_tui_cell("R", 3),
-        relay_tui_cell("idx", 3),
+        relay_tui_cell("rule", 4),
+        relay_tui_cell("idx/tid", 14),
         relay_tui_cell("state", 6),
         relay_tui_cell("mode", 8),
         relay_tui_cell("flows", 5),
@@ -989,16 +1273,16 @@ fn format_relay_tui_tunnel_header(width: usize, compact: bool) -> String {
 fn format_relay_tui_tunnel_row(row: &RelayTuiTunnelRow, width: usize, compact: bool) -> String {
     let active = format_millis_ago(row.last_active_ago_ms);
     let expire = format_millis_in(row.expires_in_ms);
-    if compact || width < 76 {
+    if compact || width < 84 {
         return format!(
-            "R{} {} {} {} flows={} active={} exp={}",
-            row.rule_idx, row.tunnel_idx, row.state, row.mode, row.flow_count, active, expire
+            "R{} {} {} {} {} {} {}",
+            row.rule_idx, row.tunnel_label, row.state, row.mode, row.flow_count, active, expire
         );
     }
     format!(
         "{} {} {} {} {} {} {}",
-        relay_tui_cell(&format!("R{}", row.rule_idx), 3),
-        relay_tui_cell(format!("{}", row.tunnel_idx).as_str(), 3),
+        relay_tui_cell(format!("R{}", row.rule_idx).as_str(), 4),
+        relay_tui_cell(&row.tunnel_label, 14),
         relay_tui_cell(row.state, 6),
         relay_tui_cell(&row.mode, 8),
         relay_tui_cell(format!("{}", row.flow_count).as_str(), 5),
@@ -1009,46 +1293,46 @@ fn format_relay_tui_tunnel_row(row: &RelayTuiTunnelRow, width: usize, compact: b
 
 fn format_relay_tui_flow_header(width: usize, compact: bool) -> String {
     if compact {
-        return "R flow tun idle route src -> target".to_string();
+        return "rule flow idx/tid expire route src -> target".to_string();
     }
-    let path_w = width.saturating_sub(3 + 1 + 11 + 1 + 4 + 1 + 10 + 1 + 10 + 1);
+    let path_w = width.saturating_sub(4 + 1 + 11 + 1 + 14 + 1 + 10 + 1 + 10 + 1);
     if path_w < 18 {
-        return "R flow tun idle route src -> target".to_string();
+        return "rule flow idx/tid expire route src -> target".to_string();
     }
     format!(
         "{} {} {} {} {} {}",
-        relay_tui_cell("R", 3),
+        relay_tui_cell("rule", 4),
         relay_tui_cell("flow_id", 11),
-        relay_tui_cell("tun", 4),
-        relay_tui_cell("idle", 10),
+        relay_tui_cell("idx/tid", 14),
+        relay_tui_cell("expire", 10),
         relay_tui_cell("route", 10),
         relay_tui_cell("src -> target", path_w),
     )
 }
 
 fn format_relay_tui_flow_row(row: &RelayTuiFlowRow, width: usize, compact: bool) -> String {
-    let idle = format_millis_ago(Some(row.idle_for_ms));
-    let route = format_millis_ago(Some(row.route_age_ms));
+    let expire = format_millis(row.expire_in_ms);
+    let route = format_millis(row.route_in_ms);
     let path = format!("{} -> {}", row.src, row.target);
     if compact {
         return format!(
-            "R{} {} t{} idle={} route={} {}",
-            row.rule_idx, row.flow_id, row.tunnel_idx, idle, route, path
+            "R{} {} {} {} {} {}",
+            row.rule_idx, row.flow_id, row.tunnel_label, expire, route, path
         );
     }
-    let path_w = width.saturating_sub(3 + 1 + 11 + 1 + 4 + 1 + 10 + 1 + 10 + 1);
+    let path_w = width.saturating_sub(4 + 1 + 11 + 1 + 14 + 1 + 10 + 1 + 10 + 1);
     if path_w < 18 {
         return format!(
-            "R{} {} t{} idle={} route={} {}",
-            row.rule_idx, row.flow_id, row.tunnel_idx, idle, route, path
+            "R{} {} {} {} {} {}",
+            row.rule_idx, row.flow_id, row.tunnel_label, expire, route, path
         );
     }
     format!(
         "{} {} {} {} {} {}",
-        relay_tui_cell(&format!("R{}", row.rule_idx), 3),
+        relay_tui_cell(format!("R{}", row.rule_idx).as_str(), 4),
         relay_tui_cell(format!("{}", row.flow_id).as_str(), 11),
-        relay_tui_cell(format!("{}", row.tunnel_idx).as_str(), 4),
-        relay_tui_cell(&idle, 10),
+        relay_tui_cell(&row.tunnel_label, 14),
+        relay_tui_cell(&expire, 10),
         relay_tui_cell(&route, 10),
         relay_tui_cell(&path, path_w),
     )
@@ -1122,16 +1406,26 @@ fn format_millis_in(v: Option<u64>) -> String {
 }
 
 fn format_millis(ms: u64) -> String {
-    if ms >= 60_000 {
-        let minutes = ms / 60_000;
-        let seconds = (ms % 60_000) / 1_000;
+    if ms < 1_000 {
+        return "<1s".to_string();
+    }
+
+    let mut seconds = ms / 1_000;
+    let days = seconds / 86_400;
+    if days > 0 {
+        return ">=24h".to_string();
+    }
+    let hours = seconds / 3_600;
+    seconds %= 3_600;
+    let minutes = seconds / 60;
+    seconds %= 60;
+
+    if hours > 0 {
+        format!("{hours}h{minutes}m{seconds}s")
+    } else if minutes > 0 {
         format!("{minutes}m{seconds}s")
-    } else if ms >= 1_000 {
-        let seconds = ms / 1_000;
-        let millis = ms % 1_000;
-        format!("{seconds}.{millis:03}s")
     } else {
-        format!("{ms}ms")
+        format!("{seconds}s")
     }
 }
 
@@ -1181,7 +1475,7 @@ async fn do_run(args: CmdArgs) -> Result<()> {
 
     let mut state_hubs = Vec::with_capacity(rules.len());
     for (idx, rule) in rules.into_iter().enumerate() {
-        let state_hub = RelayStateHub::new(rule.listen, rule.target);
+        let state_hub = RelayStateHub::new(rule.listen, rule.target, idle_timeout);
         state_hubs.push(state_hub.clone());
         let worker = RelayWorker {
             signal_url: signal_url.clone(),
@@ -1564,6 +1858,7 @@ async fn run_relay_session<H: CtrlHandler>(
     let mut recv_tasks: Vec<Option<JoinHandle<()>>> = Vec::with_capacity(desired);
     let mut tunnel_states: Vec<Option<RelayTunnelState>> = Vec::with_capacity(desired);
     let mut tunnel_activity: Vec<Option<Instant>> = Vec::with_capacity(desired);
+    let mut next_tunnel_id = 1_u64;
     let (inbound_tx, inbound_rx) = mpsc::channel::<TunnelRecvEvent>(1024);
     for _ in 0..desired {
         let tunnel_idx = tunnels.len();
@@ -1585,10 +1880,17 @@ async fn run_relay_session<H: CtrlHandler>(
         tunnel_states.push(Some(RelayTunnelState::new(
             Instant::now(),
             p2p_channel_lifetime,
+            next_tunnel_id,
         )));
+        next_tunnel_id = next_tunnel_id.saturating_add(1);
         tunnel_activity.push(Some(Instant::now()));
+        let tunnel_id = tunnel_states[tunnel_idx]
+            .as_ref()
+            .map(|x| x.tunnel_id)
+            .unwrap_or(0);
         state_hub.emit(RelayLifecycleEvent::TunnelOpened {
             tunnel_idx,
+            tunnel_id,
             mode: tunnels[tunnel_idx]
                 .as_ref()
                 .map(|x| x.codec.mode_name().to_string())
@@ -1618,6 +1920,7 @@ async fn run_relay_session<H: CtrlHandler>(
         tunnel_states,
         tunnel_activity,
         p2p_channel_lifetime,
+        next_tunnel_id,
         inbound_tx,
         inbound_rx,
     )
@@ -1777,6 +2080,7 @@ async fn try_expand_tunnels<H: CtrlHandler>(
     recv_tasks: &mut Vec<Option<JoinHandle<()>>>,
     tunnel_states: &mut Vec<Option<RelayTunnelState>>,
     tunnel_activity: &mut Vec<Option<Instant>>,
+    next_tunnel_id: &mut u64,
     inbound_tx: &mpsc::Sender<TunnelRecvEvent>,
     connect_timeout: &mut Duration,
 ) {
@@ -1811,17 +2115,28 @@ async fn try_expand_tunnels<H: CtrlHandler>(
                     tunnel_states.push(Some(RelayTunnelState::new(
                         Instant::now(),
                         p2p_channel_lifetime,
+                        *next_tunnel_id,
                     )));
+                    *next_tunnel_id = (*next_tunnel_id).saturating_add(1);
                     tunnel_activity.push(Some(Instant::now()));
                 } else {
                     tunnels[tunnel_idx] = Some(tunnel);
                     recv_tasks[tunnel_idx] = Some(recv_task);
-                    tunnel_states[tunnel_idx] =
-                        Some(RelayTunnelState::new(Instant::now(), p2p_channel_lifetime));
+                    tunnel_states[tunnel_idx] = Some(RelayTunnelState::new(
+                        Instant::now(),
+                        p2p_channel_lifetime,
+                        *next_tunnel_id,
+                    ));
+                    *next_tunnel_id = (*next_tunnel_id).saturating_add(1);
                     tunnel_activity[tunnel_idx] = Some(Instant::now());
                 }
+                let tunnel_id = tunnel_states[tunnel_idx]
+                    .as_ref()
+                    .map(|x| x.tunnel_id)
+                    .unwrap_or(0);
                 state_hub.emit(RelayLifecycleEvent::TunnelOpened {
                     tunnel_idx,
+                    tunnel_id,
                     mode,
                     source: "scale-up",
                 });
@@ -1867,6 +2182,7 @@ fn shrink_tunnels(
         let Some(tunnel_idx) = last_active_tunnel_idx(tunnels) else {
             break;
         };
+        let tunnel_id = tunnel_states[tunnel_idx].as_ref().map(|x| x.tunnel_id);
         if let Some(task) = recv_tasks[tunnel_idx].take() {
             task.abort();
         }
@@ -1880,6 +2196,7 @@ fn shrink_tunnels(
         );
         state_hub.emit(RelayLifecycleEvent::TunnelClosed {
             tunnel_idx,
+            tunnel_id,
             reason: "scale-down".to_string(),
         });
     }
@@ -1896,6 +2213,13 @@ fn first_inactive_tunnel_idx(tunnels: &[Option<RelayTunnel>]) -> Option<usize> {
 
 fn last_active_tunnel_idx(tunnels: &[Option<RelayTunnel>]) -> Option<usize> {
     tunnels.iter().rposition(|x| x.is_some())
+}
+
+fn tunnel_id_at(tunnel_states: &[Option<RelayTunnelState>], tunnel_idx: usize) -> Option<u64> {
+    tunnel_states
+        .get(tunnel_idx)
+        .and_then(|x| x.as_ref())
+        .map(|x| x.tunnel_id)
 }
 
 fn build_tunnel_flow_loads(
@@ -2017,11 +2341,39 @@ fn compact_tunnel_slots(
     tunnel_states: &mut Vec<Option<RelayTunnelState>>,
     tunnel_activity: &mut Vec<Option<Instant>>,
 ) {
-    while tunnels.last().is_some_and(|x| x.is_none()) {
+    while tunnels.last().is_some_and(|x| x.is_none())
+        && tunnel_states.last().is_some_and(|x| x.is_none())
+        && tunnel_activity.last().is_some_and(|x| x.is_none())
+    {
         tunnels.pop();
         recv_tasks.pop();
         tunnel_states.pop();
         tunnel_activity.pop();
+    }
+}
+
+fn cleanup_stale_down_tunnel_markers(
+    tunnels: &mut [Option<RelayTunnel>],
+    recv_tasks: &mut [Option<JoinHandle<()>>],
+    tunnel_states: &mut [Option<RelayTunnelState>],
+    tunnel_activity: &mut [Option<Instant>],
+) {
+    let now = Instant::now();
+    for tunnel_idx in 0..tunnels.len() {
+        if tunnels[tunnel_idx].is_some() {
+            continue;
+        }
+        let down_expired = tunnel_states[tunnel_idx]
+            .as_ref()
+            .and_then(|x| x.down_until)
+            .is_some_and(|until| now >= until);
+        if down_expired {
+            if let Some(task) = recv_tasks[tunnel_idx].take() {
+                task.abort();
+            }
+            tunnel_states[tunnel_idx] = None;
+            tunnel_activity[tunnel_idx] = None;
+        }
     }
 }
 
@@ -2101,10 +2453,14 @@ fn rebalance_client_flows(
                 flow_id: flow.flow_id,
                 src: *src,
                 old_tunnel_idx: current_idx,
+                old_tunnel_id: Some(flow.tunnel_id),
                 new_tunnel_idx: best_idx,
+                new_tunnel_id: tunnel_id_at(tunnel_states, best_idx),
                 reason: "rebalance",
             });
             flow.tunnel_idx = best_idx;
+            flow.tunnel_id = tunnel_id_at(tunnel_states, best_idx)
+                .unwrap_or_else(|| (best_idx as u64).saturating_add(1));
             migrated += 1;
         }
         flow.route_updated_at = now;
@@ -2130,6 +2486,7 @@ async fn try_rotate_expired_tunnels<H: CtrlHandler>(
     recv_tasks: &mut Vec<Option<JoinHandle<()>>>,
     tunnel_states: &mut Vec<Option<RelayTunnelState>>,
     tunnel_activity: &mut Vec<Option<Instant>>,
+    next_tunnel_id: &mut u64,
     inbound_tx: &mpsc::Sender<TunnelRecvEvent>,
     connect_timeout: &mut Duration,
 ) {
@@ -2167,18 +2524,38 @@ async fn try_rotate_expired_tunnels<H: CtrlHandler>(
                 if new_idx == tunnels.len() {
                     tunnels.push(Some(new_tunnel));
                     recv_tasks.push(Some(recv_task));
-                    tunnel_states.push(Some(RelayTunnelState::new(now, p2p_channel_lifetime)));
+                    tunnel_states.push(Some(RelayTunnelState::new(
+                        now,
+                        p2p_channel_lifetime,
+                        *next_tunnel_id,
+                    )));
+                    *next_tunnel_id = (*next_tunnel_id).saturating_add(1);
                     tunnel_activity.push(Some(now));
                 } else {
                     tunnels[new_idx] = Some(new_tunnel);
                     recv_tasks[new_idx] = Some(recv_task);
-                    tunnel_states[new_idx] = Some(RelayTunnelState::new(now, p2p_channel_lifetime));
+                    tunnel_states[new_idx] = Some(RelayTunnelState::new(
+                        now,
+                        p2p_channel_lifetime,
+                        *next_tunnel_id,
+                    ));
+                    *next_tunnel_id = (*next_tunnel_id).saturating_add(1);
                     tunnel_activity[new_idx] = Some(now);
                 }
 
                 if let Some(old_state) = tunnel_states.get_mut(old_idx).and_then(|x| x.as_mut()) {
                     old_state.allocatable = false;
                 }
+                let new_tunnel_id = tunnel_states
+                    .get(new_idx)
+                    .and_then(|x| x.as_ref())
+                    .map(|x| x.tunnel_id)
+                    .unwrap_or(0);
+                let old_tunnel_id = tunnel_states
+                    .get(old_idx)
+                    .and_then(|x| x.as_ref())
+                    .map(|x| x.tunnel_id)
+                    .unwrap_or(0);
                 tracing::info!(
                     "relay tunnel rotated: old_idx [{}] -> new_idx [{}], old enters draining",
                     old_idx,
@@ -2186,12 +2563,15 @@ async fn try_rotate_expired_tunnels<H: CtrlHandler>(
                 );
                 state_hub.emit(RelayLifecycleEvent::TunnelOpened {
                     tunnel_idx: new_idx,
+                    tunnel_id: new_tunnel_id,
                     mode,
                     source: "rotate",
                 });
                 state_hub.emit(RelayLifecycleEvent::TunnelRotated {
                     old_tunnel_idx: old_idx,
+                    old_tunnel_id,
                     new_tunnel_idx: new_idx,
+                    new_tunnel_id,
                 });
             }
             Ok(Err(e)) => {
@@ -2245,12 +2625,14 @@ fn close_drained_tunnels(
         if let Some(task) = recv_tasks[tunnel_idx].take() {
             task.abort();
         }
+        let tunnel_id = Some(state.tunnel_id);
         tunnels[tunnel_idx] = None;
         tunnel_states[tunnel_idx] = None;
         tunnel_activity[tunnel_idx] = None;
         tracing::info!("relay tunnel closed(drained): idx [{}]", tunnel_idx);
         state_hub.emit(RelayLifecycleEvent::TunnelClosed {
             tunnel_idx,
+            tunnel_id,
             reason: "drained".to_string(),
         });
     }
@@ -2270,6 +2652,7 @@ async fn relay_loop<H: CtrlHandler>(
     mut tunnel_states: Vec<Option<RelayTunnelState>>,
     mut tunnel_activity: Vec<Option<Instant>>,
     p2p_channel_lifetime: Duration,
+    mut next_tunnel_id: u64,
     inbound_tx: mpsc::Sender<TunnelRecvEvent>,
     mut inbound_rx: mpsc::Receiver<TunnelRecvEvent>,
 ) -> Result<()> {
@@ -2351,10 +2734,14 @@ async fn relay_loop<H: CtrlHandler>(
                             flow_id: flow.flow_id,
                             src: from,
                             old_tunnel_idx: flow.tunnel_idx,
+                            old_tunnel_id: Some(flow.tunnel_id),
                             new_tunnel_idx: new_idx,
+                            new_tunnel_id: tunnel_id_at(&tunnel_states, new_idx),
                             reason: "rebound",
                         });
                         flow.tunnel_idx = new_idx;
+                        flow.tunnel_id = tunnel_id_at(&tunnel_states, new_idx)
+                            .unwrap_or_else(|| (new_idx as u64).saturating_add(1));
                         flow.route_updated_at = now;
                     }
                     (flow.flow_id, flow.tunnel_idx)
@@ -2389,6 +2776,8 @@ async fn relay_loop<H: CtrlHandler>(
                         updated_at: now,
                         route_updated_at: now,
                         tunnel_idx,
+                        tunnel_id: tunnel_id_at(&tunnel_states, tunnel_idx)
+                            .unwrap_or_else(|| (tunnel_idx as u64).saturating_add(1)),
                     });
                     if tunnel_idx < flow_loads.len() {
                         flow_loads[tunnel_idx] = flow_loads[tunnel_idx].saturating_add(1);
@@ -2406,6 +2795,7 @@ async fn relay_loop<H: CtrlHandler>(
                         src: from,
                         target,
                         tunnel_idx,
+                        tunnel_id: tunnel_id_at(&tunnel_states, tunnel_idx),
                     });
                     (flow_id, tunnel_idx)
                 };
@@ -2449,6 +2839,14 @@ async fn relay_loop<H: CtrlHandler>(
                 };
                 match evt {
                     TunnelRecvEvent::Packet(pkt) => {
+                        if pkt.tunnel_idx >= tunnels.len() || tunnels[pkt.tunnel_idx].is_none() {
+                            tracing::debug!(
+                                "drop stale tunnel packet: flow [{}], tunnel [{}]",
+                                pkt.flow_id,
+                                pkt.tunnel_idx
+                            );
+                            continue;
+                        }
                         if pkt.tunnel_idx < tunnel_activity.len() {
                             tunnel_activity[pkt.tunnel_idx] = Some(Instant::now());
                         }
@@ -2474,6 +2872,9 @@ async fn relay_loop<H: CtrlHandler>(
                         }
                     }
                     TunnelRecvEvent::Heartbeat { tunnel_idx } => {
+                        if tunnel_idx >= tunnels.len() || tunnels[tunnel_idx].is_none() {
+                            continue;
+                        }
                         if tunnel_idx < tunnel_activity.len() {
                             tunnel_activity[tunnel_idx] = Some(Instant::now());
                         }
@@ -2490,8 +2891,15 @@ async fn relay_loop<H: CtrlHandler>(
 
                         tunnels[tunnel_idx] = None;
                         recv_tasks[tunnel_idx] = None;
-                        tunnel_states[tunnel_idx] = None;
-                        tunnel_activity[tunnel_idx] = None;
+                        let closed_at = Instant::now();
+                        let tunnel_id = tunnel_states
+                            .get(tunnel_idx)
+                            .and_then(|x| x.as_ref())
+                            .map(|x| x.tunnel_id)
+                            .unwrap_or_else(|| (tunnel_idx as u64).saturating_add(1));
+                        tunnel_states[tunnel_idx] =
+                            Some(RelayTunnelState::down_marker(closed_at, tunnel_id));
+                        tunnel_activity[tunnel_idx] = Some(closed_at);
                         tracing::warn!(
                             "relay tunnel closed: idx [{}], reason [{}], active={}",
                             tunnel_idx,
@@ -2500,16 +2908,17 @@ async fn relay_loop<H: CtrlHandler>(
                         );
                         state_hub.emit(RelayLifecycleEvent::TunnelClosed {
                             tunnel_idx,
+                            tunnel_id: Some(tunnel_id),
                             reason: reason.clone(),
                         });
 
                         let mut removed = Vec::new();
                         for (src, flow) in src_to_flow.iter() {
                             if flow.tunnel_idx == tunnel_idx {
-                                removed.push((*src, flow.flow_id));
+                                removed.push((*src, flow.flow_id, flow.tunnel_id));
                             }
                         }
-                        for (src, flow_id) in removed {
+                        for (src, flow_id, flow_tunnel_id) in removed {
                             src_to_flow.remove(&src);
                             flow_to_src.remove(&flow_id);
                             tracing::debug!(
@@ -2522,6 +2931,7 @@ async fn relay_loop<H: CtrlHandler>(
                                 flow_id,
                                 src,
                                 tunnel_idx,
+                                tunnel_id: Some(flow_tunnel_id),
                                 reason: "tunnel-lost".to_string(),
                             });
                         }
@@ -2539,6 +2949,7 @@ async fn relay_loop<H: CtrlHandler>(
                             &mut recv_tasks,
                             &mut tunnel_states,
                             &mut tunnel_activity,
+                            &mut next_tunnel_id,
                             &inbound_tx,
                             &mut p2p_expand_connect_timeout,
                         )
@@ -2576,6 +2987,7 @@ async fn relay_loop<H: CtrlHandler>(
                         &mut recv_tasks,
                         &mut tunnel_states,
                         &mut tunnel_activity,
+                        &mut next_tunnel_id,
                         &inbound_tx,
                         &mut p2p_expand_connect_timeout,
                     )
@@ -2592,6 +3004,7 @@ async fn relay_loop<H: CtrlHandler>(
                     &mut recv_tasks,
                     &mut tunnel_states,
                     &mut tunnel_activity,
+                    &mut next_tunnel_id,
                     &inbound_tx,
                     &mut p2p_expand_connect_timeout,
                 )
@@ -2608,6 +3021,12 @@ async fn relay_loop<H: CtrlHandler>(
                 close_drained_tunnels(
                     state_hub,
                     &src_to_flow,
+                    &mut tunnels,
+                    &mut recv_tasks,
+                    &mut tunnel_states,
+                    &mut tunnel_activity,
+                );
+                cleanup_stale_down_tunnel_markers(
                     &mut tunnels,
                     &mut recv_tasks,
                     &mut tunnel_states,
@@ -2705,13 +3124,26 @@ struct RelayTunnel {
 struct RelayTunnelState {
     allocatable: bool,
     expire_at: Instant,
+    tunnel_id: u64,
+    down_until: Option<Instant>,
 }
 
 impl RelayTunnelState {
-    fn new(now: Instant, p2p_channel_lifetime: Duration) -> Self {
+    fn new(now: Instant, p2p_channel_lifetime: Duration, tunnel_id: u64) -> Self {
         Self {
             allocatable: true,
             expire_at: now + p2p_channel_lifetime,
+            tunnel_id,
+            down_until: None,
+        }
+    }
+
+    fn down_marker(now: Instant, tunnel_id: u64) -> Self {
+        Self {
+            allocatable: false,
+            expire_at: now,
+            tunnel_id,
+            down_until: Some(now + RELAY_TUNNEL_DOWN_TTL),
         }
     }
 }
@@ -2756,6 +3188,7 @@ fn cleanup_client_flows(
                 flow_id,
                 src,
                 tunnel_idx: flow.tunnel_idx,
+                tunnel_id: Some(flow.tunnel_id),
                 reason: format!("idle-timeout {}s", idle_elapsed.as_secs()),
             });
         }
@@ -3146,6 +3579,7 @@ struct ClientFlow {
     updated_at: Instant,
     route_updated_at: Instant,
     tunnel_idx: usize,
+    tunnel_id: u64,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -3229,7 +3663,7 @@ pub struct CmdArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_udp_relay_packet, encode_udp_relay_packet, max_udp_payload_auto,
+        decode_udp_relay_packet, encode_udp_relay_packet, format_millis, max_udp_payload_auto,
         pick_best_tunnel_idx_by, pick_latest_agent, resolve_udp_max_payload, ChannelPoolConfig,
         RelayRule, UdpRelayCodec,
     };
@@ -3255,6 +3689,22 @@ mod tests {
     fn parse_rule_invalid_target() {
         let r = RelayRule::parse("udp://0.0.0.0:15353?to=dns.google:53");
         assert!(r.is_err(), "{r:?}");
+    }
+
+    #[test]
+    fn format_millis_thresholds() {
+        assert_eq!(format_millis(0), "<1s");
+        assert_eq!(format_millis(999), "<1s");
+        assert_eq!(format_millis(1_000), "1s");
+        assert_eq!(format_millis(1_999), "1s");
+        assert_eq!(format_millis(59_000), "59s");
+    }
+
+    #[test]
+    fn format_millis_multi_units() {
+        assert_eq!(format_millis(60_000), "1m0s");
+        assert_eq!(format_millis(3_661_000), "1h1m1s");
+        assert_eq!(format_millis(90_061_000), ">=24h");
     }
 
     #[test]
