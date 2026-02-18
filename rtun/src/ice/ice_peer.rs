@@ -25,6 +25,19 @@ use super::ice_socket::{
     udp_flush, udp_run_until_done, CheckerConfig, IceChecker, IceCreds, IceSocket, StunResolver,
 };
 
+pub const DEFAULT_ICE_SERVERS: [&str; 6] = [
+    "stun:stun.miwifi.com:3478",
+    "stun:stun.chat.bilibili.com:3478",
+    "stun:stun.cloudflare.com:3478",
+    "stun:stun1.l.google.com:19302",
+    "stun:stun2.l.google.com:19302",
+    "stun:stun.qq.com:3478",
+];
+
+pub fn default_ice_servers() -> Vec<String> {
+    DEFAULT_ICE_SERVERS.iter().map(|x| (*x).to_string()).collect()
+}
+
 #[derive(Debug, Default)]
 pub struct IceConfig {
     pub servers: Vec<String>,

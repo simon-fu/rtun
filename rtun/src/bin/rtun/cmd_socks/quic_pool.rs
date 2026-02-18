@@ -12,7 +12,7 @@ use rtun::{
     },
     async_rt::spawn_with_name,
     ice::{
-        ice_peer::{IceArgs, IceConfig, IcePeer},
+        ice_peer::{default_ice_servers, IceArgs, IceConfig, IcePeer},
         ice_quic::{QuicConn, QuicIceCert, UpgradeToQuic},
     },
     proto::{
@@ -834,15 +834,7 @@ async fn echo_throughput(
 }
 
 async fn punch<H: CtrlHandler>(ctrl: CtrlInvoker<H>) -> Result<QuicConn> {
-    let ice_servers = vec![
-        "stun:stun.miwifi.com:3478".into(),
-        "stun:stun.chat.bilibili.com:3478".into(),
-        "stun:stun.cloudflare.com:3478".into(),
-        "stun:stun1.l.google.com:19302".into(),
-        "stun:stun2.l.google.com:19302".into(),
-        "stun:stun.qq.com:3478".into(),
-        // "124.222.49.56:3478".into(), // stun.qq.com:3478 dns
-    ];
+    let ice_servers = default_ice_servers();
 
     let mut peer = IcePeer::with_config(IceConfig {
         servers: ice_servers.clone(),

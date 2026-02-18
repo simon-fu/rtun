@@ -21,7 +21,7 @@ use crossterm::{
 use regex::Regex;
 use rtun::{
     async_rt::{run_multi_thread, spawn_with_name},
-    ice::ice_peer::{IceArgs, IceConfig, IcePeer},
+    ice::ice_peer::{default_ice_servers, IceArgs, IceConfig, IcePeer},
     proto::{open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, P2PArgs, UdpRelayArgs},
     switch::{
         invoker_ctrl::{CtrlHandler, CtrlInvoker},
@@ -2606,17 +2606,6 @@ fn make_quic_sub_url(
         .query_pairs_mut()
         .append_pair("token", token.as_str());
     Ok(sub_url)
-}
-
-fn default_ice_servers() -> Vec<String> {
-    vec![
-        "stun:stun.miwifi.com:3478".into(),
-        "stun:stun.chat.bilibili.com:3478".into(),
-        "stun:stun.cloudflare.com:3478".into(),
-        "stun:stun1.l.google.com:19302".into(),
-        "stun:stun2.l.google.com:19302".into(),
-        "stun:stun.qq.com:3478".into(),
-    ]
 }
 
 fn encode_udp_relay_packet(

@@ -20,7 +20,7 @@ use crate::{
     channel::{ChId, ChReceiver, ChSender, ChSenderWeak, CHANNEL_SIZE},
     huid::{gen_huid::gen_huid, HUId},
     ice::{
-        ice_peer::{IceArgs, IceConfig, IcePeer},
+        ice_peer::{default_ice_servers, IceArgs, IceConfig, IcePeer},
         ice_quic::{QuicIceCert, QuicStream, UpgradeToQuic},
         throughput::run_throughput,
         webrtc_ice_peer::{DtlsIceArgs, WebrtcIceConfig, WebrtcIcePeer},
@@ -302,11 +302,7 @@ async fn handle_quic_socks(
     let remote_cert_der = remote_args.cert_der;
 
     let mut peer = IcePeer::with_config(IceConfig {
-        servers: vec![
-            "stun:stun1.l.google.com:19302".into(),
-            "stun:stun2.l.google.com:19302".into(),
-            "stun:stun.qq.com:3478".into(),
-        ],
+        servers: default_ice_servers(),
         // disable_dtls: remote_args.cert_fingerprint.is_none(),
         ..Default::default()
     });
@@ -401,11 +397,7 @@ async fn handle_udp_relay(mut remote_args: UdpRelayArgs) -> Result<OpenP2PRespon
     let max_payload = resolve_udp_relay_max_payload(remote_args.max_payload, codec)?;
 
     let mut peer = IcePeer::with_config(IceConfig {
-        servers: vec![
-            "stun:stun1.l.google.com:19302".into(),
-            "stun:stun2.l.google.com:19302".into(),
-            "stun:stun.qq.com:3478".into(),
-        ],
+        servers: default_ice_servers(),
         ..Default::default()
     });
 
@@ -800,11 +792,7 @@ async fn handle_quic_throughput(mut remote_args: QuicThroughputArgs) -> Result<O
     // let remote_args: IceArgs = remote_args.into();
 
     let mut peer = IcePeer::with_config(IceConfig {
-        servers: vec![
-            "stun:stun1.l.google.com:19302".into(),
-            "stun:stun2.l.google.com:19302".into(),
-            "stun:stun.qq.com:3478".into(),
-        ],
+        servers: default_ice_servers(),
         ..Default::default()
     });
 
@@ -865,11 +853,7 @@ async fn handle_webrtc_throughput(
     };
 
     let mut peer = WebrtcIcePeer::with_config(WebrtcIceConfig {
-        servers: vec![
-            "stun:stun1.l.google.com:19302".into(),
-            "stun:stun2.l.google.com:19302".into(),
-            "stun:stun.qq.com:3478".into(),
-        ],
+        servers: default_ice_servers(),
         disable_dtls: remote_args.cert_fingerprint.is_none(),
         ..Default::default()
     });
