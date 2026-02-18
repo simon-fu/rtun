@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use protobuf::MessageField;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
@@ -372,7 +372,9 @@ async fn quic_tunnel_task(
     }
 }
 
-const UDP_RELAY_META_LEN: usize = 8;
+const UDP_RELAY_META_LEN_LEGACY: usize = 8;
+const UDP_RELAY_META_LEN_OBFS: usize = 9;
+const UDP_RELAY_FLOW_ID_MASK: u64 = (1_u64 << 48) - 1;
 const UDP_RELAY_DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const UDP_RELAY_PACKET_LIMIT: usize = 1400;
 const UDP_RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
@@ -395,7 +397,8 @@ async fn handle_udp_relay(mut remote_args: UdpRelayArgs) -> Result<OpenP2PRespon
         Duration::from_secs(remote_args.idle_timeout_secs as u64)
     };
 
-    let max_payload = resolve_udp_relay_max_payload(remote_args.max_payload)?;
+    let codec = UdpRelayCodec::new(remote_args.obfs_seed);
+    let max_payload = resolve_udp_relay_max_payload(remote_args.max_payload, codec)?;
 
     let mut peer = IcePeer::with_config(IceConfig {
         servers: vec![
@@ -409,13 +412,14 @@ async fn handle_udp_relay(mut remote_args: UdpRelayArgs) -> Result<OpenP2PRespon
     let uid = peer.uid();
     let local_ice = peer.server_gather(remote_ice.clone()).await?;
     tracing::debug!(
-        "starting udp relay tunnel {uid}, local {local_ice:?}, remote {remote_ice:?}, target [{target_addr}], idle {:?}, max_payload {}",
+        "starting udp relay tunnel {uid}, local {local_ice:?}, remote {remote_ice:?}, target [{target_addr}], idle {:?}, max_payload {}, codec {}",
         idle_timeout,
-        max_payload
+        max_payload,
+        codec.mode_name()
     );
 
     spawn_with_name(format!("udp-relay-{uid}"), async move {
-        let r = udp_relay_task(peer, target_addr, idle_timeout, max_payload).await;
+        let r = udp_relay_task(peer, target_addr, idle_timeout, max_payload, codec).await;
         tracing::debug!("finished {r:?}");
     });
 
@@ -426,6 +430,7 @@ async fn handle_udp_relay(mut remote_args: UdpRelayArgs) -> Result<OpenP2PRespon
                 target_addr: target_addr.to_string().into(),
                 idle_timeout_secs: idle_timeout.as_secs().min(u32::MAX as u64) as u32,
                 max_payload: max_payload as u32,
+                obfs_seed: codec.obfs_seed,
                 ..Default::default()
             })),
             ..Default::default()
@@ -436,8 +441,8 @@ async fn handle_udp_relay(mut remote_args: UdpRelayArgs) -> Result<OpenP2PRespon
     Ok(rsp)
 }
 
-fn resolve_udp_relay_max_payload(input: u32) -> Result<usize> {
-    let auto = udp_relay_auto_payload();
+fn resolve_udp_relay_max_payload(input: u32, codec: UdpRelayCodec) -> Result<usize> {
+    let auto = udp_relay_auto_payload(codec);
     if input == 0 {
         return Ok(auto);
     }
@@ -454,8 +459,8 @@ fn resolve_udp_relay_max_payload(input: u32) -> Result<usize> {
     Ok(value)
 }
 
-fn udp_relay_auto_payload() -> usize {
-    UDP_RELAY_PACKET_LIMIT.saturating_sub(UDP_RELAY_META_LEN)
+fn udp_relay_auto_payload(codec: UdpRelayCodec) -> usize {
+    UDP_RELAY_PACKET_LIMIT.saturating_sub(codec.header_len())
 }
 
 async fn udp_relay_task(
@@ -463,11 +468,12 @@ async fn udp_relay_task(
     target_addr: SocketAddr,
     idle_timeout: Duration,
     max_payload: usize,
+    codec: UdpRelayCodec,
 ) -> Result<()> {
     let conn = peer.accept().await?;
     let (socket, _cfg, remote_addr) = conn.into_parts();
     socket.connect(remote_addr).await?;
-    run_udp_relay_server_loop(socket, target_addr, idle_timeout, max_payload).await
+    run_udp_relay_server_loop(socket, target_addr, idle_timeout, max_payload, codec).await
 }
 
 async fn run_udp_relay_server_loop(
@@ -475,8 +481,10 @@ async fn run_udp_relay_server_loop(
     target_addr: SocketAddr,
     idle_timeout: Duration,
     max_payload: usize,
+    codec: UdpRelayCodec,
 ) -> Result<()> {
     let mut tunnel_buf = vec![0_u8; 64 * 1024];
+    let mut tunnel_send_buf = vec![0_u8; codec.header_len() + max_payload];
     let mut flows: HashMap<u64, RelayFlow> = HashMap::new();
     let (flow_tx, mut flow_rx) = mpsc::channel::<RelayFlowPacket>(1024);
     let mut cleanup_interval = tokio::time::interval(Duration::from_secs(1));
@@ -491,7 +499,7 @@ async fn run_udp_relay_server_loop(
                 if n == 0 {
                     bail!("udp relay tunnel closed");
                 }
-                let (flow_id, payload) = decode_udp_relay_packet(&tunnel_buf[..n])?;
+                let (flow_id, payload) = decode_udp_relay_packet(&tunnel_buf[..n], codec)?;
                 if flow_id == UDP_RELAY_HEARTBEAT_FLOW_ID && payload.is_empty() {
                     continue;
                 }
@@ -522,9 +530,13 @@ async fn run_udp_relay_server_loop(
                     bail!("udp relay flow recv channel closed");
                 };
 
-                let mut frame = BytesMut::with_capacity(UDP_RELAY_META_LEN + packet.payload.len());
-                encode_udp_relay_packet(&mut frame, packet.flow_id, &packet.payload)?;
-                tunnel.send(&frame[..]).await?;
+                let frame_len = encode_udp_relay_packet(
+                    &mut tunnel_send_buf,
+                    packet.flow_id,
+                    &packet.payload,
+                    codec,
+                )?;
+                tunnel.send(&tunnel_send_buf[..frame_len]).await?;
 
                 if let Some(flow) = flows.get_mut(&packet.flow_id) {
                     flow.updated_at = Instant::now();
@@ -534,9 +546,13 @@ async fn run_udp_relay_server_loop(
                 cleanup_relay_flows(&mut flows, idle_timeout);
             }
             _ = heartbeat_interval.tick() => {
-                let mut frame = BytesMut::with_capacity(UDP_RELAY_META_LEN);
-                encode_udp_relay_packet(&mut frame, UDP_RELAY_HEARTBEAT_FLOW_ID, &[])?;
-                tunnel.send(&frame[..]).await?;
+                let frame_len = encode_udp_relay_packet(
+                    &mut tunnel_send_buf,
+                    UDP_RELAY_HEARTBEAT_FLOW_ID,
+                    &[],
+                    codec,
+                )?;
+                tunnel.send(&tunnel_send_buf[..frame_len]).await?;
             }
         }
     }
@@ -637,39 +653,126 @@ fn any_addr_for(target_addr: SocketAddr) -> SocketAddr {
     }
 }
 
-fn encode_udp_relay_packet(buf: &mut BytesMut, flow_id: u64, payload: &[u8]) -> Result<()> {
+fn encode_udp_relay_packet(
+    buf: &mut [u8],
+    flow_id: u64,
+    payload: &[u8],
+    codec: UdpRelayCodec,
+) -> Result<usize> {
     if payload.len() > u16::MAX as usize {
         bail!("payload too large [{}]", payload.len());
     }
-    buf.put_slice(&flow_id.to_be_bytes()[2..]);
-    buf.put_u16(payload.len() as u16);
-    buf.put_slice(payload);
-    Ok(())
+    let header_len = codec.header_len();
+    let packet_len = header_len + payload.len();
+    if packet_len > buf.len() {
+        bail!("packet buffer too small [{}] < [{}]", buf.len(), packet_len);
+    }
+
+    let flow_id = flow_id & UDP_RELAY_FLOW_ID_MASK;
+    if codec.is_obfs() {
+        let nonce = rand::random::<u8>();
+        let meta = (flow_id << 16) | payload.len() as u64;
+        let obfs_meta = meta ^ udp_relay_obfs_mask(codec.obfs_seed, nonce);
+        buf[0] = nonce;
+        buf[1..9].copy_from_slice(&obfs_meta.to_be_bytes());
+    } else {
+        buf[..6].copy_from_slice(&flow_id.to_be_bytes()[2..]);
+        buf[6..8].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+
+    buf[header_len..packet_len].copy_from_slice(payload);
+    Ok(packet_len)
 }
 
-fn decode_udp_relay_packet(packet: &[u8]) -> Result<(u64, &[u8])> {
-    if packet.len() < UDP_RELAY_META_LEN {
+fn decode_udp_relay_packet(packet: &[u8], codec: UdpRelayCodec) -> Result<(u64, &[u8])> {
+    if codec.is_obfs() {
+        if packet.len() < UDP_RELAY_META_LEN_OBFS {
+            bail!(
+                "packet as least [{}] but [{}]",
+                UDP_RELAY_META_LEN_OBFS,
+                packet.len()
+            );
+        }
+
+        let nonce = packet[0];
+        let mut meta_raw = [0_u8; 8];
+        meta_raw.copy_from_slice(&packet[1..UDP_RELAY_META_LEN_OBFS]);
+        let meta = u64::from_be_bytes(meta_raw) ^ udp_relay_obfs_mask(codec.obfs_seed, nonce);
+        let flow_id = (meta >> 16) & UDP_RELAY_FLOW_ID_MASK;
+        let len = (meta & 0xffff) as usize;
+        if len > packet.len() - UDP_RELAY_META_LEN_OBFS {
+            bail!(
+                "meta.len [{}] exceed [{}]",
+                len,
+                packet.len() - UDP_RELAY_META_LEN_OBFS
+            );
+        }
+
+        let payload = &packet[UDP_RELAY_META_LEN_OBFS..UDP_RELAY_META_LEN_OBFS + len];
+        return Ok((flow_id, payload));
+    }
+
+    if packet.len() < UDP_RELAY_META_LEN_LEGACY {
         bail!(
             "packet as least [{}] but [{}]",
-            UDP_RELAY_META_LEN,
+            UDP_RELAY_META_LEN_LEGACY,
             packet.len()
         );
     }
 
-    let mut meta = &packet[..UDP_RELAY_META_LEN];
-    let flow_id = u64::from_be_bytes([0, 0, meta[0], meta[1], meta[2], meta[3], meta[4], meta[5]]);
-    meta.advance(6);
-    let len = meta.get_u16() as usize;
-    if len > packet.len() - UDP_RELAY_META_LEN {
+    let flow_id = u64::from_be_bytes([
+        0, 0, packet[0], packet[1], packet[2], packet[3], packet[4], packet[5],
+    ]);
+    let len = u16::from_be_bytes([packet[6], packet[7]]) as usize;
+    if len > packet.len() - UDP_RELAY_META_LEN_LEGACY {
         bail!(
             "meta.len [{}] exceed [{}]",
             len,
-            packet.len() - UDP_RELAY_META_LEN
+            packet.len() - UDP_RELAY_META_LEN_LEGACY
         );
     }
 
-    let payload = &packet[UDP_RELAY_META_LEN..UDP_RELAY_META_LEN + len];
+    let payload = &packet[UDP_RELAY_META_LEN_LEGACY..UDP_RELAY_META_LEN_LEGACY + len];
     Ok((flow_id, payload))
+}
+
+fn udp_relay_obfs_mask(seed: u32, nonce: u8) -> u64 {
+    let mut z = ((seed as u64) << 8) | nonce as u64;
+    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UdpRelayCodec {
+    obfs_seed: u32,
+}
+
+impl UdpRelayCodec {
+    fn new(obfs_seed: u32) -> Self {
+        Self { obfs_seed }
+    }
+
+    fn is_obfs(self) -> bool {
+        self.obfs_seed != 0
+    }
+
+    fn header_len(self) -> usize {
+        if self.is_obfs() {
+            UDP_RELAY_META_LEN_OBFS
+        } else {
+            UDP_RELAY_META_LEN_LEGACY
+        }
+    }
+
+    fn mode_name(self) -> &'static str {
+        if self.is_obfs() {
+            "obfs-v1"
+        } else {
+            "legacy"
+        }
+    }
 }
 
 struct RelayFlow {

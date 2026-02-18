@@ -58,7 +58,7 @@ rtun relay \
 已知问题与后续改进：
 
 - [x] 建立 P2P 连接后，`relay` 数据面当前没有心跳包；长时间空闲时可能被 NAT 回收映射，导致 P2P 中断（已实现保活心跳）
-- [ ] 当前 UDP 数据包格式固定为 `flow_id(6 bytes) + len(2 bytes) + payload(len bytes)`，容易被运营商/GFW做特征识别并触发限速或断连
+- [x] UDP relay 数据面已支持 `obfs-v1` 帧编码（`obfs_seed + nonce` 混淆头部元数据），不再使用固定明文 `flow_id + len` 包头特征（保留 `obfs_seed=0` 的 legacy 兼容模式）
 - [ ] 当前未支持 Hysteria2 的端口跳跃能力
 
 ## Manual Release Workflow

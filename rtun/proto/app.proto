@@ -118,6 +118,7 @@ message UdpRelayArgs {
     string target_addr                  = 2;
     uint32 idle_timeout_secs            = 3;
     uint32 max_payload                  = 4;
+    uint32 obfs_seed                    = 5;
 }
 
 message P2PDtlsArgs {
