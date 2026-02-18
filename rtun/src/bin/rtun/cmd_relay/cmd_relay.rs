@@ -728,17 +728,37 @@ fn pick_best_active_tunnel_idx(
     cursor: &mut usize,
     now: Instant,
 ) -> Option<usize> {
-    if tunnels.is_empty() {
+    pick_best_tunnel_idx_by(
+        tunnels.len(),
+        |idx| tunnels[idx].is_some(),
+        tunnel_activity,
+        flow_loads,
+        cursor,
+        now,
+    )
+}
+
+fn pick_best_tunnel_idx_by<F>(
+    len: usize,
+    mut is_active: F,
+    tunnel_activity: &[Option<Instant>],
+    flow_loads: &[usize],
+    cursor: &mut usize,
+    now: Instant,
+) -> Option<usize>
+where
+    F: FnMut(usize) -> bool,
+{
+    if len == 0 {
         return None;
     }
 
-    let len = tunnels.len();
     let start = *cursor % len;
     let mut best_idx = None;
     let mut best_key = None;
     for offset in 0..len {
         let idx = (start + offset) % len;
-        if tunnels[idx].is_none() {
+        if !is_active(idx) {
             continue;
         }
 
@@ -972,7 +992,20 @@ async fn relay_loop<H: CtrlHandler>(
                         tunnel_idx,
                         e
                     );
-                    break Err(e.into());
+                    if inbound_tx
+                        .send(TunnelRecvEvent::Closed {
+                            tunnel_idx,
+                            reason: format!("send failed [{e}]"),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break Err(anyhow::anyhow!("relay tunnel close event channel closed"));
+                    }
+                    continue;
+                }
+                if tunnel_idx < tunnel_activity.len() {
+                    tunnel_activity[tunnel_idx] = Some(now);
                 }
             }
             evt = inbound_rx.recv() => {
@@ -1109,7 +1142,7 @@ async fn relay_loop<H: CtrlHandler>(
                 }
             }
             _ = heartbeat.tick() => {
-                let mut heartbeat_error = None;
+                let mut failed_tunnels = Vec::new();
                 for (tunnel_idx, tunnel) in tunnels.iter().enumerate() {
                     let Some(tunnel) = tunnel.as_ref() else {
                         continue;
@@ -1121,16 +1154,30 @@ async fn relay_loop<H: CtrlHandler>(
                         tunnel.codec,
                     )?;
                     if let Err(e) = tunnel.socket.send(&tunnel_send_buf[..packet_len]).await {
-                        heartbeat_error = Some(anyhow::anyhow!(
-                            "relay heartbeat failed: tunnel [{}], err [{}]",
+                        tracing::warn!(
+                            "relay heartbeat send failed: tunnel [{}], err [{}]",
                             tunnel_idx,
                             e
-                        ));
+                        );
+                        failed_tunnels.push((tunnel_idx, e.to_string()));
+                    } else if tunnel_idx < tunnel_activity.len() {
+                        tunnel_activity[tunnel_idx] = Some(Instant::now());
+                    }
+                }
+                for (tunnel_idx, reason) in failed_tunnels {
+                    if inbound_tx
+                        .send(TunnelRecvEvent::Closed {
+                            tunnel_idx,
+                            reason: format!("heartbeat send failed [{reason}]"),
+                        })
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
-                if let Some(e) = heartbeat_error {
-                    break Err(e);
+                if inbound_tx.is_closed() {
+                    break Err(anyhow::anyhow!("relay tunnel close event channel closed"));
                 }
             }
         }
@@ -1643,10 +1690,12 @@ pub struct CmdArgs {
 mod tests {
     use super::{
         decode_udp_relay_packet, encode_udp_relay_packet, max_udp_payload_auto, pick_latest_agent,
-        resolve_udp_max_payload, ChannelPoolConfig, RelayRule, UdpRelayCodec,
+        pick_best_tunnel_idx_by, resolve_udp_max_payload, ChannelPoolConfig, RelayRule,
+        UdpRelayCodec,
     };
     use crate::rest_proto::AgentInfo;
     use regex::Regex;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn parse_rule_with_proto() {
@@ -1757,6 +1806,67 @@ mod tests {
         let cfg = ChannelPoolConfig::new(2, 4).unwrap();
         assert_eq!(cfg.desired_channels(0), 2);
         assert_eq!(cfg.desired_channels(10), 4);
+    }
+
+    #[test]
+    fn pick_best_tunnel_prefers_fresh_and_low_load() {
+        let now = Instant::now();
+        let active = [true, true, true];
+        let activity = vec![
+            Some(now - Duration::from_secs(30)),
+            Some(now - Duration::from_secs(1)),
+            Some(now - Duration::from_secs(2)),
+        ];
+        let loads = [0_usize, 2, 0];
+        let mut cursor = 0;
+
+        let selected = pick_best_tunnel_idx_by(
+            active.len(),
+            |idx| active[idx],
+            activity.as_slice(),
+            loads.as_slice(),
+            &mut cursor,
+            now,
+        );
+        assert_eq!(selected, Some(2));
+    }
+
+    #[test]
+    fn pick_best_tunnel_respects_cursor_tiebreak() {
+        let now = Instant::now();
+        let active = [true, true];
+        let activity = vec![Some(now - Duration::from_secs(1)), Some(now - Duration::from_secs(1))];
+        let loads = [1_usize, 1];
+        let mut cursor = 1;
+
+        let selected = pick_best_tunnel_idx_by(
+            active.len(),
+            |idx| active[idx],
+            activity.as_slice(),
+            loads.as_slice(),
+            &mut cursor,
+            now,
+        );
+        assert_eq!(selected, Some(1));
+    }
+
+    #[test]
+    fn pick_best_tunnel_returns_none_when_no_active() {
+        let now = Instant::now();
+        let active = [false, false];
+        let activity = vec![Some(now), Some(now)];
+        let loads = [0_usize, 0];
+        let mut cursor = 0;
+
+        let selected = pick_best_tunnel_idx_by(
+            active.len(),
+            |idx| active[idx],
+            activity.as_slice(),
+            loads.as_slice(),
+            &mut cursor,
+            now,
+        );
+        assert_eq!(selected, None);
     }
 
     fn test_agent(name: &str, addr: &str, expire_at: u64, instance_id: Option<&str>) -> AgentInfo {
