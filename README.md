@@ -45,6 +45,7 @@ rtun relay \
 - `--agent`：agent 名称正则，默认 `.*`
 - `--udp-idle-timeout`：UDP flow 空闲超时（秒），默认 `120`
 - `--udp-max-payload`：UDP 负载上限（字节），默认自动计算
+- `--p2p-channel-lifetime`：p2p 通道生命周期（秒），默认 `120`
 
 行为说明：
 
@@ -88,7 +89,7 @@ rtun relay \
 
 通道生命周期与容量规则：
 
-- [x] 每条通道绑定过期时间 `expire_at`（当前实现为固定生命周期 120s）
+- [x] 每条通道绑定过期时间 `expire_at`（当前支持 `--p2p-channel-lifetime` 配置，默认 120s）
 - [x] 到期时触发创建新的替换通道
 - [x] 只有替换通道创建成功后，旧通道才停止分配新 flow（进入排空）
 - [x] 若替换通道持续创建失败，旧通道保持可分配状态并继续工作
@@ -145,6 +146,8 @@ rtun relay \
   - 信令路径：`quic://`
 - 默认用例：`relay_quic_smoke_multi_tunnel_e2e`
   - 覆盖 `--p2p-min-channels=1 --p2p-max-channels=2` 的基础多通道路径
+- 慢速用例（默认忽略）：`relay_quic_longrun_e2e`
+  - 覆盖 relay 长跑稳定性，并观测通道轮换日志（不强制轮换一定发生）
 - 慢速用例（默认忽略）：`relay_quic_agent_switch_e2e`
   - 覆盖基于 `expire_in` 的 agent 切换连续性（`expire_in` 当前是分钟粒度）
 
@@ -154,7 +157,13 @@ rtun relay \
 # 仅跑默认 smoke
 cargo test -p rtun --test relay_e2e relay_quic_smoke_e2e -- --nocapture
 
-# 包含慢速 agent 切换用例
+# 跑慢速长跑稳定性用例
+cargo test -p rtun --test relay_e2e relay_quic_longrun_e2e -- --ignored --nocapture
+
+# 跑慢速 agent 切换用例
+cargo test -p rtun --test relay_e2e relay_quic_agent_switch_e2e -- --ignored --nocapture
+
+# 一次性跑所有 ignored 慢速用例
 cargo test -p rtun --test relay_e2e -- --ignored --nocapture
 ```
 

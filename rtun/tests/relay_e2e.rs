@@ -204,6 +204,136 @@ async fn relay_quic_smoke_multi_tunnel_e2e() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow/manual: relay long-run stability; run on demand"]
+async fn relay_quic_longrun_e2e() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (cert_path, key_path) = write_test_cert_pair(temp.path())?;
+
+    let signal_port = reserve_tcp_port()?;
+    let relay_port = reserve_udp_port()?;
+
+    let (echo_addr, echo_stop, echo_task) = spawn_udp_echo_server().await?;
+    let signal_addr = format!("127.0.0.1:{signal_port}");
+    let relay_addr: SocketAddr = format!("127.0.0.1:{relay_port}").parse()?;
+    let quic_url = format!("quic://{signal_addr}");
+    let rule = format!("udp://{relay_addr}?to={echo_addr}");
+
+    let mut listen = Proc::spawn(
+        "listen",
+        [
+            "agent",
+            "listen",
+            "--addr",
+            signal_addr.as_str(),
+            "--https-key",
+            key_path.to_string_lossy().as_ref(),
+            "--https-cert",
+            cert_path.to_string_lossy().as_ref(),
+            "--secret",
+            TEST_SECRET,
+        ],
+    )
+    .await?;
+
+    let mut publisher = Proc::spawn(
+        "pub",
+        [
+            "agent",
+            "pub",
+            quic_url.as_str(),
+            "--agent",
+            "relay-e2e-rotate",
+            "--expire_in",
+            "10",
+            "--secret",
+            TEST_SECRET,
+            "--quic-insecure",
+        ],
+    )
+    .await?;
+
+    let mut relay = Proc::spawn(
+        "relay",
+        [
+            "relay",
+            "-L",
+            rule.as_str(),
+            quic_url.as_str(),
+            "--agent",
+            "^relay-e2e-rotate$",
+            "--secret",
+            TEST_SECRET,
+            "--quic-insecure",
+            "--udp-idle-timeout",
+            "30",
+            "--p2p-min-channels",
+            "1",
+            "--p2p-max-channels",
+            "1",
+            "--p2p-channel-lifetime",
+            "12",
+        ],
+    )
+    .await?;
+
+    let run_result = async {
+        wait_for_ready_roundtrip(&mut listen, &mut publisher, &mut relay, relay_addr).await?;
+
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let mut idx = 0_u64;
+        let mut success = 0_u32;
+        let mut consecutive_failures = 0_u32;
+        let mut saw_rotation = false;
+        while Instant::now() < deadline {
+            listen.ensure_running()?;
+            publisher.ensure_running()?;
+            relay.ensure_running()?;
+
+            let payload = format!("longrun-{idx}").into_bytes();
+            match udp_roundtrip(relay_addr, &payload).await {
+                Ok(()) => {
+                    success += 1;
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures > 10 {
+                        bail!("too many consecutive relay failures in longrun test: {e:#}");
+                    }
+                }
+            }
+            idx += 1;
+
+            let relay_log = format!("{}\n{}", relay.stdout(), relay.stderr());
+            if relay_log.contains("relay tunnel rotated:") {
+                saw_rotation = true;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        if success == 0 {
+            bail!("no successful roundtrip observed in longrun test");
+        }
+
+        if !saw_rotation {
+            tracing::info!("longrun test finished without tunnel rotation");
+        }
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    relay.terminate().await;
+    publisher.terminate().await;
+    listen.terminate().await;
+
+    let _ = echo_stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), echo_task).await;
+
+    run_result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "slow/manual: expire_in is minute-based; run on demand"]
 async fn relay_quic_agent_switch_e2e() -> Result<()> {
     let temp = TempDir::new()?;
@@ -373,6 +503,14 @@ async fn wait_for_ready_roundtrip(
 }
 
 async fn udp_roundtrip(relay_addr: SocketAddr, payload: &[u8]) -> Result<()> {
+    udp_roundtrip_with_timeout(relay_addr, payload, ROUND_TRIP_TIMEOUT).await
+}
+
+async fn udp_roundtrip_with_timeout(
+    relay_addr: SocketAddr,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<()> {
     let socket = UdpSocket::bind("127.0.0.1:0")
         .await
         .with_context(|| "bind udp client failed")?;
@@ -383,7 +521,7 @@ async fn udp_roundtrip(relay_addr: SocketAddr, payload: &[u8]) -> Result<()> {
         .with_context(|| format!("send udp to relay failed [{relay_addr}]"))?;
 
     let mut recv_buf = [0_u8; 4096];
-    let (n, _from) = tokio::time::timeout(ROUND_TRIP_TIMEOUT, socket.recv_from(&mut recv_buf))
+    let (n, _from) = tokio::time::timeout(timeout, socket.recv_from(&mut recv_buf))
         .await
         .with_context(|| "udp recv timeout")?
         .with_context(|| "recv udp from relay failed")?;

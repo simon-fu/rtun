@@ -45,12 +45,12 @@ const UDP_RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const UDP_RELAY_HEARTBEAT_FLOW_ID: u64 = 0;
 const DEFAULT_P2P_MIN_CHANNELS: usize = 1;
 const DEFAULT_P2P_MAX_CHANNELS: usize = 1;
+const DEFAULT_P2P_CHANNEL_LIFETIME_SECS: u64 = 120;
 const P2P_EXPAND_CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const FLOW_ROUTE_RESELECT_INTERVAL: Duration = Duration::from_secs(5);
 const FLOW_MIGRATE_STALE_GAP: Duration = Duration::from_secs(6);
 const FLOW_MIGRATE_LOAD_GAP: usize = 2;
 const TUNNEL_STALE_THRESHOLD: Duration = Duration::from_secs(12);
-const P2P_CHANNEL_LIFETIME: Duration = Duration::from_secs(120);
 
 pub fn run(args: CmdArgs) -> Result<()> {
     init_log_and_run(do_run(args))?
@@ -72,6 +72,12 @@ async fn do_run(args: CmdArgs) -> Result<()> {
         args.udp_idle_timeout
     };
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
+    let p2p_channel_lifetime_secs = if args.p2p_channel_lifetime == 0 {
+        DEFAULT_P2P_CHANNEL_LIFETIME_SECS
+    } else {
+        args.p2p_channel_lifetime
+    };
+    let p2p_channel_lifetime = Duration::from_secs(p2p_channel_lifetime_secs);
     let max_payload = resolve_udp_max_payload(args.udp_max_payload)?;
     let channel_pool = ChannelPoolConfig::new(args.p2p_min_channels, args.p2p_max_channels)?;
 
@@ -85,11 +91,12 @@ async fn do_run(args: CmdArgs) -> Result<()> {
     }
 
     tracing::info!(
-        "relay defaults: udp_idle_timeout={}s, udp_max_payload={} bytes, p2p_channels={}/{}",
+        "relay defaults: udp_idle_timeout={}s, udp_max_payload={} bytes, p2p_channels={}/{}, p2p_channel_lifetime={}s",
         idle_timeout_secs,
         max_payload,
         channel_pool.min_channels,
-        channel_pool.max_channels
+        channel_pool.max_channels,
+        p2p_channel_lifetime_secs
     );
 
     for (idx, rule) in rules.into_iter().enumerate() {
@@ -101,6 +108,7 @@ async fn do_run(args: CmdArgs) -> Result<()> {
             idle_timeout,
             max_payload,
             channel_pool,
+            p2p_channel_lifetime,
             rule,
         };
 
@@ -347,6 +355,7 @@ async fn run_with_ws_signal(
             worker.idle_timeout,
             worker.max_payload,
             worker.channel_pool,
+            worker.p2p_channel_lifetime,
         ) => r,
         r = session.wait_for_completed() => {
             r?;
@@ -385,6 +394,7 @@ async fn run_with_quic_signal(
             worker.idle_timeout,
             worker.max_payload,
             worker.channel_pool,
+            worker.p2p_channel_lifetime,
         ) => r,
         r = session.wait_for_completed() => {
             r?;
@@ -408,6 +418,7 @@ async fn run_relay_session<H: CtrlHandler>(
     idle_timeout: Duration,
     max_payload: usize,
     channel_pool: ChannelPoolConfig,
+    p2p_channel_lifetime: Duration,
 ) -> Result<()> {
     let idle_timeout_secs = u32::try_from(idle_timeout.as_secs())
         .with_context(|| format!("udp idle timeout too large [{}s]", idle_timeout.as_secs()))?;
@@ -434,7 +445,10 @@ async fn run_relay_session<H: CtrlHandler>(
         );
         recv_tasks.push(Some(recv_task));
         tunnels.push(Some(tunnel));
-        tunnel_states.push(Some(RelayTunnelState::new(Instant::now())));
+        tunnel_states.push(Some(RelayTunnelState::new(
+            Instant::now(),
+            p2p_channel_lifetime,
+        )));
         tunnel_activity.push(Some(Instant::now()));
     }
 
@@ -449,6 +463,7 @@ async fn run_relay_session<H: CtrlHandler>(
         recv_tasks,
         tunnel_states,
         tunnel_activity,
+        p2p_channel_lifetime,
         inbound_tx,
         inbound_rx,
     )
@@ -601,6 +616,7 @@ async fn try_expand_tunnels<H: CtrlHandler>(
     target: SocketAddr,
     idle_timeout_secs: u32,
     max_payload: usize,
+    p2p_channel_lifetime: Duration,
     desired: usize,
     tunnels: &mut Vec<Option<RelayTunnel>>,
     recv_tasks: &mut Vec<Option<JoinHandle<()>>>,
@@ -636,12 +652,18 @@ async fn try_expand_tunnels<H: CtrlHandler>(
                 if tunnel_idx == tunnels.len() {
                     tunnels.push(Some(tunnel));
                     recv_tasks.push(Some(recv_task));
-                    tunnel_states.push(Some(RelayTunnelState::new(Instant::now())));
+                    tunnel_states.push(Some(RelayTunnelState::new(
+                        Instant::now(),
+                        p2p_channel_lifetime,
+                    )));
                     tunnel_activity.push(Some(Instant::now()));
                 } else {
                     tunnels[tunnel_idx] = Some(tunnel);
                     recv_tasks[tunnel_idx] = Some(recv_task);
-                    tunnel_states[tunnel_idx] = Some(RelayTunnelState::new(Instant::now()));
+                    tunnel_states[tunnel_idx] = Some(RelayTunnelState::new(
+                        Instant::now(),
+                        p2p_channel_lifetime,
+                    ));
                     tunnel_activity[tunnel_idx] = Some(Instant::now());
                 }
             }
@@ -923,6 +945,7 @@ async fn try_rotate_expired_tunnels<H: CtrlHandler>(
     target: SocketAddr,
     idle_timeout_secs: u32,
     max_payload: usize,
+    p2p_channel_lifetime: Duration,
     tunnels: &mut Vec<Option<RelayTunnel>>,
     recv_tasks: &mut Vec<Option<JoinHandle<()>>>,
     tunnel_states: &mut Vec<Option<RelayTunnelState>>,
@@ -963,12 +986,12 @@ async fn try_rotate_expired_tunnels<H: CtrlHandler>(
                 if new_idx == tunnels.len() {
                     tunnels.push(Some(new_tunnel));
                     recv_tasks.push(Some(recv_task));
-                    tunnel_states.push(Some(RelayTunnelState::new(now)));
+                    tunnel_states.push(Some(RelayTunnelState::new(now, p2p_channel_lifetime)));
                     tunnel_activity.push(Some(now));
                 } else {
                     tunnels[new_idx] = Some(new_tunnel);
                     recv_tasks[new_idx] = Some(recv_task);
-                    tunnel_states[new_idx] = Some(RelayTunnelState::new(now));
+                    tunnel_states[new_idx] = Some(RelayTunnelState::new(now, p2p_channel_lifetime));
                     tunnel_activity[new_idx] = Some(now);
                 }
 
@@ -1042,6 +1065,7 @@ async fn relay_loop<H: CtrlHandler>(
     mut recv_tasks: Vec<Option<JoinHandle<()>>>,
     mut tunnel_states: Vec<Option<RelayTunnelState>>,
     mut tunnel_activity: Vec<Option<Instant>>,
+    p2p_channel_lifetime: Duration,
     inbound_tx: mpsc::Sender<TunnelRecvEvent>,
     mut inbound_rx: mpsc::Receiver<TunnelRecvEvent>,
 ) -> Result<()> {
@@ -1279,6 +1303,7 @@ async fn relay_loop<H: CtrlHandler>(
                             target,
                             idle_timeout_secs,
                             max_payload,
+                            p2p_channel_lifetime,
                             desired,
                             &mut tunnels,
                             &mut recv_tasks,
@@ -1313,6 +1338,7 @@ async fn relay_loop<H: CtrlHandler>(
                         target,
                         idle_timeout_secs,
                         max_payload,
+                        p2p_channel_lifetime,
                         desired,
                         &mut tunnels,
                         &mut recv_tasks,
@@ -1327,6 +1353,7 @@ async fn relay_loop<H: CtrlHandler>(
                     target,
                     idle_timeout_secs,
                     max_payload,
+                    p2p_channel_lifetime,
                     &mut tunnels,
                     &mut recv_tasks,
                     &mut tunnel_states,
@@ -1429,10 +1456,10 @@ struct RelayTunnelState {
 }
 
 impl RelayTunnelState {
-    fn new(now: Instant) -> Self {
+    fn new(now: Instant, p2p_channel_lifetime: Duration) -> Self {
         Self {
             allocatable: true,
-            expire_at: now + P2P_CHANNEL_LIFETIME,
+            expire_at: now + p2p_channel_lifetime,
         }
     }
 }
@@ -1762,6 +1789,7 @@ struct RelayWorker {
     idle_timeout: Duration,
     max_payload: usize,
     channel_pool: ChannelPoolConfig,
+    p2p_channel_lifetime: Duration,
     rule: RelayRule,
 }
 
@@ -1926,6 +1954,13 @@ pub struct CmdArgs {
         default_value_t = DEFAULT_P2P_MAX_CHANNELS
     )]
     p2p_max_channels: usize,
+
+    #[clap(
+        long = "p2p-channel-lifetime",
+        long_help = "relay p2p channel lifetime in seconds before rotation",
+        default_value_t = DEFAULT_P2P_CHANNEL_LIFETIME_SECS
+    )]
+    p2p_channel_lifetime: u64,
 }
 
 #[cfg(test)]
