@@ -1,6 +1,8 @@
 use std::{
+    cmp::Ordering,
     collections::HashMap,
     net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -20,6 +22,8 @@ use rtun::{
 };
 use tokio::{
     net::UdpSocket,
+    sync::oneshot,
+    task::JoinHandle,
     time::{self, MissedTickBehavior},
 };
 
@@ -102,9 +106,11 @@ async fn do_run(args: CmdArgs) -> Result<()> {
 }
 
 async fn run_worker(worker: RelayWorker) -> Result<()> {
-    let local = UdpSocket::bind(worker.rule.listen)
-        .await
-        .with_context(|| format!("bind local udp failed [{}]", worker.rule.listen))?;
+    let local = Arc::new(
+        UdpSocket::bind(worker.rule.listen)
+            .await
+            .with_context(|| format!("bind local udp failed [{}]", worker.rule.listen))?,
+    );
 
     tracing::info!(
         "relay(udp) listen on [{}] -> [{}]",
@@ -112,13 +118,19 @@ async fn run_worker(worker: RelayWorker) -> Result<()> {
         worker.rule.target
     );
 
+    let mut next_agent_hint: Option<AgentInfo> = None;
     loop {
-        let selected = select_latest_agent(
-            &worker.signal_url,
-            &worker.agent_regex,
-            worker.quic_insecure,
-        )
-        .await;
+        let selected = match next_agent_hint.take() {
+            Some(agent) => Ok(agent),
+            None => {
+                select_latest_agent(
+                    &worker.signal_url,
+                    &worker.agent_regex,
+                    worker.quic_insecure,
+                )
+                .await
+            }
+        };
 
         let selected = match selected {
             Ok(v) => v,
@@ -136,18 +148,82 @@ async fn run_worker(worker: RelayWorker) -> Result<()> {
             selected.expire_at
         );
 
-        let r = if worker.signal_url.scheme().eq_ignore_ascii_case("quic") {
-            run_with_quic_signal(&worker, &local, &selected).await
-        } else {
-            run_with_ws_signal(&worker, &local, &selected).await
+        let (stop_tx, mut session_task) =
+            spawn_relay_session_task(worker.clone(), local.clone(), selected.clone());
+        let expire_wait = duration_until_expire(selected.expire_at);
+
+        tokio::select! {
+            r = &mut session_task => {
+                log_session_task_result(r);
+            }
+            _ = time::sleep(expire_wait) => {
+                tracing::info!(
+                    "current agent reached expire_at, preparing replacement: agent [{}], instance [{:?}]",
+                    selected.name,
+                    selected.instance_id
+                );
+
+                match wait_replacement_agent_ready(&worker, &selected, &session_task).await {
+                    Some(next_agent) => {
+                        tracing::info!(
+                            "replacement agent ready, switching: old [{}]-[{:?}] -> new [{}]-[{:?}]",
+                            selected.name,
+                            selected.instance_id,
+                            next_agent.name,
+                            next_agent.instance_id
+                        );
+                        let _ = stop_tx.send(());
+                        let r = session_task.await;
+                        log_session_task_result(r);
+                        next_agent_hint = Some(next_agent);
+                    }
+                    None => {
+                        let r = session_task.await;
+                        log_session_task_result(r);
+                    }
+                }
+            }
         };
 
-        match r {
-            Ok(()) => {
-                tracing::warn!("relay session closed");
+        time::sleep(LOOP_RETRY_INTERVAL).await;
+    }
+}
+
+fn spawn_relay_session_task(
+    worker: RelayWorker,
+    local: Arc<UdpSocket>,
+    selected: AgentInfo,
+) -> (oneshot::Sender<()>, JoinHandle<Result<()>>) {
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let task_name = format!("relay-session-{}", selected.name);
+    let handle = spawn_with_name(task_name, async move {
+        if worker.signal_url.scheme().eq_ignore_ascii_case("quic") {
+            run_with_quic_signal(&worker, local.as_ref(), &selected, stop_rx).await
+        } else {
+            run_with_ws_signal(&worker, local.as_ref(), &selected, stop_rx).await
+        }
+    });
+    (stop_tx, handle)
+}
+
+async fn wait_replacement_agent_ready(
+    worker: &RelayWorker,
+    current: &AgentInfo,
+    session_task: &JoinHandle<Result<()>>,
+) -> Option<AgentInfo> {
+    loop {
+        if session_task.is_finished() {
+            tracing::warn!("current session closed while waiting replacement");
+            return None;
+        }
+
+        match find_connectable_replacement_agent(worker, current).await {
+            Ok(Some(agent)) => return Some(agent),
+            Ok(None) => {
+                tracing::debug!("no replacement agent ready yet");
             }
             Err(e) => {
-                tracing::warn!("relay session failed [{e}]");
+                tracing::debug!("find replacement agent failed [{e}]");
             }
         }
 
@@ -155,10 +231,88 @@ async fn run_worker(worker: RelayWorker) -> Result<()> {
     }
 }
 
+async fn find_connectable_replacement_agent(
+    worker: &RelayWorker,
+    current: &AgentInfo,
+) -> Result<Option<AgentInfo>> {
+    let mut candidates = query_candidate_agents(
+        &worker.signal_url,
+        &worker.agent_regex,
+        worker.quic_insecure,
+    )
+    .await?;
+
+    for candidate in candidates.drain(..) {
+        if is_same_agent_instance(&candidate, current) {
+            continue;
+        }
+
+        match probe_agent_connection(worker, &candidate).await {
+            Ok(()) => return Ok(Some(candidate)),
+            Err(e) => {
+                tracing::debug!(
+                    "replacement probe failed: agent [{}], instance [{:?}], err [{}]",
+                    candidate.name,
+                    candidate.instance_id,
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+async fn probe_agent_connection(worker: &RelayWorker, selected: &AgentInfo) -> Result<()> {
+    if worker.signal_url.scheme().eq_ignore_ascii_case("quic") {
+        let sub_url = make_quic_sub_url(&worker.signal_url, selected, worker.secret.as_deref())?;
+        let _stream = quic_signal::connect_sub_with_opts(&sub_url, worker.quic_insecure)
+            .await
+            .with_context(|| format!("connect to replacement agent failed [{}]", sub_url))?;
+    } else {
+        let sub_url = make_ws_sub_url(&worker.signal_url, selected, worker.secret.as_deref())?;
+        let (_stream, _rsp) = ws_connect_to(sub_url.as_str())
+            .await
+            .with_context(|| format!("connect to replacement agent failed [{}]", sub_url))?;
+    }
+    Ok(())
+}
+
+fn is_same_agent_instance(a: &AgentInfo, b: &AgentInfo) -> bool {
+    if a.name != b.name {
+        return false;
+    }
+
+    match (a.instance_id.as_deref(), b.instance_id.as_deref()) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.addr == b.addr,
+    }
+}
+
+fn duration_until_expire(expire_at: u64) -> Duration {
+    let now_ms = Local::now().timestamp_millis() as u64;
+    Duration::from_millis(expire_at.saturating_sub(now_ms))
+}
+
+fn log_session_task_result(r: Result<Result<()>, tokio::task::JoinError>) {
+    match r {
+        Ok(Ok(())) => {
+            tracing::warn!("relay session closed");
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("relay session failed [{e}]");
+        }
+        Err(e) => {
+            tracing::warn!("relay session task panicked [{e}]");
+        }
+    }
+}
+
 async fn run_with_ws_signal(
     worker: &RelayWorker,
     local: &UdpSocket,
     selected: &AgentInfo,
+    mut stop_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
     let sub_url = make_ws_sub_url(&worker.signal_url, selected, worker.secret.as_deref())?;
     let (stream, _rsp) = ws_connect_to(sub_url.as_str())
@@ -174,6 +328,14 @@ async fn run_with_ws_signal(
             r?;
             bail!("signal session closed")
         }
+        _ = &mut stop_rx => {
+            tracing::info!(
+                "relay session stop requested: agent [{}], instance [{:?}]",
+                selected.name,
+                selected.instance_id
+            );
+            Ok(())
+        }
     }
 }
 
@@ -181,6 +343,7 @@ async fn run_with_quic_signal(
     worker: &RelayWorker,
     local: &UdpSocket,
     selected: &AgentInfo,
+    mut stop_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
     let sub_url = make_quic_sub_url(&worker.signal_url, selected, worker.secret.as_deref())?;
     let stream = quic_signal::connect_sub_with_opts(&sub_url, worker.quic_insecure)
@@ -195,6 +358,14 @@ async fn run_with_quic_signal(
         r = session.wait_for_completed() => {
             r?;
             bail!("signal session closed")
+        }
+        _ = &mut stop_rx => {
+            tracing::info!(
+                "relay session stop requested: agent [{}], instance [{:?}]",
+                selected.name,
+                selected.instance_id
+            );
+            Ok(())
         }
     }
 }
@@ -439,19 +610,65 @@ async fn select_latest_agent(
     agent_regex: &Regex,
     quic_insecure: bool,
 ) -> Result<AgentInfo> {
-    let mut agents = if signal_url.scheme().eq_ignore_ascii_case("quic") {
+    let mut agents = query_candidate_agents(signal_url, agent_regex, quic_insecure).await?;
+    if agents.is_empty() {
+        bail!("no matched agent");
+    }
+    Ok(agents.swap_remove(0))
+}
+
+async fn query_candidate_agents(
+    signal_url: &url::Url,
+    agent_regex: &Regex,
+    quic_insecure: bool,
+) -> Result<Vec<AgentInfo>> {
+    let agents = if signal_url.scheme().eq_ignore_ascii_case("quic") {
         quic_signal::query_sessions_with_opts(signal_url, quic_insecure).await?
     } else {
         get_agents(signal_url).await?
     };
+    let now_ms = Local::now().timestamp_millis() as u64;
+    Ok(filter_and_sort_agents(agents, agent_regex, now_ms))
+}
 
-    agents.retain(|x| agent_regex.is_match(&x.name));
+fn pick_latest_agent(
+    mut agents: Vec<AgentInfo>,
+    agent_regex: &Regex,
+    now_ms: u64,
+) -> Result<AgentInfo> {
+    agents = filter_and_sort_agents(agents, agent_regex, now_ms);
     if agents.is_empty() {
         bail!("no matched agent");
     }
 
-    agents.sort_by(|a, b| b.expire_at.cmp(&a.expire_at));
     Ok(agents.swap_remove(0))
+}
+
+fn filter_and_sort_agents(
+    mut agents: Vec<AgentInfo>,
+    agent_regex: &Regex,
+    now_ms: u64,
+) -> Vec<AgentInfo> {
+    agents.retain(|x| agent_regex.is_match(&x.name) && x.expire_at > now_ms);
+    agents.sort_by(cmp_agent_priority);
+    agents
+}
+
+fn cmp_agent_priority(a: &AgentInfo, b: &AgentInfo) -> Ordering {
+    b.expire_at
+        .cmp(&a.expire_at)
+        .then_with(|| cmp_instance_id_desc(a.instance_id.as_deref(), b.instance_id.as_deref()))
+        .then_with(|| a.name.cmp(&b.name))
+        .then_with(|| a.addr.cmp(&b.addr))
+}
+
+fn cmp_instance_id_desc(a: Option<&str>, b: Option<&str>) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => b.cmp(a),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 
 fn make_ws_sub_url(
@@ -757,9 +974,11 @@ pub struct CmdArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_udp_relay_packet, encode_udp_relay_packet, max_udp_payload_auto,
+        decode_udp_relay_packet, encode_udp_relay_packet, max_udp_payload_auto, pick_latest_agent,
         resolve_udp_max_payload, RelayRule, UdpRelayCodec,
     };
+    use crate::rest_proto::AgentInfo;
+    use regex::Regex;
 
     #[test]
     fn parse_rule_with_proto() {
@@ -807,5 +1026,56 @@ mod tests {
         let (id, payload) = decode_udp_relay_packet(&buf[..n], codec).unwrap();
         assert_eq!(id, 12345);
         assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn pick_latest_agent_prefers_expire_at() {
+        let agents = vec![
+            test_agent("a", "127.0.0.1:1001", 2_000, Some("i1")),
+            test_agent("b", "127.0.0.1:1002", 3_000, Some("i2")),
+        ];
+        let regex = Regex::new(".*").unwrap();
+        let selected = pick_latest_agent(agents, &regex, 1_500).unwrap();
+        assert_eq!(selected.name, "b");
+    }
+
+    #[test]
+    fn pick_latest_agent_filters_expired() {
+        let agents = vec![
+            test_agent("a", "127.0.0.1:1001", 1_000, Some("i1")),
+            test_agent("b", "127.0.0.1:1002", 2_000, Some("i2")),
+        ];
+        let regex = Regex::new(".*").unwrap();
+        let selected = pick_latest_agent(agents, &regex, 1_500).unwrap();
+        assert_eq!(selected.name, "b");
+    }
+
+    #[test]
+    fn pick_latest_agent_tiebreak_instance_id() {
+        let agents = vec![
+            test_agent("rtun", "127.0.0.1:1001", 2_000, Some("A1")),
+            test_agent("rtun", "127.0.0.1:1002", 2_000, Some("Z9")),
+        ];
+        let regex = Regex::new("rtun").unwrap();
+        let selected = pick_latest_agent(agents, &regex, 1_000).unwrap();
+        assert_eq!(selected.instance_id.as_deref(), Some("Z9"));
+    }
+
+    #[test]
+    fn pick_latest_agent_rejects_no_match() {
+        let agents = vec![test_agent("a", "127.0.0.1:1001", 2_000, Some("i1"))];
+        let regex = Regex::new("b").unwrap();
+        let selected = pick_latest_agent(agents, &regex, 1_000);
+        assert!(selected.is_err());
+    }
+
+    fn test_agent(name: &str, addr: &str, expire_at: u64, instance_id: Option<&str>) -> AgentInfo {
+        AgentInfo {
+            name: name.to_string(),
+            addr: addr.to_string(),
+            expire_at,
+            instance_id: instance_id.map(|x| x.to_string()),
+            ver: None,
+        }
     }
 }

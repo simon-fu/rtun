@@ -51,7 +51,9 @@ rtun relay \
 - 信令支持 `https://` 和 `quic://`
 - 转发使用底层 ICE P2P UDP 数据通道
 - agent 选择按 `expire_at` 降序，优先选择过期时间最晚的实例
-- 运行中保持当前 agent；当前 agent 下线/不可用后再重选
+- 运行中保持当前 agent，直到其到达 `expire_at`
+- 到期后按优先级选择新 agent，并先完成连接探测；仅在新 agent 可连接时才切换
+- 若新 agent 持续不可连接，当前 agent 继续工作（直到自身下线/不可用）
 - 通过 `(agent_name, instance_id)` 绑定，避免同名 agent 重启混淆
 - 超过 `udp-max-payload` 的包默认丢弃并记日志
 
