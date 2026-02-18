@@ -133,6 +133,30 @@ rtun relay \
 - UDP 负载上限：`--udp-max-payload` 超限丢包行为正确
 - 编码兼容：`obfs-v1` 与 `obfs_seed=0` 兼容路径
 
+当前已落地（最小框架）：
+
+- 新增进程级集成测试：`rtun/tests/relay_e2e.rs`
+- 默认用例：`relay_quic_smoke_e2e`
+  - 启动 `agent listen`、`agent pub`、`relay`
+  - 使用本地 UDP echo 服务验证端到端转发正确性
+  - 信令路径：`quic://`
+- 慢速用例（默认忽略）：`relay_quic_agent_switch_e2e`
+  - 覆盖基于 `expire_in` 的 agent 切换连续性（`expire_in` 当前是分钟粒度）
+
+运行方式：
+
+```bash
+# 仅跑默认 smoke
+cargo test -p rtun --test relay_e2e relay_quic_smoke_e2e -- --nocapture
+
+# 包含慢速 agent 切换用例
+cargo test -p rtun --test relay_e2e -- --ignored --nocapture
+```
+
+说明：
+
+- `https://` 信令的自动化 e2e 仍待补充（当前客户端没有 `https insecure` 测试开关，默认需受信证书链）
+
 ## Manual Release Workflow
 
 GitHub Actions: `.github/workflows/build-manual-release.yml`
