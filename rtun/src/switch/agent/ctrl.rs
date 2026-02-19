@@ -1107,16 +1107,16 @@ mod tests {
             flow_tx.clone(),
             1200,
         )
-            .await
-            .with_context(|| "create first relay flow failed")?;
+        .await
+        .with_context(|| "create first relay flow failed")?;
         let flow_b = get_or_create_shared_relay_flow(
             &shared_flows,
             RelayFlowKey::new(1, target_addr),
             flow_tx,
             1200,
         )
-            .await
-            .with_context(|| "create second relay flow failed")?;
+        .await
+        .with_context(|| "create second relay flow failed")?;
 
         let src_port_a = flow_a.socket.local_addr()?.port();
         let src_port_b = flow_b.socket.local_addr()?.port();

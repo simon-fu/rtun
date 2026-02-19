@@ -35,7 +35,10 @@ pub const DEFAULT_ICE_SERVERS: [&str; 6] = [
 ];
 
 pub fn default_ice_servers() -> Vec<String> {
-    DEFAULT_ICE_SERVERS.iter().map(|x| (*x).to_string()).collect()
+    DEFAULT_ICE_SERVERS
+        .iter()
+        .map(|x| (*x).to_string())
+        .collect()
 }
 
 #[derive(Debug, Default)]
