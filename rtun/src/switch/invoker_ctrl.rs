@@ -1,22 +1,26 @@
 use crate::{
     actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker},
     channel::{ChId, ChSender},
-    proto::{KickDownArgs, OpenP2PResponse, OpenShellArgs, OpenSocksArgs, P2PArgs},
+    proto::{
+        ExecAgentScriptArgs, ExecAgentScriptResult, KickDownArgs, OpenP2PResponse, OpenShellArgs,
+        OpenSocksArgs, P2PArgs,
+    },
 };
 use anyhow::Result;
 
 use super::entity_watch::{OpWatch, WatchResult};
 
-pub trait CtrlHandler: ActorEntity 
-+ AsyncHandler<OpWatch, Response = WatchResult>
-// + AsyncHandler<OpOpenChannel, Response = OpenChannelResult>
-+ AsyncHandler<OpCloseChannel, Response = CloseChannelResult>
-+ AsyncHandler<OpOpenShell, Response = OpOpenShellResult>
-+ AsyncHandler<OpOpenSocks, Response = OpOpenSocksResult>
-+ AsyncHandler<OpKickDown, Response = OpKickDownResult>
-+ AsyncHandler<OpOpenP2P, Response = OpOpenP2PResult>
+pub trait CtrlHandler:
+    ActorEntity
+    + AsyncHandler<OpWatch, Response = WatchResult>
+    // + AsyncHandler<OpOpenChannel, Response = OpenChannelResult>
+    + AsyncHandler<OpCloseChannel, Response = CloseChannelResult>
+    + AsyncHandler<OpOpenShell, Response = OpOpenShellResult>
+    + AsyncHandler<OpOpenSocks, Response = OpOpenSocksResult>
+    + AsyncHandler<OpKickDown, Response = OpKickDownResult>
+    + AsyncHandler<OpOpenP2P, Response = OpOpenP2PResult>
+    + AsyncHandler<OpExecAgentScript, Response = OpExecAgentScriptResult>
 {
-
 }
 
 pub struct CtrlInvoker<H: CtrlHandler> {
@@ -80,6 +84,10 @@ where
     pub async fn open_p2p(&self, args: P2PArgs) -> OpOpenP2PResult {
         self.invoker.invoke(OpOpenP2P(args)).await?
     }
+
+    pub async fn exec_agent_script(&self, args: ExecAgentScriptArgs) -> OpExecAgentScriptResult {
+        self.invoker.invoke(OpExecAgentScript(args)).await?
+    }
 }
 
 pub struct CtrlWeak<H: CtrlHandler> {
@@ -129,3 +137,8 @@ pub type OpKickDownResult = Result<()>;
 pub struct OpOpenP2P(pub P2PArgs);
 
 pub type OpOpenP2PResult = Result<OpenP2PResponse>;
+
+#[derive(Debug)]
+pub struct OpExecAgentScript(pub ExecAgentScriptArgs);
+
+pub type OpExecAgentScriptResult = Result<ExecAgentScriptResult>;

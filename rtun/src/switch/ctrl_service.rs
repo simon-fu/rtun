@@ -8,7 +8,8 @@ use crate::{
     huid::HUId,
     proto::{
         c2arequest::C2a_req_args, make_open_p2p_response_error, make_open_shell_response_error,
-        make_open_shell_response_ok, make_response_status_ok, C2ARequest, KickDownArgs, Pong,
+        make_open_shell_response_ok, make_response_status_ok, C2ARequest, ExecAgentScriptResult,
+        KickDownArgs, Pong,
     },
 };
 use bytes::Bytes;
@@ -172,6 +173,23 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                     Err(e) => make_open_p2p_response_error(e),
                 };
 
+                let data: Bytes = rsp.write_to_bytes()?.into();
+                ctrl_tx
+                    .send_data(data)
+                    .await
+                    .map_err(|_x| anyhow!("send data fail"))?;
+            }
+
+            C2a_req_args::ExecAgentScript(args) => {
+                let rsp = match agent.exec_agent_script(args).await {
+                    Ok(v) => v,
+                    Err(e) => ExecAgentScriptResult {
+                        status_code: -1,
+                        reason: format!("{e:#}").into(),
+                        exit_code: -1,
+                        ..Default::default()
+                    },
+                };
                 let data: Bytes = rsp.write_to_bytes()?.into();
                 ctrl_tx
                     .send_data(data)

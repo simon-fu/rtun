@@ -13,16 +13,17 @@ use crate::{
     huid::HUId,
     proto::{
         c2arequest::C2a_req_args, open_channel_response::Open_ch_rsp, C2ARequest, CloseChannelArgs,
-        KickDownArgs, OpenChannelResponse, OpenP2PResponse, OpenShellArgs, OpenSocksArgs, P2PArgs,
-        Ping, Pong, ResponseStatus,
+        ExecAgentScriptArgs, ExecAgentScriptResult, KickDownArgs, OpenChannelResponse,
+        OpenP2PResponse, OpenShellArgs, OpenSocksArgs, P2PArgs, Ping, Pong, ResponseStatus,
     },
 };
 
 use super::{
     entity_watch::{CtrlGuard, CtrlWatch, OpWatch, WatchResult},
     invoker_ctrl::{
-        CloseChannelResult, CtrlHandler, CtrlInvoker, OpCloseChannel, OpKickDown, OpKickDownResult,
-        OpOpenP2P, OpOpenP2PResult, OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult,
+        CloseChannelResult, CtrlHandler, CtrlInvoker, OpCloseChannel, OpExecAgentScript,
+        OpExecAgentScriptResult, OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult,
+        OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult,
     },
     invoker_switch::{SwitchHanlder, SwitchInvoker},
     next_ch_id::NextChId,
@@ -235,6 +236,15 @@ impl<H: SwitchHanlder> AsyncHandler<OpOpenP2P> for Entity<H> {
             Ok(args) => Ok(args),
             Err(e) => Err(e),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl<H: SwitchHanlder> AsyncHandler<OpExecAgentScript> for Entity<H> {
+    type Response = OpExecAgentScriptResult;
+
+    async fn handle(&mut self, req: OpExecAgentScript) -> Self::Response {
+        c2a_exec_agent_script(&mut self.pair, req.0).await
     }
 }
 
@@ -512,5 +522,31 @@ pub async fn c2a_open_p2p(pair: &mut ChPair, args: P2PArgs) -> Result<OpenP2PRes
     let rsp = OpenP2PResponse::parse_from_bytes(&packet.payload)
         .with_context(|| "parse open p2p response failed")?;
 
+    Ok(rsp)
+}
+
+pub async fn c2a_exec_agent_script(
+    pair: &mut ChPair,
+    args: ExecAgentScriptArgs,
+) -> Result<ExecAgentScriptResult> {
+    let data = C2ARequest {
+        c2a_req_args: Some(C2a_req_args::ExecAgentScript(args)),
+        ..Default::default()
+    }
+    .write_to_bytes()?;
+
+    pair.tx
+        .send_data(data.into())
+        .await
+        .map_err(|_e| anyhow!("send exec agent script failed"))?;
+
+    let packet = pair
+        .rx
+        .recv_packet()
+        .await
+        .with_context(|| "recv exec agent script response failed")?;
+
+    let rsp = ExecAgentScriptResult::parse_from_bytes(&packet.payload)
+        .with_context(|| "parse exec agent script response failed")?;
     Ok(rsp)
 }

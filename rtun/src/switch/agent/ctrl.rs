@@ -2,12 +2,15 @@ use std::{
     collections::HashMap,
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::PathBuf,
+    process::Stdio,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
+use chrono::Local;
 use protobuf::MessageField;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
@@ -26,21 +29,25 @@ use crate::{
         webrtc_ice_peer::{DtlsIceArgs, WebrtcIceConfig, WebrtcIcePeer},
     },
     proto::{
-        open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, OpenP2PResponse, P2PArgs, P2PDtlsArgs,
-        P2PQuicArgs, QuicSocksArgs, QuicThroughputArgs, UdpRelayArgs, WebrtcThroughputArgs,
+        open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, ExecAgentScriptArgs,
+        ExecAgentScriptResult, OpenP2PResponse, P2PArgs, P2PDtlsArgs, P2PQuicArgs, QuicSocksArgs,
+        QuicThroughputArgs, UdpRelayArgs, WebrtcThroughputArgs,
     },
     switch::{
         agent::ch_socks::ChSocks,
         entity_watch::{CtrlGuard, OpWatch, WatchResult},
         invoker_ctrl::{
-            CtrlWeak, OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult, OpOpenShell,
-            OpOpenShellResult, OpOpenSocks, OpOpenSocksResult,
+            CtrlWeak, OpExecAgentScript, OpExecAgentScriptResult, OpKickDown, OpKickDownResult,
+            OpOpenP2P, OpOpenP2PResult, OpOpenShell, OpOpenShellResult, OpOpenSocks,
+            OpOpenSocksResult,
         },
         next_ch_id::NextChId,
     },
 };
 use tokio::{
+    io::AsyncReadExt,
     net::UdpSocket,
+    process::Command,
     sync::{mpsc, oneshot, Mutex as AsyncMutex},
     time::timeout,
 };
@@ -281,6 +288,18 @@ impl AsyncHandler<OpOpenP2P> for Entity {
     }
 }
 
+#[async_trait::async_trait]
+impl AsyncHandler<OpExecAgentScript> for Entity {
+    type Response = OpExecAgentScriptResult;
+
+    async fn handle(&mut self, req: OpExecAgentScript) -> Self::Response {
+        if self.disable_shell {
+            bail!("shell disabled")
+        }
+        handle_exec_agent_script(req.0).await
+    }
+}
+
 struct DisableShell(bool);
 
 #[async_trait::async_trait]
@@ -378,6 +397,216 @@ const UDP_RELAY_DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const UDP_RELAY_PACKET_LIMIT: usize = 1400;
 const UDP_RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const UDP_RELAY_HEARTBEAT_FLOW_ID: u64 = 0;
+const EXEC_SCRIPT_DEFAULT_TIMEOUT_SECS: u64 = 30;
+const EXEC_SCRIPT_DEFAULT_STDOUT_LIMIT: usize = 256 * 1024;
+const EXEC_SCRIPT_DEFAULT_STDERR_LIMIT: usize = 256 * 1024;
+
+struct ExecScriptOutput {
+    exit_code: i32,
+    timed_out: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+async fn handle_exec_agent_script(args: ExecAgentScriptArgs) -> Result<ExecAgentScriptResult> {
+    let timeout_secs = if args.timeout_secs == 0 {
+        EXEC_SCRIPT_DEFAULT_TIMEOUT_SECS
+    } else {
+        args.timeout_secs as u64
+    };
+    let timeout_duration = Duration::from_secs(timeout_secs);
+    let max_stdout_bytes = if args.max_stdout_bytes == 0 {
+        EXEC_SCRIPT_DEFAULT_STDOUT_LIMIT
+    } else {
+        args.max_stdout_bytes as usize
+    };
+    let max_stderr_bytes = if args.max_stderr_bytes == 0 {
+        EXEC_SCRIPT_DEFAULT_STDERR_LIMIT
+    } else {
+        args.max_stderr_bytes as usize
+    };
+
+    if args.content.is_empty() {
+        return Ok(ExecAgentScriptResult {
+            status_code: -1,
+            reason: "empty script content".into(),
+            exit_code: -1,
+            ..Default::default()
+        });
+    }
+
+    let script_name_raw = String::from_utf8_lossy(args.name.as_ref());
+    let script_name = sanitize_script_name(script_name_raw.as_ref());
+    let temp_path = make_exec_script_temp_path(script_name.as_str());
+    let run_result = async {
+        tokio::fs::write(&temp_path, args.content.as_ref())
+            .await
+            .with_context(|| format!("write script file failed [{}]", temp_path.display()))?;
+        set_exec_script_permissions(&temp_path).await?;
+        run_script_file(
+            &temp_path,
+            timeout_duration,
+            max_stdout_bytes,
+            max_stderr_bytes,
+        )
+        .await
+    }
+    .await;
+
+    if let Err(e) = tokio::fs::remove_file(&temp_path).await {
+        if e.kind() != ErrorKind::NotFound {
+            tracing::warn!(
+                "remove temp script file failed [{}], err [{}]",
+                temp_path.display(),
+                e
+            );
+        }
+    }
+
+    match run_result {
+        Ok(output) => Ok(ExecAgentScriptResult {
+            status_code: 0,
+            reason: "ok".into(),
+            exit_code: output.exit_code,
+            timed_out: output.timed_out,
+            stdout_truncated: output.stdout_truncated,
+            stderr_truncated: output.stderr_truncated,
+            stdout: output.stdout.into(),
+            stderr: output.stderr.into(),
+            ..Default::default()
+        }),
+        Err(e) => Ok(ExecAgentScriptResult {
+            status_code: -1,
+            reason: format!("{e:#}").into(),
+            exit_code: -1,
+            ..Default::default()
+        }),
+    }
+}
+
+fn sanitize_script_name(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            output.push(ch);
+        } else {
+            output.push('_');
+        }
+    }
+    if output.is_empty() {
+        "script".to_string()
+    } else {
+        output
+    }
+}
+
+fn make_exec_script_temp_path(script_name: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "rtun-agent-script-{}-{}-{:016x}.sh",
+        script_name,
+        Local::now().timestamp_millis(),
+        rand::random::<u64>()
+    ));
+    path
+}
+
+async fn set_exec_script_permissions(path: &PathBuf) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = tokio::fs::metadata(path)
+            .await
+            .with_context(|| format!("read script file metadata failed [{}]", path.display()))?
+            .permissions();
+        perms.set_mode(0o700);
+        tokio::fs::set_permissions(path, perms)
+            .await
+            .with_context(|| format!("set script file permissions failed [{}]", path.display()))?;
+    }
+    Ok(())
+}
+
+async fn run_script_file(
+    path: &PathBuf,
+    timeout_duration: Duration,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+) -> Result<ExecScriptOutput> {
+    let mut child = Command::new("sh")
+        .arg(path.as_os_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn script failed [{}]", path.display()))?;
+
+    let stdout = child.stdout.take().with_context(|| "missing stdout pipe")?;
+    let stderr = child.stderr.take().with_context(|| "missing stderr pipe")?;
+    let stdout_task = tokio::spawn(read_stream_capped(stdout, max_stdout_bytes));
+    let stderr_task = tokio::spawn(read_stream_capped(stderr, max_stderr_bytes));
+
+    let mut timed_out = false;
+    let status = match timeout(timeout_duration, child.wait()).await {
+        Ok(wait_result) => wait_result.with_context(|| "wait script process failed")?,
+        Err(_) => {
+            timed_out = true;
+            if let Err(e) = child.kill().await {
+                tracing::debug!("kill timed out script failed [{e}]");
+            }
+            child
+                .wait()
+                .await
+                .with_context(|| "wait timed out script process failed")?
+        }
+    };
+
+    let (stdout, stdout_truncated) = stdout_task
+        .await
+        .with_context(|| "join stdout reader failed")??;
+    let (stderr, stderr_truncated) = stderr_task
+        .await
+        .with_context(|| "join stderr reader failed")??;
+
+    Ok(ExecScriptOutput {
+        exit_code: status.code().unwrap_or(-1),
+        timed_out,
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+    })
+}
+
+async fn read_stream_capped<R>(mut reader: R, max_bytes: usize) -> Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut truncated = false;
+    let mut data = Vec::new();
+    let mut buf = [0_u8; 4096];
+
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        if data.len() >= max_bytes {
+            truncated = true;
+            continue;
+        }
+
+        let remain = max_bytes.saturating_sub(data.len());
+        let take = remain.min(n);
+        data.extend_from_slice(&buf[..take]);
+        if take < n {
+            truncated = true;
+        }
+    }
+    Ok((data, truncated))
+}
 
 type SharedRelayFlows = Arc<AsyncMutex<HashMap<RelayFlowKey, Arc<SharedRelayFlow>>>>;
 
@@ -1127,6 +1356,32 @@ mod tests {
             src_port_a, src_port_b,
             "same flow should preserve target-side source port across tunnel switch, but changed from [{src_port_a}] to [{src_port_b}]"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exec_agent_script_should_return_stdout_stderr_and_exit_code() -> Result<()> {
+        let rsp = handle_exec_agent_script(ExecAgentScriptArgs {
+            name: "test".into(),
+            content: b"#!/usr/bin/env sh\necho hello\necho error >&2\n"
+                .to_vec()
+                .into(),
+            timeout_secs: 3,
+            max_stdout_bytes: 4096,
+            max_stderr_bytes: 4096,
+            ..Default::default()
+        })
+        .await?;
+
+        assert_eq!(rsp.status_code, 0);
+        assert_eq!(rsp.exit_code, 0);
+        assert!(!rsp.timed_out);
+
+        let stdout = String::from_utf8_lossy(rsp.stdout.as_ref());
+        let stderr = String::from_utf8_lossy(rsp.stderr.as_ref());
+        assert!(stdout.contains("hello"), "stdout={stdout}");
+        assert!(stderr.contains("error"), "stderr={stderr}");
 
         Ok(())
     }

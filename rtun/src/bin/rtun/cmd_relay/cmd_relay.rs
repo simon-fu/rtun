@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::OpenOptions,
     io::{self, IsTerminal, Write},
     net::{IpAddr, SocketAddr},
@@ -23,7 +23,10 @@ use regex::Regex;
 use rtun::{
     async_rt::{run_multi_thread, spawn_with_name},
     ice::ice_peer::{default_ice_servers, IceArgs, IceConfig, IcePeer},
-    proto::{open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, P2PArgs, UdpRelayArgs},
+    proto::{
+        open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, ExecAgentScriptArgs,
+        ExecAgentScriptResult, P2PArgs, UdpRelayArgs,
+    },
     switch::{
         invoker_ctrl::{CtrlHandler, CtrlInvoker},
         session_stream::make_stream_session,
@@ -65,6 +68,9 @@ const TUNNEL_STALE_THRESHOLD: Duration = Duration::from_secs(12);
 const RELAY_TUNNEL_DOWN_TTL: Duration = Duration::from_secs(10);
 const RELAY_TUI_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
 const RELAY_TUI_MAX_EVENT_BUFFER: usize = 256;
+const DEFAULT_AGENT_SCRIPT_TIMEOUT_SECS: u64 = 30;
+const AGENT_SCRIPT_STDOUT_LIMIT: u32 = 256 * 1024;
+const AGENT_SCRIPT_STDERR_LIMIT: u32 = 256 * 1024;
 
 fn next_expand_connect_timeout(curr: Duration) -> Duration {
     let doubled_ms = curr.as_millis().saturating_mul(2);
@@ -1464,6 +1470,21 @@ async fn do_run(args: CmdArgs) -> Result<()> {
     let p2p_channel_lifetime = Duration::from_secs(p2p_channel_lifetime_secs);
     let max_payload = resolve_udp_max_payload(args.udp_max_payload)?;
     let channel_pool = ChannelPoolConfig::new(args.p2p_min_channels, args.p2p_max_channels)?;
+    let agent_script_timeout_secs = if args.agent_script_timeout == 0 {
+        DEFAULT_AGENT_SCRIPT_TIMEOUT_SECS
+    } else {
+        args.agent_script_timeout
+    };
+    let agent_script_timeout = Duration::from_secs(agent_script_timeout_secs);
+    let agent_scripts = Arc::new(load_agent_scripts(&args)?);
+    if !agent_scripts.is_empty() {
+        tracing::info!(
+            "relay agent scripts enabled: count={}, timeout={}s, fail_policy={:?}",
+            agent_scripts.len(),
+            agent_script_timeout_secs,
+            args.agent_script_fail_policy
+        );
+    }
 
     let mut rules = Vec::with_capacity(args.local_rules.len());
     for rule in args.local_rules {
@@ -1496,6 +1517,9 @@ async fn do_run(args: CmdArgs) -> Result<()> {
             max_payload,
             channel_pool,
             p2p_channel_lifetime,
+            agent_scripts: agent_scripts.clone(),
+            agent_script_timeout,
+            agent_script_fail_policy: args.agent_script_fail_policy,
             rule,
             state_hub,
         };
@@ -1536,14 +1560,25 @@ async fn run_worker(worker: RelayWorker) -> Result<()> {
     );
 
     let mut next_agent_hint: Option<AgentInfo> = None;
+    let mut blocked_agents: HashSet<String> = HashSet::new();
     loop {
         let selected = match next_agent_hint.take() {
-            Some(agent) => Ok(agent),
+            Some(agent) if !blocked_agents.contains(&agent_instance_key(&agent)) => Ok(agent),
             None => {
                 select_latest_agent(
                     &worker.signal_url,
                     &worker.agent_regex,
                     worker.quic_insecure,
+                    &blocked_agents,
+                )
+                .await
+            }
+            _ => {
+                select_latest_agent(
+                    &worker.signal_url,
+                    &worker.agent_regex,
+                    worker.quic_insecure,
+                    &blocked_agents,
                 )
                 .await
             }
@@ -1552,7 +1587,14 @@ async fn run_worker(worker: RelayWorker) -> Result<()> {
         let selected = match selected {
             Ok(v) => v,
             Err(e) => {
-                tracing::debug!("select agent failed [{e}]");
+                if !blocked_agents.is_empty() {
+                    tracing::warn!(
+                        "select agent failed with blocked set, clear once and retry [{e}]"
+                    );
+                    blocked_agents.clear();
+                } else {
+                    tracing::debug!("select agent failed [{e}]");
+                }
                 time::sleep(LOOP_RETRY_INTERVAL).await;
                 continue;
             }
@@ -1578,6 +1620,17 @@ async fn run_worker(worker: RelayWorker) -> Result<()> {
 
         tokio::select! {
             r = &mut session_task => {
+                if let Some(reason) = script_switch_reason(&r) {
+                    let key = agent_instance_key(&selected);
+                    tracing::warn!(
+                        "mark agent unavailable for this process due to script failure: agent [{}], instance [{:?}], key [{}], reason [{}]",
+                        selected.name,
+                        selected.instance_id,
+                        key,
+                        reason
+                    );
+                    blocked_agents.insert(key);
+                }
                 handle_session_task_result(&worker.state_hub, &selected, r);
             }
             _ = time::sleep(expire_wait) => {
@@ -1587,7 +1640,7 @@ async fn run_worker(worker: RelayWorker) -> Result<()> {
                     selected.instance_id
                 );
 
-                match wait_replacement_agent_ready(&worker, &selected, &session_task).await {
+                match wait_replacement_agent_ready(&worker, &selected, &session_task, &blocked_agents).await {
                     Some(next_agent) => {
                         tracing::info!(
                             "replacement agent ready, switching: old [{}]-[{:?}] -> new [{}]-[{:?}]",
@@ -1604,11 +1657,33 @@ async fn run_worker(worker: RelayWorker) -> Result<()> {
                         });
                         let _ = stop_tx.send(());
                         let r = session_task.await;
+                        if let Some(reason) = script_switch_reason(&r) {
+                            let key = agent_instance_key(&selected);
+                            tracing::warn!(
+                                "mark agent unavailable for this process due to script failure: agent [{}], instance [{:?}], key [{}], reason [{}]",
+                                selected.name,
+                                selected.instance_id,
+                                key,
+                                reason
+                            );
+                            blocked_agents.insert(key);
+                        }
                         handle_session_task_result(&worker.state_hub, &selected, r);
                         next_agent_hint = Some(next_agent);
                     }
                     None => {
                         let r = session_task.await;
+                        if let Some(reason) = script_switch_reason(&r) {
+                            let key = agent_instance_key(&selected);
+                            tracing::warn!(
+                                "mark agent unavailable for this process due to script failure: agent [{}], instance [{:?}], key [{}], reason [{}]",
+                                selected.name,
+                                selected.instance_id,
+                                key,
+                                reason
+                            );
+                            blocked_agents.insert(key);
+                        }
                         handle_session_task_result(&worker.state_hub, &selected, r);
                     }
                 }
@@ -1640,6 +1715,7 @@ async fn wait_replacement_agent_ready(
     worker: &RelayWorker,
     current: &AgentInfo,
     session_task: &JoinHandle<Result<()>>,
+    blocked_agents: &HashSet<String>,
 ) -> Option<AgentInfo> {
     loop {
         if session_task.is_finished() {
@@ -1647,7 +1723,7 @@ async fn wait_replacement_agent_ready(
             return None;
         }
 
-        match find_connectable_replacement_agent(worker, current).await {
+        match find_connectable_replacement_agent(worker, current, blocked_agents).await {
             Ok(Some(agent)) => return Some(agent),
             Ok(None) => {
                 tracing::debug!("no replacement agent ready yet");
@@ -1664,6 +1740,7 @@ async fn wait_replacement_agent_ready(
 async fn find_connectable_replacement_agent(
     worker: &RelayWorker,
     current: &AgentInfo,
+    blocked_agents: &HashSet<String>,
 ) -> Result<Option<AgentInfo>> {
     let mut candidates = query_candidate_agents(
         &worker.signal_url,
@@ -1674,6 +1751,9 @@ async fn find_connectable_replacement_agent(
 
     for candidate in candidates.drain(..) {
         if is_same_agent_instance(&candidate, current) {
+            continue;
+        }
+        if blocked_agents.contains(&agent_instance_key(&candidate)) {
             continue;
         }
 
@@ -1716,6 +1796,22 @@ fn is_same_agent_instance(a: &AgentInfo, b: &AgentInfo) -> bool {
     match (a.instance_id.as_deref(), b.instance_id.as_deref()) {
         (Some(x), Some(y)) => x == y,
         _ => a.addr == b.addr,
+    }
+}
+
+fn agent_instance_key(agent: &AgentInfo) -> String {
+    match agent.instance_id.as_deref() {
+        Some(instance_id) => format!("{}#{}", agent.name, instance_id),
+        None => format!("{}@{}", agent.name, agent.addr),
+    }
+}
+
+fn script_switch_reason(r: &Result<Result<()>, tokio::task::JoinError>) -> Option<String> {
+    match r {
+        Ok(Err(e)) => e
+            .downcast_ref::<AgentScriptSwitchAgentError>()
+            .map(|x| x.reason.clone()),
+        _ => None,
     }
 }
 
@@ -1775,6 +1871,14 @@ async fn run_with_ws_signal(
         });
 
     let ctrl = session.ctrl_client().clone_invoker();
+    run_agent_scripts(
+        &ctrl,
+        selected,
+        worker.agent_scripts.as_slice(),
+        worker.agent_script_timeout,
+        worker.agent_script_fail_policy,
+    )
+    .await?;
     tokio::select! {
         r = run_relay_session(
             ctrl,
@@ -1823,6 +1927,14 @@ async fn run_with_quic_signal(
         });
 
     let ctrl = session.ctrl_client().clone_invoker();
+    run_agent_scripts(
+        &ctrl,
+        selected,
+        worker.agent_scripts.as_slice(),
+        worker.agent_script_timeout,
+        worker.agent_script_fail_policy,
+    )
+    .await?;
     tokio::select! {
         r = run_relay_session(
             ctrl,
@@ -1848,6 +1960,98 @@ async fn run_with_quic_signal(
             Ok(())
         }
     }
+}
+
+async fn run_agent_scripts<H: CtrlHandler>(
+    ctrl: &CtrlInvoker<H>,
+    selected: &AgentInfo,
+    scripts: &[RelayAgentScriptSpec],
+    timeout: Duration,
+    fail_policy: AgentScriptFailPolicy,
+) -> Result<()> {
+    if scripts.is_empty() {
+        return Ok(());
+    }
+
+    let timeout_secs = timeout.as_secs().min(u32::MAX as u64) as u32;
+    for (idx, script) in scripts.iter().enumerate() {
+        let display_name = script.display_name();
+        tracing::info!(
+            "running agent script [{}/{}]: [{}], agent [{}], instance [{:?}]",
+            idx + 1,
+            scripts.len(),
+            display_name,
+            selected.name,
+            selected.instance_id
+        );
+
+        let rsp = ctrl
+            .exec_agent_script(ExecAgentScriptArgs {
+                name: script.request_name().into(),
+                content: script.content.to_vec().into(),
+                timeout_secs,
+                max_stdout_bytes: AGENT_SCRIPT_STDOUT_LIMIT,
+                max_stderr_bytes: AGENT_SCRIPT_STDERR_LIMIT,
+                ..Default::default()
+            })
+            .await
+            .with_context(|| format!("execute agent script request failed [{display_name}]"))?;
+
+        let summary = format_exec_agent_script_summary(&rsp);
+        let stdout = String::from_utf8_lossy(rsp.stdout.as_ref());
+        let stderr = String::from_utf8_lossy(rsp.stderr.as_ref());
+        if !stdout.is_empty() {
+            tracing::info!("agent script stdout [{}]:\n{}", display_name, stdout);
+        }
+        if !stderr.is_empty() {
+            tracing::warn!("agent script stderr [{}]:\n{}", display_name, stderr);
+        }
+
+        if is_exec_agent_script_ok(&rsp) {
+            tracing::info!("agent script succeeded [{}]: {}", display_name, summary);
+            continue;
+        }
+
+        let reason = format!(
+            "script [{}] failed on agent [{}]-[{:?}]: {}",
+            display_name, selected.name, selected.instance_id, summary
+        );
+        match fail_policy {
+            AgentScriptFailPolicy::Ignore => {
+                tracing::warn!("{reason}, ignore by fail-policy");
+            }
+            AgentScriptFailPolicy::SwitchAgent => {
+                return Err(AgentScriptSwitchAgentError { reason }.into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_exec_agent_script_ok(rsp: &ExecAgentScriptResult) -> bool {
+    rsp.status_code == 0 && !rsp.timed_out && rsp.exit_code == 0
+}
+
+fn format_exec_agent_script_summary(rsp: &ExecAgentScriptResult) -> String {
+    format!(
+        "status_code={}, exit_code={}, timed_out={}, stdout={}B{}, stderr={}B{}, reason={}",
+        rsp.status_code,
+        rsp.exit_code,
+        rsp.timed_out,
+        rsp.stdout.len(),
+        if rsp.stdout_truncated {
+            "(truncated)"
+        } else {
+            ""
+        },
+        rsp.stderr.len(),
+        if rsp.stderr_truncated {
+            "(truncated)"
+        } else {
+            ""
+        },
+        rsp.reason
+    )
 }
 
 async fn run_relay_session<H: CtrlHandler>(
@@ -3551,8 +3755,12 @@ async fn select_latest_agent(
     signal_url: &url::Url,
     agent_regex: &Regex,
     quic_insecure: bool,
+    blocked_agents: &HashSet<String>,
 ) -> Result<AgentInfo> {
     let mut agents = query_candidate_agents(signal_url, agent_regex, quic_insecure).await?;
+    if !blocked_agents.is_empty() {
+        agents.retain(|x| !blocked_agents.contains(&agent_instance_key(x)));
+    }
     if agents.is_empty() {
         bail!("no matched agent");
     }
@@ -3780,6 +3988,48 @@ impl UdpRelayCodec {
     }
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+enum AgentScriptFailPolicy {
+    Ignore,
+    SwitchAgent,
+}
+
+#[derive(Debug, Clone)]
+enum RelayAgentScriptSource {
+    Embedded { name: String },
+    File { path: PathBuf },
+}
+
+#[derive(Debug, Clone)]
+struct RelayAgentScriptSpec {
+    source: RelayAgentScriptSource,
+    content: Arc<[u8]>,
+}
+
+impl RelayAgentScriptSpec {
+    fn display_name(&self) -> String {
+        match &self.source {
+            RelayAgentScriptSource::Embedded { name } => format!("embedded:{name}"),
+            RelayAgentScriptSource::File { path } => format!("file:{}", path.display()),
+        }
+    }
+
+    fn request_name(&self) -> String {
+        match &self.source {
+            RelayAgentScriptSource::Embedded { name } => format!("embedded:{name}"),
+            RelayAgentScriptSource::File { path } => {
+                format!("file:{}", path.to_string_lossy())
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("agent script failed and fail-policy=switch-agent: {reason}")]
+struct AgentScriptSwitchAgentError {
+    reason: String,
+}
+
 #[derive(Debug, Clone)]
 struct RelayWorker {
     signal_url: url::Url,
@@ -3790,6 +4040,9 @@ struct RelayWorker {
     max_payload: usize,
     channel_pool: ChannelPoolConfig,
     p2p_channel_lifetime: Duration,
+    agent_scripts: Arc<Vec<RelayAgentScriptSpec>>,
+    agent_script_timeout: Duration,
+    agent_script_fail_policy: AgentScriptFailPolicy,
     rule: RelayRule,
     state_hub: RelayStateHub,
 }
@@ -3887,6 +4140,107 @@ impl RelayRule {
     }
 }
 
+fn load_agent_scripts(args: &CmdArgs) -> Result<Vec<RelayAgentScriptSpec>> {
+    let ordered_sources = collect_ordered_script_sources(args);
+    let mut scripts = Vec::with_capacity(ordered_sources.len());
+    for source in ordered_sources {
+        let content: Arc<[u8]> = match &source {
+            RelayAgentScriptSource::Embedded { name } => embedded_agent_script(name)
+                .with_context(|| format!("unknown embedded agent script [{name}]"))?,
+            RelayAgentScriptSource::File { path } => std::fs::read(path)
+                .with_context(|| format!("read agent script file failed [{}]", path.display()))?
+                .into_boxed_slice()
+                .into(),
+        };
+        scripts.push(RelayAgentScriptSpec { source, content });
+    }
+    Ok(scripts)
+}
+
+fn embedded_agent_script(name: &str) -> Result<Arc<[u8]>> {
+    let script = match name {
+        "bootstrap_env" => Some(include_bytes!("embedded_scripts/bootstrap_env.sh").as_slice()),
+        "noop" => Some(include_bytes!("embedded_scripts/noop.sh").as_slice()),
+        _ => None,
+    }
+    .with_context(|| format!("unknown embedded script [{name}]"))?;
+    Ok(script.to_vec().into_boxed_slice().into())
+}
+
+fn collect_ordered_script_sources(args: &CmdArgs) -> Vec<RelayAgentScriptSource> {
+    let expected = args.agent_scripts.len() + args.agent_script_files.len();
+    if expected == 0 {
+        return Vec::new();
+    }
+
+    let parsed = parse_script_sources_from_argv();
+    if parsed.len() == expected {
+        return parsed;
+    }
+
+    let mut fallback = Vec::with_capacity(expected);
+    for name in &args.agent_scripts {
+        fallback.push(RelayAgentScriptSource::Embedded { name: name.clone() });
+    }
+    for path in &args.agent_script_files {
+        fallback.push(RelayAgentScriptSource::File { path: path.clone() });
+    }
+    fallback
+}
+
+fn parse_script_sources_from_argv() -> Vec<RelayAgentScriptSource> {
+    let argv: Vec<String> = std::env::args().collect();
+    parse_script_sources_from_args(argv.iter().map(|x| x.as_str()))
+}
+
+fn parse_script_sources_from_args<'a, I>(args: I) -> Vec<RelayAgentScriptSource>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let argv: Vec<String> = args.into_iter().map(|x| x.to_string()).collect();
+    let mut sources = Vec::new();
+    let mut idx = 0_usize;
+    while idx < argv.len() {
+        let arg = argv[idx].as_str();
+        if arg == "--agent-script" {
+            if let Some(v) = argv.get(idx + 1) {
+                sources.push(RelayAgentScriptSource::Embedded { name: v.clone() });
+                idx += 2;
+                continue;
+            }
+            idx += 1;
+            continue;
+        }
+        if let Some(v) = arg.strip_prefix("--agent-script=") {
+            sources.push(RelayAgentScriptSource::Embedded {
+                name: v.to_string(),
+            });
+            idx += 1;
+            continue;
+        }
+        if arg == "--agent-script-file" {
+            if let Some(v) = argv.get(idx + 1) {
+                sources.push(RelayAgentScriptSource::File {
+                    path: PathBuf::from(v),
+                });
+                idx += 2;
+                continue;
+            }
+            idx += 1;
+            continue;
+        }
+        if let Some(v) = arg.strip_prefix("--agent-script-file=") {
+            sources.push(RelayAgentScriptSource::File {
+                path: PathBuf::from(v),
+            });
+            idx += 1;
+            continue;
+        }
+        idx += 1;
+    }
+    sources
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ClientFlow {
     flow_id: u64,
@@ -3940,6 +4294,33 @@ pub struct CmdArgs {
     log_file: Option<PathBuf>,
 
     #[clap(
+        long = "agent-script",
+        long_help = "embedded agent script name, repeatable"
+    )]
+    agent_scripts: Vec<String>,
+
+    #[clap(
+        long = "agent-script-file",
+        long_help = "agent script file path, repeatable"
+    )]
+    agent_script_files: Vec<PathBuf>,
+
+    #[clap(
+        long = "agent-script-timeout",
+        long_help = "single agent script timeout in seconds",
+        default_value_t = DEFAULT_AGENT_SCRIPT_TIMEOUT_SECS
+    )]
+    agent_script_timeout: u64,
+
+    #[clap(
+        long = "agent-script-fail-policy",
+        long_help = "agent script failure policy",
+        value_enum,
+        default_value_t = AgentScriptFailPolicy::Ignore
+    )]
+    agent_script_fail_policy: AgentScriptFailPolicy,
+
+    #[clap(
         long = "udp-idle-timeout",
         long_help = "udp flow idle timeout in seconds",
         default_value_t = DEFAULT_UDP_IDLE_TIMEOUT_SECS,
@@ -3978,8 +4359,9 @@ pub struct CmdArgs {
 mod tests {
     use super::{
         decode_udp_relay_packet, encode_udp_relay_packet, format_millis, max_udp_payload_auto,
-        pick_best_tunnel_idx_by, pick_latest_agent, resolve_udp_max_payload, ChannelPoolConfig,
-        RelayRule, UdpRelayCodec,
+        parse_script_sources_from_args, pick_best_tunnel_idx_by, pick_latest_agent,
+        resolve_udp_max_payload, ChannelPoolConfig, RelayAgentScriptSource, RelayRule,
+        UdpRelayCodec,
     };
     use crate::rest_proto::AgentInfo;
     use regex::Regex;
@@ -4181,6 +4563,44 @@ mod tests {
             now,
         );
         assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn parse_script_sources_should_preserve_cli_order() {
+        let parsed = parse_script_sources_from_args([
+            "rtun",
+            "relay",
+            "--agent-script",
+            "bootstrap_env",
+            "--agent-script-file",
+            "./scripts/a.sh",
+            "--agent-script=noop",
+            "--agent-script-file=./scripts/b.sh",
+        ]);
+        assert_eq!(parsed.len(), 4);
+        assert!(matches!(
+            &parsed[0],
+            RelayAgentScriptSource::Embedded { name } if name == "bootstrap_env"
+        ));
+        assert!(matches!(
+            &parsed[1],
+            RelayAgentScriptSource::File { path } if path == std::path::Path::new("./scripts/a.sh")
+        ));
+        assert!(matches!(
+            &parsed[2],
+            RelayAgentScriptSource::Embedded { name } if name == "noop"
+        ));
+        assert!(matches!(
+            &parsed[3],
+            RelayAgentScriptSource::File { path } if path == std::path::Path::new("./scripts/b.sh")
+        ));
+    }
+
+    #[test]
+    fn embedded_script_lookup_should_validate_name() {
+        assert!(super::embedded_agent_script("bootstrap_env").is_ok());
+        assert!(super::embedded_agent_script("noop").is_ok());
+        assert!(super::embedded_agent_script("not_found").is_err());
     }
 
     fn test_agent(name: &str, addr: &str, expire_at: u64, instance_id: Option<&str>) -> AgentInfo {

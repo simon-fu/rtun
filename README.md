@@ -58,7 +58,7 @@ rtun relay \
 - 通过 `(agent_name, instance_id)` 绑定，避免同名 agent 重启混淆
 - 超过 `udp-max-payload` 的包默认丢弃并记日志
 
-### Relay 远程脚本执行需求（待实现）
+### Relay 远程脚本执行
 
 - relay 支持下发脚本到 agent：脚本内容由 relay 发送到 agent，agent 写入临时文件，执行完成后删除该脚本文件，再将执行输出返回 relay。
 - relay 同时支持两种脚本来源：内置 embed 脚本、外部脚本文件。
@@ -66,22 +66,23 @@ rtun relay \
 - 脚本输出上限：`stdout` 与 `stderr` 各 `256KB`。
 - 默认行为：每次 relay 连上 agent 后都会执行脚本。
 
-参数草案（待实现）：
+参数：
 
 - `--agent-script <name>`：选择内置 embed 脚本名，可重复。
+- 当前内置脚本：`bootstrap_env`、`noop`。
 - `--agent-script-file <path>`：选择本地脚本文件，可重复。
 - `--agent-script-timeout <secs>`：单脚本执行超时秒数。
 - `--agent-script-fail-policy <ignore|switch-agent>`：
   - `ignore`（默认）：脚本失败仅记录日志，不影响当前 agent 使用。
   - `switch-agent`：脚本失败时将当前 agent 标记不可用并切换下一个 agent。
 
-执行顺序与时机（待实现）：
+执行顺序与时机：
 
 - 每次 relay 连上 agent 后，按命令行声明顺序执行脚本。
 - 可同时声明 embed 脚本与脚本文件，统一排队执行。
 - agent 端每个脚本执行流程：接收脚本内容 -> 写临时文件 -> 执行 -> 回传结果 -> 删除临时文件。
 
-示例（待实现）：
+示例：
 
 ```bash
 rtun relay \
