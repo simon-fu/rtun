@@ -443,9 +443,9 @@ async fn relay_quic_same_flow_target_src_port_should_stay_stable_e2e() -> Result
             "--p2p-min-channels",
             "1",
             "--p2p-max-channels",
-            "3",
+            "1",
             "--p2p-channel-lifetime",
-            "8",
+            "12",
         ],
     )
     .await?;
@@ -467,16 +467,22 @@ async fn relay_quic_same_flow_target_src_port_should_stay_stable_e2e() -> Result
             .map(|i| format!("stable-flow-{i}").into_bytes())
             .collect();
 
-        // First packets go through initial tunnel.
-        source
-            .send_to(payloads[0].as_slice(), relay_addr)
-            .await
-            .with_context(|| format!("send udp to relay failed [{relay_addr}]"))?;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        source
-            .send_to(payloads[1].as_slice(), relay_addr)
-            .await
-            .with_context(|| format!("send udp to relay failed [{relay_addr}]"))?;
+        // First packets go through initial tunnel and must all roundtrip.
+        for payload in payloads.iter().take(2) {
+            source
+                .send_to(payload.as_slice(), relay_addr)
+                .await
+                .with_context(|| format!("send udp to relay failed [{relay_addr}]"))?;
+            let replies = recv_udp_replies_until(&source, 1, Duration::from_secs(3))
+                .await
+                .with_context(|| "recv pre-rotate reply failed")?;
+            if replies.len() != 1 || replies[0] != *payload {
+                bail!(
+                    "pre-rotate roundtrip mismatch, got={replies:?}, want={payload:?}\n{}",
+                    dump_process_logs([&listen, &publisher, &relay])
+                );
+            }
+        }
 
         wait_for_process_log_contains(
             &mut relay,
@@ -486,13 +492,21 @@ async fn relay_quic_same_flow_target_src_port_should_stay_stable_e2e() -> Result
         .await?;
 
         // Remaining packets are sent after tunnel rotation.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(6)).await;
         for payload in payloads.iter().skip(2) {
             source
                 .send_to(payload.as_slice(), relay_addr)
                 .await
                 .with_context(|| format!("send udp to relay failed [{relay_addr}]"))?;
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            let replies = recv_udp_replies_until(&source, 1, Duration::from_secs(3))
+                .await
+                .with_context(|| "recv post-rotate reply failed")?;
+            if replies.len() != 1 || replies[0] != *payload {
+                bail!(
+                    "post-rotate roundtrip mismatch, got={replies:?}, want={payload:?}\n{}",
+                    dump_process_logs([&listen, &publisher, &relay])
+                );
+            }
         }
 
         let deadline = Instant::now() + Duration::from_secs(20);

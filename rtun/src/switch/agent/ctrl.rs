@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -41,7 +41,7 @@ use crate::{
 };
 use tokio::{
     net::UdpSocket,
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, Mutex as AsyncMutex},
     time::timeout,
 };
 
@@ -84,6 +84,7 @@ pub async fn make_agent_ctrl(uid: HUId) -> Result<AgentCtrl> {
         uid,
         socks_server: super::ch_socks::Server::try_new("127.0.0.1:1080").await?,
         channels: Default::default(),
+        udp_relay_flows: Arc::new(AsyncMutex::new(HashMap::new())),
         weak: None,
         guard: CtrlGuard::new(),
         disable_shell: false,
@@ -256,7 +257,9 @@ impl AsyncHandler<OpOpenP2P> for Entity {
                     .with_context(|| "no base in quic socks args")?;
                 return handle_quic_socks(self.socks_server.clone(), args).await;
             }
-            P2p_args::UdpRelay(args) => return handle_udp_relay(args).await,
+            P2p_args::UdpRelay(args) => {
+                return handle_udp_relay(self.udp_relay_flows.clone(), args).await
+            }
             P2p_args::QuicThrput(args) => return handle_quic_throughput(args).await,
             P2p_args::WebrtcThrput(args) => return handle_webrtc_throughput(args).await,
         }
@@ -376,7 +379,38 @@ const UDP_RELAY_PACKET_LIMIT: usize = 1400;
 const UDP_RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const UDP_RELAY_HEARTBEAT_FLOW_ID: u64 = 0;
 
-async fn handle_udp_relay(mut remote_args: UdpRelayArgs) -> Result<OpenP2PResponse> {
+type SharedRelayFlows = Arc<AsyncMutex<HashMap<RelayFlowKey, Arc<SharedRelayFlow>>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RelayFlowKey {
+    flow_id: u64,
+    target_addr: SocketAddr,
+}
+
+impl RelayFlowKey {
+    fn new(flow_id: u64, target_addr: SocketAddr) -> Self {
+        Self {
+            flow_id,
+            target_addr,
+        }
+    }
+}
+
+struct SharedRelayFlowState {
+    updated_at: Instant,
+    flow_tx: mpsc::Sender<RelayFlowPacket>,
+    stop_tx: Option<oneshot::Sender<()>>,
+}
+
+struct SharedRelayFlow {
+    socket: Arc<UdpSocket>,
+    state: Mutex<SharedRelayFlowState>,
+}
+
+async fn handle_udp_relay(
+    shared_flows: SharedRelayFlows,
+    mut remote_args: UdpRelayArgs,
+) -> Result<OpenP2PResponse> {
     let remote_ice: IceArgs = remote_args
         .ice
         .take()
@@ -411,7 +445,15 @@ async fn handle_udp_relay(mut remote_args: UdpRelayArgs) -> Result<OpenP2PRespon
     );
 
     spawn_with_name(format!("udp-relay-{uid}"), async move {
-        let r = udp_relay_task(peer, target_addr, idle_timeout, max_payload, codec).await;
+        let r = udp_relay_task(
+            peer,
+            target_addr,
+            idle_timeout,
+            max_payload,
+            codec,
+            shared_flows,
+        )
+        .await;
         tracing::debug!("finished {r:?}");
     });
 
@@ -461,11 +503,20 @@ async fn udp_relay_task(
     idle_timeout: Duration,
     max_payload: usize,
     codec: UdpRelayCodec,
+    shared_flows: SharedRelayFlows,
 ) -> Result<()> {
     let conn = peer.accept().await?;
     let (socket, _cfg, remote_addr) = conn.into_parts();
     socket.connect(remote_addr).await?;
-    run_udp_relay_server_loop(socket, target_addr, idle_timeout, max_payload, codec).await
+    run_udp_relay_server_loop(
+        socket,
+        target_addr,
+        idle_timeout,
+        max_payload,
+        codec,
+        shared_flows,
+    )
+    .await
 }
 
 async fn run_udp_relay_server_loop(
@@ -474,10 +525,10 @@ async fn run_udp_relay_server_loop(
     idle_timeout: Duration,
     max_payload: usize,
     codec: UdpRelayCodec,
+    shared_flows: SharedRelayFlows,
 ) -> Result<()> {
     let mut tunnel_buf = vec![0_u8; 64 * 1024];
     let mut tunnel_send_buf = vec![0_u8; codec.header_len() + max_payload];
-    let mut flows: HashMap<u64, RelayFlow> = HashMap::new();
     let (flow_tx, mut flow_rx) = mpsc::channel::<RelayFlowPacket>(1024);
     let mut cleanup_interval = tokio::time::interval(Duration::from_secs(1));
     cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -500,20 +551,19 @@ async fn run_udp_relay_server_loop(
                     continue;
                 }
 
-                if !flows.contains_key(&flow_id) {
-                    let flow = new_relay_flow(flow_id, target_addr, flow_tx.clone(), max_payload).await?;
-                    flows.insert(flow_id, flow);
-                }
-
-                if let Some(flow) = flows.get_mut(&flow_id) {
-                    flow.updated_at = Instant::now();
-                    if let Err(e) = flow.socket.send(payload).await {
-                        tracing::warn!("send udp relay payload failed for flow [{}]: {e}", flow_id);
-                        if let Some(mut removed) = flows.remove(&flow_id) {
-                            if let Some(stop_tx) = removed.stop_tx.take() {
-                                let _ = stop_tx.send(());
-                            }
-                        }
+                let key = RelayFlowKey::new(flow_id, target_addr);
+                let flow = get_or_create_shared_relay_flow(
+                    &shared_flows,
+                    key,
+                    flow_tx.clone(),
+                    max_payload,
+                )
+                .await?;
+                touch_shared_relay_flow(&flow);
+                if let Err(e) = flow.socket.send(payload).await {
+                    tracing::warn!("send udp relay payload failed for flow [{}]: {e}", flow_id);
+                    if remove_shared_relay_flow(&shared_flows, key).await {
+                        tracing::debug!("removed broken udp relay flow [{}]", flow_id);
                     }
                 }
             }
@@ -529,13 +579,9 @@ async fn run_udp_relay_server_loop(
                     codec,
                 )?;
                 tunnel.send(&tunnel_send_buf[..frame_len]).await?;
-
-                if let Some(flow) = flows.get_mut(&packet.flow_id) {
-                    flow.updated_at = Instant::now();
-                }
             }
             _ = cleanup_interval.tick() => {
-                cleanup_relay_flows(&mut flows, idle_timeout);
+                cleanup_shared_relay_flows(&shared_flows, idle_timeout).await;
             }
             _ = heartbeat_interval.tick() => {
                 let frame_len = encode_udp_relay_packet(
@@ -550,51 +596,113 @@ async fn run_udp_relay_server_loop(
     }
 }
 
-async fn new_relay_flow(
-    flow_id: u64,
-    target_addr: SocketAddr,
+async fn get_or_create_shared_relay_flow(
+    shared_flows: &SharedRelayFlows,
+    key: RelayFlowKey,
     flow_tx: mpsc::Sender<RelayFlowPacket>,
     max_payload: usize,
-) -> Result<RelayFlow> {
-    let bind_addr = any_addr_for(target_addr);
+) -> Result<Arc<SharedRelayFlow>> {
+    {
+        let flows = shared_flows.lock().await;
+        if let Some(flow) = flows.get(&key) {
+            let flow = flow.clone();
+            bind_shared_flow_sender(&flow, flow_tx);
+            return Ok(flow);
+        }
+    }
+
+    let bind_addr = any_addr_for(key.target_addr);
     let socket = UdpSocket::bind(bind_addr)
         .await
         .with_context(|| format!("bind udp relay flow failed [{}]", bind_addr))?;
     socket
-        .connect(target_addr)
+        .connect(key.target_addr)
         .await
-        .with_context(|| format!("connect udp relay target failed [{}]", target_addr))?;
+        .with_context(|| format!("connect udp relay target failed [{}]", key.target_addr))?;
     let socket = Arc::new(socket);
 
     let (stop_tx, stop_rx) = oneshot::channel();
-    let socket2 = socket.clone();
-    spawn_with_name(format!("udp-relay-flow-{flow_id}"), async move {
-        let r = relay_flow_recv_task(flow_id, socket2, flow_tx, stop_rx, max_payload).await;
+    let flow = Arc::new(SharedRelayFlow {
+        socket,
+        state: Mutex::new(SharedRelayFlowState {
+            updated_at: Instant::now(),
+            flow_tx: flow_tx.clone(),
+            stop_tx: Some(stop_tx),
+        }),
+    });
+
+    {
+        let mut flows = shared_flows.lock().await;
+        if let Some(existing) = flows.get(&key) {
+            let existing = existing.clone();
+            bind_shared_flow_sender(&existing, flow_tx.clone());
+            return Ok(existing);
+        }
+        flows.insert(key, flow.clone());
+    }
+
+    let socket2 = flow.socket.clone();
+    let flow2 = flow.clone();
+    spawn_with_name(format!("udp-relay-flow-{}", key.flow_id), async move {
+        let r = relay_flow_recv_task(key.flow_id, socket2, flow2, stop_rx, max_payload).await;
         tracing::trace!("finished {r:?}");
         r
     });
 
-    Ok(RelayFlow {
-        socket,
-        updated_at: Instant::now(),
-        stop_tx: Some(stop_tx),
-    })
+    Ok(flow)
 }
 
-fn cleanup_relay_flows(flows: &mut HashMap<u64, RelayFlow>, idle_timeout: Duration) {
-    let now = Instant::now();
-    let mut expired = Vec::new();
-    for (flow_id, flow) in flows.iter() {
-        if now.duration_since(flow.updated_at) >= idle_timeout {
-            expired.push(*flow_id);
+fn bind_shared_flow_sender(flow: &Arc<SharedRelayFlow>, flow_tx: mpsc::Sender<RelayFlowPacket>) {
+    if let Ok(mut state) = flow.state.lock() {
+        state.updated_at = Instant::now();
+        state.flow_tx = flow_tx;
+    }
+}
+
+fn touch_shared_relay_flow(flow: &Arc<SharedRelayFlow>) {
+    if let Ok(mut state) = flow.state.lock() {
+        state.updated_at = Instant::now();
+    }
+}
+
+async fn remove_shared_relay_flow(shared_flows: &SharedRelayFlows, key: RelayFlowKey) -> bool {
+    let removed = {
+        let mut flows = shared_flows.lock().await;
+        flows.remove(&key)
+    };
+    let Some(flow) = removed else {
+        return false;
+    };
+    if let Ok(mut state) = flow.state.lock() {
+        if let Some(stop_tx) = state.stop_tx.take() {
+            let _ = stop_tx.send(());
         }
     }
+    true
+}
 
-    for flow_id in expired {
-        if let Some(mut flow) = flows.remove(&flow_id) {
-            if let Some(stop_tx) = flow.stop_tx.take() {
-                let _ = stop_tx.send(());
+async fn cleanup_shared_relay_flows(shared_flows: &SharedRelayFlows, idle_timeout: Duration) {
+    let now = Instant::now();
+    let expired: Vec<RelayFlowKey> = {
+        let flows = shared_flows.lock().await;
+        let mut out = Vec::new();
+        for (key, flow) in flows.iter() {
+            let idle = flow
+                .state
+                .lock()
+                .ok()
+                .map(|s| now.duration_since(s.updated_at))
+                .unwrap_or_default();
+            if idle >= idle_timeout {
+                out.push(*key);
             }
+        }
+        out
+    };
+
+    for key in expired {
+        if remove_shared_relay_flow(shared_flows, key).await {
+            tracing::debug!("udp relay flow timeout: flow [{}]", key.flow_id);
         }
     }
 }
@@ -602,7 +710,7 @@ fn cleanup_relay_flows(flows: &mut HashMap<u64, RelayFlow>, idle_timeout: Durati
 async fn relay_flow_recv_task(
     flow_id: u64,
     socket: Arc<UdpSocket>,
-    tx: mpsc::Sender<RelayFlowPacket>,
+    flow: Arc<SharedRelayFlow>,
     mut stop_rx: oneshot::Receiver<()>,
     max_payload: usize,
 ) -> Result<()> {
@@ -630,8 +738,15 @@ async fn relay_flow_recv_task(
 
                 let mut payload = BytesMut::with_capacity(n);
                 payload.put_slice(&buf[..n]);
+                let tx = if let Ok(mut state) = flow.state.lock() {
+                    state.updated_at = Instant::now();
+                    state.flow_tx.clone()
+                } else {
+                    continue;
+                };
                 if tx.send(RelayFlowPacket { flow_id, payload }).await.is_err() {
-                    return Ok(());
+                    // Tunnel receiver may have rotated; keep socket alive and wait for new binding.
+                    continue;
                 }
             }
         }
@@ -765,12 +880,6 @@ impl UdpRelayCodec {
             "legacy"
         }
     }
-}
-
-struct RelayFlow {
-    socket: Arc<UdpSocket>,
-    updated_at: Instant,
-    stop_tx: Option<oneshot::Sender<()>>,
 }
 
 struct RelayFlowPacket {
@@ -922,6 +1031,7 @@ pub struct Entity {
     next_ch_id: NextChId,
     socks_server: super::ch_socks::Server,
     channels: HashMap<ChId, ChItem>,
+    udp_relay_flows: SharedRelayFlows,
     weak: Option<CtrlWeak<Self>>,
     guard: CtrlGuard,
     disable_shell: bool,
@@ -987,25 +1097,31 @@ mod tests {
         // UDP connect() does not require target to be online; use a fixed local address
         // so this test only validates flow/socket reuse semantics.
         let target_addr: SocketAddr = "127.0.0.1:9".parse()?;
+        let shared_flows: SharedRelayFlows = Arc::new(AsyncMutex::new(HashMap::new()));
         let (flow_tx, _flow_rx) = mpsc::channel::<RelayFlowPacket>(8);
 
         // Simulate same flow_id arriving via two different tunnels on agent side.
-        let mut flow_a = new_relay_flow(1, target_addr, flow_tx.clone(), 1200)
+        let flow_a = get_or_create_shared_relay_flow(
+            &shared_flows,
+            RelayFlowKey::new(1, target_addr),
+            flow_tx.clone(),
+            1200,
+        )
             .await
             .with_context(|| "create first relay flow failed")?;
-        let mut flow_b = new_relay_flow(1, target_addr, flow_tx, 1200)
+        let flow_b = get_or_create_shared_relay_flow(
+            &shared_flows,
+            RelayFlowKey::new(1, target_addr),
+            flow_tx,
+            1200,
+        )
             .await
             .with_context(|| "create second relay flow failed")?;
 
         let src_port_a = flow_a.socket.local_addr()?.port();
         let src_port_b = flow_b.socket.local_addr()?.port();
 
-        if let Some(stop_tx) = flow_a.stop_tx.take() {
-            let _ = stop_tx.send(());
-        }
-        if let Some(stop_tx) = flow_b.stop_tx.take() {
-            let _ = stop_tx.send(());
-        }
+        let _ = remove_shared_relay_flow(&shared_flows, RelayFlowKey::new(1, target_addr)).await;
 
         assert_eq!(
             src_port_a, src_port_b,
