@@ -882,7 +882,9 @@ fn render_relay_tui(
                         .map(|x| format!("T{x}"))
                         .unwrap_or_else(|| "-".to_string())
                 ),
-                expire_in_ms: snapshot.flow_idle_timeout_ms.saturating_sub(flow.idle_for_ms),
+                expire_in_ms: snapshot
+                    .flow_idle_timeout_ms
+                    .saturating_sub(flow.idle_for_ms),
                 route_in_ms,
             });
         }
@@ -923,22 +925,22 @@ fn render_relay_tui(
     relay_tui_push_line(
         &mut lines,
         format!(
-        "rtun relay tui {}  q/esc:quit  r:refresh",
-        Local::now().format("%H:%M:%S"),
+            "rtun relay tui {}  q/esc:quit  r:refresh",
+            Local::now().format("%H:%M:%S"),
         ),
         RelayTuiLineKind::Title,
     );
     relay_tui_push_line(
         &mut lines,
         format!(
-        "screen:{}x{}  rules:{} agents:{} tunnels:{} flows:{} events:{}",
-        width,
-        height,
-        snapshots.len(),
-        agent_rows.len(),
-        tunnel_rows.len(),
-        flow_rows.len(),
-        recent_events.len(),
+            "screen:{}x{}  rules:{} agents:{} tunnels:{} flows:{} events:{}",
+            width,
+            height,
+            snapshots.len(),
+            agent_rows.len(),
+            tunnel_rows.len(),
+            flow_rows.len(),
+            recent_events.len(),
         ),
         RelayTuiLineKind::Summary,
     );
@@ -988,7 +990,10 @@ fn render_relay_tui(
         if agent_rows.len() > budgets.agents.max(1) {
             relay_tui_push_line(
                 &mut lines,
-                format!("... {} more agents", agent_rows.len() - budgets.agents.max(1)),
+                format!(
+                    "... {} more agents",
+                    agent_rows.len() - budgets.agents.max(1)
+                ),
                 RelayTuiLineKind::Summary,
             );
         }
@@ -1019,7 +1024,10 @@ fn render_relay_tui(
         if tunnel_rows.len() > budgets.tunnels.max(1) {
             relay_tui_push_line(
                 &mut lines,
-                format!("... {} more tunnels", tunnel_rows.len() - budgets.tunnels.max(1)),
+                format!(
+                    "... {} more tunnels",
+                    tunnel_rows.len() - budgets.tunnels.max(1)
+                ),
                 RelayTuiLineKind::Summary,
             );
         }
@@ -1053,7 +1061,11 @@ fn render_relay_tui(
 
     if !recent_events.is_empty() && budgets.events > 0 {
         relay_tui_push_line(&mut lines, "", RelayTuiLineKind::Summary);
-        relay_tui_push_line(&mut lines, "[Recent Events]", RelayTuiLineKind::SectionEvents);
+        relay_tui_push_line(
+            &mut lines,
+            "[Recent Events]",
+            RelayTuiLineKind::SectionEvents,
+        );
         let event_limit = budgets.events;
         let start = recent_events.len().saturating_sub(event_limit);
         for line in recent_events.iter().skip(start).rev() {
@@ -1187,9 +1199,8 @@ fn format_relay_tui_agent_header(width: usize, compact: bool) -> String {
     if compact {
         return "rule name conn expire addr inst".to_string();
     }
-    let addr_w = width.saturating_sub(
-        rule_w + 1 + name_w + 1 + inst_w + 1 + conn_w + 1 + expire_w + 1,
-    );
+    let addr_w =
+        width.saturating_sub(rule_w + 1 + name_w + 1 + inst_w + 1 + conn_w + 1 + expire_w + 1);
     if addr_w < 12 {
         return "rule name conn expire addr inst".to_string();
     }
@@ -1228,9 +1239,8 @@ fn format_relay_tui_agent_row(
         );
     }
 
-    let addr_w = width.saturating_sub(
-        rule_w + 1 + name_w + 1 + inst_w + 1 + conn_w + 1 + expire_w + 1,
-    );
+    let addr_w =
+        width.saturating_sub(rule_w + 1 + name_w + 1 + inst_w + 1 + conn_w + 1 + expire_w + 1);
     if addr_w < 12 {
         return format!(
             "R{} {} {} {} {} {}",
@@ -2090,7 +2100,10 @@ async fn try_expand_tunnels<H: CtrlHandler>(
             None => tunnels.len(),
         };
         let timeout = *connect_timeout;
-        match time::timeout(timeout, open_udp_relay_tunnel(ctrl, target, idle_timeout_secs, max_payload))
+        match time::timeout(
+            timeout,
+            open_udp_relay_tunnel(ctrl, target, idle_timeout_secs, max_payload),
+        )
         .await
         {
             Ok(Ok(tunnel)) => {
@@ -2503,7 +2516,10 @@ async fn try_rotate_expired_tunnels<H: CtrlHandler>(
         }
 
         let timeout = *connect_timeout;
-        match time::timeout(timeout, open_udp_relay_tunnel(ctrl, target, idle_timeout_secs, max_payload))
+        match time::timeout(
+            timeout,
+            open_udp_relay_tunnel(ctrl, target, idle_timeout_secs, max_payload),
+        )
         .await
         {
             Ok(Ok(new_tunnel)) => {
@@ -2638,6 +2654,157 @@ fn close_drained_tunnels(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TunnelOpenAction {
+    ScaleUp { desired: usize },
+    Rotate { old_idx: usize },
+    DemandOpen,
+}
+
+#[derive(Debug)]
+enum TunnelOpenTaskResult {
+    Opened(RelayTunnel),
+    Timeout,
+}
+
+#[derive(Debug)]
+struct PendingTunnelOpen {
+    action: TunnelOpenAction,
+    timeout: Duration,
+    handle: JoinHandle<Result<TunnelOpenTaskResult>>,
+}
+
+fn first_expired_allocatable_tunnel_idx(
+    tunnels: &[Option<RelayTunnel>],
+    tunnel_states: &[Option<RelayTunnelState>],
+    now: Instant,
+) -> Option<usize> {
+    for old_idx in 0..tunnels.len() {
+        if !is_tunnel_allocatable(old_idx, tunnels, tunnel_states) {
+            continue;
+        }
+        let Some(state) = tunnel_states.get(old_idx).and_then(|x| x.as_ref()) else {
+            continue;
+        };
+        if now >= state.expire_at {
+            return Some(old_idx);
+        }
+    }
+    None
+}
+
+fn pick_tunnel_open_action(
+    channel_pool: ChannelPoolConfig,
+    active_flows: usize,
+    demand_open_pending: bool,
+    tunnels: &[Option<RelayTunnel>],
+    tunnel_states: &[Option<RelayTunnelState>],
+    now: Instant,
+) -> Option<TunnelOpenAction> {
+    let desired = channel_pool.desired_channels(active_flows);
+    if active_tunnel_count(tunnels) < desired {
+        return Some(TunnelOpenAction::ScaleUp { desired });
+    }
+
+    if let Some(old_idx) = first_expired_allocatable_tunnel_idx(tunnels, tunnel_states, now) {
+        return Some(TunnelOpenAction::Rotate { old_idx });
+    }
+
+    if demand_open_pending && active_tunnel_count(tunnels) == 0 && channel_pool.min_channels == 0 {
+        return Some(TunnelOpenAction::DemandOpen);
+    }
+
+    None
+}
+
+fn spawn_tunnel_open_task<H: CtrlHandler>(
+    ctrl: CtrlInvoker<H>,
+    action: TunnelOpenAction,
+    timeout: Duration,
+    target: SocketAddr,
+    idle_timeout_secs: u32,
+    max_payload: usize,
+) -> PendingTunnelOpen {
+    let task_name = match action {
+        TunnelOpenAction::ScaleUp { .. } => "relay-tunnel-open-scale-up",
+        TunnelOpenAction::Rotate { .. } => "relay-tunnel-open-rotate",
+        TunnelOpenAction::DemandOpen => "relay-tunnel-open-demand",
+    }
+    .to_string();
+
+    let handle = spawn_with_name(task_name, async move {
+        match time::timeout(
+            timeout,
+            open_udp_relay_tunnel(&ctrl, target, idle_timeout_secs, max_payload),
+        )
+        .await
+        {
+            Ok(Ok(tunnel)) => Ok(TunnelOpenTaskResult::Opened(tunnel)),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Ok(TunnelOpenTaskResult::Timeout),
+        }
+    });
+
+    PendingTunnelOpen {
+        action,
+        timeout,
+        handle,
+    }
+}
+
+fn apply_opened_tunnel(
+    tunnel: RelayTunnel,
+    now: Instant,
+    p2p_channel_lifetime: Duration,
+    max_payload: usize,
+    next_tunnel_id: &mut u64,
+    inbound_tx: &mpsc::Sender<TunnelRecvEvent>,
+    tunnels: &mut Vec<Option<RelayTunnel>>,
+    recv_tasks: &mut Vec<Option<JoinHandle<()>>>,
+    tunnel_states: &mut Vec<Option<RelayTunnelState>>,
+    tunnel_activity: &mut Vec<Option<Instant>>,
+) -> (usize, u64, String) {
+    let tunnel_idx = match first_inactive_tunnel_idx(tunnels) {
+        Some(idx) => idx,
+        None => tunnels.len(),
+    };
+    let mode = tunnel.codec.mode_name().to_string();
+    let recv_task = spawn_tunnel_recv_task(
+        tunnel_idx,
+        tunnel.socket.clone(),
+        tunnel.codec,
+        max_payload,
+        inbound_tx.clone(),
+    );
+
+    if tunnel_idx == tunnels.len() {
+        tunnels.push(Some(tunnel));
+        recv_tasks.push(Some(recv_task));
+        tunnel_states.push(Some(RelayTunnelState::new(
+            now,
+            p2p_channel_lifetime,
+            *next_tunnel_id,
+        )));
+        tunnel_activity.push(Some(now));
+    } else {
+        tunnels[tunnel_idx] = Some(tunnel);
+        recv_tasks[tunnel_idx] = Some(recv_task);
+        tunnel_states[tunnel_idx] = Some(RelayTunnelState::new(
+            now,
+            p2p_channel_lifetime,
+            *next_tunnel_id,
+        ));
+        tunnel_activity[tunnel_idx] = Some(now);
+    }
+    *next_tunnel_id = (*next_tunnel_id).saturating_add(1);
+
+    let tunnel_id = tunnel_states[tunnel_idx]
+        .as_ref()
+        .map(|x| x.tunnel_id)
+        .unwrap_or(0);
+    (tunnel_idx, tunnel_id, mode)
+}
+
 async fn relay_loop<H: CtrlHandler>(
     ctrl: CtrlInvoker<H>,
     local: &UdpSocket,
@@ -2656,9 +2823,6 @@ async fn relay_loop<H: CtrlHandler>(
     inbound_tx: mpsc::Sender<TunnelRecvEvent>,
     mut inbound_rx: mpsc::Receiver<TunnelRecvEvent>,
 ) -> Result<()> {
-    if active_tunnel_count(&tunnels) == 0 {
-        bail!("no relay tunnel available");
-    }
     state_hub.set_selected_agent(selected, true);
     let idle_timeout_secs = u32::try_from(idle_timeout.as_secs())
         .with_context(|| format!("udp idle timeout too large [{}s]", idle_timeout.as_secs()))?;
@@ -2670,6 +2834,8 @@ async fn relay_loop<H: CtrlHandler>(
     let mut next_flow = 1_u64;
     let mut next_tunnel_for_new_flow = 0_usize;
     let mut p2p_expand_connect_timeout = P2P_EXPAND_CONNECT_TIMEOUT_INITIAL;
+    let mut pending_tunnel_open: Option<PendingTunnelOpen> = None;
+    let mut demand_open_pending = false;
 
     let mut cleanup = time::interval(FLOW_CLEANUP_INTERVAL);
     cleanup.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -2677,8 +2843,28 @@ async fn relay_loop<H: CtrlHandler>(
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let result: Result<()> = loop {
+        if pending_tunnel_open.is_none() {
+            if let Some(action) = pick_tunnel_open_action(
+                channel_pool,
+                src_to_flow.len(),
+                demand_open_pending,
+                &tunnels,
+                &tunnel_states,
+                Instant::now(),
+            ) {
+                pending_tunnel_open = Some(spawn_tunnel_open_task(
+                    ctrl.clone(),
+                    action,
+                    p2p_expand_connect_timeout,
+                    target,
+                    idle_timeout_secs,
+                    max_payload,
+                ));
+            }
+        }
+
         tokio::select! {
-            r = local.recv_from(&mut local_buf) => {
+            r = local.recv_from(&mut local_buf), if active_tunnel_count(&tunnels) > 0 => {
                 let (n, from) = r?;
                 if n == 0 {
                     continue;
@@ -2833,6 +3019,192 @@ async fn relay_loop<H: CtrlHandler>(
                     tunnel_activity[tunnel_idx] = Some(now);
                 }
             }
+            _ = local.readable(), if active_tunnel_count(&tunnels) == 0 && channel_pool.min_channels == 0 && pending_tunnel_open.is_none() => {
+                demand_open_pending = true;
+            }
+            open_result = async {
+                let pending = pending_tunnel_open
+                    .as_mut()
+                    .expect("pending tunnel open must exist");
+                (&mut pending.handle).await
+            }, if pending_tunnel_open.is_some() => {
+                let pending = pending_tunnel_open
+                    .take()
+                    .expect("pending tunnel open must exist");
+                match open_result {
+                    Ok(Ok(TunnelOpenTaskResult::Opened(tunnel))) => {
+                        p2p_expand_connect_timeout = P2P_EXPAND_CONNECT_TIMEOUT_INITIAL;
+                        let now = Instant::now();
+                        let (new_idx, new_tunnel_id, mode) = apply_opened_tunnel(
+                            tunnel,
+                            now,
+                            p2p_channel_lifetime,
+                            max_payload,
+                            &mut next_tunnel_id,
+                            &inbound_tx,
+                            &mut tunnels,
+                            &mut recv_tasks,
+                            &mut tunnel_states,
+                            &mut tunnel_activity,
+                        );
+
+                        match pending.action {
+                            TunnelOpenAction::ScaleUp { .. } => {
+                                tracing::info!(
+                                    "relay tunnel connected(scale-up): idx [{}], codec [{}], active={}",
+                                    new_idx,
+                                    mode,
+                                    active_tunnel_count(&tunnels)
+                                );
+                                state_hub.emit(RelayLifecycleEvent::TunnelOpened {
+                                    tunnel_idx: new_idx,
+                                    tunnel_id: new_tunnel_id,
+                                    mode,
+                                    source: "scale-up",
+                                });
+                            }
+                            TunnelOpenAction::Rotate { old_idx } => {
+                                let mut old_tunnel_id = 0_u64;
+                                let mut rotated = false;
+                                if let Some(old_state) =
+                                    tunnel_states.get_mut(old_idx).and_then(|x| x.as_mut())
+                                {
+                                    old_tunnel_id = old_state.tunnel_id;
+                                    if old_state.allocatable {
+                                        old_state.allocatable = false;
+                                        rotated = true;
+                                    }
+                                }
+
+                                tracing::info!(
+                                    "relay tunnel connected(rotate): idx [{}], codec [{}], active={}",
+                                    new_idx,
+                                    mode,
+                                    active_tunnel_count(&tunnels)
+                                );
+                                state_hub.emit(RelayLifecycleEvent::TunnelOpened {
+                                    tunnel_idx: new_idx,
+                                    tunnel_id: new_tunnel_id,
+                                    mode,
+                                    source: "rotate",
+                                });
+
+                                if rotated {
+                                    tracing::info!(
+                                        "relay tunnel rotated: old_idx [{}] -> new_idx [{}], old enters draining",
+                                        old_idx,
+                                        new_idx
+                                    );
+                                    state_hub.emit(RelayLifecycleEvent::TunnelRotated {
+                                        old_tunnel_idx: old_idx,
+                                        old_tunnel_id,
+                                        new_tunnel_idx: new_idx,
+                                        new_tunnel_id,
+                                    });
+                                } else {
+                                    tracing::debug!(
+                                        "relay tunnel rotate fallback: old_idx [{}] no longer allocatable/alive",
+                                        old_idx
+                                    );
+                                }
+                            }
+                            TunnelOpenAction::DemandOpen => {
+                                demand_open_pending = false;
+                                tracing::info!(
+                                    "relay tunnel connected(demand-open): idx [{}], codec [{}], active={}",
+                                    new_idx,
+                                    mode,
+                                    active_tunnel_count(&tunnels)
+                                );
+                                state_hub.emit(RelayLifecycleEvent::TunnelOpened {
+                                    tunnel_idx: new_idx,
+                                    tunnel_id: new_tunnel_id,
+                                    mode,
+                                    source: "demand-open",
+                                });
+                            }
+                        }
+                    }
+                    Ok(Ok(TunnelOpenTaskResult::Timeout)) => {
+                        let next_timeout = next_expand_connect_timeout(p2p_expand_connect_timeout);
+                        match pending.action {
+                            TunnelOpenAction::ScaleUp { desired } => {
+                                let target_idx = first_inactive_tunnel_idx(&tunnels)
+                                    .unwrap_or(tunnels.len());
+                                tracing::debug!(
+                                    "relay tunnel scale-up timeout: idx [{}], desired [{}], timeout={}ms, next_timeout={}ms",
+                                    target_idx,
+                                    desired,
+                                    pending.timeout.as_millis(),
+                                    next_timeout.as_millis()
+                                );
+                            }
+                            TunnelOpenAction::Rotate { old_idx } => {
+                                tracing::debug!(
+                                    "relay tunnel rotate timeout(open replacement): old_idx [{}], timeout={}ms, next_timeout={}ms",
+                                    old_idx,
+                                    pending.timeout.as_millis(),
+                                    next_timeout.as_millis()
+                                );
+                            }
+                            TunnelOpenAction::DemandOpen => {
+                                tracing::debug!(
+                                    "relay tunnel demand-open timeout: timeout={}ms, next_timeout={}ms",
+                                    pending.timeout.as_millis(),
+                                    next_timeout.as_millis()
+                                );
+                            }
+                        }
+                        p2p_expand_connect_timeout = next_timeout;
+                    }
+                    Ok(Err(e)) => {
+                        let next_timeout = next_expand_connect_timeout(p2p_expand_connect_timeout);
+                        match pending.action {
+                            TunnelOpenAction::ScaleUp { desired } => {
+                                let target_idx = first_inactive_tunnel_idx(&tunnels)
+                                    .unwrap_or(tunnels.len());
+                                tracing::warn!(
+                                    "relay tunnel scale-up failed: idx [{}], desired [{}], timeout={}ms, next_timeout={}ms, err [{}]",
+                                    target_idx,
+                                    desired,
+                                    pending.timeout.as_millis(),
+                                    next_timeout.as_millis(),
+                                    e
+                                );
+                            }
+                            TunnelOpenAction::Rotate { old_idx } => {
+                                tracing::warn!(
+                                    "relay tunnel rotate failed(open replacement): old_idx [{}], timeout={}ms, next_timeout={}ms, err [{}]",
+                                    old_idx,
+                                    pending.timeout.as_millis(),
+                                    next_timeout.as_millis(),
+                                    e
+                                );
+                            }
+                            TunnelOpenAction::DemandOpen => {
+                                tracing::warn!(
+                                    "relay tunnel demand-open failed: timeout={}ms, next_timeout={}ms, err [{}]",
+                                    pending.timeout.as_millis(),
+                                    next_timeout.as_millis(),
+                                    e
+                                );
+                            }
+                        }
+                        p2p_expand_connect_timeout = next_timeout;
+                    }
+                    Err(e) => {
+                        let next_timeout = next_expand_connect_timeout(p2p_expand_connect_timeout);
+                        tracing::warn!(
+                            "relay tunnel open task failed: action [{:?}], timeout={}ms, next_timeout={}ms, err [{}]",
+                            pending.action,
+                            pending.timeout.as_millis(),
+                            next_timeout.as_millis(),
+                            e
+                        );
+                        p2p_expand_connect_timeout = next_timeout;
+                    }
+                }
+            }
             evt = inbound_rx.recv() => {
                 let Some(evt) = evt else {
                     break Err(anyhow::anyhow!("relay tunnel recv loop channel closed"));
@@ -2936,29 +3308,6 @@ async fn relay_loop<H: CtrlHandler>(
                             });
                         }
 
-                        let desired = channel_pool.desired_channels(src_to_flow.len());
-                        try_expand_tunnels(
-                            &ctrl,
-                            state_hub,
-                            target,
-                            idle_timeout_secs,
-                            max_payload,
-                            p2p_channel_lifetime,
-                            desired,
-                            &mut tunnels,
-                            &mut recv_tasks,
-                            &mut tunnel_states,
-                            &mut tunnel_activity,
-                            &mut next_tunnel_id,
-                            &inbound_tx,
-                            &mut p2p_expand_connect_timeout,
-                        )
-                        .await;
-
-                        if active_tunnel_count(&tunnels) == 0 {
-                            break Err(anyhow::anyhow!("all relay tunnels are closed"));
-                        }
-
                         compact_tunnel_slots(
                             &mut tunnels,
                             &mut recv_tasks,
@@ -2974,41 +3323,6 @@ async fn relay_loop<H: CtrlHandler>(
             _ = cleanup.tick() => {
                 cleanup_client_flows(state_hub, &mut src_to_flow, &mut flow_to_src, idle_timeout);
                 let desired = channel_pool.desired_channels(src_to_flow.len());
-                if active_tunnel_count(&tunnels) < desired {
-                    try_expand_tunnels(
-                        &ctrl,
-                        state_hub,
-                        target,
-                        idle_timeout_secs,
-                        max_payload,
-                        p2p_channel_lifetime,
-                        desired,
-                        &mut tunnels,
-                        &mut recv_tasks,
-                        &mut tunnel_states,
-                        &mut tunnel_activity,
-                        &mut next_tunnel_id,
-                        &inbound_tx,
-                        &mut p2p_expand_connect_timeout,
-                    )
-                    .await;
-                }
-                try_rotate_expired_tunnels(
-                    &ctrl,
-                    state_hub,
-                    target,
-                    idle_timeout_secs,
-                    max_payload,
-                    p2p_channel_lifetime,
-                    &mut tunnels,
-                    &mut recv_tasks,
-                    &mut tunnel_states,
-                    &mut tunnel_activity,
-                    &mut next_tunnel_id,
-                    &inbound_tx,
-                    &mut p2p_expand_connect_timeout,
-                )
-                .await;
                 rebalance_client_flows(
                     state_hub,
                     &mut src_to_flow,
@@ -3108,6 +3422,9 @@ async fn relay_loop<H: CtrlHandler>(
         &tunnel_activity,
         &src_to_flow,
     );
+    if let Some(pending) = pending_tunnel_open.take() {
+        pending.handle.abort();
+    }
     for task in recv_tasks.into_iter().flatten() {
         task.abort();
     }
@@ -3485,9 +3802,6 @@ struct ChannelPoolConfig {
 
 impl ChannelPoolConfig {
     fn new(min_channels: usize, max_channels: usize) -> Result<Self> {
-        if min_channels == 0 {
-            bail!("p2p min channels must be >= 1");
-        }
         if max_channels == 0 {
             bail!("p2p max channels must be >= 1");
         }
@@ -3778,7 +4092,7 @@ mod tests {
 
     #[test]
     fn channel_pool_config_validation() {
-        assert!(ChannelPoolConfig::new(0, 1).is_err());
+        assert!(ChannelPoolConfig::new(0, 1).is_ok());
         assert!(ChannelPoolConfig::new(1, 0).is_err());
         assert!(ChannelPoolConfig::new(2, 1).is_err());
         assert!(ChannelPoolConfig::new(1, 2).is_ok());
@@ -3796,6 +4110,13 @@ mod tests {
         let cfg = ChannelPoolConfig::new(2, 4).unwrap();
         assert_eq!(cfg.desired_channels(0), 2);
         assert_eq!(cfg.desired_channels(10), 4);
+    }
+
+    #[test]
+    fn channel_pool_allows_zero_min_for_on_demand_open() {
+        let cfg = ChannelPoolConfig::new(0, 3).unwrap();
+        assert_eq!(cfg.desired_channels(0), 0);
+        assert_eq!(cfg.desired_channels(1), 3);
     }
 
     #[test]

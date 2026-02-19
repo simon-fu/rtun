@@ -204,6 +204,118 @@ async fn relay_quic_smoke_multi_tunnel_e2e() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_quic_min_zero_opens_tunnel_on_demand_e2e() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (cert_path, key_path) = write_test_cert_pair(temp.path())?;
+
+    let signal_port = reserve_tcp_port()?;
+    let relay_port = reserve_udp_port()?;
+
+    let (echo_addr, echo_stop, echo_task) = spawn_udp_echo_server().await?;
+    let signal_addr = format!("127.0.0.1:{signal_port}");
+    let relay_addr: SocketAddr = format!("127.0.0.1:{relay_port}").parse()?;
+    let quic_url = format!("quic://{signal_addr}");
+    let rule = format!("udp://{relay_addr}?to={echo_addr}");
+
+    let mut listen = Proc::spawn(
+        "listen",
+        [
+            "agent",
+            "listen",
+            "--addr",
+            signal_addr.as_str(),
+            "--https-key",
+            key_path.to_string_lossy().as_ref(),
+            "--https-cert",
+            cert_path.to_string_lossy().as_ref(),
+            "--secret",
+            TEST_SECRET,
+        ],
+    )
+    .await?;
+
+    let mut publisher = Proc::spawn(
+        "pub",
+        [
+            "agent",
+            "pub",
+            quic_url.as_str(),
+            "--agent",
+            "relay-e2e-min-zero",
+            "--expire_in",
+            "10",
+            "--secret",
+            TEST_SECRET,
+            "--quic-insecure",
+        ],
+    )
+    .await?;
+
+    let mut relay = Proc::spawn(
+        "relay",
+        [
+            "relay",
+            "-L",
+            rule.as_str(),
+            quic_url.as_str(),
+            "--agent",
+            "^relay-e2e-min-zero$",
+            "--secret",
+            TEST_SECRET,
+            "--quic-insecure",
+            "--udp-idle-timeout",
+            "30",
+            "--p2p-min-channels",
+            "0",
+            "--p2p-max-channels",
+            "1",
+        ],
+    )
+    .await?;
+
+    let run_result = async {
+        wait_for_process_log_contains(&mut relay, "relay(udp) listen on", Duration::from_secs(10))
+            .await?;
+        listen.ensure_running()?;
+        publisher.ensure_running()?;
+        relay.ensure_running()?;
+
+        // No bootstrap tunnel at min=0. First packet should trigger demand-open and still roundtrip.
+        let first_payload = b"relay-demand-open-first".to_vec();
+        udp_roundtrip_with_timeout(
+            relay_addr,
+            first_payload.as_slice(),
+            Duration::from_secs(20),
+        )
+        .await?;
+
+        wait_for_process_log_contains(
+            &mut relay,
+            "relay tunnel connected(demand-open):",
+            Duration::from_secs(10),
+        )
+        .await?;
+
+        for idx in 0..3 {
+            let payload = format!("relay-demand-open-{idx}").into_bytes();
+            udp_roundtrip(relay_addr, payload.as_slice()).await?;
+        }
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    relay.terminate().await;
+    publisher.terminate().await;
+    listen.terminate().await;
+
+    let _ = echo_stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), echo_task).await;
+
+    run_result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "manual reproducer: fixed source burst + sticky target peer"]
 async fn relay_quic_fixed_source_burst_multi_tunnel_e2e() -> Result<()> {
     let temp = TempDir::new()?;
@@ -945,7 +1057,8 @@ async fn wait_for_process_log_contains(
     }
 }
 
-async fn spawn_udp_echo_server() -> Result<(SocketAddr, oneshot::Sender<()>, JoinHandle<Result<()>>)> {
+async fn spawn_udp_echo_server() -> Result<(SocketAddr, oneshot::Sender<()>, JoinHandle<Result<()>>)>
+{
     let socket = UdpSocket::bind("127.0.0.1:0")
         .await
         .with_context(|| "bind udp echo server failed")?;
@@ -1107,13 +1220,14 @@ async fn wait_for_sticky_accepted_count(
 }
 
 fn reserve_tcp_port() -> Result<u16> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).with_context(|| "reserve tcp port failed")?;
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).with_context(|| "reserve tcp port failed")?;
     Ok(listener.local_addr()?.port())
 }
 
 fn reserve_udp_port() -> Result<u16> {
-    let socket = std::net::UdpSocket::bind(("127.0.0.1", 0))
-        .with_context(|| "reserve udp port failed")?;
+    let socket =
+        std::net::UdpSocket::bind(("127.0.0.1", 0)).with_context(|| "reserve udp port failed")?;
     Ok(socket.local_addr()?.port())
 }
 
@@ -1186,7 +1300,8 @@ impl TempDir {
             .as_nanos();
         let pid = std::process::id();
         let path = std::env::temp_dir().join(format!("rtun-relay-e2e-{pid}-{now}"));
-        fs::create_dir_all(&path).with_context(|| format!("create temp dir failed [{:?}]", path))?;
+        fs::create_dir_all(&path)
+            .with_context(|| format!("create temp dir failed [{:?}]", path))?;
         Ok(Self { path })
     }
 

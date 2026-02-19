@@ -97,7 +97,10 @@ rtun relay \
 - 通道池支持最小/最大值：`--p2p-min-channels`、`--p2p-max-channels`
 - 当 `active_flows == 0` 时，仅维持最小通道数
 - 当 `active_flows > 0` 时，扩容至最大通道数
-- v1 先要求 `--p2p-min-channels >= 1`，暂不支持 `min=0` 的按需建链模式
+- [x] 支持 `--p2p-min-channels=0` 的按需建链模式
+  - 当 `active_tunnels == 0` 且 `min=0` 时，进入“背压模式”：暂停读取本地 UDP socket（不再 `recv_from`）
+  - 控制面保持运行，持续创建首条可用 tunnel；首条 tunnel 建立成功后恢复读取本地 UDP socket
+  - 该背压是 UDP socket 接收侧背压：数据先留在内核接收缓冲，缓冲满后按 UDP 语义丢包
 - [x] flow 按固定周期重选通道；到期通道在重选过程中逐步排空
 
 可观测性与运维界面（TUI）：
