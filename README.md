@@ -71,6 +71,8 @@ rtun relay \
 - `--agent-script <name>`：选择内置 embed 脚本名，可重复。
 - 当前内置脚本：`bootstrap_env`、`hy2`、`noop`。
 - `--agent-script-file <path>`：选择本地脚本文件，可重复。
+- `--agent-script-arg <arg>`：给“当前脚本”追加单个参数，可重复。
+- `--agent-script-args "<arg string>"`：给“当前脚本”追加 shell 风格参数串（由 `shell-words` 解析），可重复。
 - `--agent-script-timeout <secs>`：单脚本执行超时秒数。
 - `--agent-script-fail-policy <ignore|switch-agent>`：
   - `ignore`（默认）：脚本失败仅记录日志，不影响当前 agent 使用。
@@ -81,6 +83,7 @@ rtun relay \
 - 每次 relay 连上 agent 后，按命令行声明顺序执行脚本。
 - 可同时声明 embed 脚本与脚本文件，统一排队执行。
 - agent 端每个脚本执行流程：接收脚本内容 -> 写临时文件 -> 执行 -> 回传结果 -> 删除临时文件。
+- `--agent-script-arg/--agent-script-args` 绑定到最近一个 `--agent-script/--agent-script-file`。
 
 示例：
 
@@ -91,7 +94,12 @@ rtun relay \
   --secret sec123 \
   --quic-insecure \
   --agent-script bootstrap_env \
+  --agent-script-args "--mode=prepare --retry=3" \
+  --agent-script hy2 \
+  --agent-script-arg=--version=v2.7.0 \
+  --agent-script-arg=--listen=127.0.0.1:4433 \
   --agent-script-file ./scripts/agent-prepare.sh \
+  --agent-script-arg "--phase=post" \
   --agent-script-timeout 30 \
   --agent-script-fail-policy switch-agent
 ```
@@ -111,7 +119,7 @@ rtun relay \
 - `hy2` 脚本运行目录默认是 `~/.rtun/hy2`（可通过 `RTUN_HY2_HOME` 覆盖）。
 - 自动证书路径：`~/.rtun/hy2/self_signed_certs/cert.pem` 与 `~/.rtun/hy2/self_signed_certs/key.pem`。
 - 会下载指定平台二进制（支持 macOS arm64/amd64、Linux arm64/amd64），后台启动并写入 `hysteria.log`。
-- relay 当前下发脚本时不附带参数；若需自定义 `hy2` 参数，可用 `--agent-script-file` 提供包装脚本。
+- agent 执行脚本时使用 `sh <temp_script> <argv...>`，每个参数按独立 argv 传递，不做 shell 拼接。
 
 已知问题与后续改进：
 

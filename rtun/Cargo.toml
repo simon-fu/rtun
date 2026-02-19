@@ -115,6 +115,7 @@ indexmap = "=2.0.2"
 regex = "=1.10.2"
 crc = "=3.2.1"
 fast-socks5 = "=0.9.6"
+shell-words = "=1.1.0"
 
 surge-ping = "=0.8.1"
 

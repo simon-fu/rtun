@@ -1989,6 +1989,11 @@ async fn run_agent_scripts<H: CtrlHandler>(
             .exec_agent_script(ExecAgentScriptArgs {
                 name: script.request_name().into(),
                 content: script.content.to_vec().into(),
+                argv: script
+                    .argv
+                    .iter()
+                    .map(|x| protobuf::Chars::from(x.as_str()))
+                    .collect(),
                 timeout_secs,
                 max_stdout_bytes: AGENT_SCRIPT_STDOUT_LIMIT,
                 max_stderr_bytes: AGENT_SCRIPT_STDERR_LIMIT,
@@ -4004,6 +4009,7 @@ enum RelayAgentScriptSource {
 struct RelayAgentScriptSpec {
     source: RelayAgentScriptSource,
     content: Arc<[u8]>,
+    argv: Vec<String>,
 }
 
 impl RelayAgentScriptSpec {
@@ -4028,6 +4034,12 @@ impl RelayAgentScriptSpec {
 #[error("agent script failed and fail-policy=switch-agent: {reason}")]
 struct AgentScriptSwitchAgentError {
     reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct RelayAgentScriptCliSpec {
+    source: RelayAgentScriptSource,
+    argv: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4141,10 +4153,10 @@ impl RelayRule {
 }
 
 fn load_agent_scripts(args: &CmdArgs) -> Result<Vec<RelayAgentScriptSpec>> {
-    let ordered_sources = collect_ordered_script_sources(args);
-    let mut scripts = Vec::with_capacity(ordered_sources.len());
-    for source in ordered_sources {
-        let content: Arc<[u8]> = match &source {
+    let ordered_specs = collect_ordered_script_specs(args)?;
+    let mut scripts = Vec::with_capacity(ordered_specs.len());
+    for cli_spec in ordered_specs {
+        let content: Arc<[u8]> = match &cli_spec.source {
             RelayAgentScriptSource::Embedded { name } => embedded_agent_script(name)
                 .with_context(|| format!("unknown embedded agent script [{name}]"))?,
             RelayAgentScriptSource::File { path } => std::fs::read(path)
@@ -4152,7 +4164,11 @@ fn load_agent_scripts(args: &CmdArgs) -> Result<Vec<RelayAgentScriptSpec>> {
                 .into_boxed_slice()
                 .into(),
         };
-        scripts.push(RelayAgentScriptSpec { source, content });
+        scripts.push(RelayAgentScriptSpec {
+            source: cli_spec.source,
+            content,
+            argv: cli_spec.argv,
+        });
     }
     Ok(scripts)
 }
@@ -4168,78 +4184,157 @@ fn embedded_agent_script(name: &str) -> Result<Arc<[u8]>> {
     Ok(script.to_vec().into_boxed_slice().into())
 }
 
-fn collect_ordered_script_sources(args: &CmdArgs) -> Vec<RelayAgentScriptSource> {
+fn collect_ordered_script_specs(args: &CmdArgs) -> Result<Vec<RelayAgentScriptCliSpec>> {
     let expected = args.agent_scripts.len() + args.agent_script_files.len();
     if expected == 0 {
-        return Vec::new();
+        if !args.agent_script_arg.is_empty() || !args.agent_script_args.is_empty() {
+            bail!("--agent-script-arg/--agent-script-args requires --agent-script or --agent-script-file");
+        }
+        return Ok(Vec::new());
     }
 
-    let parsed = parse_script_sources_from_argv();
+    let parsed = parse_script_specs_from_argv()?;
     if parsed.len() == expected {
-        return parsed;
+        return Ok(parsed);
+    }
+
+    if !args.agent_script_arg.is_empty() || !args.agent_script_args.is_empty() {
+        bail!(
+            "failed to map --agent-script-arg/--agent-script-args to scripts: expected {} script items, parsed {} from argv",
+            expected,
+            parsed.len()
+        );
     }
 
     let mut fallback = Vec::with_capacity(expected);
     for name in &args.agent_scripts {
-        fallback.push(RelayAgentScriptSource::Embedded { name: name.clone() });
+        fallback.push(RelayAgentScriptCliSpec {
+            source: RelayAgentScriptSource::Embedded { name: name.clone() },
+            argv: Vec::new(),
+        });
     }
     for path in &args.agent_script_files {
-        fallback.push(RelayAgentScriptSource::File { path: path.clone() });
+        fallback.push(RelayAgentScriptCliSpec {
+            source: RelayAgentScriptSource::File { path: path.clone() },
+            argv: Vec::new(),
+        });
     }
-    fallback
+    Ok(fallback)
 }
 
-fn parse_script_sources_from_argv() -> Vec<RelayAgentScriptSource> {
+fn parse_script_specs_from_argv() -> Result<Vec<RelayAgentScriptCliSpec>> {
     let argv: Vec<String> = std::env::args().collect();
-    parse_script_sources_from_args(argv.iter().map(|x| x.as_str()))
+    parse_script_specs_from_args(argv.iter().map(|x| x.as_str()))
 }
 
-fn parse_script_sources_from_args<'a, I>(args: I) -> Vec<RelayAgentScriptSource>
+fn parse_script_specs_from_args<'a, I>(args: I) -> Result<Vec<RelayAgentScriptCliSpec>>
 where
     I: IntoIterator<Item = &'a str>,
 {
     let argv: Vec<String> = args.into_iter().map(|x| x.to_string()).collect();
-    let mut sources = Vec::new();
+    let mut specs = Vec::new();
     let mut idx = 0_usize;
     while idx < argv.len() {
         let arg = argv[idx].as_str();
         if arg == "--agent-script" {
-            if let Some(v) = argv.get(idx + 1) {
-                sources.push(RelayAgentScriptSource::Embedded { name: v.clone() });
-                idx += 2;
-                continue;
-            }
-            idx += 1;
+            let v = argv
+                .get(idx + 1)
+                .with_context(|| "missing value for --agent-script")?;
+            specs.push(RelayAgentScriptCliSpec {
+                source: RelayAgentScriptSource::Embedded { name: v.clone() },
+                argv: Vec::new(),
+            });
+            idx += 2;
             continue;
         }
         if let Some(v) = arg.strip_prefix("--agent-script=") {
-            sources.push(RelayAgentScriptSource::Embedded {
-                name: v.to_string(),
+            specs.push(RelayAgentScriptCliSpec {
+                source: RelayAgentScriptSource::Embedded {
+                    name: v.to_string(),
+                },
+                argv: Vec::new(),
             });
             idx += 1;
             continue;
         }
         if arg == "--agent-script-file" {
-            if let Some(v) = argv.get(idx + 1) {
-                sources.push(RelayAgentScriptSource::File {
+            let v = argv
+                .get(idx + 1)
+                .with_context(|| "missing value for --agent-script-file")?;
+            specs.push(RelayAgentScriptCliSpec {
+                source: RelayAgentScriptSource::File {
                     path: PathBuf::from(v),
-                });
-                idx += 2;
-                continue;
-            }
-            idx += 1;
+                },
+                argv: Vec::new(),
+            });
+            idx += 2;
             continue;
         }
         if let Some(v) = arg.strip_prefix("--agent-script-file=") {
-            sources.push(RelayAgentScriptSource::File {
-                path: PathBuf::from(v),
+            specs.push(RelayAgentScriptCliSpec {
+                source: RelayAgentScriptSource::File {
+                    path: PathBuf::from(v),
+                },
+                argv: Vec::new(),
             });
+            idx += 1;
+            continue;
+        }
+        if arg == "--agent-script-arg" {
+            let v = argv
+                .get(idx + 1)
+                .with_context(|| "missing value for --agent-script-arg")?;
+            append_single_script_arg(specs.as_mut_slice(), v.to_string(), "--agent-script-arg")?;
+            idx += 2;
+            continue;
+        }
+        if let Some(v) = arg.strip_prefix("--agent-script-arg=") {
+            append_single_script_arg(specs.as_mut_slice(), v.to_string(), "--agent-script-arg")?;
+            idx += 1;
+            continue;
+        }
+        if arg == "--agent-script-args" {
+            let v = argv
+                .get(idx + 1)
+                .with_context(|| "missing value for --agent-script-args")?;
+            append_shell_script_args(specs.as_mut_slice(), v, "--agent-script-args")?;
+            idx += 2;
+            continue;
+        }
+        if let Some(v) = arg.strip_prefix("--agent-script-args=") {
+            append_shell_script_args(specs.as_mut_slice(), v, "--agent-script-args")?;
             idx += 1;
             continue;
         }
         idx += 1;
     }
-    sources
+    Ok(specs)
+}
+
+fn append_single_script_arg(
+    specs: &mut [RelayAgentScriptCliSpec],
+    value: String,
+    flag: &str,
+) -> Result<()> {
+    let curr = specs.last_mut().with_context(|| {
+        format!("{flag} must appear after --agent-script or --agent-script-file")
+    })?;
+    curr.argv.push(value);
+    Ok(())
+}
+
+fn append_shell_script_args(
+    specs: &mut [RelayAgentScriptCliSpec],
+    raw: &str,
+    flag: &str,
+) -> Result<()> {
+    let curr = specs.last_mut().with_context(|| {
+        format!("{flag} must appear after --agent-script or --agent-script-file")
+    })?;
+    let parsed = shell_words::split(raw)
+        .with_context(|| format!("parse {flag} failed for input [{}]", raw))?;
+    curr.argv.extend(parsed);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4307,6 +4402,18 @@ pub struct CmdArgs {
     agent_script_files: Vec<PathBuf>,
 
     #[clap(
+        long = "agent-script-arg",
+        long_help = "single argument passed to current script, repeatable"
+    )]
+    agent_script_arg: Vec<String>,
+
+    #[clap(
+        long = "agent-script-args",
+        long_help = "shell-style arguments string passed to current script, repeatable"
+    )]
+    agent_script_args: Vec<String>,
+
+    #[clap(
         long = "agent-script-timeout",
         long_help = "single agent script timeout in seconds",
         default_value_t = DEFAULT_AGENT_SCRIPT_TIMEOUT_SECS
@@ -4360,7 +4467,7 @@ pub struct CmdArgs {
 mod tests {
     use super::{
         decode_udp_relay_packet, encode_udp_relay_packet, format_millis, max_udp_payload_auto,
-        parse_script_sources_from_args, pick_best_tunnel_idx_by, pick_latest_agent,
+        parse_script_specs_from_args, pick_best_tunnel_idx_by, pick_latest_agent,
         resolve_udp_max_payload, ChannelPoolConfig, RelayAgentScriptSource, RelayRule,
         UdpRelayCodec,
     };
@@ -4567,34 +4674,84 @@ mod tests {
     }
 
     #[test]
-    fn parse_script_sources_should_preserve_cli_order() {
-        let parsed = parse_script_sources_from_args([
+    fn parse_script_specs_should_preserve_cli_order_and_bind_args() {
+        let parsed = parse_script_specs_from_args([
             "rtun",
             "relay",
             "--agent-script",
             "bootstrap_env",
+            "--agent-script-arg",
+            "--force_dl=true",
+            "--agent-script-args",
+            "--version=v2.7.0 --listen=127.0.0.1:4433",
             "--agent-script-file",
             "./scripts/a.sh",
             "--agent-script=noop",
+            "--agent-script-arg=--x=1",
             "--agent-script-file=./scripts/b.sh",
-        ]);
+        ])
+        .unwrap();
         assert_eq!(parsed.len(), 4);
         assert!(matches!(
-            &parsed[0],
+            &parsed[0].source,
             RelayAgentScriptSource::Embedded { name } if name == "bootstrap_env"
         ));
+        assert_eq!(
+            parsed[0].argv,
+            vec![
+                "--force_dl=true".to_string(),
+                "--version=v2.7.0".to_string(),
+                "--listen=127.0.0.1:4433".to_string()
+            ]
+        );
         assert!(matches!(
-            &parsed[1],
+            &parsed[1].source,
             RelayAgentScriptSource::File { path } if path == std::path::Path::new("./scripts/a.sh")
         ));
+        assert!(parsed[1].argv.is_empty());
         assert!(matches!(
-            &parsed[2],
+            &parsed[2].source,
             RelayAgentScriptSource::Embedded { name } if name == "noop"
         ));
+        assert_eq!(parsed[2].argv, vec!["--x=1".to_string()]);
         assert!(matches!(
-            &parsed[3],
+            &parsed[3].source,
             RelayAgentScriptSource::File { path } if path == std::path::Path::new("./scripts/b.sh")
         ));
+        assert!(parsed[3].argv.is_empty());
+    }
+
+    #[test]
+    fn parse_script_specs_should_reject_args_before_script() {
+        let err = parse_script_specs_from_args([
+            "rtun",
+            "relay",
+            "--agent-script-args",
+            "--version=v2.7.0",
+        ])
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(
+                "--agent-script-args must appear after --agent-script or --agent-script-file"
+            ),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn parse_script_specs_should_report_invalid_shell_words() {
+        let err = parse_script_specs_from_args([
+            "rtun",
+            "relay",
+            "--agent-script",
+            "hy2",
+            "--agent-script-args",
+            "\"unterminated",
+        ])
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("parse --agent-script-args failed"), "{msg}");
     }
 
     #[test]

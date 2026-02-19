@@ -83,6 +83,7 @@ message ExecAgentScriptArgs {
     uint32 timeout_secs                 = 3;
     uint32 max_stdout_bytes             = 4;
     uint32 max_stderr_bytes             = 5;
+    repeated string argv                = 6;
 }
 
 message ExecAgentScriptResult {

@@ -439,6 +439,7 @@ async fn handle_exec_agent_script(args: ExecAgentScriptArgs) -> Result<ExecAgent
 
     let script_name_raw = String::from_utf8_lossy(args.name.as_ref());
     let script_name = sanitize_script_name(script_name_raw.as_ref());
+    let script_argv: Vec<String> = args.argv.iter().map(|x| x.to_string()).collect();
     let temp_path = make_exec_script_temp_path(script_name.as_str());
     let run_result = async {
         tokio::fs::write(&temp_path, args.content.as_ref())
@@ -447,6 +448,7 @@ async fn handle_exec_agent_script(args: ExecAgentScriptArgs) -> Result<ExecAgent
         set_exec_script_permissions(&temp_path).await?;
         run_script_file(
             &temp_path,
+            script_argv.as_slice(),
             timeout_duration,
             max_stdout_bytes,
             max_stderr_bytes,
@@ -531,12 +533,14 @@ async fn set_exec_script_permissions(path: &PathBuf) -> Result<()> {
 
 async fn run_script_file(
     path: &PathBuf,
+    script_argv: &[String],
     timeout_duration: Duration,
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
 ) -> Result<ExecScriptOutput> {
     let mut child = Command::new("sh")
         .arg(path.as_os_str())
+        .args(script_argv)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1382,6 +1386,35 @@ mod tests {
         let stderr = String::from_utf8_lossy(rsp.stderr.as_ref());
         assert!(stdout.contains("hello"), "stdout={stdout}");
         assert!(stderr.contains("error"), "stderr={stderr}");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exec_agent_script_should_receive_argv() -> Result<()> {
+        let rsp = handle_exec_agent_script(ExecAgentScriptArgs {
+            name: "argv".into(),
+            content: b"#!/usr/bin/env sh\necho \"arg1=$1\"\necho \"arg2=$2\"\n"
+                .to_vec()
+                .into(),
+            argv: vec![
+                protobuf::Chars::from("foo"),
+                protobuf::Chars::from("bar baz"),
+            ],
+            timeout_secs: 3,
+            max_stdout_bytes: 4096,
+            max_stderr_bytes: 4096,
+            ..Default::default()
+        })
+        .await?;
+
+        assert_eq!(rsp.status_code, 0);
+        assert_eq!(rsp.exit_code, 0);
+        assert!(!rsp.timed_out);
+
+        let stdout = String::from_utf8_lossy(rsp.stdout.as_ref());
+        assert!(stdout.contains("arg1=foo"), "stdout={stdout}");
+        assert!(stdout.contains("arg2=bar baz"), "stdout={stdout}");
 
         Ok(())
     }
