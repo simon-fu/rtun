@@ -69,7 +69,7 @@ rtun relay \
 参数：
 
 - `--agent-script <name>`：选择内置 embed 脚本名，可重复。
-- 当前内置脚本：`bootstrap_env`、`noop`。
+- 当前内置脚本：`bootstrap_env`、`hy2`、`noop`。
 - `--agent-script-file <path>`：选择本地脚本文件，可重复。
 - `--agent-script-timeout <secs>`：单脚本执行超时秒数。
 - `--agent-script-fail-policy <ignore|switch-agent>`：
@@ -95,6 +95,23 @@ rtun relay \
   --agent-script-timeout 30 \
   --agent-script-fail-policy switch-agent
 ```
+
+内置脚本 `hy2`（hysteria2 server 启动脚本）参数：
+
+- `--version <v2.x.y|2.x.y|app/v2.x.y>`：默认 `v2.7.0`
+- `--password <value>`：默认 `rtun_hy2_password`
+- `--listen <port|host:port>`：默认 `127.0.0.1:4433`
+- `--lock[=true|false]` / `--no-lock`：默认加锁
+- `--force_close[=true|false]`：默认 `false`
+- `--force_dl[=true|false]`：默认 `false`
+- `--cert <path>` + `--key <path>`：可选；未指定时自动生成并复用自签名证书
+
+说明：
+
+- `hy2` 脚本运行目录默认是 `~/.rtun/hy2`（可通过 `RTUN_HY2_HOME` 覆盖）。
+- 自动证书路径：`~/.rtun/hy2/self_signed_certs/cert.pem` 与 `~/.rtun/hy2/self_signed_certs/key.pem`。
+- 会下载指定平台二进制（支持 macOS arm64/amd64、Linux arm64/amd64），后台启动并写入 `hysteria.log`。
+- relay 当前下发脚本时不附带参数；若需自定义 `hy2` 参数，可用 `--agent-script-file` 提供包装脚本。
 
 已知问题与后续改进：
 

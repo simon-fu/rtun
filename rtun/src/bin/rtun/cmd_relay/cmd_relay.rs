@@ -4160,6 +4160,7 @@ fn load_agent_scripts(args: &CmdArgs) -> Result<Vec<RelayAgentScriptSpec>> {
 fn embedded_agent_script(name: &str) -> Result<Arc<[u8]>> {
     let script = match name {
         "bootstrap_env" => Some(include_bytes!("embedded_scripts/bootstrap_env.sh").as_slice()),
+        "hy2" => Some(include_bytes!("embedded_scripts/hy2.sh").as_slice()),
         "noop" => Some(include_bytes!("embedded_scripts/noop.sh").as_slice()),
         _ => None,
     }
@@ -4599,6 +4600,7 @@ mod tests {
     #[test]
     fn embedded_script_lookup_should_validate_name() {
         assert!(super::embedded_agent_script("bootstrap_env").is_ok());
+        assert!(super::embedded_agent_script("hy2").is_ok());
         assert!(super::embedded_agent_script("noop").is_ok());
         assert!(super::embedded_agent_script("not_found").is_err());
     }
