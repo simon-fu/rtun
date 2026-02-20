@@ -162,23 +162,24 @@ rtun relay \
 
 ### 多通道智能路由方案草案（进行中）
 
-背景澄清：
+需求与方向：
 
-- 目标是缓解“单通道 UDP 限速/阻断”风险，提高可用性与稳定性
-- 对 `rtun relay` 来说，仅增加本地/目标端口规则收益有限
-- 需要在 `relay <-> agent` 之间维持多条并行 p2p tunnel，并在 tunnel 间切换
+- 目标是缓解“单通道 UDP 限速/阻断”风险，提高可用性与稳定性。
+- 对 `rtun relay` 来说，仅增加本地/目标端口规则收益有限。
+- 需要在 `relay <-> agent` 之间维持多条并行 p2p tunnel，并在 tunnel 间切换。
+- 实施顺序：先做协议变更（统计上报），再做选路策略优化。
+- 现阶段不考虑旧格式兼容（尚未正式上线），但协议设计要预留未来兼容与扩展能力。
+- 选路策略保持简单可解释，不引入复杂模型。
 
-方案要点：
+现状约束与已确认规则：
 
-- `relay` 侧维护一个 p2p tunnel 池（而不是单 tunnel）
-- 同一个 `relay` 控制会话内，多条 tunnel 共享同一张 flow map
-- 同一 `flow_id` 在 agent 侧始终复用同一个目标 UDP socket（不因 tunnel 切换重建）
-- 不引入 `relay_session_id`，作用域按“单 relay 控制会话”隔离
-- tunnel 选路不固定，基于“通畅度”做动态分配
-- 通畅度指标包括：心跳丢失率、RTT(EWMA)、连续发送失败、近期吞吐
-- 使用 `flow` 级迁移：新 flow 选更优 tunnel，已有 flow 在当前 tunnel 退化时迁移
-- 回包可走任意可用 tunnel，由 flow 选路策略决定
-- UDP 乱序/丢包按协议本身特性处理，上层业务需容忍
+- `relay` 侧维护一个 p2p tunnel 池（而不是单 tunnel）。
+- 同一个 `relay` 控制会话内，多条 tunnel 共享同一张 flow map。
+- 同一 `flow_id` 在 agent 侧始终复用同一个目标 UDP socket（不因 tunnel 切换重建）。
+- 不引入 `relay_session_id`，作用域按“单 relay 控制会话”隔离。
+- 使用 `flow` 级迁移：新 flow 选更优 tunnel，已有 flow 在当前 tunnel 退化时迁移。
+- 回包可走任意可用 tunnel，由 flow 选路策略决定。
+- UDP 乱序/丢包按协议本身特性处理，上层业务需容忍。
 
 通道生命周期与容量规则：
 
@@ -195,6 +196,59 @@ rtun relay \
   - 控制面保持运行，持续创建首条可用 tunnel；首条 tunnel 建立成功后恢复读取本地 UDP socket
   - 该背压是 UDP socket 接收侧背压：数据先留在内核接收缓冲，缓冲满后按 UDP 语义丢包
 - [x] flow 按固定周期重选通道；到期通道在重选过程中逐步排空
+
+协议变更方向（先做）：
+
+- 控制统计走 `tunnel` 数据通道，使用保留 `flow_id=0` 承载控制消息（业务流固定 `flow_id>=1`）。
+- 低频聚合上报：心跳保活 `3s`，统计上报 `6s`（可配置）。
+- 当前阶段不要求向旧格式兼容（尚未正式上线），但协议字段设计需支持未来扩展与兼容演进。
+
+数据面包格式（vNext 草案，未实现）：
+
+- 业务数据流（`flow_id>=1`）：
+  - 基础头：`nonce(8) + flow_id(32) + len(16) + tag(16) + flags(8)`
+  - 可选头：当 `flags.HAS_SEQ=1` 时，追加 `seq(varint)`（变长，无符号）
+  - 负载：`payload(len bytes)`
+- `len` 语义固定为“payload 字节长度”，不包含任何头部/可选字段。
+- `tag` 仍用于头部合法性校验；在 vNext 中建议把 `flags` 与 `seq`（若存在）纳入校验输入，降低误解码与错解析风险。
+
+控制面包格式（`flow_id=0`）：
+
+- 控制消息承载在 `flow_id=0` 的 payload 内，使用控制帧头 + `body(TLV...)`。
+- 控制帧头建议字段：
+  - `magic`
+  - `ctrl_ver`
+  - `msg_type`（`HEARTBEAT` / `STATS`）
+  - `flags`
+  - `seq`
+  - `ts_ms`
+- `STATS` 采用累计计数器（非纯 delta），便于抗丢包/乱序并支持未来扩展：
+  - `tx/rx packets/bytes`
+  - `drop_decode/drop_oversize/drop_no_route`
+  - `rtt_ewma_ms`
+  - `rx_bitrate_bps`（可选）
+
+TLV 约定（用于控制帧 body）：
+
+- `T`：`1 byte`
+  - 高 1 bit：`critical` 标志
+  - 低 7 bit：`type id`
+- `L`：`2 bytes`（`u16`，big-endian）
+- `V`：`L` 字节
+- 未识别类型：
+  - `critical=0`：跳过
+  - `critical=1`：按协议错误处理（拒收该控制帧）
+
+选路策略方向（后做，简化版）：
+
+- 评分只使用少量核心指标：`loss`、`rtt`、`rx_bitrate`。
+- 保持“硬过滤 + 简单打分 + 少量探测”三段式，避免过度复杂：
+  - 硬过滤：连续超时/严重异常的 tunnel 暂停分配新 flow。
+  - 简单打分：从可用 tunnel 中选分数最高者分配新 flow。
+  - 少量探测：给非最优 tunnel 保留小比例探测流量，避免长期失真。
+- 关键例外：当可用 tunnel 只有 1 条时，即使该 tunnel 处于降级状态，也必须继续分配新 flow（否则业务完全不可用）。
+- 小样本保护：样本不足时不做“永久坏状态”判定；状态需可恢复，避免 tunnel 因持续小样本长期陷入不可选状态。
+- 迁移策略保持保守：仅新 flow 默认按评分选路，已有 flow 仅在当前 tunnel 退化明显时迁移。
 
 可观测性与运维界面（TUI）：
 
@@ -306,6 +360,34 @@ cargo test -p rtun --test relay_e2e -- --ignored --nocapture
 说明：
 
 - `https://` 信令的自动化 e2e 仍待补充（当前客户端没有 `https insecure` 测试开关，默认需受信证书链）
+
+### 全量测试现状（2026-02-20）
+
+说明：
+
+- 以下结果来自本地执行：
+  - `cargo test --workspace`
+  - `cargo test --workspace -- --test-threads=1`
+  - `cargo test --workspace -- --ignored --test-threads=1`
+- `relay_e2e` 当前全部通过（含 ignored 慢速用例）。
+
+默认测试集中已知失败（后续处理）：
+
+- `ice::ice_candidate::test::test_candidate`
+- `ice::ice_quic::manual_test_ice_quic`
+- `ice::ice_quic::manual_test_ice_quic_drop`
+- `ice::ice_socket::test::test_resolve_basic`
+- `ice::ice_socket::test::test_resolve_inexist`
+- `ice::ice_socket::test::test_resolve_nat`
+- `ice::throughput::test_ice_conn::test_ice_conn_throughput`
+- `ice::throughput::test_quinn::test_quinn_throughput`
+- `ice::throughput::test_tokio_kcp::test_tokio_kcp_throughput`
+- `ice::webrtc_ice_peer::test_webrtc_ice_peer`
+- `kcp::test::test_kcp_flush`
+
+`ignored` 测试集中已知卡住项（后续处理）：
+
+- `cmd_udp::cmd_udp::test_udp::test_udp`（长时间无输出，需单独排查）
 
 ## Manual Release Workflow
 
