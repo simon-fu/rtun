@@ -747,11 +747,20 @@ async fn udp_relay_task(
     codec: UdpRelayCodec,
     shared_flows: SharedRelayFlows,
 ) -> Result<()> {
-    let conn = peer.accept().await?;
+    let conn = peer
+        .accept()
+        .await
+        .with_context(|| format!("udp relay accept p2p failed, target [{}]", target_addr))?;
     let (socket, _cfg, remote_addr) = conn.into_parts();
-    socket.connect(remote_addr).await?;
+    socket.connect(remote_addr).await.with_context(|| {
+        format!(
+            "udp relay connect p2p remote failed, remote [{}], target [{}]",
+            remote_addr, target_addr
+        )
+    })?;
     run_udp_relay_server_loop(
         socket,
+        remote_addr,
         target_addr,
         idle_timeout,
         max_payload,
@@ -759,10 +768,17 @@ async fn udp_relay_task(
         shared_flows,
     )
     .await
+    .with_context(|| {
+        format!(
+            "udp relay server loop failed, remote [{}], target [{}]",
+            remote_addr, target_addr
+        )
+    })
 }
 
 async fn run_udp_relay_server_loop(
     tunnel: UdpSocket,
+    remote_addr: SocketAddr,
     target_addr: SocketAddr,
     idle_timeout: Duration,
     max_payload: usize,
@@ -780,11 +796,26 @@ async fn run_udp_relay_server_loop(
     loop {
         tokio::select! {
             r = tunnel.recv(&mut tunnel_buf) => {
-                let n = r?;
+                let n = r.with_context(|| {
+                    format!(
+                        "udp relay tunnel recv failed, remote [{}], target [{}]",
+                        remote_addr, target_addr
+                    )
+                })?;
                 if n == 0 {
-                    bail!("udp relay tunnel closed");
+                    bail!(
+                        "udp relay tunnel closed, remote [{}], target [{}]",
+                        remote_addr,
+                        target_addr
+                    );
                 }
-                let (flow_id, payload) = decode_udp_relay_packet(&tunnel_buf[..n], codec)?;
+                let (flow_id, payload) =
+                    decode_udp_relay_packet(&tunnel_buf[..n], codec).with_context(|| {
+                        format!(
+                            "decode udp relay packet failed, bytes [{}], remote [{}], target [{}]",
+                            n, remote_addr, target_addr
+                        )
+                    })?;
                 if flow_id == UDP_RELAY_HEARTBEAT_FLOW_ID && payload.is_empty() {
                     continue;
                 }
@@ -800,7 +831,13 @@ async fn run_udp_relay_server_loop(
                     flow_tx.clone(),
                     max_payload,
                 )
-                .await?;
+                .await
+                .with_context(|| {
+                    format!(
+                        "get/create udp relay flow failed, flow [{}], remote [{}], target [{}]",
+                        flow_id, remote_addr, target_addr
+                    )
+                })?;
                 touch_shared_relay_flow(&flow);
                 if let Err(e) = flow.socket.send(payload).await {
                     tracing::warn!("send udp relay payload failed for flow [{}]: {e}", flow_id);
@@ -819,8 +856,25 @@ async fn run_udp_relay_server_loop(
                     packet.flow_id,
                     &packet.payload,
                     codec,
-                )?;
-                tunnel.send(&tunnel_send_buf[..frame_len]).await?;
+                )
+                .with_context(|| {
+                    format!(
+                        "encode udp relay response failed, flow [{}], payload [{}], remote [{}], target [{}]",
+                        packet.flow_id,
+                        packet.payload.len(),
+                        remote_addr,
+                        target_addr
+                    )
+                })?;
+                tunnel
+                    .send(&tunnel_send_buf[..frame_len])
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "udp relay tunnel send failed, flow [{}], bytes [{}], remote [{}], target [{}]",
+                            packet.flow_id, frame_len, remote_addr, target_addr
+                        )
+                    })?;
             }
             _ = cleanup_interval.tick() => {
                 cleanup_shared_relay_flows(&shared_flows, idle_timeout).await;
@@ -831,8 +885,22 @@ async fn run_udp_relay_server_loop(
                     UDP_RELAY_HEARTBEAT_FLOW_ID,
                     &[],
                     codec,
-                )?;
-                tunnel.send(&tunnel_send_buf[..frame_len]).await?;
+                )
+                .with_context(|| {
+                    format!(
+                        "encode udp relay heartbeat failed, remote [{}], target [{}]",
+                        remote_addr, target_addr
+                    )
+                })?;
+                tunnel
+                    .send(&tunnel_send_buf[..frame_len])
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "udp relay heartbeat send failed, bytes [{}], remote [{}], target [{}]",
+                            frame_len, remote_addr, target_addr
+                        )
+                    })?;
             }
         }
     }
