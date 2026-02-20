@@ -124,11 +124,41 @@ rtun relay \
 已知问题与后续改进：
 
 - [x] 建立 P2P 连接后，`relay` 数据面当前没有心跳包；长时间空闲时可能被 NAT 回收映射，导致 P2P 中断（已实现保活心跳）
-- [x] UDP relay 数据面已支持 `obfs-v1` 帧编码（`obfs_seed + nonce` 混淆头部元数据），不再使用固定明文 `flow_id + len` 包头特征（保留 `obfs_seed=0` 的 legacy 兼容模式）
+- [x] UDP relay 数据面已支持 `obfs` 头部混淆 + `tag` 校验（`flow_id(32) + len(16) + tag(16)`），降低非 relay 数据误解码概率（保留 `obfs_seed=0` 的 legacy 兼容路径）
 - [~] 已支持基础多 p2p 通道池能力（`--p2p-min-channels/--p2p-max-channels`、新 flow 轮询分配、空闲缩容）
 - [~] 已实现第一版“智能路由”：按通道活跃度+负载进行新 flow 分配，并对已建立 flow 做周期重选迁移
 - [~] 已实现通道到期替换与排空关闭：旧通道到期后先尝试建新通道，成功后旧通道停止新 flow 分配，flow 排空后关闭
 - [ ] 尚未实现精细质量评分（如 RTT EWMA、吞吐/丢包指标融合与自适应权重）
+
+### Tunnel 头校验（已实现）
+
+目标：
+
+- 减少“非 relay 数据（如 STUN）被误解码为 relay 包”的概率
+- 保持当前 `obfs` 的低特征外观，不引入固定明文 magic
+- 在不增加头长的前提下增强包头合法性校验
+
+当前实现（仅 `obfs` 模式，头长仍为 9 字节）：
+
+- `nonce`：8 bit（与当前一致）
+- `meta`：64 bit（继续做 `obfs_seed + nonce` 混淆）
+- `meta` 字段：
+  - `flow_id(32)`
+  - `len(16)`
+  - `tag(16)`
+- `tag` 为会话相关的轻量校验值（由 `obfs_seed/nonce/flow_id/len` 计算）
+
+解码处理策略：
+
+- 正常解码后再校验 `tag`
+- `tag` 校验失败时：
+  - 命中 STUN magic（`0x2112A442`） -> `debug` 日志并丢包
+  - 非 STUN -> `warn` 日志并丢包
+- 校验失败不立即断开 tunnel，由心跳超时（当前 30 秒）兜底收敛
+
+说明：
+
+- 当前实现未引入 `codec_version` 协商（按当前阶段统一协议格式运行）
 
 ### 多通道智能路由方案草案（进行中）
 
