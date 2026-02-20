@@ -840,9 +840,20 @@ async fn run_udp_relay_server_loop(
                 })?;
                 touch_shared_relay_flow(&flow);
                 if let Err(e) = flow.socket.send(payload).await {
-                    tracing::warn!("send udp relay payload failed for flow [{}]: {e}", flow_id);
-                    if remove_shared_relay_flow(&shared_flows, key, "target-send-failed").await {
-                        tracing::debug!("removed broken udp relay flow [{}]", flow_id);
+                    if e.kind() == ErrorKind::ConnectionRefused {
+                        tracing::debug!(
+                            "udp relay target refused packet, keep flow alive: flow [{}], target [{}], err [{}]",
+                            flow_id,
+                            target_addr,
+                            e
+                        );
+                    } else {
+                        tracing::warn!(
+                            "send udp relay payload failed, keep flow alive: flow [{}], target [{}], err [{}]",
+                            flow_id,
+                            target_addr,
+                            e
+                        );
                     }
                 }
             }
