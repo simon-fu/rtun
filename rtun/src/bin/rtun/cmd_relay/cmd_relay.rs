@@ -52,12 +52,14 @@ const DEFAULT_UDP_IDLE_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_P2P_PACKET_LIMIT: usize = 1452 ;
 const UDP_RELAY_META_LEN_LEGACY: usize = 8;
 const UDP_RELAY_META_LEN_OBFS: usize = 9;
-const UDP_RELAY_FLOW_ID_MASK: u64 = (1_u64 << 48) - 1;
+const UDP_RELAY_FLOW_ID_MASK_LEGACY: u64 = (1_u64 << 48) - 1;
+const UDP_RELAY_FLOW_ID_MASK_OBFS: u64 = u32::MAX as u64;
 const LOOP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const FLOW_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const UDP_RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const UDP_RELAY_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 const UDP_RELAY_HEARTBEAT_FLOW_ID: u64 = 0;
+const STUN_MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
 const DEFAULT_P2P_MIN_CHANNELS: usize = 1;
 const DEFAULT_P2P_MAX_CHANNELS: usize = 1;
 const DEFAULT_P2P_CHANNEL_LIFETIME_SECS: u64 = 120;
@@ -2265,15 +2267,27 @@ fn spawn_tunnel_recv_task(
                         Ok(v) => v,
                         Err(e) => {
                             let packet = &tun_buf[..n];
-                            tracing::warn!(
-                                "relay tunnel decode failed: tunnel [{}], codec [{}], header [{}], bytes [{}], packet {}, err [{}]",
-                                tunnel_idx,
-                                codec.mode_name(),
-                                codec.header_len(),
-                                n,
-                                packet.dump_bin_limit(24),
-                                e
-                            );
+                            if is_udp_relay_tag_mismatch(&e) && packet_has_stun_magic(packet) {
+                                tracing::debug!(
+                                    "relay tunnel decode dropped stun-like packet: tunnel [{}], codec [{}], header [{}], bytes [{}], packet {}, err [{}]",
+                                    tunnel_idx,
+                                    codec.mode_name(),
+                                    codec.header_len(),
+                                    n,
+                                    packet.dump_bin_limit(24),
+                                    e
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "relay tunnel decode failed: tunnel [{}], codec [{}], header [{}], bytes [{}], packet {}, err [{}]",
+                                    tunnel_idx,
+                                    codec.mode_name(),
+                                    codec.header_len(),
+                                    n,
+                                    packet.dump_bin_limit(24),
+                                    e
+                                );
+                            }
                             continue;
                         }
                     };
@@ -3174,8 +3188,7 @@ async fn relay_loop<H: CtrlHandler>(
                     if active_tunnel_count(&tunnels) == 0 {
                         break Err(anyhow::anyhow!("no relay tunnel available"));
                     }
-                    let flow_id = next_flow;
-                    next_flow = next_nonzero_flow_id(next_flow);
+                    let flow_id = alloc_next_flow_id(&mut next_flow, &flow_to_src)?;
                     let mut tunnel_idx = pick_best_active_tunnel_idx(
                         &tunnels,
                         &tunnel_states,
@@ -3754,11 +3767,29 @@ fn cleanup_client_flows(
 }
 
 fn next_nonzero_flow_id(curr: u64) -> u64 {
-    let mut next = curr.wrapping_add(1);
+    let mut next =
+        (curr & UDP_RELAY_FLOW_ID_MASK_OBFS).wrapping_add(1) & UDP_RELAY_FLOW_ID_MASK_OBFS;
     if next == 0 {
         next = 1;
     }
     next
+}
+
+fn alloc_next_flow_id(
+    next_flow: &mut u64,
+    flow_to_src: &HashMap<u64, SocketAddr>,
+) -> Result<u64> {
+    let start = *next_flow;
+    loop {
+        let flow_id = *next_flow;
+        *next_flow = next_nonzero_flow_id(*next_flow);
+        if !flow_to_src.contains_key(&flow_id) {
+            return Ok(flow_id);
+        }
+        if *next_flow == start {
+            bail!("no available relay flow id");
+        }
+    }
 }
 
 fn resolve_udp_max_payload(input: Option<usize>) -> Result<usize> {
@@ -3908,14 +3939,17 @@ fn encode_udp_relay_packet(
         bail!("packet buffer too small [{}] < [{}]", buf.len(), packet_len);
     }
 
-    let flow_id = flow_id & UDP_RELAY_FLOW_ID_MASK;
     if codec.is_obfs() {
+        let flow_id = flow_id & UDP_RELAY_FLOW_ID_MASK_OBFS;
         let nonce = rand::random::<u8>();
-        let meta = (flow_id << 16) | payload.len() as u64;
+        let len = payload.len() as u16;
+        let tag = udp_relay_tag(codec.obfs_seed, nonce, flow_id, len);
+        let meta = (flow_id << 32) | ((len as u64) << 16) | tag as u64;
         let obfs_meta = meta ^ udp_relay_obfs_mask(codec.obfs_seed, nonce);
         buf[0] = nonce;
         buf[1..9].copy_from_slice(&obfs_meta.to_be_bytes());
     } else {
+        let flow_id = flow_id & UDP_RELAY_FLOW_ID_MASK_LEGACY;
         buf[..6].copy_from_slice(&flow_id.to_be_bytes()[2..]);
         buf[6..8].copy_from_slice(&(payload.len() as u16).to_be_bytes());
     }
@@ -3938,8 +3972,13 @@ fn decode_udp_relay_packet(packet: &[u8], codec: UdpRelayCodec) -> Result<(u64, 
         let mut meta_raw = [0_u8; 8];
         meta_raw.copy_from_slice(&packet[1..UDP_RELAY_META_LEN_OBFS]);
         let meta = u64::from_be_bytes(meta_raw) ^ udp_relay_obfs_mask(codec.obfs_seed, nonce);
-        let flow_id = (meta >> 16) & UDP_RELAY_FLOW_ID_MASK;
-        let len = (meta & 0xffff) as usize;
+        let flow_id = (meta >> 32) & UDP_RELAY_FLOW_ID_MASK_OBFS;
+        let len = ((meta >> 16) & 0xffff) as usize;
+        let got_tag = (meta & 0xffff) as u16;
+        let expected_tag = udp_relay_tag(codec.obfs_seed, nonce, flow_id, len as u16);
+        if got_tag != expected_tag {
+            bail!("tag mismatch [{}] expected [{}]", got_tag, expected_tag);
+        }
         if len > packet.len() - UDP_RELAY_META_LEN_OBFS {
             bail!(
                 "meta.len [{}] exceed [{}]",
@@ -3990,6 +4029,25 @@ fn udp_relay_obfs_mask(seed: u32, nonce: u8) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
+}
+
+fn udp_relay_tag(seed: u32, nonce: u8, flow_id: u64, len: u16) -> u16 {
+    let mut z = ((seed as u64) << 32) | (flow_id & UDP_RELAY_FLOW_ID_MASK_OBFS);
+    z ^= (nonce as u64) << 56;
+    z ^= (len as u64) << 16;
+    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    (z ^ (z >> 16) ^ (z >> 32) ^ (z >> 48)) as u16
+}
+
+fn packet_has_stun_magic(packet: &[u8]) -> bool {
+    packet.len() >= 8 && packet[4..8] == STUN_MAGIC_COOKIE
+}
+
+fn is_udp_relay_tag_mismatch(err: &anyhow::Error) -> bool {
+    err.to_string().contains("tag mismatch")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4567,6 +4625,19 @@ mod tests {
         let (id, payload) = decode_udp_relay_packet(&buf[..n], codec).unwrap();
         assert_eq!(id, 12345);
         assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn relay_packet_codec_obfs_tag_mismatch() {
+        let mut buf = vec![0_u8; 64];
+        let codec = UdpRelayCodec::new(123456789);
+        let n = encode_udp_relay_packet(&mut buf, 12345, b"hello", codec).unwrap();
+        buf[1] ^= 0x01;
+        let err = decode_udp_relay_packet(&buf[..n], codec).unwrap_err();
+        assert!(
+            err.to_string().contains("tag mismatch"),
+            "unexpected decode err: {err:?}"
+        );
     }
 
     #[test]
