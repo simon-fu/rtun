@@ -22,6 +22,7 @@ use crossterm::{
 use regex::Regex;
 use rtun::{
     async_rt::{run_multi_thread, spawn_with_name},
+    hex::BinStrLine,
     ice::ice_peer::{default_ice_servers, IceArgs, IceConfig, IcePeer},
     proto::{
         open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, ExecAgentScriptArgs,
@@ -2238,17 +2239,25 @@ fn spawn_tunnel_recv_task(
                 break;
             }
 
-            let (flow_id, payload) = match decode_udp_relay_packet(&tun_buf[..n], codec) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = inbound_tx
-                        .send(TunnelRecvEvent::Closed {
-                            tunnel_idx,
-                            reason: format!("decode failed [{e}]"),
-                        })
-                        .await;
-                    break;
-                }
+                let (flow_id, payload) = match decode_udp_relay_packet(&tun_buf[..n], codec) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let packet = &tun_buf[..n];
+                        let _ = inbound_tx
+                            .send(TunnelRecvEvent::Closed {
+                                tunnel_idx,
+                                reason: format!(
+                                    "decode failed: codec [{}], header [{}], bytes [{}], packet {}, err [{}]",
+                                    codec.mode_name(),
+                                    codec.header_len(),
+                                    n,
+                                    packet.dump_bin_limit(24),
+                                    e
+                                ),
+                            })
+                            .await;
+                        break;
+                    }
             };
 
             if flow_id == UDP_RELAY_HEARTBEAT_FLOW_ID && payload.is_empty() {

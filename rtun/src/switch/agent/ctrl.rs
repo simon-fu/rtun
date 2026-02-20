@@ -22,6 +22,7 @@ use crate::{
     async_rt::{spawn_with_inherit, spawn_with_name},
     channel::{ChId, ChReceiver, ChSender, ChSenderWeak, CHANNEL_SIZE},
     huid::{gen_huid::gen_huid, HUId},
+    hex::BinStrLine,
     ice::{
         ice_peer::{default_ice_servers, IceArgs, IceConfig, IcePeer},
         ice_quic::{QuicIceCert, QuicStream, UpgradeToQuic},
@@ -809,11 +810,16 @@ async fn run_udp_relay_server_loop(
                         target_addr
                     );
                 }
-                let (flow_id, payload) =
-                    decode_udp_relay_packet(&tunnel_buf[..n], codec).with_context(|| {
+                let (flow_id, payload) = decode_udp_relay_packet(&tunnel_buf[..n], codec)
+                    .with_context(|| {
                         format!(
-                            "decode udp relay packet failed, bytes [{}], remote [{}], target [{}]",
-                            n, remote_addr, target_addr
+                            "decode udp relay packet failed, codec [{}], header [{}], bytes [{}], remote [{}], target [{}], packet {}",
+                            codec.mode_name(),
+                            codec.header_len(),
+                            n,
+                            remote_addr,
+                            target_addr,
+                            (&tunnel_buf[..n]).dump_bin_limit(24)
                         )
                     })?;
                 if flow_id == UDP_RELAY_HEARTBEAT_FLOW_ID && payload.is_empty() {
