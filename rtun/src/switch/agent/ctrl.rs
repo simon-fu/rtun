@@ -687,7 +687,16 @@ async fn handle_udp_relay(
             shared_flows,
         )
         .await;
-        tracing::debug!("finished {r:?}");
+        match r {
+            Ok(()) => {
+                tracing::debug!("udp relay tunnel closed: uid [{uid}], target [{target_addr}]");
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "udp relay tunnel failed: uid [{uid}], target [{target_addr}], err [{e}]"
+                );
+            }
+        }
     });
 
     let rsp = OpenP2PResponse {
@@ -780,7 +789,7 @@ async fn run_udp_relay_server_loop(
                     continue;
                 }
                 if payload.len() > max_payload {
-                    tracing::warn!("drop oversized udp relay request: flow [{}], size [{}], max [{}]", flow_id, payload.len(), max_payload);
+                    tracing::debug!("drop oversized udp relay request: flow [{}], size [{}], max [{}]", flow_id, payload.len(), max_payload);
                     continue;
                 }
 
@@ -795,7 +804,7 @@ async fn run_udp_relay_server_loop(
                 touch_shared_relay_flow(&flow);
                 if let Err(e) = flow.socket.send(payload).await {
                     tracing::warn!("send udp relay payload failed for flow [{}]: {e}", flow_id);
-                    if remove_shared_relay_flow(&shared_flows, key).await {
+                    if remove_shared_relay_flow(&shared_flows, key, "target-send-failed").await {
                         tracing::debug!("removed broken udp relay flow [{}]", flow_id);
                     }
                 }
@@ -853,6 +862,7 @@ async fn get_or_create_shared_relay_flow(
         .await
         .with_context(|| format!("connect udp relay target failed [{}]", key.target_addr))?;
     let socket = Arc::new(socket);
+    let local_src_addr = socket.local_addr().ok();
 
     let (stop_tx, stop_rx) = oneshot::channel();
     let flow = Arc::new(SharedRelayFlow {
@@ -864,7 +874,7 @@ async fn get_or_create_shared_relay_flow(
         }),
     });
 
-    {
+    let active_flows = {
         let mut flows = shared_flows.lock().await;
         if let Some(existing) = flows.get(&key) {
             let existing = existing.clone();
@@ -872,13 +882,41 @@ async fn get_or_create_shared_relay_flow(
             return Ok(existing);
         }
         flows.insert(key, flow.clone());
-    }
+        flows.len()
+    };
+
+    tracing::debug!(
+        "udp relay flow created: flow [{}], route [{} -> {}], active [{}]",
+        key.flow_id,
+        local_src_addr
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        key.target_addr,
+        active_flows,
+    );
 
     let socket2 = flow.socket.clone();
     let flow2 = flow.clone();
+    let flow_key = key;
     spawn_with_name(format!("udp-relay-flow-{}", key.flow_id), async move {
-        let r = relay_flow_recv_task(key.flow_id, socket2, flow2, stop_rx, max_payload).await;
-        tracing::trace!("finished {r:?}");
+        let r = relay_flow_recv_task(flow_key.flow_id, socket2, flow2, stop_rx, max_payload).await;
+        match &r {
+            Ok(()) => {
+                tracing::debug!(
+                    "udp relay flow recv task stopped: flow [{}], target [{}]",
+                    flow_key.flow_id,
+                    flow_key.target_addr
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "udp relay flow recv task failed: flow [{}], target [{}], err [{}]",
+                    flow_key.flow_id,
+                    flow_key.target_addr,
+                    e
+                );
+            }
+        }
         r
     });
 
@@ -898,19 +936,35 @@ fn touch_shared_relay_flow(flow: &Arc<SharedRelayFlow>) {
     }
 }
 
-async fn remove_shared_relay_flow(shared_flows: &SharedRelayFlows, key: RelayFlowKey) -> bool {
-    let removed = {
+async fn remove_shared_relay_flow(
+    shared_flows: &SharedRelayFlows,
+    key: RelayFlowKey,
+    reason: &str,
+) -> bool {
+    let (removed, active_flows) = {
         let mut flows = shared_flows.lock().await;
-        flows.remove(&key)
+        let removed = flows.remove(&key);
+        (removed, flows.len())
     };
     let Some(flow) = removed else {
         return false;
     };
+    let local_src_addr = flow.socket.local_addr().ok();
     if let Ok(mut state) = flow.state.lock() {
         if let Some(stop_tx) = state.stop_tx.take() {
             let _ = stop_tx.send(());
         }
     }
+    tracing::debug!(
+        "udp relay flow closed: flow [{}], route [{} -> {}], reason [{}], active [{}]",
+        key.flow_id,
+        local_src_addr
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        key.target_addr,
+        reason,
+        active_flows,
+    );
     true
 }
 
@@ -934,7 +988,7 @@ async fn cleanup_shared_relay_flows(shared_flows: &SharedRelayFlows, idle_timeou
     };
 
     for key in expired {
-        if remove_shared_relay_flow(shared_flows, key).await {
+        if remove_shared_relay_flow(shared_flows, key, "idle-timeout").await {
             tracing::debug!("udp relay flow timeout: flow [{}]", key.flow_id);
         }
     }
@@ -1354,7 +1408,12 @@ mod tests {
         let src_port_a = flow_a.socket.local_addr()?.port();
         let src_port_b = flow_b.socket.local_addr()?.port();
 
-        let _ = remove_shared_relay_flow(&shared_flows, RelayFlowKey::new(1, target_addr)).await;
+        let _ = remove_shared_relay_flow(
+            &shared_flows,
+            RelayFlowKey::new(1, target_addr),
+            "test-cleanup",
+        )
+        .await;
 
         assert_eq!(
             src_port_a, src_port_b,
