@@ -48,7 +48,7 @@ use crate::{
 };
 
 const DEFAULT_UDP_IDLE_TIMEOUT_SECS: u64 = 120;
-const DEFAULT_P2P_PACKET_LIMIT: usize = 1400;
+const DEFAULT_P2P_PACKET_LIMIT: usize = 1452 ;
 const UDP_RELAY_META_LEN_LEGACY: usize = 8;
 const UDP_RELAY_META_LEN_OBFS: usize = 9;
 const UDP_RELAY_FLOW_ID_MASK: u64 = (1_u64 << 48) - 1;
