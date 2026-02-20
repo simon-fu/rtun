@@ -27,3 +27,5 @@ pub mod session_agent;
 pub mod next_ch_id;
 
 pub mod entity_watch;
+
+pub mod udp_relay_codec;
