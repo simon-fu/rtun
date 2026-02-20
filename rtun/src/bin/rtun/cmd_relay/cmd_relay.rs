@@ -56,6 +56,7 @@ const UDP_RELAY_FLOW_ID_MASK: u64 = (1_u64 << 48) - 1;
 const LOOP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const FLOW_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const UDP_RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+const UDP_RELAY_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 const UDP_RELAY_HEARTBEAT_FLOW_ID: u64 = 0;
 const DEFAULT_P2P_MIN_CHANNELS: usize = 1;
 const DEFAULT_P2P_MAX_CHANNELS: usize = 1;
@@ -2216,81 +2217,101 @@ fn spawn_tunnel_recv_task(
     let task_name = format!("relay-tunnel-rx-{tunnel_idx}");
     spawn_with_name(task_name, async move {
         let mut tun_buf = vec![0_u8; 64 * 1024];
+        let mut timeout_check = time::interval(Duration::from_secs(1));
+        timeout_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut last_valid_recv_at = Instant::now();
         loop {
-            let n = match socket.recv(&mut tun_buf).await {
-                Ok(n) => n,
-                Err(e) => {
-                    let _ = inbound_tx
-                        .send(TunnelRecvEvent::Closed {
-                            tunnel_idx,
-                            reason: e.to_string(),
-                        })
-                        .await;
-                    break;
-                }
-            };
-            if n == 0 {
-                let _ = inbound_tx
-                    .send(TunnelRecvEvent::Closed {
-                        tunnel_idx,
-                        reason: "recv 0".to_string(),
-                    })
-                    .await;
-                break;
-            }
-
-                let (flow_id, payload) = match decode_udp_relay_packet(&tun_buf[..n], codec) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let packet = &tun_buf[..n];
+            tokio::select! {
+                _ = timeout_check.tick() => {
+                    let idle = Instant::now().saturating_duration_since(last_valid_recv_at);
+                    if idle >= UDP_RELAY_HEARTBEAT_TIMEOUT {
                         let _ = inbound_tx
                             .send(TunnelRecvEvent::Closed {
                                 tunnel_idx,
                                 reason: format!(
-                                    "decode failed: codec [{}], header [{}], bytes [{}], packet {}, err [{}]",
-                                    codec.mode_name(),
-                                    codec.header_len(),
-                                    n,
-                                    packet.dump_bin_limit(24),
-                                    e
+                                    "heartbeat timeout: no valid packet for {}ms (timeout={}ms)",
+                                    idle.as_millis(),
+                                    UDP_RELAY_HEARTBEAT_TIMEOUT.as_millis()
                                 ),
                             })
                             .await;
                         break;
                     }
-            };
-
-            if flow_id == UDP_RELAY_HEARTBEAT_FLOW_ID && payload.is_empty() {
-                if inbound_tx
-                    .send(TunnelRecvEvent::Heartbeat { tunnel_idx })
-                    .await
-                    .is_err()
-                {
-                    break;
                 }
-                continue;
-            }
-            if payload.len() > max_payload {
-                tracing::warn!(
-                    "drop oversized tunnel udp packet: tunnel [{}], flow [{}], size [{}], max [{}]",
-                    tunnel_idx,
-                    flow_id,
-                    payload.len(),
-                    max_payload
-                );
-                continue;
-            }
+                r = socket.recv(&mut tun_buf) => {
+                    let n = match r {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = inbound_tx
+                                .send(TunnelRecvEvent::Closed {
+                                    tunnel_idx,
+                                    reason: e.to_string(),
+                                })
+                                .await;
+                            break;
+                        }
+                    };
+                    if n == 0 {
+                        let _ = inbound_tx
+                            .send(TunnelRecvEvent::Closed {
+                                tunnel_idx,
+                                reason: "recv 0".to_string(),
+                            })
+                            .await;
+                        break;
+                    }
 
-            if inbound_tx
-                .send(TunnelRecvEvent::Packet(TunnelInboundPacket {
-                    tunnel_idx,
-                    flow_id,
-                    payload: payload.to_vec(),
-                }))
-                .await
-                .is_err()
-            {
-                break;
+                    let (flow_id, payload) = match decode_udp_relay_packet(&tun_buf[..n], codec) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let packet = &tun_buf[..n];
+                            tracing::warn!(
+                                "relay tunnel decode failed: tunnel [{}], codec [{}], header [{}], bytes [{}], packet {}, err [{}]",
+                                tunnel_idx,
+                                codec.mode_name(),
+                                codec.header_len(),
+                                n,
+                                packet.dump_bin_limit(24),
+                                e
+                            );
+                            continue;
+                        }
+                    };
+                    last_valid_recv_at = Instant::now();
+
+                    if flow_id == UDP_RELAY_HEARTBEAT_FLOW_ID && payload.is_empty() {
+                        if inbound_tx
+                            .send(TunnelRecvEvent::Heartbeat { tunnel_idx })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    if payload.len() > max_payload {
+                        tracing::warn!(
+                            "drop oversized tunnel udp packet: tunnel [{}], flow [{}], size [{}], max [{}]",
+                            tunnel_idx,
+                            flow_id,
+                            payload.len(),
+                            max_payload
+                        );
+                        continue;
+                    }
+
+                    if inbound_tx
+                        .send(TunnelRecvEvent::Packet(TunnelInboundPacket {
+                            tunnel_idx,
+                            flow_id,
+                            payload: payload.to_vec(),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }
     })

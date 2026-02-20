@@ -397,6 +397,7 @@ const UDP_RELAY_FLOW_ID_MASK: u64 = (1_u64 << 48) - 1;
 const UDP_RELAY_DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const UDP_RELAY_PACKET_LIMIT: usize = 1452 ;
 const UDP_RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+const UDP_RELAY_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 const UDP_RELAY_HEARTBEAT_FLOW_ID: u64 = 0;
 const EXEC_SCRIPT_DEFAULT_TIMEOUT_SECS: u64 = 30;
 const EXEC_SCRIPT_DEFAULT_STDOUT_LIMIT: usize = 256 * 1024;
@@ -793,6 +794,9 @@ async fn run_udp_relay_server_loop(
     cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat_interval = tokio::time::interval(UDP_RELAY_HEARTBEAT_INTERVAL);
     heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat_timeout_check = tokio::time::interval(Duration::from_secs(1));
+    heartbeat_timeout_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_valid_recv_at = Instant::now();
 
     loop {
         tokio::select! {
@@ -810,18 +814,23 @@ async fn run_udp_relay_server_loop(
                         target_addr
                     );
                 }
-                let (flow_id, payload) = decode_udp_relay_packet(&tunnel_buf[..n], codec)
-                    .with_context(|| {
-                        format!(
-                            "decode udp relay packet failed, codec [{}], header [{}], bytes [{}], remote [{}], target [{}], packet {}",
+                let (flow_id, payload) = match decode_udp_relay_packet(&tunnel_buf[..n], codec) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            "decode udp relay packet failed, codec [{}], header [{}], bytes [{}], remote [{}], target [{}], packet {}, err [{}]",
                             codec.mode_name(),
                             codec.header_len(),
                             n,
                             remote_addr,
                             target_addr,
-                            (&tunnel_buf[..n]).dump_bin_limit(24)
-                        )
-                    })?;
+                            (&tunnel_buf[..n]).dump_bin_limit(24),
+                            e
+                        );
+                        continue;
+                    }
+                };
+                last_valid_recv_at = Instant::now();
                 if flow_id == UDP_RELAY_HEARTBEAT_FLOW_ID && payload.is_empty() {
                     continue;
                 }
@@ -918,6 +927,18 @@ async fn run_udp_relay_server_loop(
                             frame_len, remote_addr, target_addr
                         )
                     })?;
+            }
+            _ = heartbeat_timeout_check.tick() => {
+                let idle = Instant::now().saturating_duration_since(last_valid_recv_at);
+                if idle >= UDP_RELAY_HEARTBEAT_TIMEOUT {
+                    bail!(
+                        "udp relay heartbeat timeout: no valid packet for {}ms (timeout={}ms), remote [{}], target [{}]",
+                        idle.as_millis(),
+                        UDP_RELAY_HEARTBEAT_TIMEOUT.as_millis(),
+                        remote_addr,
+                        target_addr
+                    );
+                }
             }
         }
     }
