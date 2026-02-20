@@ -204,6 +204,107 @@ async fn relay_quic_smoke_multi_tunnel_e2e() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_quic_same_socket_burst_e2e() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (cert_path, key_path) = write_test_cert_pair(temp.path())?;
+
+    let signal_port = reserve_tcp_port()?;
+    let relay_port = reserve_udp_port()?;
+
+    let (echo_addr, echo_stop, echo_task) = spawn_udp_echo_server().await?;
+    let signal_addr = format!("127.0.0.1:{signal_port}");
+    let relay_addr: SocketAddr = format!("127.0.0.1:{relay_port}").parse()?;
+    let quic_url = format!("quic://{signal_addr}");
+    let rule = format!("udp://{relay_addr}?to={echo_addr}");
+
+    let mut listen = Proc::spawn(
+        "listen",
+        [
+            "agent",
+            "listen",
+            "--addr",
+            signal_addr.as_str(),
+            "--https-key",
+            key_path.to_string_lossy().as_ref(),
+            "--https-cert",
+            cert_path.to_string_lossy().as_ref(),
+            "--secret",
+            TEST_SECRET,
+        ],
+    )
+    .await?;
+
+    let mut publisher = Proc::spawn(
+        "pub",
+        [
+            "agent",
+            "pub",
+            quic_url.as_str(),
+            "--agent",
+            "relay-e2e-same-socket",
+            "--expire_in",
+            "10",
+            "--secret",
+            TEST_SECRET,
+            "--quic-insecure",
+        ],
+    )
+    .await?;
+
+    let mut relay = Proc::spawn(
+        "relay",
+        [
+            "relay",
+            "-L",
+            rule.as_str(),
+            quic_url.as_str(),
+            "--agent",
+            "^relay-e2e-same-socket$",
+            "--secret",
+            TEST_SECRET,
+            "--quic-insecure",
+            "--udp-idle-timeout",
+            "30",
+            "--p2p-min-channels",
+            "1",
+            "--p2p-max-channels",
+            "2",
+        ],
+    )
+    .await?;
+
+    let run_result = async {
+        wait_for_ready_roundtrip(&mut listen, &mut publisher, &mut relay, relay_addr).await?;
+
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .with_context(|| "bind same-socket udp client failed")?;
+        for idx in 0..50 {
+            let payload = format!("same-socket-{idx}").into_bytes();
+            udp_roundtrip_with_socket(
+                &socket,
+                relay_addr,
+                payload.as_slice(),
+                Duration::from_secs(2),
+            )
+            .await?;
+        }
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    relay.terminate().await;
+    publisher.terminate().await;
+    listen.terminate().await;
+
+    let _ = echo_stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), echo_task).await;
+
+    run_result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_quic_min_zero_opens_tunnel_on_demand_e2e() -> Result<()> {
     let temp = TempDir::new()?;
     let (cert_path, key_path) = write_test_cert_pair(temp.path())?;
@@ -990,6 +1091,15 @@ async fn udp_roundtrip_with_timeout(
         .await
         .with_context(|| "bind udp client failed")?;
 
+    udp_roundtrip_with_socket(&socket, relay_addr, payload, timeout).await
+}
+
+async fn udp_roundtrip_with_socket(
+    socket: &UdpSocket,
+    relay_addr: SocketAddr,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<()> {
     socket
         .send_to(payload, relay_addr)
         .await
