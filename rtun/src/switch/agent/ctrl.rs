@@ -697,7 +697,7 @@ async fn handle_udp_relay(
             }
             Err(e) => {
                 tracing::warn!(
-                    "[relay_agent_diag] udp relay tunnel failed: uid [{uid}], target [{target_addr}], err [{e}]"
+                    "[relay_agent_diag] udp relay tunnel failed: uid [{uid}], target [{target_addr}], err [{e:#}]"
                 );
             }
         }
@@ -1032,10 +1032,9 @@ async fn get_or_create_shared_relay_flow(
             }
             Err(e) => {
                 tracing::warn!(
-                    "[relay_agent_diag] udp relay flow recv task failed: flow [{}], target [{}], err [{}]",
+                    "[relay_agent_diag] udp relay flow recv task failed: flow [{}], target [{}], err [{e:#}]",
                     flow_key.flow_id,
                     flow_key.target_addr,
-                    e
                 );
             }
         }
