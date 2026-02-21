@@ -62,6 +62,7 @@ const UDP_RELAY_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_P2P_MIN_CHANNELS: usize = 1;
 const DEFAULT_P2P_MAX_CHANNELS: usize = 1;
 const DEFAULT_P2P_CHANNEL_LIFETIME_SECS: u64 = 120;
+const AGENT_REPLACE_AHEAD: Duration = Duration::from_secs(10 * 60);
 const P2P_EXPAND_CONNECT_TIMEOUT_INITIAL: Duration = Duration::from_secs(5);
 const P2P_EXPAND_CONNECT_TIMEOUT_MAX: Duration = Duration::from_secs(30);
 const FLOW_ROUTE_RESELECT_INTERVAL: Duration = Duration::from_secs(5);
@@ -1619,7 +1620,7 @@ async fn run_worker(worker: RelayWorker) -> Result<()> {
 
         let (stop_tx, mut session_task) =
             spawn_relay_session_task(worker.clone(), local.clone(), selected.clone());
-        let expire_wait = duration_until_expire(selected.expire_at);
+        let expire_wait = duration_until_replacement_window(selected.expire_at, AGENT_REPLACE_AHEAD);
 
         tokio::select! {
             r = &mut session_task => {
@@ -1638,7 +1639,8 @@ async fn run_worker(worker: RelayWorker) -> Result<()> {
             }
             _ = time::sleep(expire_wait) => {
                 tracing::info!(
-                    "current agent reached expire_at, preparing replacement: agent [{}], instance [{:?}]",
+                    "current agent entered replacement window (ahead={}s), preparing replacement: agent [{}], instance [{:?}]",
+                    AGENT_REPLACE_AHEAD.as_secs(),
                     selected.name,
                     selected.instance_id
                 );
@@ -1818,9 +1820,17 @@ fn script_switch_reason(r: &Result<Result<()>, tokio::task::JoinError>) -> Optio
     }
 }
 
-fn duration_until_expire(expire_at: u64) -> Duration {
-    let now_ms = Local::now().timestamp_millis() as u64;
-    Duration::from_millis(expire_at.saturating_sub(now_ms))
+fn duration_until_replacement_window(expire_at: u64, replace_ahead: Duration) -> Duration {
+    duration_until_replacement_window_at(expire_at, replace_ahead, now_millis_u64())
+}
+
+fn duration_until_replacement_window_at(
+    expire_at: u64,
+    replace_ahead: Duration,
+    now_ms: u64,
+) -> Duration {
+    let replace_at_ms = expire_at.saturating_sub(replace_ahead.as_millis() as u64);
+    Duration::from_millis(replace_at_ms.saturating_sub(now_ms))
 }
 
 fn handle_session_task_result(
@@ -4396,8 +4406,8 @@ pub struct CmdArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_udp_relay_packet, encode_udp_relay_packet, format_millis, max_udp_payload_auto,
-        parse_script_specs_from_args, pick_best_tunnel_idx_by, pick_latest_agent,
+        decode_udp_relay_packet, duration_until_replacement_window_at, encode_udp_relay_packet,
+        format_millis, max_udp_payload_auto, parse_script_specs_from_args, pick_best_tunnel_idx_by, pick_latest_agent,
         resolve_udp_max_payload, ChannelPoolConfig, RelayAgentScriptSource, RelayRule,
         UdpRelayCodec,
     };
@@ -4521,6 +4531,22 @@ mod tests {
         let regex = Regex::new("b").unwrap();
         let selected = pick_latest_agent(agents, &regex, 1_000);
         assert!(selected.is_err());
+    }
+
+    #[test]
+    fn replacement_window_wait_when_expire_after_11_minutes() {
+        let now_ms = 1_000_000_u64;
+        let expire_at = now_ms + 11 * 60 * 1_000;
+        let wait = duration_until_replacement_window_at(expire_at, Duration::from_secs(600), now_ms);
+        assert_eq!(wait, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn replacement_window_wait_zero_when_expire_within_10_minutes() {
+        let now_ms = 1_000_000_u64;
+        let expire_at = now_ms + 9 * 60 * 1_000;
+        let wait = duration_until_replacement_window_at(expire_at, Duration::from_secs(600), now_ms);
+        assert_eq!(wait, Duration::from_secs(0));
     }
 
     #[test]
