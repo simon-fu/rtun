@@ -44,8 +44,8 @@ use crate::{
         },
         next_ch_id::NextChId,
         udp_relay_codec::{
-            decode_udp_relay_packet, encode_udp_relay_packet, is_udp_relay_tag_mismatch,
-            packet_has_stun_magic, UdpRelayCodec, UDP_RELAY_HEARTBEAT_FLOW_ID,
+            decode_udp_relay_packet, encode_udp_relay_packet, packet_has_stun_magic,
+            UdpRelayCodec, UDP_RELAY_HEARTBEAT_FLOW_ID,
         },
     },
 };
@@ -672,8 +672,8 @@ async fn handle_udp_relay(
 
     let uid = peer.uid();
     let local_ice = peer.server_gather(remote_ice.clone()).await?;
-    tracing::debug!(
-        "starting udp relay tunnel {uid}, local {local_ice:?}, remote {remote_ice:?}, target [{target_addr}], idle {:?}, max_payload {}, codec {}",
+    tracing::warn!(
+        "[relay_agent_diag] starting udp relay tunnel {uid}, local {local_ice:?}, remote {remote_ice:?}, target [{target_addr}], idle {:?}, max_payload {}, codec {}",
         idle_timeout,
         max_payload,
         codec.mode_name()
@@ -691,11 +691,13 @@ async fn handle_udp_relay(
         .await;
         match r {
             Ok(()) => {
-                tracing::debug!("udp relay tunnel closed: uid [{uid}], target [{target_addr}]");
+                tracing::warn!(
+                    "[relay_agent_diag] udp relay tunnel closed: uid [{uid}], target [{target_addr}]"
+                );
             }
             Err(e) => {
-                tracing::debug!(
-                    "udp relay tunnel failed: uid [{uid}], target [{target_addr}], err [{e}]"
+                tracing::warn!(
+                    "[relay_agent_diag] udp relay tunnel failed: uid [{uid}], target [{target_addr}], err [{e}]"
                 );
             }
         }
@@ -818,7 +820,7 @@ async fn run_udp_relay_server_loop(
                     Ok(v) => v,
                     Err(e) => {
                         let packet = &tunnel_buf[..n];
-                        if is_udp_relay_tag_mismatch(&e) && packet_has_stun_magic(packet) {
+                        if packet_has_stun_magic(packet) {
                             tracing::debug!(
                                 "decode udp relay packet dropped stun-like packet, codec [{}], header [{}], bytes [{}], remote [{}], target [{}], packet {}, err [{}]",
                                 codec.mode_name(),
@@ -870,8 +872,8 @@ async fn run_udp_relay_server_loop(
                 touch_shared_relay_flow(&flow);
                 if let Err(e) = flow.socket.send(payload).await {
                     if e.kind() == ErrorKind::ConnectionRefused {
-                        tracing::debug!(
-                            "udp relay target refused packet, keep flow alive: flow [{}], target [{}], err [{}]",
+                        tracing::warn!(
+                            "[relay_agent_diag] udp relay target refused packet, keep flow alive: flow [{}], target [{}], err [{}]",
                             flow_id,
                             target_addr,
                             e
@@ -1029,8 +1031,8 @@ async fn get_or_create_shared_relay_flow(
                 );
             }
             Err(e) => {
-                tracing::debug!(
-                    "udp relay flow recv task failed: flow [{}], target [{}], err [{}]",
+                tracing::warn!(
+                    "[relay_agent_diag] udp relay flow recv task failed: flow [{}], target [{}], err [{}]",
                     flow_key.flow_id,
                     flow_key.target_addr,
                     e

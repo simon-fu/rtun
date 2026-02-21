@@ -33,7 +33,7 @@ use rtun::{
         session_stream::make_stream_session,
         udp_relay_codec::{
             decode_udp_relay_packet, encode_udp_relay_packet, gen_udp_relay_obfs_seed,
-            is_udp_relay_tag_mismatch, packet_has_stun_magic, UdpRelayCodec,
+            packet_has_stun_magic, UdpRelayCodec,
             UDP_RELAY_FLOW_ID_MASK_OBFS, UDP_RELAY_HEARTBEAT_FLOW_ID, UDP_RELAY_META_LEN_OBFS,
         },
     },
@@ -2276,7 +2276,7 @@ fn spawn_tunnel_recv_task(
                         Ok(v) => v,
                         Err(e) => {
                             let packet = &tun_buf[..n];
-                            if is_udp_relay_tag_mismatch(&e) && packet_has_stun_magic(packet) {
+                            if packet_has_stun_magic(packet) {
                                 tracing::debug!(
                                     "relay tunnel decode dropped stun-like packet: tunnel [{}], codec [{}], header [{}], bytes [{}], packet {}, err [{}]",
                                     tunnel_idx,

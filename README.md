@@ -260,6 +260,19 @@ TLV 约定（用于控制帧 body）：
 - 仅当显式提供 `--log-file <path>` 时写日志文件；未提供时不落盘日志
 - 非 `--tui` 模式保持现有控制台日志行为
 
+临时诊断日志关键字（agent 侧）：
+
+- 关键字：`[relay_agent_diag]`
+- 用途：临时将 agent 侧部分 relay 生命周期日志提升为 `warning`，便于线上排查
+- 当前覆盖事件：
+  - `starting udp relay tunnel`
+  - `udp relay tunnel closed`
+  - `udp relay tunnel failed`
+  - `udp relay target refused packet, keep flow alive`
+  - `udp relay flow recv task failed`
+- 使用示例：`grep "relay_agent_diag" /path/to/agent.log`
+- 回退方式：按 `relay_agent_diag` 关键字检索并统一降级日志级别
+
 ### 实施里程碑（建议）
 
 - P0：多通道智能路由核心能力（通道池、选路、flow 迁移、通道到期替换）

@@ -228,6 +228,7 @@ impl StunResolver {
         A: ToSocketAddrs + ToString,
     {
         let resolver = self;
+        let local_ip_family = socket.local_addr().ok().map(|x| x.ip().is_ipv4());
 
         let mut lookup_futures = FuturesUnordered::new();
         for host in servers {
@@ -264,7 +265,23 @@ impl StunResolver {
                 r = lookup_futures.next(), if !lookup_futures.is_empty() => {
                     match r {
                         Some(Ok((iter, addr))) => {
-                            resolver.kick_targets(iter, Instant::now(), Some(addr.as_str()))?;
+                            let now = Instant::now();
+                            for target in iter {
+                                let family_supported = local_ip_family.is_none_or(|is_ipv4| {
+                                    (is_ipv4 && target.ip().is_ipv4())
+                                        || (!is_ipv4 && target.ip().is_ipv6())
+                                });
+                                if family_supported {
+                                    resolver.kick_target(target, now)?;
+                                } else {
+                                    tracing::debug!(
+                                        "skip stun target due to local address family mismatch: host {:?}, local_is_ipv4 {:?}, target [{}]",
+                                        addr,
+                                        local_ip_family,
+                                        target
+                                    );
+                                }
+                            }
                         }
 
                         Some(Err(e)) => {
