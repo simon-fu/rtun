@@ -1,9 +1,13 @@
-use std::time::{Duration, Instant};
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use chrono::Local;
 use clap::Parser;
 use rtun::{
+    async_rt::spawn_with_name,
     huid::gen_huid::gen_huid,
     switch::{
         ctrl_service::ExitReason,
@@ -14,11 +18,14 @@ use rtun::{
     },
     ws::client::ws_connect_to,
 };
+use tokio::net::UdpSocket;
 
 use crate::rest_proto::{make_pub_url, make_ws_scheme};
 use crate::secret::token_gen;
 
 pub async fn run(args0: CmdArgs) -> Result<()> {
+    start_default_udp_echo_task().await?;
+
     let mut url = url::Url::parse(&args0.url).with_context(|| "invalid url")?;
 
     let is_quic = url.scheme().eq_ignore_ascii_case("quic");
@@ -94,6 +101,54 @@ pub async fn run(args0: CmdArgs) -> Result<()> {
     // let r = agent.wait_for_completed().await;
     // tracing::debug!("agent ctrl finished with {:?}", r);
     // Ok(())
+}
+
+async fn start_default_udp_echo_task() -> Result<()> {
+    const DEFAULT_UDP_ECHO_ADDR: &str = "127.0.0.1:12345";
+    let addr: SocketAddr = DEFAULT_UDP_ECHO_ADDR
+        .parse()
+        .with_context(|| format!("invalid default udp echo addr [{DEFAULT_UDP_ECHO_ADDR}]"))?;
+    let socket = UdpSocket::bind(addr)
+        .await
+        .with_context(|| format!("default udp echo bind failed [{addr}]"))?;
+
+    tracing::info!("default udp echo task listening on [{addr}]");
+
+    spawn_with_name("agent-udp-echo-default", async move {
+        if let Err(e) = run_default_udp_echo_task(addr, socket).await {
+            tracing::warn!(
+                "default udp echo task stopped: listen [{}], err [{:#}]",
+                addr,
+                e
+            );
+        }
+    });
+
+    Ok(())
+}
+
+async fn run_default_udp_echo_task(addr: SocketAddr, socket: UdpSocket) -> Result<()> {
+    let mut buf = vec![0_u8; 64 * 1024];
+
+    loop {
+        let (n, peer) = socket
+            .recv_from(&mut buf)
+            .await
+            .with_context(|| format!("udp echo recv failed [{addr}]"))?;
+        if n == 0 {
+            continue;
+        }
+
+        if let Err(e) = socket.send_to(&buf[..n], peer).await {
+            tracing::warn!(
+                "udp echo send failed: listen [{}], peer [{}], bytes [{}], err [{}]",
+                addr,
+                peer,
+                n,
+                e
+            );
+        }
+    }
 }
 
 async fn run_loop_ws(url: &url::Url, expire_in: Duration, disable_shell: bool) {
