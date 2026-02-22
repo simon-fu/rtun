@@ -83,6 +83,19 @@ fn next_expand_connect_timeout(curr: Duration) -> Duration {
     Duration::from_millis(next_ms as u64)
 }
 
+fn next_open_connect_timeout(
+    curr: Duration,
+    tunnels: &[Option<RelayTunnel>],
+) -> Duration {
+    let active = active_tunnel_count(tunnels);
+    // When all tunnels are down, keep retry cadence aggressive instead of exponential backoff.
+    if active == 0 {
+        P2P_EXPAND_CONNECT_TIMEOUT_INITIAL
+    } else {
+        next_expand_connect_timeout(curr)
+    }
+}
+
 pub fn run(args: CmdArgs) -> Result<()> {
     init_relay_log(&args)?;
     run_multi_thread(do_run(args))??;
@@ -3387,7 +3400,10 @@ async fn relay_loop<H: CtrlHandler>(
                         }
                     }
                     Ok(Ok(TunnelOpenTaskResult::Timeout)) => {
-                        let next_timeout = next_expand_connect_timeout(p2p_expand_connect_timeout);
+                        let next_timeout = next_open_connect_timeout(
+                            pending.timeout,
+                            &tunnels,
+                        );
                         match pending.action {
                             TunnelOpenAction::ScaleUp { desired } => {
                                 let target_idx = first_inactive_tunnel_idx(&tunnels)
@@ -3419,7 +3435,10 @@ async fn relay_loop<H: CtrlHandler>(
                         p2p_expand_connect_timeout = next_timeout;
                     }
                     Ok(Err(e)) => {
-                        let next_timeout = next_expand_connect_timeout(p2p_expand_connect_timeout);
+                        let next_timeout = next_open_connect_timeout(
+                            pending.timeout,
+                            &tunnels,
+                        );
                         match pending.action {
                             TunnelOpenAction::ScaleUp { desired } => {
                                 let target_idx = first_inactive_tunnel_idx(&tunnels)
@@ -3454,7 +3473,10 @@ async fn relay_loop<H: CtrlHandler>(
                         p2p_expand_connect_timeout = next_timeout;
                     }
                     Err(e) => {
-                        let next_timeout = next_expand_connect_timeout(p2p_expand_connect_timeout);
+                        let next_timeout = next_open_connect_timeout(
+                            pending.timeout,
+                            &tunnels,
+                        );
                         tracing::warn!(
                             "relay tunnel open task failed: action [{:?}], timeout={}ms, next_timeout={}ms, err [{}]",
                             pending.action,
@@ -4576,6 +4598,16 @@ mod tests {
         let cfg = ChannelPoolConfig::new(0, 3).unwrap();
         assert_eq!(cfg.desired_channels(0), 0);
         assert_eq!(cfg.desired_channels(1), 3);
+    }
+
+    #[test]
+    fn next_open_connect_timeout_resets_when_all_tunnels_down() {
+        let tunnels: Vec<Option<super::RelayTunnel>> = vec![None, None];
+        let curr = Duration::from_secs(30);
+
+        let next = super::next_open_connect_timeout(curr, &tunnels);
+
+        assert_eq!(next, super::P2P_EXPAND_CONNECT_TIMEOUT_INITIAL);
     }
 
     #[test]
