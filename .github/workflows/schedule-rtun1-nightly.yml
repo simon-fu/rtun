@@ -48,6 +48,6 @@ jobs:
         echo RUST_LOG=$RUST_LOG
         echo AGENT_NAME=$AGENT_NAME
 
-        ./rtun-x86_64-unknown-linux-musl agent pub "${{ secrets.MY_RTUN1_URL }}" --agent $AGENT_NAME --expire_in 110 --secret ${{ secrets.MY_RTUN1_SECRET }} 
+        ./rtun-x86_64-unknown-linux-musl agent pub "${{ secrets.MY_RTUN1_URL }}" --agent $AGENT_NAME --expire_in 240 --secret ${{ secrets.MY_RTUN1_SECRET }} 
 
 
