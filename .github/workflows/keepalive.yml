@@ -27,7 +27,11 @@ jobs:
           git config --local user.name "github-actions[bot]"
           
           # 追加当前时间到文件（如果文件不存在会自动创建）
-          echo "Last heartbeat: $(date)" >> KEEP_ALIVE.md
+          # 若文件末尾缺少换行，先补一个换行，避免内容粘在同一行
+          if [ -f KEEP_ALIVE.md ] && [ -s KEEP_ALIVE.md ]; then
+            tail -c 1 KEEP_ALIVE.md | od -An -t x1 | grep -q '0a' || printf '\n' >> KEEP_ALIVE.md
+          fi
+          printf 'Last heartbeat: %s\n' "$(date)" >> KEEP_ALIVE.md
           
           # 提交并推送
           git add KEEP_ALIVE.md
