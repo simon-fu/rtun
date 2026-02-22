@@ -73,6 +73,7 @@ const RELAY_TUNNEL_DOWN_TTL: Duration = Duration::from_secs(10);
 const RELAY_TUI_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
 const RELAY_TUI_MAX_EVENT_BUFFER: usize = 256;
 const DEFAULT_AGENT_SCRIPT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_P2P_OPEN_RETRY_MIN_INTERVAL_SECS: u64 = 2;
 const AGENT_SCRIPT_STDOUT_LIMIT: u32 = 256 * 1024;
 const AGENT_SCRIPT_STDERR_LIMIT: u32 = 256 * 1024;
 
@@ -1485,6 +1486,8 @@ async fn do_run(args: CmdArgs) -> Result<()> {
         args.p2p_channel_lifetime
     };
     let p2p_channel_lifetime = Duration::from_secs(p2p_channel_lifetime_secs);
+    let p2p_open_retry_min_interval_secs = args.p2p_open_retry_min_interval;
+    let p2p_open_retry_min_interval = Duration::from_secs(p2p_open_retry_min_interval_secs);
     let max_payload = resolve_udp_max_payload(args.udp_max_payload)?;
     let channel_pool = ChannelPoolConfig::new(args.p2p_min_channels, args.p2p_max_channels)?;
     let agent_script_timeout_secs = if args.agent_script_timeout == 0 {
@@ -1513,12 +1516,13 @@ async fn do_run(args: CmdArgs) -> Result<()> {
     }
 
     tracing::info!(
-        "relay defaults: udp_idle_timeout={}s, udp_max_payload={} bytes, p2p_channels={}/{}, p2p_channel_lifetime={}s",
+        "relay defaults: udp_idle_timeout={}s, udp_max_payload={} bytes, p2p_channels={}/{}, p2p_channel_lifetime={}s, p2p_open_retry_min_interval={}s",
         idle_timeout_secs,
         max_payload,
         channel_pool.min_channels,
         channel_pool.max_channels,
-        p2p_channel_lifetime_secs
+        p2p_channel_lifetime_secs,
+        p2p_open_retry_min_interval_secs
     );
 
     let mut state_hubs = Vec::with_capacity(rules.len());
@@ -1534,6 +1538,7 @@ async fn do_run(args: CmdArgs) -> Result<()> {
             max_payload,
             channel_pool,
             p2p_channel_lifetime,
+            p2p_open_retry_min_interval,
             agent_scripts: agent_scripts.clone(),
             agent_script_timeout,
             agent_script_fail_policy: args.agent_script_fail_policy,
@@ -1916,6 +1921,7 @@ async fn run_with_ws_signal(
             worker.max_payload,
             worker.channel_pool,
             worker.p2p_channel_lifetime,
+            worker.p2p_open_retry_min_interval,
         ) => r,
         r = session.wait_for_completed() => {
             r?;
@@ -1972,6 +1978,7 @@ async fn run_with_quic_signal(
             worker.max_payload,
             worker.channel_pool,
             worker.p2p_channel_lifetime,
+            worker.p2p_open_retry_min_interval,
         ) => r,
         r = session.wait_for_completed() => {
             r?;
@@ -2095,6 +2102,7 @@ async fn run_relay_session<H: CtrlHandler>(
     max_payload: usize,
     channel_pool: ChannelPoolConfig,
     p2p_channel_lifetime: Duration,
+    p2p_open_retry_min_interval: Duration,
 ) -> Result<()> {
     let idle_timeout_secs = u32::try_from(idle_timeout.as_secs())
         .with_context(|| format!("udp idle timeout too large [{}s]", idle_timeout.as_secs()))?;
@@ -2165,6 +2173,7 @@ async fn run_relay_session<H: CtrlHandler>(
         tunnel_states,
         tunnel_activity,
         p2p_channel_lifetime,
+        p2p_open_retry_min_interval,
         next_tunnel_id,
         inbound_tx,
         inbound_rx,
@@ -2946,7 +2955,24 @@ enum TunnelOpenTaskResult {
 struct PendingTunnelOpen {
     action: TunnelOpenAction,
     timeout: Duration,
+    started_at: Instant,
     handle: JoinHandle<Result<TunnelOpenTaskResult>>,
+}
+
+fn failed_open_retry_not_before(
+    started_at: Instant,
+    now: Instant,
+    min_interval: Duration,
+) -> Option<Instant> {
+    if min_interval.is_zero() {
+        return None;
+    }
+    let not_before = started_at + min_interval;
+    if now < not_before {
+        Some(not_before)
+    } else {
+        None
+    }
 }
 
 fn first_expired_allocatable_tunnel_idx(
@@ -3007,6 +3033,7 @@ fn spawn_tunnel_open_task<H: CtrlHandler>(
     }
     .to_string();
 
+    let started_at = Instant::now();
     let handle = spawn_with_name(task_name, async move {
         match time::timeout(
             timeout,
@@ -3023,6 +3050,7 @@ fn spawn_tunnel_open_task<H: CtrlHandler>(
     PendingTunnelOpen {
         action,
         timeout,
+        started_at,
         handle,
     }
 }
@@ -3094,6 +3122,7 @@ async fn relay_loop<H: CtrlHandler>(
     mut tunnel_states: Vec<Option<RelayTunnelState>>,
     mut tunnel_activity: Vec<Option<Instant>>,
     p2p_channel_lifetime: Duration,
+    p2p_open_retry_min_interval: Duration,
     mut next_tunnel_id: u64,
     inbound_tx: mpsc::Sender<TunnelRecvEvent>,
     mut inbound_rx: mpsc::Receiver<TunnelRecvEvent>,
@@ -3110,6 +3139,7 @@ async fn relay_loop<H: CtrlHandler>(
     let mut next_tunnel_for_new_flow = 0_usize;
     let mut p2p_expand_connect_timeout = P2P_EXPAND_CONNECT_TIMEOUT_INITIAL;
     let mut pending_tunnel_open: Option<PendingTunnelOpen> = None;
+    let mut next_tunnel_open_not_before: Option<Instant> = None;
     let mut demand_open_pending = false;
 
     let mut cleanup = time::interval(FLOW_CLEANUP_INTERVAL);
@@ -3118,7 +3148,24 @@ async fn relay_loop<H: CtrlHandler>(
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let result: Result<()> = loop {
-        if pending_tunnel_open.is_none() {
+        let retry_wait = if pending_tunnel_open.is_none() {
+            match next_tunnel_open_not_before {
+                Some(not_before) => {
+                    let now = Instant::now();
+                    if now < not_before {
+                        Some(not_before.saturating_duration_since(now))
+                    } else {
+                        next_tunnel_open_not_before = None;
+                        None
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        if pending_tunnel_open.is_none() && retry_wait.is_none() {
             if let Some(action) = pick_tunnel_open_action(
                 channel_pool,
                 src_to_flow.len(),
@@ -3139,6 +3186,13 @@ async fn relay_loop<H: CtrlHandler>(
         }
 
         tokio::select! {
+            _ = async {
+                if let Some(wait) = retry_wait {
+                    time::sleep(wait).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if retry_wait.is_some() => {}
             r = local.recv_from(&mut local_buf), if active_tunnel_count(&tunnels) > 0 => {
                 let (n, from) = r?;
                 if n == 0 {
@@ -3308,6 +3362,7 @@ async fn relay_loop<H: CtrlHandler>(
                 match open_result {
                     Ok(Ok(TunnelOpenTaskResult::Opened(tunnel))) => {
                         p2p_expand_connect_timeout = P2P_EXPAND_CONNECT_TIMEOUT_INITIAL;
+                        next_tunnel_open_not_before = None;
                         let now = Instant::now();
                         let (new_idx, new_tunnel_id, mode) = apply_opened_tunnel(
                             tunnel,
@@ -3404,6 +3459,20 @@ async fn relay_loop<H: CtrlHandler>(
                             pending.timeout,
                             &tunnels,
                         );
+                        let now = Instant::now();
+                        next_tunnel_open_not_before = failed_open_retry_not_before(
+                            pending.started_at,
+                            now,
+                            p2p_open_retry_min_interval,
+                        );
+                        if let Some(not_before) = next_tunnel_open_not_before {
+                            tracing::debug!(
+                                "relay tunnel open retry throttled(after timeout): wait={}ms, elapsed={}ms, min_interval={}ms",
+                                not_before.saturating_duration_since(now).as_millis(),
+                                now.saturating_duration_since(pending.started_at).as_millis(),
+                                p2p_open_retry_min_interval.as_millis()
+                            );
+                        }
                         match pending.action {
                             TunnelOpenAction::ScaleUp { desired } => {
                                 let target_idx = first_inactive_tunnel_idx(&tunnels)
@@ -3439,6 +3508,20 @@ async fn relay_loop<H: CtrlHandler>(
                             pending.timeout,
                             &tunnels,
                         );
+                        let now = Instant::now();
+                        next_tunnel_open_not_before = failed_open_retry_not_before(
+                            pending.started_at,
+                            now,
+                            p2p_open_retry_min_interval,
+                        );
+                        if let Some(not_before) = next_tunnel_open_not_before {
+                            tracing::debug!(
+                                "relay tunnel open retry throttled(after error): wait={}ms, elapsed={}ms, min_interval={}ms",
+                                not_before.saturating_duration_since(now).as_millis(),
+                                now.saturating_duration_since(pending.started_at).as_millis(),
+                                p2p_open_retry_min_interval.as_millis()
+                            );
+                        }
                         match pending.action {
                             TunnelOpenAction::ScaleUp { desired } => {
                                 let target_idx = first_inactive_tunnel_idx(&tunnels)
@@ -3477,6 +3560,20 @@ async fn relay_loop<H: CtrlHandler>(
                             pending.timeout,
                             &tunnels,
                         );
+                        let now = Instant::now();
+                        next_tunnel_open_not_before = failed_open_retry_not_before(
+                            pending.started_at,
+                            now,
+                            p2p_open_retry_min_interval,
+                        );
+                        if let Some(not_before) = next_tunnel_open_not_before {
+                            tracing::debug!(
+                                "relay tunnel open retry throttled(after task error): wait={}ms, elapsed={}ms, min_interval={}ms",
+                                not_before.saturating_duration_since(now).as_millis(),
+                                now.saturating_duration_since(pending.started_at).as_millis(),
+                                p2p_open_retry_min_interval.as_millis()
+                            );
+                        }
                         tracing::warn!(
                             "relay tunnel open task failed: action [{:?}], timeout={}ms, next_timeout={}ms, err [{}]",
                             pending.action,
@@ -4014,6 +4111,7 @@ struct RelayWorker {
     max_payload: usize,
     channel_pool: ChannelPoolConfig,
     p2p_channel_lifetime: Duration,
+    p2p_open_retry_min_interval: Duration,
     agent_scripts: Arc<Vec<RelayAgentScriptSpec>>,
     agent_script_timeout: Duration,
     agent_script_fail_policy: AgentScriptFailPolicy,
@@ -4423,6 +4521,13 @@ pub struct CmdArgs {
         default_value_t = DEFAULT_P2P_CHANNEL_LIFETIME_SECS
     )]
     p2p_channel_lifetime: u64,
+
+    #[clap(
+        long = "p2p-open-retry-min-interval",
+        long_help = "minimum interval in seconds between failed tunnel-open attempt starts",
+        default_value_t = DEFAULT_P2P_OPEN_RETRY_MIN_INTERVAL_SECS
+    )]
+    p2p_open_retry_min_interval: u64,
 }
 
 #[cfg(test)]
@@ -4608,6 +4713,26 @@ mod tests {
         let next = super::next_open_connect_timeout(curr, &tunnels);
 
         assert_eq!(next, super::P2P_EXPAND_CONNECT_TIMEOUT_INITIAL);
+    }
+
+    #[test]
+    fn failed_open_retry_min_interval_is_measured_from_attempt_start() {
+        let started_at = Instant::now();
+        let min_interval = Duration::from_secs(2);
+
+        let retry_not_before = super::failed_open_retry_not_before(
+            started_at,
+            started_at + Duration::from_millis(100),
+            min_interval,
+        );
+        assert_eq!(retry_not_before, Some(started_at + min_interval));
+
+        let retry_not_before = super::failed_open_retry_not_before(
+            started_at,
+            started_at + Duration::from_secs(2),
+            min_interval,
+        );
+        assert_eq!(retry_not_before, None);
     }
 
     #[test]
