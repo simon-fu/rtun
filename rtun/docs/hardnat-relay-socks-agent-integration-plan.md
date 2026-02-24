@@ -225,37 +225,36 @@
 
 ---
 
-## Milestone 3：`relay + agent` 的 UDP relay 高难 NAT fallback（第一条生产路径）
+## Milestone 3：`relay + agent` 的 UDP relay 高难 NAT 参数/日志占位（不实现 fallback）
 
 ### 目标
 
-在 `UdpRelay` 建链中增加 `fallback` 模式：ICE 失败后尝试高难 NAT 打洞；默认关闭。
+在 `UdpRelay` 建链路径中补齐 hard-nat 的参数入口与诊断日志占位，默认关闭；本里程碑不实现 fallback 打洞逻辑。
 
 ### 待办事项
 
-- [ ] 定义 `UdpRelay` 的建链编排层（例如 `open_udp_relay_tunnel_with_fallback`）
-- [ ] 保留现有 `open_udp_relay_tunnel(...)` 作为 ICE 主路径实现
-- [ ] 仅在 `hard_nat.mode=fallback` 时启用 fallback 分支
-- [ ] relay 侧：ICE 失败条件分类（仅对可重试/无选中地址触发 fallback）
-- [ ] agent 侧：`handle_udp_relay(...)` 增加 hard-nat server 角色支持（不影响 ICE 默认路径）
-- [ ] 实现 token/session 关联，避免串会话误判
-- [ ] 成功后统一返回同样的 UDP 通道抽象给上层（上层不用知道来源）
-- [ ] 失败时保留原有错误并追加 hard-nat 失败上下文
-- [ ] 增加独立日志前缀（建议 `[relay_hardnat_diag]` / `[agent_hardnat_diag]`）
+- [x] `cmd_relay` 增加 hard-nat CLI 参数（默认 `off`）
+- [x] relay 侧把 CLI 参数映射到 `UdpRelayArgs.hard_nat`（仅传参，不改建链分支）
+- [x] relay 侧增加 hard-nat 配置日志（mode/role/socket_count/scan_count/ttl 等）
+- [x] agent 侧增强 hard-nat 参数解析与诊断日志（收到非 `off` 时打印明确告警/占位日志）
+- [x] 保持 `open_udp_relay_tunnel(...)` 与 `handle_udp_relay(...)` 的 ICE 主路径行为不变
+- [x] 增加参数解析/默认值单测（至少 `off`、`fallback`、`role`、`ttl/no_ttl`）
+- [x] 增加日志前缀约定（建议 `[relay_hardnat_diag]` / `[agent_hardnat_diag]`）
+- [x] 在文档中明确：实际 fallback 实现延后到后续里程碑
 
 ### 验收项
 
 - [ ] 默认模式（off）下，`relay` 行为完全不变
-- [ ] `fallback` 开启后，普通网络场景 ICE 成功，hard-nat 不干扰
-- [ ] 人工构造 ICE 失败场景时，能看到 fallback 尝试日志
-- [ ] fallback 成功时，UDP relay 能持续转发（用 `udp echo` + `udp_probe_local.py` 验证）
+- [ ] 传入 hard-nat 参数时，relay/agent 两侧能看到一致的配置/占位日志
+- [ ] 设置 `hard_nat.mode=fallback` 时，不触发实际 fallback，只出现明确“未实现/占位”日志
+- [ ] 基本 UDP relay 建链/转发回归不受影响
 
 ### 人工检查点（必须停）
 
-1. 重点评审资源释放（socket/task 是否泄漏）
-2. 检查日志是否能明确区分 `ICE fail` / `HardNAT fail`
-3. 长跑验证（至少一轮）
-4. 确认后进入 Milestone 4
+1. 审查 CLI 参数默认值与 proto 映射是否一致
+2. 检查占位日志是否足够明确（不会误导为已启用 fallback）
+3. 回归一轮 UDP relay 基本链路（确认无行为变化）
+4. 确认后进入 Milestone 4（再决定是否恢复/插入 relay fallback 实现里程碑）
 
 ---
 
@@ -382,7 +381,7 @@
 - [x] Milestone 0（方案文档）已创建
 - [x] Milestone 1 实施完成（人工检查通过）
 - [ ] Milestone 2 实施完成（待人工检查）
-- [ ] Milestone 3 未开始
+- [ ] Milestone 3 实施完成（待人工检查）
 - [ ] Milestone 4 未开始
 - [ ] Milestone 5 未开始
 - [ ] Milestone 6 未开始

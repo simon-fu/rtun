@@ -650,7 +650,8 @@ async fn handle_udp_relay(
     let hard_nat_mode = resolve_udp_relay_hard_nat_mode(&remote_args.hard_nat);
     if hard_nat_mode != HardNatMode::Off {
         tracing::warn!(
-            "[relay_agent_diag] udp relay hard-nat mode [{hard_nat_mode:?}] requested but not implemented in this build; fallback to ICE-only"
+            "[agent_hardnat_diag] udp relay hard-nat requested (placeholder only): {}; ICE-only path remains active",
+            format_udp_relay_hard_nat_args(&remote_args.hard_nat, hard_nat_mode),
         );
     }
     let remote_ice: IceArgs = remote_args
@@ -760,6 +761,38 @@ fn resolve_udp_relay_hard_nat_mode(hard_nat: &MessageField<P2PHardNatArgs>) -> H
         3 => HardNatMode::Force,
         _ => HardNatMode::Off,
     }
+}
+
+fn format_udp_relay_hard_nat_args(
+    hard_nat: &MessageField<P2PHardNatArgs>,
+    mode: HardNatMode,
+) -> String {
+    let Some(hard_nat) = hard_nat.as_ref() else {
+        return format!("mode={mode:?}, field=missing");
+    };
+
+    let role = match hard_nat.role {
+        1 => "nat3",
+        2 => "nat4",
+        _ => "auto",
+    };
+    let ttl = match (hard_nat.ttl, hard_nat.no_ttl) {
+        (0, true) => "disabled".to_string(),
+        (ttl, true) => format!("{ttl} (disabled by no_ttl)"),
+        (0, false) => "auto".to_string(),
+        (ttl, false) => ttl.to_string(),
+    };
+
+    format!(
+        "mode={mode:?}, role={}, socket_count={}, scan_count={}, interval_ms={}, batch_interval_ms={}, ttl={}, no_ttl={}",
+        role,
+        hard_nat.socket_count,
+        hard_nat.scan_count,
+        hard_nat.interval_ms,
+        hard_nat.batch_interval_ms,
+        ttl,
+        hard_nat.no_ttl
+    )
 }
 
 async fn udp_relay_task(
