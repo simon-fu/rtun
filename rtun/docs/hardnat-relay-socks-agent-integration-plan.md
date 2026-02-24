@@ -203,13 +203,13 @@
 
 ### 待办事项
 
-- [ ] 在 `rtun/proto/app.proto` 新增 `P2PHardNatArgs`（optional）
-- [ ] 在 `UdpRelayArgs` 挂载 `hard_nat` 可选字段
+- [x] 在 `rtun/proto/app.proto` 新增 `P2PHardNatArgs`（optional）
+- [x] 在 `UdpRelayArgs` 挂载 `hard_nat` 可选字段
 - [ ] （可选）在 `P2PQuicArgs` 挂载 `hard_nat` 可选字段（若阶段内准备同步做 socks）
-- [ ] 重新生成 proto 代码（若工程生成流程需要）
-- [ ] 在 relay 构造 `UdpRelayArgs` 时支持填充字段（默认不填）
-- [ ] 在 agent 解析 `UdpRelayArgs` 时安全读取字段（不存在则 `off`）
-- [ ] 增加兼容性测试/断言（字段缺失不改变行为）
+- [x] 重新生成 proto 代码（若工程生成流程需要）
+- [x] 在 relay 构造 `UdpRelayArgs` 时支持填充字段（默认不填）
+- [x] 在 agent 解析 `UdpRelayArgs` 时安全读取字段（不存在则 `off`）
+- [x] 增加兼容性测试/断言（字段缺失不改变行为）
 
 ### 验收项
 
@@ -381,7 +381,7 @@
 
 - [x] Milestone 0（方案文档）已创建
 - [x] Milestone 1 实施完成（人工检查通过）
-- [ ] Milestone 2 未开始
+- [ ] Milestone 2 实施完成（待人工检查）
 - [ ] Milestone 3 未开始
 - [ ] Milestone 4 未开始
 - [ ] Milestone 5 未开始

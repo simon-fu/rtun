@@ -29,10 +29,11 @@ use crate::{
         throughput::run_throughput,
         webrtc_ice_peer::{DtlsIceArgs, WebrtcIceConfig, WebrtcIcePeer},
     },
+    p2p::hard_nat::HardNatMode,
     proto::{
         open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, ExecAgentScriptArgs,
-        ExecAgentScriptResult, OpenP2PResponse, P2PArgs, P2PDtlsArgs, P2PQuicArgs, QuicSocksArgs,
-        QuicThroughputArgs, UdpRelayArgs, WebrtcThroughputArgs,
+        ExecAgentScriptResult, OpenP2PResponse, P2PArgs, P2PDtlsArgs, P2PHardNatArgs,
+        P2PQuicArgs, QuicSocksArgs, QuicThroughputArgs, UdpRelayArgs, WebrtcThroughputArgs,
     },
     switch::{
         agent::ch_socks::ChSocks,
@@ -646,6 +647,12 @@ async fn handle_udp_relay(
     shared_flows: SharedRelayFlows,
     mut remote_args: UdpRelayArgs,
 ) -> Result<OpenP2PResponse> {
+    let hard_nat_mode = resolve_udp_relay_hard_nat_mode(&remote_args.hard_nat);
+    if hard_nat_mode != HardNatMode::Off {
+        tracing::warn!(
+            "[relay_agent_diag] udp relay hard-nat mode [{hard_nat_mode:?}] requested but not implemented in this build; fallback to ICE-only"
+        );
+    }
     let remote_ice: IceArgs = remote_args
         .ice
         .take()
@@ -741,6 +748,18 @@ fn resolve_udp_relay_max_payload(input: u32, codec: UdpRelayCodec) -> Result<usi
 
 fn udp_relay_auto_payload(codec: UdpRelayCodec) -> usize {
     UDP_RELAY_PACKET_LIMIT.saturating_sub(codec.header_len())
+}
+
+fn resolve_udp_relay_hard_nat_mode(hard_nat: &MessageField<P2PHardNatArgs>) -> HardNatMode {
+    let Some(hard_nat) = hard_nat.as_ref() else {
+        return HardNatMode::Off;
+    };
+    match hard_nat.mode {
+        1 => HardNatMode::Fallback,
+        2 => HardNatMode::Assist,
+        3 => HardNatMode::Force,
+        _ => HardNatMode::Off,
+    }
 }
 
 async fn udp_relay_task(
@@ -1377,6 +1396,21 @@ impl Drop for ChItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn udp_relay_hard_nat_mode_defaults_to_off_when_field_missing_or_zero() {
+        let args = UdpRelayArgs::default();
+        assert_eq!(resolve_udp_relay_hard_nat_mode(&args.hard_nat), HardNatMode::Off);
+
+        let args = UdpRelayArgs {
+            hard_nat: MessageField::some(P2PHardNatArgs {
+                mode: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(resolve_udp_relay_hard_nat_mode(&args.hard_nat), HardNatMode::Off);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn udp_relay_same_flow_should_keep_stable_target_src_port_across_tunnels() -> Result<()> {

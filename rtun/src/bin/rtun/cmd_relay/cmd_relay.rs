@@ -26,7 +26,7 @@ use rtun::{
     ice::ice_peer::{default_ice_servers, IceArgs, IceConfig, IcePeer},
     proto::{
         open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, ExecAgentScriptArgs,
-        ExecAgentScriptResult, P2PArgs, UdpRelayArgs,
+        ExecAgentScriptResult, P2PArgs, P2PHardNatArgs, UdpRelayArgs,
     },
     switch::{
         invoker_ctrl::{CtrlHandler, CtrlInvoker},
@@ -2202,6 +2202,7 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
                 idle_timeout_secs,
                 max_payload: max_payload as u32,
                 obfs_seed: local_codec.obfs_seed,
+                hard_nat: build_udp_relay_hard_nat_args(),
                 ..Default::default()
             })),
             ..Default::default()
@@ -2238,6 +2239,11 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
         socket: Arc::new(socket),
         codec,
     })
+}
+
+fn build_udp_relay_hard_nat_args() -> protobuf::MessageField<P2PHardNatArgs> {
+    // Milestone 2 protocol hook: keep relay behavior unchanged until CLI/policy wiring lands.
+    protobuf::MessageField::none()
 }
 
 fn spawn_tunnel_recv_task(
