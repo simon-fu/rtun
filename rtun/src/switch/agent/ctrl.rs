@@ -322,6 +322,13 @@ async fn handle_quic_socks(
     socks_server: super::ch_socks::Server,
     mut remote_args: P2PQuicArgs,
 ) -> Result<OpenP2PResponse> {
+    let hard_nat_mode = resolve_udp_relay_hard_nat_mode(&remote_args.hard_nat);
+    if hard_nat_mode != HardNatMode::Off {
+        tracing::warn!(
+            "[agent_hardnat_diag] quic socks hard-nat requested (placeholder only): {}; ICE-only path remains active",
+            format_udp_relay_hard_nat_args(&remote_args.hard_nat, hard_nat_mode),
+        );
+    }
     let remote_ice: IceArgs = remote_args
         .ice
         .take()
@@ -1436,6 +1443,21 @@ mod tests {
         assert_eq!(resolve_udp_relay_hard_nat_mode(&args.hard_nat), HardNatMode::Off);
 
         let args = UdpRelayArgs {
+            hard_nat: MessageField::some(P2PHardNatArgs {
+                mode: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(resolve_udp_relay_hard_nat_mode(&args.hard_nat), HardNatMode::Off);
+    }
+
+    #[test]
+    fn quic_socks_hard_nat_mode_defaults_to_off_when_field_missing_or_zero() {
+        let args = P2PQuicArgs::default();
+        assert_eq!(resolve_udp_relay_hard_nat_mode(&args.hard_nat), HardNatMode::Off);
+
+        let args = P2PQuicArgs {
             hard_nat: MessageField::some(P2PHardNatArgs {
                 mode: 0,
                 ..Default::default()

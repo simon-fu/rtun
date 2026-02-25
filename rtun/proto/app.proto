@@ -128,6 +128,7 @@ message P2PArgs  {
 message P2PQuicArgs {
     P2PIceArgs ice                      = 1;
     bytes cert_der                      = 2;
+    P2PHardNatArgs hard_nat             = 3;
 }
 
 // Hard NAT punching config carrier for OpenP2P.

@@ -258,32 +258,95 @@
 
 ---
 
-## Milestone 4：`socks + agent` 的 QUIC socks 高难 NAT fallback
+## Milestone 4：`socks + agent` 的 QUIC socks 高难 NAT 参数/日志占位（不实现 fallback）
 
 ### 目标
 
-把同样的 fallback 能力集成到 `socks` 的 QUIC 打洞路径。
+在 `socks` 的 QUIC 打洞路径中补齐 hard-nat 的参数入口与诊断日志占位，默认关闭；本里程碑不实现 fallback 打洞逻辑。
 
 ### 待办事项
 
-- [ ] 为 `QuicSocks`（`P2PQuicArgs`）增加 hard-nat 配置承载（若 Milestone 2 未做）
-- [ ] `cmd_socks` 增加 CLI 参数（默认 `off`）
-- [ ] `quic_pool.rs` 的 `punch(...)` 外层增加 fallback 编排
-- [ ] agent 侧 `handle_quic_socks(...)` 增加 hard-nat server 角色支持
-- [ ] 成功后仍按现有流程 `upgrade_to_quic(...)`，不改 QUIC 上层逻辑
-- [ ] 增加 `winner=ice|hardnat` 日志/指标
+- [x] 为 `QuicSocks`（`P2PQuicArgs`）增加 hard-nat 配置承载
+- [x] `cmd_socks` 增加 hard-nat CLI 参数（默认 `off`）
+- [x] `quic_pool.rs` 的 `punch(...)` 把 hard-nat 参数映射到 `P2PQuicArgs.hard_nat`（仅传参，不改建链分支）
+- [x] `quic_pool.rs` 增加 hard-nat 配置日志与建链占位日志（明确仍走 ICE-only）
+- [x] agent 侧 `handle_quic_socks(...)` 增加 hard-nat 参数解析与占位诊断日志
+- [x] 保持 `punch(...)` / `handle_quic_socks(...)` 的 ICE + QUIC 主路径行为不变
+- [x] 增加参数解析/默认值单测（至少 `off`、`fallback`、`role`、`ttl/no_ttl`）
+- [x] 增加日志前缀约定（建议 `[socks_hardnat_diag]` / `[agent_hardnat_diag]`）
+- [x] 在文档中明确：QUIC hard-nat fallback 实现延后到后续里程碑
 
 ### 验收项
 
 - [ ] `socks` 默认配置行为不变
-- [ ] `fallback` 模式在实验环境下可触发并完成 QUIC 建链
-- [ ] QUIC 建链成功后 SOCKS 数据面可用（基本回归）
+- [ ] 传入 hard-nat 参数时，socks/agent 两侧能看到一致的配置/占位日志
+- [ ] 设置 `hard_nat.mode=fallback` 时，不触发实际 fallback，只出现明确“未实现/占位”日志
+- [ ] QUIC 建链与 SOCKS 数据面基本回归不受影响
 
 ### 人工检查点（必须停）
 
-1. 审查 QUIC 升级前后的 socket 生命周期是否正确
-2. 验证 fallback 成功后 QUIC 层没有额外副作用
-3. 确认后进入 Milestone 5
+1. 审查 `cmd_socks` CLI 默认值与 `P2PQuicArgs.hard_nat` 映射是否一致
+2. 检查 `socks/agent` 占位日志是否足够明确（不会误导为已启用 fallback）
+3. 回归一轮 QUIC socks 基本链路（确认无行为变化）
+4. 确认后进入 Milestone 4.5（先完成 hard-nat 可复用执行层前置改造）
+
+---
+
+## Milestone 4.5：`hard_nat` 可复用执行层前置改造（一次性执行 API）
+
+### 目标
+
+为后续 `relay/socks/agent` 的 `fallback/assist` 编排提供可复用的 hard-nat 执行层接口：支持“一次性打洞并返回已选中 socket/远端地址”，避免沿用当前 CLI 风格的成功后无限发送循环。
+
+### 待办事项
+
+- [x] 在 `p2p::hard_nat` 中新增一次性执行 API（例如 `run_nat3_once` / `run_nat4_once`）
+- [x] 返回可复用连接信息（至少 role、local_addr、remote_addr、elapsed，以及可继续使用的 socket 句柄）
+- [x] 将当前 `run_nat3` / `run_nat4` 改为对一次性 API 的包装，保持 `nat4` CLI 行为不变（成功后继续发送）
+- [x] 确保探测接收任务在一次性 API 返回前停止/清理，避免与后续数据面抢读同一 socket
+- [x] 增加最小单测（校验一次性 API 相关辅助逻辑/返回结构或清理路径）
+
+### 验收项
+
+- [ ] `rtun nat4 nat3` / `rtun nat4 nat4` CLI 行为与当前保持一致
+- [ ] 一次性 API 能为后续编排层提供“可接管 socket”的返回值（无后台探测任务残留）
+- [ ] 不引入 `relay/socks/agent` 行为变化（本里程碑不接入生产路径）
+
+### 人工检查点（必须停）
+
+1. 审查一次性 API 返回结构是否足以支撑后续 fallback/assist 编排
+2. 检查探测任务清理策略是否会与后续数据面抢占 socket
+3. 手工 smoke `nat4 nat3/nat4`（确认 CLI 行为未变）
+4. 若当前无实网环境，可先以“本地 UDP 集成测试通过 + 实网 smoke 待补”方式人工确认并继续
+5. 确认后进入 Milestone 4.6（hard-nat 角色/目标规划工具）
+
+---
+
+## Milestone 4.6：`hard_nat` 角色/目标规划工具（基于 ICE 候选）
+
+### 目标
+
+在库层沉淀 hard-nat 的“角色分配”和“目标选择”规划逻辑（基于 `P2PHardNatArgs` + `IceArgs.candidates`），避免在 `relay/socks/agent` 三处各自解析 ICE 候选并做不一致的策略判断。
+
+### 待办事项
+
+- [x] 在 `p2p::hard_nat` 中增加 role hint 解析与本端角色推导工具（考虑 initiator/server 视角）
+- [x] 在 `p2p::hard_nat` 中增加基于 `IceArgs.candidates` 的候选解析与目标选择工具（优先公网 UDP 候选）
+- [x] 给出稳定的选择结果结构（至少能提供 `nat3` 目标 IP 与 `nat4` 目标 `SocketAddr`）
+- [x] 增加单测覆盖：`auto`/显式 role hint、候选优先级、忽略无效候选/非 UDP 候选
+- [x] 保持生产路径不变（本里程碑仅提供规划工具）
+
+### 验收项
+
+- [ ] 规划工具在给定 ICE 候选集合时能稳定输出目标与角色
+- [ ] 单测覆盖关键分支（role 推导、候选优先级、降级路径）
+- [ ] 不引入 `relay/socks/agent` 行为变化
+
+### 人工检查点（必须停）
+
+1. 审查 role hint 语义是否清晰（特别是“同一 proto 字段在两端的解释方式”）
+2. 审查候选优先级是否符合预期（srflx/host/relay 等）
+3. 确认后进入 Milestone 5（assist 或先插入 fallback 编排里程碑）
 
 ---
 
@@ -381,8 +444,10 @@
 - [x] Milestone 0（方案文档）已创建
 - [x] Milestone 1 实施完成（人工检查通过）
 - [ ] Milestone 2 实施完成（待人工检查）
-- [ ] Milestone 3 实施完成（待人工检查）
-- [ ] Milestone 4 未开始
+- [x] Milestone 3 实施完成（人工检查通过）
+- [x] Milestone 4 实施完成（人工检查通过）
+- [x] Milestone 4.5 实施完成（人工检查通过；已补本地 UDP 集成测试，`nat4 nat3/nat4` 实网 smoke 待补）
+- [ ] Milestone 4.6 实施完成（待人工检查）
 - [ ] Milestone 5 未开始
 - [ ] Milestone 6 未开始
 

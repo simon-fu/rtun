@@ -29,10 +29,53 @@ use super::{
 };
 use crate::{
     client_utils::{client_select_url, query_new_agents},
-    cmd_socks::quic_pool::{make_pool, AddAgent, GetCh},
+    cmd_socks::quic_pool::{
+        make_pool, AddAgent, GetCh, QuicSocksHardNatConfig, SocksHardNatModeCli,
+        SocksHardNatRoleCli, DEFAULT_P2P_HARDNAT_BATCH_INTERVAL_MS,
+        DEFAULT_P2P_HARDNAT_INTERVAL_MS, DEFAULT_P2P_HARDNAT_SCAN_COUNT,
+        DEFAULT_P2P_HARDNAT_SOCKET_COUNT,
+    },
     rest_proto::{get_agent_from_url, make_sub_url, make_ws_scheme, AgentInfo},
     secret::token_gen,
 };
+
+fn resolve_quic_socks_hard_nat_config(args: &CmdArgs) -> Result<QuicSocksHardNatConfig> {
+    let interval_ms = u32::try_from(args.p2p_hardnat_interval)
+        .with_context(|| format!("p2p hardnat interval too large [{}ms]", args.p2p_hardnat_interval))?;
+    let batch_interval_ms = u32::try_from(args.p2p_hardnat_batch_interval).with_context(|| {
+        format!(
+            "p2p hardnat batch interval too large [{}ms]",
+            args.p2p_hardnat_batch_interval
+        )
+    })?;
+
+    if args.p2p_hardnat_socket_count == 0 {
+        bail!("p2p hardnat socket count must be >= 1");
+    }
+    if args.p2p_hardnat_scan_count == 0 {
+        bail!("p2p hardnat scan count must be >= 1");
+    }
+    if interval_ms == 0 {
+        bail!("p2p hardnat interval must be >= 1ms");
+    }
+    if batch_interval_ms == 0 {
+        bail!("p2p hardnat batch interval must be >= 1ms");
+    }
+    if matches!(args.p2p_hardnat_ttl, Some(0)) {
+        bail!("p2p hardnat ttl must be >= 1");
+    }
+
+    Ok(QuicSocksHardNatConfig {
+        mode: args.p2p_hardnat,
+        role: args.p2p_hardnat_role,
+        socket_count: args.p2p_hardnat_socket_count,
+        scan_count: args.p2p_hardnat_scan_count,
+        interval_ms,
+        batch_interval_ms,
+        ttl: args.p2p_hardnat_ttl,
+        no_ttl: args.p2p_hardnat_no_ttl,
+    })
+}
 
 pub fn run(args: CmdArgs) -> Result<()> {
     // init_log_and_run(do_run(args))?
@@ -48,6 +91,7 @@ pub fn run(args: CmdArgs) -> Result<()> {
 }
 
 async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
+    let quic_socks_hard_nat = resolve_quic_socks_hard_nat_config(&args)?;
     if let Some(_socks_ws) = &args.socks_ws {
         kick_ws_socks(args.clone()).await?;
     }
@@ -208,7 +252,8 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
             Some(expr) => {
                 if !contains_regex_chars(expr) {
                     tracing::info!("agent name is simple string");
-                    add_agents(&pool, &url, &args, [expr.clone()].into_iter()).await?;
+                    add_agents(&pool, &url, &args, quic_socks_hard_nat, [expr.clone()].into_iter())
+                        .await?;
                     tokio::time::sleep(Duration::MAX / 2).await;
                     return Ok(());
                 }
@@ -234,7 +279,7 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
                 Ok(agents) => {
                     // tracing::debug!("query_new_agents success [{agents:?}]");
                     let iter = agents.into_iter().map(|x| x.name);
-                    add_agents(&pool, &url, &args, iter).await?;
+                    add_agents(&pool, &url, &args, quic_socks_hard_nat, iter).await?;
                     // for agent in agents {
                     //     let mut url = url.clone();
 
@@ -328,7 +373,13 @@ impl<'a> fmt::Display for ClashContent<'a> {
     }
 }
 
-async fn add_agents<I>(pool: &QuicPool, url: &::url::Url, args: &CmdArgs, iter: I) -> Result<()>
+async fn add_agents<I>(
+    pool: &QuicPool,
+    url: &::url::Url,
+    args: &CmdArgs,
+    hard_nat: QuicSocksHardNatConfig,
+    iter: I,
+) -> Result<()>
 where
     I: Iterator<Item = String>,
 {
@@ -348,6 +399,7 @@ where
                 name: agent,
                 url: url.to_string(),
                 quic_insecure: args.quic_insecure,
+                hard_nat,
             })
             .await??;
     }
@@ -936,6 +988,62 @@ pub struct CmdArgs {
     #[clap(long = "mode", long_help = "tunnel mode")]
     mode: Option<u32>,
 
+    #[clap(
+        long = "p2p-hardnat",
+        value_enum,
+        default_value_t = SocksHardNatModeCli::Off,
+        long_help = "hard nat punching strategy for QUIC socks p2p (placeholder only for now)"
+    )]
+    p2p_hardnat: SocksHardNatModeCli,
+
+    #[clap(
+        long = "p2p-hardnat-role",
+        value_enum,
+        default_value_t = SocksHardNatRoleCli::Auto,
+        long_help = "hard nat punching role hint (placeholder only for now)"
+    )]
+    p2p_hardnat_role: SocksHardNatRoleCli,
+
+    #[clap(
+        long = "p2p-hardnat-socket-count",
+        default_value_t = DEFAULT_P2P_HARDNAT_SOCKET_COUNT,
+        long_help = "hard nat socket count (placeholder only for now)"
+    )]
+    p2p_hardnat_socket_count: u32,
+
+    #[clap(
+        long = "p2p-hardnat-scan-count",
+        default_value_t = DEFAULT_P2P_HARDNAT_SCAN_COUNT,
+        long_help = "hard nat scan/random-port count (placeholder only for now)"
+    )]
+    p2p_hardnat_scan_count: u32,
+
+    #[clap(
+        long = "p2p-hardnat-interval",
+        default_value_t = DEFAULT_P2P_HARDNAT_INTERVAL_MS,
+        long_help = "hard nat probe interval in ms (placeholder only for now)"
+    )]
+    p2p_hardnat_interval: u64,
+
+    #[clap(
+        long = "p2p-hardnat-batch-interval",
+        default_value_t = DEFAULT_P2P_HARDNAT_BATCH_INTERVAL_MS,
+        long_help = "hard nat batch interval in ms (placeholder only for now)"
+    )]
+    p2p_hardnat_batch_interval: u64,
+
+    #[clap(
+        long = "p2p-hardnat-ttl",
+        long_help = "hard nat ttl hint (placeholder only for now)"
+    )]
+    p2p_hardnat_ttl: Option<u32>,
+
+    #[clap(
+        long = "p2p-hardnat-no-ttl",
+        long_help = "disable hard nat ttl pre-send optimization (placeholder only for now)"
+    )]
+    p2p_hardnat_no_ttl: bool,
+
     #[clap(long = "socks-ws", long_help = "listen addr for socks via ws")]
     socks_ws: Option<String>,
 
@@ -1172,5 +1280,61 @@ mod regex_text {
         assert!(rgx.is_match("rtun-2"), "{rgx}");
         assert!(rgx.is_match("rtun1"), "{rgx}");
         assert!(rgx.is_match("home_mini"), "{rgx}");
+    }
+}
+
+#[cfg(test)]
+mod hard_nat_cli_tests {
+    use super::*;
+
+    #[test]
+    fn quic_socks_hard_nat_cli_defaults_to_off() {
+        let args = CmdArgs::parse_from(["socks", "http://127.0.0.1:8080"]);
+        let cfg = resolve_quic_socks_hard_nat_config(&args).unwrap();
+
+        assert_eq!(cfg.mode, SocksHardNatModeCli::Off);
+        assert_eq!(cfg.role, SocksHardNatRoleCli::Auto);
+        assert_eq!(cfg.socket_count, DEFAULT_P2P_HARDNAT_SOCKET_COUNT);
+        assert_eq!(cfg.scan_count, DEFAULT_P2P_HARDNAT_SCAN_COUNT);
+        assert_eq!(cfg.interval_ms, DEFAULT_P2P_HARDNAT_INTERVAL_MS as u32);
+        assert_eq!(
+            cfg.batch_interval_ms,
+            DEFAULT_P2P_HARDNAT_BATCH_INTERVAL_MS as u32
+        );
+        assert_eq!(cfg.ttl, None);
+        assert!(!cfg.no_ttl);
+    }
+
+    #[test]
+    fn quic_socks_hard_nat_cli_parses_fallback_role_ttl_and_no_ttl() {
+        let args = CmdArgs::parse_from([
+            "socks",
+            "quic://rtun.example:9888",
+            "--p2p-hardnat",
+            "fallback",
+            "--p2p-hardnat-role",
+            "nat4",
+            "--p2p-hardnat-socket-count",
+            "17",
+            "--p2p-hardnat-scan-count",
+            "33",
+            "--p2p-hardnat-interval",
+            "1500",
+            "--p2p-hardnat-batch-interval",
+            "4500",
+            "--p2p-hardnat-ttl",
+            "9",
+            "--p2p-hardnat-no-ttl",
+        ]);
+        let cfg = resolve_quic_socks_hard_nat_config(&args).unwrap();
+
+        assert_eq!(cfg.mode, SocksHardNatModeCli::Fallback);
+        assert_eq!(cfg.role, SocksHardNatRoleCli::Nat4);
+        assert_eq!(cfg.socket_count, 17);
+        assert_eq!(cfg.scan_count, 33);
+        assert_eq!(cfg.interval_ms, 1500);
+        assert_eq!(cfg.batch_interval_ms, 4500);
+        assert_eq!(cfg.ttl, Some(9));
+        assert!(cfg.no_ttl);
     }
 }

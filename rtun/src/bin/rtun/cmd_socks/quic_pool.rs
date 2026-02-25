@@ -16,8 +16,8 @@ use rtun::{
         ice_quic::{QuicConn, QuicIceCert, UpgradeToQuic},
     },
     proto::{
-        open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, P2PArgs, P2PQuicArgs, QuicSocksArgs,
-        QuicStats,
+        open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, P2PArgs, P2PHardNatArgs, P2PQuicArgs,
+        QuicSocksArgs, QuicStats,
     },
     switch::{
         invoker_ctrl::{CtrlHandler, CtrlInvoker},
@@ -33,6 +33,123 @@ use tokio::{
 // use super::quic_session::{QuicSession, make_quic_session, SetCtrl, StreamPair, ReqCh};
 
 pub type StreamPair = (SendStream, RecvStream);
+
+pub const DEFAULT_P2P_HARDNAT_SOCKET_COUNT: u32 = 64;
+pub const DEFAULT_P2P_HARDNAT_SCAN_COUNT: u32 = 64;
+pub const DEFAULT_P2P_HARDNAT_INTERVAL_MS: u64 = 1000;
+pub const DEFAULT_P2P_HARDNAT_BATCH_INTERVAL_MS: u64 = 5000;
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+pub enum SocksHardNatModeCli {
+    Off,
+    Fallback,
+    Assist,
+    Force,
+}
+
+impl SocksHardNatModeCli {
+    pub fn to_proto_u32(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Fallback => 1,
+            Self::Assist => 2,
+            Self::Force => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+pub enum SocksHardNatRoleCli {
+    Auto,
+    Nat3,
+    Nat4,
+}
+
+impl SocksHardNatRoleCli {
+    pub fn to_proto_u32(self) -> u32 {
+        match self {
+            Self::Auto => 0,
+            Self::Nat3 => 1,
+            Self::Nat4 => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuicSocksHardNatConfig {
+    pub mode: SocksHardNatModeCli,
+    pub role: SocksHardNatRoleCli,
+    pub socket_count: u32,
+    pub scan_count: u32,
+    pub interval_ms: u32,
+    pub batch_interval_ms: u32,
+    pub ttl: Option<u32>,
+    pub no_ttl: bool,
+}
+
+impl Default for QuicSocksHardNatConfig {
+    fn default() -> Self {
+        Self {
+            mode: SocksHardNatModeCli::Off,
+            role: SocksHardNatRoleCli::Auto,
+            socket_count: DEFAULT_P2P_HARDNAT_SOCKET_COUNT,
+            scan_count: DEFAULT_P2P_HARDNAT_SCAN_COUNT,
+            interval_ms: DEFAULT_P2P_HARDNAT_INTERVAL_MS as u32,
+            batch_interval_ms: DEFAULT_P2P_HARDNAT_BATCH_INTERVAL_MS as u32,
+            ttl: None,
+            no_ttl: false,
+        }
+    }
+}
+
+impl QuicSocksHardNatConfig {
+    pub fn is_off(self) -> bool {
+        self.mode == SocksHardNatModeCli::Off
+    }
+
+    fn ttl_display(self) -> String {
+        match (self.ttl, self.no_ttl) {
+            (Some(ttl), true) => format!("{ttl} (disabled by no_ttl)"),
+            (Some(ttl), false) => ttl.to_string(),
+            (None, true) => "disabled".to_string(),
+            (None, false) => "auto".to_string(),
+        }
+    }
+
+    fn describe(self) -> String {
+        format!(
+            "mode={:?}, role={:?}, socket_count={}, scan_count={}, interval_ms={}, batch_interval_ms={}, ttl={}, no_ttl={}",
+            self.mode,
+            self.role,
+            self.socket_count,
+            self.scan_count,
+            self.interval_ms,
+            self.batch_interval_ms,
+            self.ttl_display(),
+            self.no_ttl
+        )
+    }
+}
+
+fn build_quic_socks_hard_nat_args(
+    cfg: QuicSocksHardNatConfig,
+) -> ::protobuf::MessageField<P2PHardNatArgs> {
+    if cfg.is_off() {
+        return ::protobuf::MessageField::none();
+    }
+
+    ::protobuf::MessageField::some(P2PHardNatArgs {
+        mode: cfg.mode.to_proto_u32(),
+        role: cfg.role.to_proto_u32(),
+        socket_count: cfg.socket_count,
+        scan_count: cfg.scan_count,
+        interval_ms: cfg.interval_ms,
+        batch_interval_ms: cfg.batch_interval_ms,
+        ttl: cfg.ttl.unwrap_or_default(),
+        no_ttl: cfg.no_ttl,
+        ..Default::default()
+    })
+}
 
 // pub struct AgentPool<H: CtrlHandler> {
 //     shared: Arc<Mutex<Work<H>>>,
@@ -183,6 +300,7 @@ pub struct AddAgent {
     pub name: String,
     pub url: String,
     pub quic_insecure: bool,
+    pub hard_nat: QuicSocksHardNatConfig,
 }
 
 const STYLE_GENERAL: &str = "{prefix:.bold.dim} {spinner} {wide_msg:}";
@@ -199,7 +317,13 @@ impl AsyncHandler<AddAgent> for Entity {
             name: req.name,
             url: req.url,
             quic_insecure: req.quic_insecure,
+            hard_nat: req.hard_nat,
         });
+        tracing::info!(
+            "[socks_hardnat_diag] quic socks hard-nat config for agent [{}]: {}",
+            agent.name.as_str(),
+            agent.hard_nat.describe()
+        );
 
         let mut conns = Vec::new();
 
@@ -696,7 +820,7 @@ async fn connecting_task(
         bar.update_msg("connecting");
 
         let r = tokio::select! {
-            r = try_connet(&mut bar, agent.url.as_str(), ck_speed, agent.quic_insecure) => r,
+            r = try_connet(&mut bar, agent.url.as_str(), ck_speed, agent.quic_insecure, agent.hard_nat) => r,
             _r = guard_rx.recv() => {
                 tracing::debug!("dropped guard");
                 return
@@ -730,6 +854,7 @@ async fn try_connet(
     url_str: &str,
     ck_speed: bool,
     quic_insecure: bool,
+    hard_nat: QuicSocksHardNatConfig,
 ) -> Result<(QuicConn, Option<u64>)> {
     tracing::debug!("connecting to [{url_str}]");
 
@@ -742,14 +867,14 @@ async fn try_connet(
                 .with_context(|| "connect to agent failed")?;
             let session = make_stream_session(stream.split(), false).await?;
             let ctrl = session.ctrl_client().clone_invoker();
-            punch(ctrl).await
+            punch(ctrl, hard_nat).await
         } else {
             let (stream, _r) = ws_connect_to(url_str)
                 .await
                 .with_context(|| "connect to agent failed")?;
             let session = make_stream_session(stream.split(), false).await?;
             let ctrl = session.ctrl_client().clone_invoker();
-            punch(ctrl).await
+            punch(ctrl, hard_nat).await
         }
         // let conn = punch(ctrl).await?;
         // Result::<()>::Ok(())
@@ -833,7 +958,10 @@ async fn echo_throughput(
     Ok(speed)
 }
 
-async fn punch<H: CtrlHandler>(ctrl: CtrlInvoker<H>) -> Result<QuicConn> {
+async fn punch<H: CtrlHandler>(
+    ctrl: CtrlInvoker<H>,
+    hard_nat: QuicSocksHardNatConfig,
+) -> Result<QuicConn> {
     let ice_servers = default_ice_servers();
 
     let mut peer = IcePeer::with_config(IceConfig {
@@ -847,6 +975,12 @@ async fn punch<H: CtrlHandler>(ctrl: CtrlInvoker<H>) -> Result<QuicConn> {
 
     let local_cert = QuicIceCert::try_new()?;
     let cert_der = local_cert.to_bytes()?.into();
+    if !hard_nat.is_off() {
+        tracing::warn!(
+            "[socks_hardnat_diag] quic socks hard-nat requested (placeholder only): {}; ICE-only path remains active",
+            hard_nat.describe()
+        );
+    }
 
     let rsp = ctrl
         .open_p2p(P2PArgs {
@@ -854,6 +988,7 @@ async fn punch<H: CtrlHandler>(ctrl: CtrlInvoker<H>) -> Result<QuicConn> {
                 base: Some(P2PQuicArgs {
                     ice: Some(local_args.into()).into(),
                     cert_der,
+                    hard_nat: build_quic_socks_hard_nat_args(hard_nat),
                     ..Default::default()
                 })
                 .into(),
@@ -948,6 +1083,7 @@ struct AgentShared {
     name: String,
     url: String,
     quic_insecure: bool,
+    hard_nat: QuicSocksHardNatConfig,
 }
 
 fn random_conn_mut(agents: &mut IndexMap<String, AgentSlot>) -> Option<(&mut ConnSlot, ConnIndex)> {
