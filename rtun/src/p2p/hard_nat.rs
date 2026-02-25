@@ -298,7 +298,11 @@ pub fn half_hops_from_ping_ttl(ttl: u32) -> Option<u32> {
     };
 
     let half = hops / 2;
-    if half == 0 { None } else { Some(half) }
+    if half == 0 {
+        None
+    } else {
+        Some(half)
+    }
 }
 
 pub async fn run_nat3(args: Nat3RunConfig) -> Result<()> {
@@ -347,6 +351,7 @@ pub async fn run_nat3_once(args: Nat3RunConfig) -> Result<HardNatConnectedSocket
             info!("recv finished [{r:?}]");
         })
     };
+    let recv_tasks = RecvTaskGuard::new(vec![recv_task]);
 
     let mut has_recv = false;
     let mut num = 0_usize;
@@ -408,7 +413,7 @@ pub async fn run_nat3_once(args: Nat3RunConfig) -> Result<HardNatConnectedSocket
     let first = shared
         .first_connected_conn(HardNatRole::Nat3, start_at)
         .with_context(|| "missing connected target")?;
-    abort_recv_tasks(vec![recv_task]).await;
+    recv_tasks.abort_and_wait().await;
     Ok(first)
 }
 
@@ -440,7 +445,7 @@ pub async fn run_nat4_once(args: Nat4RunConfig) -> Result<HardNatConnectedSocket
     };
 
     let mut senders = Vec::with_capacity(args.count);
-    let mut recv_tasks = Vec::with_capacity(args.count);
+    let mut recv_tasks = RecvTaskGuard::with_capacity(args.count);
 
     for _ in 0..args.count {
         let listen = "0.0.0.0:0";
@@ -505,7 +510,7 @@ pub async fn run_nat4_once(args: Nat4RunConfig) -> Result<HardNatConnectedSocket
     let first = shared
         .first_connected_conn(HardNatRole::Nat4, start_at)
         .with_context(|| "missing connected target")?;
-    abort_recv_tasks(recv_tasks).await;
+    recv_tasks.abort_and_wait().await;
     Ok(first)
 }
 
@@ -591,10 +596,39 @@ async fn recv_loop(socket: Arc<UdpSocket>, text: &str, shared: &Arc<Shared>) -> 
     }
 }
 
-async fn abort_recv_tasks(tasks: Vec<JoinHandle<()>>) {
-    for task in tasks {
-        task.abort();
-        let _ = task.await;
+#[derive(Default)]
+struct RecvTaskGuard {
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl RecvTaskGuard {
+    fn new(tasks: Vec<JoinHandle<()>>) -> Self {
+        Self { tasks }
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            tasks: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, task: JoinHandle<()>) {
+        self.tasks.push(task);
+    }
+
+    async fn abort_and_wait(mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for RecvTaskGuard {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 
@@ -778,7 +812,10 @@ mod tests {
         assert_eq!(plan.parsed_candidates, 3);
         assert_eq!(plan.usable_udp_candidates, 2);
         assert_eq!(plan.nat3_target_ip, Some("114.249.237.39".parse().unwrap()));
-        assert_eq!(plan.nat4_target, Some("114.249.237.39:65140".parse().unwrap()));
+        assert_eq!(
+            plan.nat4_target,
+            Some("114.249.237.39:65140".parse().unwrap())
+        );
     }
 
     #[test]
@@ -881,9 +918,14 @@ mod tests {
         let payload = b"after-return";
         conn.socket.send_to(payload, echo_addr).await?;
         let mut buf = [0_u8; 128];
-        let (len, from) = tokio::time::timeout(Duration::from_millis(300), conn.socket.recv_from(&mut buf))
-            .await
-            .with_context(|| "recv after run_nat4_once return timed out (possible probe recv task still reading)")??;
+        let (len, from) = tokio::time::timeout(
+            Duration::from_millis(300),
+            conn.socket.recv_from(&mut buf),
+        )
+        .await
+        .with_context(|| {
+            "recv after run_nat4_once return timed out (possible probe recv task still reading)"
+        })??;
         assert_eq!(from, echo_addr);
         assert_eq!(&buf[..len], payload);
 

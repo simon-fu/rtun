@@ -21,19 +21,23 @@ use crate::{
     },
     async_rt::{spawn_with_inherit, spawn_with_name},
     channel::{ChId, ChReceiver, ChSender, ChSenderWeak, CHANNEL_SIZE},
-    huid::{gen_huid::gen_huid, HUId},
     hex::BinStrLine,
+    huid::{gen_huid::gen_huid, HUId},
     ice::{
         ice_peer::{default_ice_servers, IceArgs, IceConfig, IcePeer},
         ice_quic::{QuicIceCert, QuicStream, UpgradeToQuic},
         throughput::run_throughput,
         webrtc_ice_peer::{DtlsIceArgs, WebrtcIceConfig, WebrtcIcePeer},
     },
-    p2p::hard_nat::HardNatMode,
+    p2p::hard_nat::{
+        derive_target_plan_from_ice, resolve_role_plan, run_nat3_once, run_nat4_once,
+        HardNatConnectedSocket, HardNatMode, HardNatRole, HardNatRoleHint, Nat3RunConfig,
+        Nat4RunConfig,
+    },
     proto::{
         open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, ExecAgentScriptArgs,
-        ExecAgentScriptResult, OpenP2PResponse, P2PArgs, P2PDtlsArgs, P2PHardNatArgs,
-        P2PQuicArgs, QuicSocksArgs, QuicThroughputArgs, UdpRelayArgs, WebrtcThroughputArgs,
+        ExecAgentScriptResult, OpenP2PResponse, P2PArgs, P2PDtlsArgs, P2PHardNatArgs, P2PQuicArgs,
+        QuicSocksArgs, QuicThroughputArgs, UdpRelayArgs, WebrtcThroughputArgs,
     },
     switch::{
         agent::ch_socks::ChSocks,
@@ -45,8 +49,8 @@ use crate::{
         },
         next_ch_id::NextChId,
         udp_relay_codec::{
-            decode_udp_relay_packet, encode_udp_relay_packet, packet_has_stun_magic,
-            UdpRelayCodec, UDP_RELAY_HEARTBEAT_FLOW_ID,
+            decode_udp_relay_packet, encode_udp_relay_packet, packet_has_stun_magic, UdpRelayCodec,
+            UDP_RELAY_HEARTBEAT_FLOW_ID,
         },
     },
 };
@@ -404,9 +408,13 @@ async fn quic_tunnel_task(
 }
 
 const UDP_RELAY_DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const UDP_RELAY_PACKET_LIMIT: usize = 1452 ;
+const UDP_RELAY_PACKET_LIMIT: usize = 1452;
 const UDP_RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const UDP_RELAY_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
+const UDP_RELAY_HARD_NAT_DEFAULT_SOCKET_COUNT: u32 = 64;
+const UDP_RELAY_HARD_NAT_DEFAULT_SCAN_COUNT: u32 = 64;
+const UDP_RELAY_HARD_NAT_DEFAULT_INTERVAL_MS: u32 = 1000;
+const UDP_RELAY_HARD_NAT_DEFAULT_BATCH_INTERVAL_MS: u32 = 5000;
 const EXEC_SCRIPT_DEFAULT_TIMEOUT_SECS: u64 = 30;
 const EXEC_SCRIPT_DEFAULT_STDOUT_LIMIT: usize = 256 * 1024;
 const EXEC_SCRIPT_DEFAULT_STDERR_LIMIT: usize = 256 * 1024;
@@ -654,11 +662,16 @@ async fn handle_udp_relay(
     shared_flows: SharedRelayFlows,
     mut remote_args: UdpRelayArgs,
 ) -> Result<OpenP2PResponse> {
-    let hard_nat_mode = resolve_udp_relay_hard_nat_mode(&remote_args.hard_nat);
-    if hard_nat_mode != HardNatMode::Off {
+    let hard_nat_cfg = UdpRelayHardNatConfig::from_proto(&remote_args.hard_nat);
+    if hard_nat_cfg.mode == HardNatMode::Force {
+        tracing::warn!(
+            "[agent_hardnat_diag] udp relay hard-nat force enabled: {}; force path will be used instead of ICE accept",
+            format_udp_relay_hard_nat_args(&remote_args.hard_nat, hard_nat_cfg.mode),
+        );
+    } else if hard_nat_cfg.mode != HardNatMode::Off {
         tracing::warn!(
             "[agent_hardnat_diag] udp relay hard-nat requested (placeholder only): {}; ICE-only path remains active",
-            format_udp_relay_hard_nat_args(&remote_args.hard_nat, hard_nat_mode),
+            format_udp_relay_hard_nat_args(&remote_args.hard_nat, hard_nat_cfg.mode),
         );
     }
     let remote_ice: IceArgs = remote_args
@@ -695,15 +708,28 @@ async fn handle_udp_relay(
     );
 
     spawn_with_name(format!("udp-relay-{uid}"), async move {
-        let r = udp_relay_task(
-            peer,
-            target_addr,
-            idle_timeout,
-            max_payload,
-            codec,
-            shared_flows,
-        )
-        .await;
+        let r = if hard_nat_cfg.is_force() {
+            udp_relay_task_hard_nat(
+                remote_ice,
+                hard_nat_cfg,
+                target_addr,
+                idle_timeout,
+                max_payload,
+                codec,
+                shared_flows,
+            )
+            .await
+        } else {
+            udp_relay_task(
+                peer,
+                target_addr,
+                idle_timeout,
+                max_payload,
+                codec,
+                shared_flows,
+            )
+            .await
+        };
         match r {
             Ok(()) => {
                 tracing::warn!(
@@ -756,6 +782,87 @@ fn resolve_udp_relay_max_payload(input: u32, codec: UdpRelayCodec) -> Result<usi
 
 fn udp_relay_auto_payload(codec: UdpRelayCodec) -> usize {
     UDP_RELAY_PACKET_LIMIT.saturating_sub(codec.header_len())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UdpRelayHardNatConfig {
+    mode: HardNatMode,
+    role_hint: HardNatRoleHint,
+    socket_count: u32,
+    scan_count: u32,
+    interval_ms: u32,
+    batch_interval_ms: u32,
+    ttl: Option<u32>,
+    no_ttl: bool,
+}
+
+impl UdpRelayHardNatConfig {
+    fn from_proto(hard_nat: &MessageField<P2PHardNatArgs>) -> Self {
+        let mode = resolve_udp_relay_hard_nat_mode(hard_nat);
+        let Some(args) = hard_nat.as_ref() else {
+            return Self {
+                mode,
+                role_hint: HardNatRoleHint::Auto,
+                socket_count: UDP_RELAY_HARD_NAT_DEFAULT_SOCKET_COUNT,
+                scan_count: UDP_RELAY_HARD_NAT_DEFAULT_SCAN_COUNT,
+                interval_ms: UDP_RELAY_HARD_NAT_DEFAULT_INTERVAL_MS,
+                batch_interval_ms: UDP_RELAY_HARD_NAT_DEFAULT_BATCH_INTERVAL_MS,
+                ttl: None,
+                no_ttl: false,
+            };
+        };
+
+        let socket_count = if args.socket_count == 0 {
+            UDP_RELAY_HARD_NAT_DEFAULT_SOCKET_COUNT
+        } else {
+            args.socket_count
+        };
+        let scan_count = if args.scan_count == 0 {
+            UDP_RELAY_HARD_NAT_DEFAULT_SCAN_COUNT
+        } else {
+            args.scan_count
+        };
+        let interval_ms = if args.interval_ms == 0 {
+            UDP_RELAY_HARD_NAT_DEFAULT_INTERVAL_MS
+        } else {
+            args.interval_ms
+        };
+        let batch_interval_ms = if args.batch_interval_ms == 0 {
+            UDP_RELAY_HARD_NAT_DEFAULT_BATCH_INTERVAL_MS
+        } else {
+            args.batch_interval_ms
+        };
+        let no_ttl = args.no_ttl;
+        let ttl = if no_ttl || args.ttl == 0 {
+            None
+        } else {
+            Some(args.ttl)
+        };
+
+        Self {
+            mode,
+            role_hint: HardNatRoleHint::from_proto_args(args),
+            socket_count,
+            scan_count,
+            interval_ms,
+            batch_interval_ms,
+            ttl,
+            no_ttl,
+        }
+    }
+
+    fn is_force(self) -> bool {
+        self.mode == HardNatMode::Force
+    }
+
+    fn ttl_display(self) -> String {
+        match (self.ttl, self.no_ttl) {
+            (Some(ttl), true) => format!("{ttl} (disabled by no_ttl)"),
+            (Some(ttl), false) => ttl.to_string(),
+            (None, true) => "disabled".to_string(),
+            (None, false) => "auto".to_string(),
+        }
+    }
 }
 
 fn resolve_udp_relay_hard_nat_mode(hard_nat: &MessageField<P2PHardNatArgs>) -> HardNatMode {
@@ -821,6 +928,7 @@ async fn udp_relay_task(
             remote_addr, target_addr
         )
     })?;
+    let socket = Arc::new(socket);
     run_udp_relay_server_loop(
         socket,
         remote_addr,
@@ -839,8 +947,120 @@ async fn udp_relay_task(
     })
 }
 
+async fn udp_relay_task_hard_nat(
+    remote_ice: IceArgs,
+    hard_nat_cfg: UdpRelayHardNatConfig,
+    target_addr: SocketAddr,
+    idle_timeout: Duration,
+    max_payload: usize,
+    codec: UdpRelayCodec,
+    shared_flows: SharedRelayFlows,
+) -> Result<()> {
+    let hard_nat_conn = open_udp_relay_hard_nat_socket(remote_ice, hard_nat_cfg, false)
+        .await
+        .with_context(|| {
+            format!(
+                "udp relay hard-nat connect failed, target [{}]",
+                target_addr
+            )
+        })?;
+    let HardNatConnectedSocket {
+        role,
+        socket,
+        local_addr,
+        remote_addr,
+        elapsed,
+    } = hard_nat_conn;
+    socket.connect(remote_addr).await.with_context(|| {
+        format!(
+            "udp relay hard-nat connect remote failed, remote [{}], target [{}]",
+            remote_addr, target_addr
+        )
+    })?;
+    tracing::warn!(
+        "[agent_hardnat_diag] udp relay hard-nat connected: role={}, local=[{}], remote=[{}], elapsed={}ms, target=[{}]",
+        role.as_str(),
+        local_addr,
+        remote_addr,
+        elapsed.as_millis(),
+        target_addr
+    );
+    run_udp_relay_server_loop(
+        socket,
+        remote_addr,
+        target_addr,
+        idle_timeout,
+        max_payload,
+        codec,
+        shared_flows,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "udp relay hard-nat server loop failed, remote [{}], target [{}]",
+            remote_addr, target_addr
+        )
+    })
+}
+
+async fn open_udp_relay_hard_nat_socket(
+    remote_ice: IceArgs,
+    hard_nat_cfg: UdpRelayHardNatConfig,
+    is_initiator: bool,
+) -> Result<HardNatConnectedSocket> {
+    let role_plan = resolve_role_plan(hard_nat_cfg.role_hint, is_initiator);
+    let target_plan = derive_target_plan_from_ice(&remote_ice);
+    tracing::warn!(
+        "[agent_hardnat_diag] udp relay hard-nat planning: local_role={}, remote_role={}, parsed_candidates={}, usable_udp_candidates={}, nat3_target_ip={:?}, nat4_target={:?}, socket_count={}, scan_count={}, interval={}ms, batch_interval={}ms, ttl={}",
+        role_plan.local_role.as_str(),
+        role_plan.remote_role.as_str(),
+        target_plan.parsed_candidates,
+        target_plan.usable_udp_candidates,
+        target_plan.nat3_target_ip,
+        target_plan.nat4_target,
+        hard_nat_cfg.socket_count,
+        hard_nat_cfg.scan_count,
+        hard_nat_cfg.interval_ms,
+        hard_nat_cfg.batch_interval_ms,
+        hard_nat_cfg.ttl_display(),
+    );
+
+    let interval = Duration::from_millis(hard_nat_cfg.interval_ms as u64);
+    let ttl = hard_nat_cfg.ttl;
+    match role_plan.local_role {
+        HardNatRole::Nat3 => {
+            let target_ip = target_plan
+                .nat3_target_ip
+                .with_context(|| "hard-nat nat3 target ip missing from remote ICE")?;
+            run_nat3_once(Nat3RunConfig {
+                content: None,
+                target_ip,
+                count: hard_nat_cfg.scan_count as usize,
+                listen: "0.0.0.0:0".to_string(),
+                ttl,
+                interval,
+                batch_interval: Duration::from_millis(hard_nat_cfg.batch_interval_ms as u64),
+            })
+            .await
+        }
+        HardNatRole::Nat4 => {
+            let target = target_plan
+                .nat4_target
+                .with_context(|| "hard-nat nat4 target socket missing from remote ICE")?;
+            run_nat4_once(Nat4RunConfig {
+                content: None,
+                target,
+                count: hard_nat_cfg.socket_count as usize,
+                ttl,
+                interval,
+            })
+            .await
+        }
+    }
+}
+
 async fn run_udp_relay_server_loop(
-    tunnel: UdpSocket,
+    tunnel: Arc<UdpSocket>,
     remote_addr: SocketAddr,
     target_addr: SocketAddr,
     idle_timeout: Duration,
@@ -1440,7 +1660,10 @@ mod tests {
     #[test]
     fn udp_relay_hard_nat_mode_defaults_to_off_when_field_missing_or_zero() {
         let args = UdpRelayArgs::default();
-        assert_eq!(resolve_udp_relay_hard_nat_mode(&args.hard_nat), HardNatMode::Off);
+        assert_eq!(
+            resolve_udp_relay_hard_nat_mode(&args.hard_nat),
+            HardNatMode::Off
+        );
 
         let args = UdpRelayArgs {
             hard_nat: MessageField::some(P2PHardNatArgs {
@@ -1449,13 +1672,19 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(resolve_udp_relay_hard_nat_mode(&args.hard_nat), HardNatMode::Off);
+        assert_eq!(
+            resolve_udp_relay_hard_nat_mode(&args.hard_nat),
+            HardNatMode::Off
+        );
     }
 
     #[test]
     fn quic_socks_hard_nat_mode_defaults_to_off_when_field_missing_or_zero() {
         let args = P2PQuicArgs::default();
-        assert_eq!(resolve_udp_relay_hard_nat_mode(&args.hard_nat), HardNatMode::Off);
+        assert_eq!(
+            resolve_udp_relay_hard_nat_mode(&args.hard_nat),
+            HardNatMode::Off
+        );
 
         let args = P2PQuicArgs {
             hard_nat: MessageField::some(P2PHardNatArgs {
@@ -1464,7 +1693,10 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(resolve_udp_relay_hard_nat_mode(&args.hard_nat), HardNatMode::Off);
+        assert_eq!(
+            resolve_udp_relay_hard_nat_mode(&args.hard_nat),
+            HardNatMode::Off
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

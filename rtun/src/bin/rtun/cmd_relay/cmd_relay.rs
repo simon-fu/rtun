@@ -24,6 +24,10 @@ use rtun::{
     async_rt::{run_multi_thread, spawn_with_name},
     hex::BinStrLine,
     ice::ice_peer::{default_ice_servers, IceArgs, IceConfig, IcePeer},
+    p2p::hard_nat::{
+        derive_target_plan_from_ice, resolve_role_plan, run_nat3_once, run_nat4_once,
+        HardNatConnectedSocket, HardNatRole, HardNatRoleHint, Nat3RunConfig, Nat4RunConfig,
+    },
     proto::{
         open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, ExecAgentScriptArgs,
         ExecAgentScriptResult, P2PArgs, P2PHardNatArgs, UdpRelayArgs,
@@ -33,8 +37,8 @@ use rtun::{
         session_stream::make_stream_session,
         udp_relay_codec::{
             decode_udp_relay_packet, encode_udp_relay_packet, gen_udp_relay_obfs_seed,
-            packet_has_stun_magic, UdpRelayCodec,
-            UDP_RELAY_FLOW_ID_MASK_OBFS, UDP_RELAY_HEARTBEAT_FLOW_ID, UDP_RELAY_META_LEN_OBFS,
+            packet_has_stun_magic, UdpRelayCodec, UDP_RELAY_FLOW_ID_MASK_OBFS,
+            UDP_RELAY_HEARTBEAT_FLOW_ID, UDP_RELAY_META_LEN_OBFS,
         },
     },
     ws::client::ws_connect_to,
@@ -54,7 +58,7 @@ use crate::{
 };
 
 const DEFAULT_UDP_IDLE_TIMEOUT_SECS: u64 = 120;
-const DEFAULT_P2P_PACKET_LIMIT: usize = 1452 ;
+const DEFAULT_P2P_PACKET_LIMIT: usize = 1452;
 const LOOP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const FLOW_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const UDP_RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
@@ -151,6 +155,18 @@ impl RelayUdpHardNatConfig {
         self.mode == RelayHardNatModeCli::Off
     }
 
+    fn is_force(self) -> bool {
+        self.mode == RelayHardNatModeCli::Force
+    }
+
+    fn role_hint(self) -> HardNatRoleHint {
+        match self.role {
+            RelayHardNatRoleCli::Auto => HardNatRoleHint::Auto,
+            RelayHardNatRoleCli::Nat3 => HardNatRoleHint::Nat3,
+            RelayHardNatRoleCli::Nat4 => HardNatRoleHint::Nat4,
+        }
+    }
+
     fn ttl_display(self) -> String {
         match (self.ttl, self.no_ttl) {
             (Some(ttl), true) => format!("{ttl} (disabled by no_ttl)"),
@@ -162,8 +178,12 @@ impl RelayUdpHardNatConfig {
 }
 
 fn resolve_relay_udp_hard_nat_config(args: &CmdArgs) -> Result<RelayUdpHardNatConfig> {
-    let interval_ms = u32::try_from(args.p2p_hardnat_interval)
-        .with_context(|| format!("p2p hardnat interval too large [{}ms]", args.p2p_hardnat_interval))?;
+    let interval_ms = u32::try_from(args.p2p_hardnat_interval).with_context(|| {
+        format!(
+            "p2p hardnat interval too large [{}ms]",
+            args.p2p_hardnat_interval
+        )
+    })?;
     let batch_interval_ms = u32::try_from(args.p2p_hardnat_batch_interval).with_context(|| {
         format!(
             "p2p hardnat batch interval too large [{}ms]",
@@ -206,10 +226,7 @@ fn next_expand_connect_timeout(curr: Duration) -> Duration {
     Duration::from_millis(next_ms as u64)
 }
 
-fn next_open_connect_timeout(
-    curr: Duration,
-    tunnels: &[Option<RelayTunnel>],
-) -> Duration {
+fn next_open_connect_timeout(curr: Duration, tunnels: &[Option<RelayTunnel>]) -> Duration {
     let active = active_tunnel_count(tunnels);
     // When all tunnels are down, keep retry cadence aggressive instead of exponential backoff.
     if active == 0 {
@@ -1773,7 +1790,8 @@ async fn run_worker(worker: RelayWorker) -> Result<()> {
 
         let (stop_tx, mut session_task) =
             spawn_relay_session_task(worker.clone(), local.clone(), selected.clone());
-        let expire_wait = duration_until_replacement_window(selected.expire_at, AGENT_REPLACE_AHEAD);
+        let expire_wait =
+            duration_until_replacement_window(selected.expire_at, AGENT_REPLACE_AHEAD);
 
         tokio::select! {
             r = &mut session_task => {
@@ -2341,7 +2359,20 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
 
     let local_ice = peer.client_gather().await?;
     let local_codec = UdpRelayCodec::new(gen_udp_relay_obfs_seed());
-    if !udp_relay_hard_nat.is_off() {
+    if udp_relay_hard_nat.is_force() {
+        tracing::warn!(
+            "[relay_hardnat_diag] udp relay hard-nat force enabled: mode={}, role={}, socket_count={}, scan_count={}, interval={}ms, batch_interval={}ms, ttl={}, no_ttl={}, target=[{}]; force path will be used instead of ICE dial",
+            udp_relay_hard_nat.mode.as_str(),
+            udp_relay_hard_nat.role.as_str(),
+            udp_relay_hard_nat.socket_count,
+            udp_relay_hard_nat.scan_count,
+            udp_relay_hard_nat.interval_ms,
+            udp_relay_hard_nat.batch_interval_ms,
+            udp_relay_hard_nat.ttl_display(),
+            udp_relay_hard_nat.no_ttl,
+            target,
+        );
+    } else if !udp_relay_hard_nat.is_off() {
         tracing::warn!(
             "[relay_hardnat_diag] udp relay hard-nat requested (placeholder only): mode={}, role={}, socket_count={}, scan_count={}, interval={}ms, batch_interval={}ms, ttl={}, no_ttl={}, target=[{}]; ICE-only path remains active",
             udp_relay_hard_nat.mode.as_str(),
@@ -2393,13 +2424,39 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
         }
     };
 
-    let conn = peer.dial(remote_ice).await?;
-    let (socket, _cfg, remote_addr) = conn.into_parts();
-    socket.connect(remote_addr).await?;
-    Ok(RelayTunnel {
-        socket: Arc::new(socket),
-        codec,
-    })
+    let socket = if udp_relay_hard_nat.is_force() {
+        let hard_nat_conn = open_udp_relay_tunnel_hard_nat_socket(udp_relay_hard_nat, &remote_ice)
+            .await
+            .with_context(|| format!("udp relay hard-nat connect failed, target [{}]", target))?;
+        let HardNatConnectedSocket {
+            role,
+            socket,
+            local_addr,
+            remote_addr,
+            elapsed,
+        } = hard_nat_conn;
+        socket.connect(remote_addr).await.with_context(|| {
+            format!(
+                "udp relay hard-nat connect remote failed, remote [{}], target [{}]",
+                remote_addr, target
+            )
+        })?;
+        tracing::warn!(
+            "[relay_hardnat_diag] udp relay hard-nat connected: role={}, local=[{}], remote=[{}], elapsed={}ms, target=[{}]",
+            role.as_str(),
+            local_addr,
+            remote_addr,
+            elapsed.as_millis(),
+            target
+        );
+        socket
+    } else {
+        let conn = peer.dial(remote_ice).await?;
+        let (socket, _cfg, remote_addr) = conn.into_parts();
+        socket.connect(remote_addr).await?;
+        Arc::new(socket)
+    };
+    Ok(RelayTunnel { socket, codec })
 }
 
 fn build_udp_relay_hard_nat_args(
@@ -2420,6 +2477,61 @@ fn build_udp_relay_hard_nat_args(
         no_ttl: cfg.no_ttl,
         ..Default::default()
     })
+}
+
+async fn open_udp_relay_tunnel_hard_nat_socket(
+    cfg: RelayUdpHardNatConfig,
+    remote_ice: &IceArgs,
+) -> Result<HardNatConnectedSocket> {
+    let role_plan = resolve_role_plan(cfg.role_hint(), true);
+    let target_plan = derive_target_plan_from_ice(remote_ice);
+    tracing::warn!(
+        "[relay_hardnat_diag] udp relay hard-nat planning: local_role={}, remote_role={}, parsed_candidates={}, usable_udp_candidates={}, nat3_target_ip={:?}, nat4_target={:?}, socket_count={}, scan_count={}, interval={}ms, batch_interval={}ms, ttl={}",
+        role_plan.local_role.as_str(),
+        role_plan.remote_role.as_str(),
+        target_plan.parsed_candidates,
+        target_plan.usable_udp_candidates,
+        target_plan.nat3_target_ip,
+        target_plan.nat4_target,
+        cfg.socket_count,
+        cfg.scan_count,
+        cfg.interval_ms,
+        cfg.batch_interval_ms,
+        cfg.ttl_display(),
+    );
+
+    let ttl = if cfg.no_ttl { None } else { cfg.ttl };
+    let interval = Duration::from_millis(cfg.interval_ms as u64);
+    match role_plan.local_role {
+        HardNatRole::Nat3 => {
+            let target_ip = target_plan
+                .nat3_target_ip
+                .with_context(|| "hard-nat nat3 target ip missing from remote ICE")?;
+            run_nat3_once(Nat3RunConfig {
+                content: None,
+                target_ip,
+                count: cfg.scan_count as usize,
+                listen: "0.0.0.0:0".to_string(),
+                ttl,
+                interval,
+                batch_interval: Duration::from_millis(cfg.batch_interval_ms as u64),
+            })
+            .await
+        }
+        HardNatRole::Nat4 => {
+            let target = target_plan
+                .nat4_target
+                .with_context(|| "hard-nat nat4 target socket missing from remote ICE")?;
+            run_nat4_once(Nat4RunConfig {
+                content: None,
+                target,
+                count: cfg.socket_count as usize,
+                ttl,
+                interval,
+            })
+            .await
+        }
+    }
 }
 
 fn spawn_tunnel_recv_task(
@@ -4108,10 +4220,7 @@ fn next_nonzero_flow_id(curr: u64) -> u64 {
     next
 }
 
-fn alloc_next_flow_id(
-    next_flow: &mut u64,
-    flow_to_src: &HashMap<u64, SocketAddr>,
-) -> Result<u64> {
+fn alloc_next_flow_id(next_flow: &mut u64, flow_to_src: &HashMap<u64, SocketAddr>) -> Result<u64> {
     let start = *next_flow;
     loop {
         let flow_id = *next_flow;
@@ -4792,13 +4901,14 @@ pub struct CmdArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_udp_relay_hard_nat_args,
-        decode_udp_relay_packet, duration_until_replacement_window_at, encode_udp_relay_packet,
-        format_millis, max_udp_payload_auto, parse_script_specs_from_args, pick_best_tunnel_idx_by, pick_latest_agent,
-        resolve_relay_udp_hard_nat_config, resolve_udp_max_payload, ChannelPoolConfig,
-        CmdArgs, RelayAgentScriptSource, RelayHardNatModeCli, RelayHardNatRoleCli, RelayRule,
-        UdpRelayCodec, DEFAULT_P2P_HARDNAT_BATCH_INTERVAL_MS, DEFAULT_P2P_HARDNAT_INTERVAL_MS,
-        DEFAULT_P2P_HARDNAT_SCAN_COUNT, DEFAULT_P2P_HARDNAT_SOCKET_COUNT,
+        build_udp_relay_hard_nat_args, decode_udp_relay_packet,
+        duration_until_replacement_window_at, encode_udp_relay_packet, format_millis,
+        max_udp_payload_auto, parse_script_specs_from_args, pick_best_tunnel_idx_by,
+        pick_latest_agent, resolve_relay_udp_hard_nat_config, resolve_udp_max_payload,
+        ChannelPoolConfig, CmdArgs, RelayAgentScriptSource, RelayHardNatModeCli,
+        RelayHardNatRoleCli, RelayRule, UdpRelayCodec, DEFAULT_P2P_HARDNAT_BATCH_INTERVAL_MS,
+        DEFAULT_P2P_HARDNAT_INTERVAL_MS, DEFAULT_P2P_HARDNAT_SCAN_COUNT,
+        DEFAULT_P2P_HARDNAT_SOCKET_COUNT,
     };
     use crate::rest_proto::AgentInfo;
     use clap::Parser;
@@ -4825,7 +4935,10 @@ mod tests {
         assert_eq!(cfg.socket_count, DEFAULT_P2P_HARDNAT_SOCKET_COUNT);
         assert_eq!(cfg.scan_count, DEFAULT_P2P_HARDNAT_SCAN_COUNT);
         assert_eq!(cfg.interval_ms, DEFAULT_P2P_HARDNAT_INTERVAL_MS as u32);
-        assert_eq!(cfg.batch_interval_ms, DEFAULT_P2P_HARDNAT_BATCH_INTERVAL_MS as u32);
+        assert_eq!(
+            cfg.batch_interval_ms,
+            DEFAULT_P2P_HARDNAT_BATCH_INTERVAL_MS as u32
+        );
         assert_eq!(cfg.ttl, None);
         assert!(!cfg.no_ttl);
         assert!(build_udp_relay_hard_nat_args(cfg).as_ref().is_none());
@@ -4994,7 +5107,8 @@ mod tests {
     fn replacement_window_wait_when_expire_after_11_minutes() {
         let now_ms = 1_000_000_u64;
         let expire_at = now_ms + 11 * 60 * 1_000;
-        let wait = duration_until_replacement_window_at(expire_at, Duration::from_secs(600), now_ms);
+        let wait =
+            duration_until_replacement_window_at(expire_at, Duration::from_secs(600), now_ms);
         assert_eq!(wait, Duration::from_secs(60));
     }
 
@@ -5002,7 +5116,8 @@ mod tests {
     fn replacement_window_wait_zero_when_expire_within_10_minutes() {
         let now_ms = 1_000_000_u64;
         let expire_at = now_ms + 9 * 60 * 1_000;
-        let wait = duration_until_replacement_window_at(expire_at, Duration::from_secs(600), now_ms);
+        let wait =
+            duration_until_replacement_window_at(expire_at, Duration::from_secs(600), now_ms);
         assert_eq!(wait, Duration::from_secs(0));
     }
 

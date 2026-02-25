@@ -300,8 +300,7 @@ mod tests {
     fn seq_roundtrip_obfs() {
         let codec = UdpRelayCodec::new(1234);
         let mut buf = [0_u8; 256];
-        let n =
-            encode_udp_relay_packet_with_seq(&mut buf, 7, b"hello", Some(300), codec).unwrap();
+        let n = encode_udp_relay_packet_with_seq(&mut buf, 7, b"hello", Some(300), codec).unwrap();
         let pkt = decode_udp_relay_packet_ex(&buf[..n], codec).unwrap();
         assert_eq!(pkt.flow_id, 7);
         assert_eq!(pkt.payload, b"hello");
@@ -316,7 +315,8 @@ mod tests {
         let err =
             encode_udp_relay_packet_with_seq(&mut buf, 7, b"hello", Some(1), codec).unwrap_err();
         assert!(
-            err.to_string().contains("legacy codec does not support seq"),
+            err.to_string()
+                .contains("legacy codec does not support seq"),
             "unexpected err: {err}"
         );
     }
@@ -325,8 +325,7 @@ mod tests {
     fn decode_default_api_ignores_seq() {
         let codec = UdpRelayCodec::new(5678);
         let mut buf = [0_u8; 256];
-        let n =
-            encode_udp_relay_packet_with_seq(&mut buf, 9, b"payload", Some(99), codec).unwrap();
+        let n = encode_udp_relay_packet_with_seq(&mut buf, 9, b"payload", Some(99), codec).unwrap();
         let (flow_id, payload) = encode_then_decode_default(&buf[..n], codec);
         assert_eq!(flow_id, 9);
         assert_eq!(payload, b"payload");

@@ -40,8 +40,12 @@ use crate::{
 };
 
 fn resolve_quic_socks_hard_nat_config(args: &CmdArgs) -> Result<QuicSocksHardNatConfig> {
-    let interval_ms = u32::try_from(args.p2p_hardnat_interval)
-        .with_context(|| format!("p2p hardnat interval too large [{}ms]", args.p2p_hardnat_interval))?;
+    let interval_ms = u32::try_from(args.p2p_hardnat_interval).with_context(|| {
+        format!(
+            "p2p hardnat interval too large [{}ms]",
+            args.p2p_hardnat_interval
+        )
+    })?;
     let batch_interval_ms = u32::try_from(args.p2p_hardnat_batch_interval).with_context(|| {
         format!(
             "p2p hardnat batch interval too large [{}ms]",
@@ -252,8 +256,14 @@ async fn do_run(args: CmdArgs, multi: MultiProgress) -> Result<()> {
             Some(expr) => {
                 if !contains_regex_chars(expr) {
                     tracing::info!("agent name is simple string");
-                    add_agents(&pool, &url, &args, quic_socks_hard_nat, [expr.clone()].into_iter())
-                        .await?;
+                    add_agents(
+                        &pool,
+                        &url,
+                        &args,
+                        quic_socks_hard_nat,
+                        [expr.clone()].into_iter(),
+                    )
+                    .await?;
                     tokio::time::sleep(Duration::MAX / 2).await;
                     return Ok(());
                 }

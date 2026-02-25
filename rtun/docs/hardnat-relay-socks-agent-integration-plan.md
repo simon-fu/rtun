@@ -346,7 +346,36 @@
 
 1. 审查 role hint 语义是否清晰（特别是“同一 proto 字段在两端的解释方式”）
 2. 审查候选优先级是否符合预期（srflx/host/relay 等）
-3. 确认后进入 Milestone 5（assist 或先插入 fallback 编排里程碑）
+3. 确认后进入 Milestone 4.7（UDP relay `force` 单通路前置里程碑）
+
+---
+
+## Milestone 4.7：UDP relay `force` 单通路（不含 assist/fallback）
+
+### 目标
+
+在不改动默认行为的前提下，为 `relay + agent` 的 `UdpRelay` 接入真正的 hard-nat 数据面建链路径（仅 `mode=force` 生效）。保留现有 ICE 候选交换逻辑，用于 hard-nat 角色/目标规划；`off/fallback/assist` 仍保持当前行为（其中 `fallback/assist` 继续占位）。
+
+### 待办事项
+
+- [x] 让 `p2p::hard_nat` one-shot API 在 future 被取消/超时时不会泄漏内部 `recv` task（至少 `abort`）
+- [x] relay 侧 `open_udp_relay_tunnel(...)` 增加 `mode=force` 分支，使用 hard-nat one-shot 建立 tunnel socket
+- [x] agent 侧 `handle_udp_relay(...)` / `udp_relay_task(...)` 增加 `mode=force` 分支，使用 hard-nat one-shot 建立 tunnel socket
+- [x] 保持 `off/fallback/assist` 行为不变（`fallback/assist` 仍为占位日志）
+- [x] 增加/运行针对性验证（至少 `cargo check` + `hard_nat` 单测 + relay/agent hard-nat 参数相关单测）
+
+### 验收项
+
+- [ ] `mode=force` 已具备真实 hard-nat 建链路径（不再是 placeholder）
+- [ ] `off/fallback/assist` 不发生行为变化
+- [ ] one-shot API 取消路径不会遗留长期运行的探测 `recv` task（代码审查结论）
+- [ ] 针对性编译/单测通过
+
+### 人工检查点（必须停）
+
+1. 审查 relay/agent 两侧 `mode=force` 分支条件与日志，确认不会误伤默认路径
+2. 若有环境，手工验证一轮 `UDP relay + --p2p-hardnat force`；若无环境，记录为实网 smoke 待补
+3. 确认后进入 Milestone 5（assist 模式）
 
 ---
 
@@ -447,7 +476,8 @@
 - [x] Milestone 3 实施完成（人工检查通过）
 - [x] Milestone 4 实施完成（人工检查通过）
 - [x] Milestone 4.5 实施完成（人工检查通过；已补本地 UDP 集成测试，`nat4 nat3/nat4` 实网 smoke 待补）
-- [ ] Milestone 4.6 实施完成（待人工检查）
+- [x] Milestone 4.6 实施完成（人工检查通过）
+- [ ] Milestone 4.7 实施完成（待人工检查）
 - [ ] Milestone 5 未开始
 - [ ] Milestone 6 未开始
 
