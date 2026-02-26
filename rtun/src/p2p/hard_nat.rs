@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
@@ -44,6 +45,88 @@ pub enum HardNatMode {
     Fallback,
     Assist,
     Force,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistWinner {
+    Ice,
+    HardNat,
+}
+
+impl AssistWinner {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ice => "ice",
+            Self::HardNat => "hardnat",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AssistRaceBothFailed<E> {
+    pub ice_error: E,
+    pub hard_nat_error: E,
+}
+
+pub async fn race_assist<T, E, FI, FH>(
+    hard_nat_delay: Duration,
+    ice_fut: FI,
+    hard_nat_fut: FH,
+) -> std::result::Result<(AssistWinner, T), AssistRaceBothFailed<E>>
+where
+    FI: Future<Output = std::result::Result<T, E>>,
+    FH: Future<Output = std::result::Result<T, E>>,
+{
+    let delayed_hard_nat = async move {
+        if !hard_nat_delay.is_zero() {
+            tokio::time::sleep(hard_nat_delay).await;
+        }
+        hard_nat_fut.await
+    };
+
+    tokio::pin!(ice_fut);
+    tokio::pin!(delayed_hard_nat);
+
+    let mut ice_pending = true;
+    let mut hard_nat_pending = true;
+    let mut ice_error = None;
+    let mut hard_nat_error = None;
+
+    loop {
+        tokio::select! {
+            r = &mut ice_fut, if ice_pending => {
+                ice_pending = false;
+                match r {
+                    Ok(v) => return Ok((AssistWinner::Ice, v)),
+                    Err(e) => {
+                        ice_error = Some(e);
+                        if !hard_nat_pending {
+                            return Err(AssistRaceBothFailed {
+                                ice_error: ice_error.expect("ice error set"),
+                                hard_nat_error: hard_nat_error.expect("hard-nat error set"),
+                            });
+                        }
+                    }
+                }
+            }
+            r = &mut delayed_hard_nat, if hard_nat_pending => {
+                hard_nat_pending = false;
+                match r {
+                    Ok(v) => return Ok((AssistWinner::HardNat, v)),
+                    Err(e) => {
+                        hard_nat_error = Some(e);
+                        if !ice_pending {
+                            return Err(AssistRaceBothFailed {
+                                ice_error: ice_error.expect("ice error set"),
+                                hard_nat_error: hard_nat_error.expect("hard-nat error set"),
+                            });
+                        }
+                    }
+                }
+            }
+            else => unreachable!("assist race reached no-pending state without result"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -932,5 +1015,65 @@ mod tests {
         echo_task.abort();
         let _ = echo_task.await;
         Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assist_race_returns_first_success_when_both_succeed() {
+        let (winner, value) = race_assist(
+            Duration::from_millis(0),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok::<_, String>("ice")
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Ok::<_, String>("hardnat")
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(winner, AssistWinner::Ice);
+        assert_eq!(value, "ice");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assist_race_returns_both_failures_when_both_fail() {
+        let err = race_assist::<(), _, _, _>(
+            Duration::from_millis(0),
+            async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                Err::<(), _>("ice failed".to_string())
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Err::<(), _>("hardnat failed".to_string())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.ice_error, "ice failed");
+        assert_eq!(err.hard_nat_error, "hardnat failed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assist_race_keeps_waiting_after_ice_timeout_like_failure() {
+        let (winner, value) = race_assist(
+            Duration::from_millis(0),
+            async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                Err::<&'static str, _>("ice-timeout")
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                Ok::<_, &'static str>("hardnat-ok")
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(winner, AssistWinner::HardNat);
+        assert_eq!(value, "hardnat-ok");
     }
 }

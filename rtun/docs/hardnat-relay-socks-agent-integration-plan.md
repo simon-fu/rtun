@@ -379,30 +379,30 @@
 
 ---
 
-## Milestone 5：assist 模式（并联尝试，先成功者获胜）
+## Milestone 5：assist 模式（先做 UDP relay，并联尝试先成功者获胜）
 
 ### 目标
 
-增加 `assist` 模式，在高难 NAT 场景降低建链时延，但不影响默认行为。
+先在 `relay + agent` 的 `UdpRelay` 路径实现 `assist` 模式（并联 `ICE` 与 `HardNAT`，先成功者获胜），在高难 NAT 场景降低建链时延，但不影响默认行为。`socks` 的 `assist` 仍留待后续里程碑。
 
 ### 待办事项
 
-- [ ] 设计并实现“first success wins”并发编排（ICE vs HardNAT）
-- [ ] 增加延迟启动参数（例如 hard-nat 延迟 X ms 启动）
-- [ ] 实现 loser 分支取消和资源清理
-- [ ] 明确 winner 记录与日志
-- [ ] 增加竞态测试（双成功/同时失败/一方超时）
+- [x] 设计并实现“first success wins”并发编排（ICE vs HardNAT）【UDP relay】
+- [x] 增加延迟启动参数（例如 hard-nat 延迟 X ms 启动）【`assist_delay_ms` / `--p2p-hardnat-assist-delay`】
+- [x] 实现 loser 分支取消和资源清理（future drop 取消；hard-nat one-shot 内部 recv task 有 guard）
+- [x] 明确 winner 记录与日志（relay/agent 双端 `winner=ice|hardnat`）
+- [x] 增加竞态测试（双成功/同时失败/一方超时，覆盖 `race_assist(...)` helper）
 
 ### 验收项
 
-- [ ] `assist` 模式在普通 NAT 场景不显著增加资源占用/日志噪音
-- [ ] 高难 NAT 场景下相比 `fallback` 有更快成功样本（至少实验数据）
-- [ ] 无明显资源泄漏
+- [ ] `assist` 模式在普通 NAT 场景不显著增加资源占用/日志噪音（待实网 smoke）
+- [ ] 高难 NAT 场景下相比 `fallback` 有更快成功样本（至少实验数据，待实网）
+- [ ] 无明显资源泄漏（待实网长跑；当前代码审查/单测通过）
 
 ### 人工检查点（必须停）
 
-1. 重点审查并发取消与资源释放
-2. 对比 `off/fallback/assist` 三种模式日志和性能
+1. 重点审查并发取消与资源释放（relay/agent 两侧 assist winner/loser 路径）
+2. 对比 `off/fallback/assist` 三种模式日志与行为（本里程碑仅 UDP relay）
 3. 确认后进入 Milestone 6
 
 ---
@@ -477,8 +477,8 @@
 - [x] Milestone 4 实施完成（人工检查通过）
 - [x] Milestone 4.5 实施完成（人工检查通过；已补本地 UDP 集成测试，`nat4 nat3/nat4` 实网 smoke 待补）
 - [x] Milestone 4.6 实施完成（人工检查通过）
-- [ ] Milestone 4.7 实施完成（待人工检查）
-- [ ] Milestone 5 未开始
+- [x] Milestone 4.7 实施完成（人工检查通过）
+- [x] Milestone 5 实施完成（人工检查通过；已完成 UDP relay assist，实网 smoke 待补）
 - [ ] Milestone 6 未开始
 
 > 执行提醒：每完成一个 milestone，先更新本文件中的勾选状态，再停下来人工检查确认。

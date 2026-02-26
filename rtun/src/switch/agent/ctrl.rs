@@ -30,7 +30,7 @@ use crate::{
         webrtc_ice_peer::{DtlsIceArgs, WebrtcIceConfig, WebrtcIcePeer},
     },
     p2p::hard_nat::{
-        derive_target_plan_from_ice, resolve_role_plan, run_nat3_once, run_nat4_once,
+        derive_target_plan_from_ice, race_assist, resolve_role_plan, run_nat3_once, run_nat4_once,
         HardNatConnectedSocket, HardNatMode, HardNatRole, HardNatRoleHint, Nat3RunConfig,
         Nat4RunConfig,
     },
@@ -415,6 +415,7 @@ const UDP_RELAY_HARD_NAT_DEFAULT_SOCKET_COUNT: u32 = 64;
 const UDP_RELAY_HARD_NAT_DEFAULT_SCAN_COUNT: u32 = 64;
 const UDP_RELAY_HARD_NAT_DEFAULT_INTERVAL_MS: u32 = 1000;
 const UDP_RELAY_HARD_NAT_DEFAULT_BATCH_INTERVAL_MS: u32 = 5000;
+const UDP_RELAY_HARD_NAT_DEFAULT_ASSIST_DELAY_MS: u32 = 300;
 const EXEC_SCRIPT_DEFAULT_TIMEOUT_SECS: u64 = 30;
 const EXEC_SCRIPT_DEFAULT_STDOUT_LIMIT: usize = 256 * 1024;
 const EXEC_SCRIPT_DEFAULT_STDERR_LIMIT: usize = 256 * 1024;
@@ -668,6 +669,11 @@ async fn handle_udp_relay(
             "[agent_hardnat_diag] udp relay hard-nat force enabled: {}; force path will be used instead of ICE accept",
             format_udp_relay_hard_nat_args(&remote_args.hard_nat, hard_nat_cfg.mode),
         );
+    } else if hard_nat_cfg.is_assist() {
+        tracing::warn!(
+            "[agent_hardnat_diag] udp relay hard-nat assist enabled: {}; racing ICE accept vs hard-nat accept",
+            format_udp_relay_hard_nat_args(&remote_args.hard_nat, hard_nat_cfg.mode),
+        );
     } else if hard_nat_cfg.mode != HardNatMode::Off {
         tracing::warn!(
             "[agent_hardnat_diag] udp relay hard-nat requested (placeholder only): {}; ICE-only path remains active",
@@ -710,6 +716,18 @@ async fn handle_udp_relay(
     spawn_with_name(format!("udp-relay-{uid}"), async move {
         let r = if hard_nat_cfg.is_force() {
             udp_relay_task_hard_nat(
+                remote_ice,
+                hard_nat_cfg,
+                target_addr,
+                idle_timeout,
+                max_payload,
+                codec,
+                shared_flows,
+            )
+            .await
+        } else if hard_nat_cfg.is_assist() {
+            udp_relay_task_assist(
+                peer,
                 remote_ice,
                 hard_nat_cfg,
                 target_addr,
@@ -792,6 +810,7 @@ struct UdpRelayHardNatConfig {
     scan_count: u32,
     interval_ms: u32,
     batch_interval_ms: u32,
+    assist_delay_ms: u32,
     ttl: Option<u32>,
     no_ttl: bool,
 }
@@ -807,6 +826,7 @@ impl UdpRelayHardNatConfig {
                 scan_count: UDP_RELAY_HARD_NAT_DEFAULT_SCAN_COUNT,
                 interval_ms: UDP_RELAY_HARD_NAT_DEFAULT_INTERVAL_MS,
                 batch_interval_ms: UDP_RELAY_HARD_NAT_DEFAULT_BATCH_INTERVAL_MS,
+                assist_delay_ms: UDP_RELAY_HARD_NAT_DEFAULT_ASSIST_DELAY_MS,
                 ttl: None,
                 no_ttl: false,
             };
@@ -832,6 +852,11 @@ impl UdpRelayHardNatConfig {
         } else {
             args.batch_interval_ms
         };
+        let assist_delay_ms = if args.assist_delay_ms == 0 {
+            UDP_RELAY_HARD_NAT_DEFAULT_ASSIST_DELAY_MS
+        } else {
+            args.assist_delay_ms
+        };
         let no_ttl = args.no_ttl;
         let ttl = if no_ttl || args.ttl == 0 {
             None
@@ -846,6 +871,7 @@ impl UdpRelayHardNatConfig {
             scan_count,
             interval_ms,
             batch_interval_ms,
+            assist_delay_ms,
             ttl,
             no_ttl,
         }
@@ -853,6 +879,10 @@ impl UdpRelayHardNatConfig {
 
     fn is_force(self) -> bool {
         self.mode == HardNatMode::Force
+    }
+
+    fn is_assist(self) -> bool {
+        self.mode == HardNatMode::Assist
     }
 
     fn ttl_display(self) -> String {
@@ -898,12 +928,13 @@ fn format_udp_relay_hard_nat_args(
     };
 
     format!(
-        "mode={mode:?}, role={}, socket_count={}, scan_count={}, interval_ms={}, batch_interval_ms={}, ttl={}, no_ttl={}",
+        "mode={mode:?}, role={}, socket_count={}, scan_count={}, interval_ms={}, batch_interval_ms={}, assist_delay_ms={}, ttl={}, no_ttl={}",
         role,
         hard_nat.socket_count,
         hard_nat.scan_count,
         hard_nat.interval_ms,
         hard_nat.batch_interval_ms,
+        hard_nat.assist_delay_ms,
         ttl,
         hard_nat.no_ttl
     )
@@ -942,6 +973,150 @@ async fn udp_relay_task(
     .with_context(|| {
         format!(
             "udp relay server loop failed, remote [{}], target [{}]",
+            remote_addr, target_addr
+        )
+    })
+}
+
+enum UdpRelayAssistSocket {
+    Ice {
+        socket: Arc<UdpSocket>,
+        remote_addr: SocketAddr,
+    },
+    HardNat {
+        socket: Arc<UdpSocket>,
+        role: HardNatRole,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        elapsed: Duration,
+    },
+}
+
+async fn udp_relay_task_assist(
+    mut peer: IcePeer,
+    remote_ice: IceArgs,
+    hard_nat_cfg: UdpRelayHardNatConfig,
+    target_addr: SocketAddr,
+    idle_timeout: Duration,
+    max_payload: usize,
+    codec: UdpRelayCodec,
+    shared_flows: SharedRelayFlows,
+) -> Result<()> {
+    let assist_started_at = Instant::now();
+    let remote_ice_for_hard_nat = remote_ice.clone();
+    let hard_nat_delay = Duration::from_millis(hard_nat_cfg.assist_delay_ms as u64);
+
+    let ice_fut = async move {
+        let conn = peer
+            .accept()
+            .await
+            .with_context(|| format!("udp relay accept p2p failed, target [{}]", target_addr))?;
+        let (socket, _cfg, remote_addr) = conn.into_parts();
+        socket.connect(remote_addr).await.with_context(|| {
+            format!(
+                "udp relay connect p2p remote failed, remote [{}], target [{}]",
+                remote_addr, target_addr
+            )
+        })?;
+        Ok::<_, anyhow::Error>(UdpRelayAssistSocket::Ice {
+            socket: Arc::new(socket),
+            remote_addr,
+        })
+    };
+
+    let hard_nat_fut = async move {
+        let hard_nat_conn =
+            open_udp_relay_hard_nat_socket(remote_ice_for_hard_nat, hard_nat_cfg, false)
+                .await
+                .with_context(|| {
+                    format!(
+                        "udp relay hard-nat connect failed, target [{}]",
+                        target_addr
+                    )
+                })?;
+        let HardNatConnectedSocket {
+            role,
+            socket,
+            local_addr,
+            remote_addr,
+            elapsed,
+        } = hard_nat_conn;
+        socket.connect(remote_addr).await.with_context(|| {
+            format!(
+                "udp relay hard-nat connect remote failed, remote [{}], target [{}]",
+                remote_addr, target_addr
+            )
+        })?;
+        Ok::<_, anyhow::Error>(UdpRelayAssistSocket::HardNat {
+            socket,
+            role,
+            local_addr,
+            remote_addr,
+            elapsed,
+        })
+    };
+
+    let (winner, established) = race_assist(hard_nat_delay, ice_fut, hard_nat_fut)
+        .await
+        .map_err(|errs| {
+            anyhow::anyhow!(
+                "udp relay assist failed: ice=[{:#}], hard-nat=[{:#}]",
+                errs.ice_error,
+                errs.hard_nat_error
+            )
+        })?;
+
+    let assist_elapsed = assist_started_at.elapsed();
+    let (socket, remote_addr) = match established {
+        UdpRelayAssistSocket::Ice {
+            socket,
+            remote_addr,
+        } => {
+            tracing::warn!(
+                "[agent_hardnat_diag] udp relay assist winner={}: remote=[{}], elapsed={}ms, hardnat_delay={}ms, target=[{}]; loser future canceled",
+                winner.as_str(),
+                remote_addr,
+                assist_elapsed.as_millis(),
+                hard_nat_cfg.assist_delay_ms,
+                target_addr,
+            );
+            (socket, remote_addr)
+        }
+        UdpRelayAssistSocket::HardNat {
+            socket,
+            role,
+            local_addr,
+            remote_addr,
+            elapsed,
+        } => {
+            tracing::warn!(
+                "[agent_hardnat_diag] udp relay assist winner={}: role={}, local=[{}], remote=[{}], hardnat_elapsed={}ms, race_elapsed={}ms, hardnat_delay={}ms, target=[{}]; loser future canceled",
+                winner.as_str(),
+                role.as_str(),
+                local_addr,
+                remote_addr,
+                elapsed.as_millis(),
+                assist_elapsed.as_millis(),
+                hard_nat_cfg.assist_delay_ms,
+                target_addr
+            );
+            (socket, remote_addr)
+        }
+    };
+
+    run_udp_relay_server_loop(
+        socket,
+        remote_addr,
+        target_addr,
+        idle_timeout,
+        max_payload,
+        codec,
+        shared_flows,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "udp relay assist server loop failed, remote [{}], target [{}]",
             remote_addr, target_addr
         )
     })
@@ -1697,6 +1872,33 @@ mod tests {
             resolve_udp_relay_hard_nat_mode(&args.hard_nat),
             HardNatMode::Off
         );
+    }
+
+    #[test]
+    fn udp_relay_hard_nat_config_defaults_and_parses_assist_delay() {
+        let cfg = UdpRelayHardNatConfig::from_proto(&MessageField::none());
+        assert_eq!(
+            cfg.assist_delay_ms,
+            UDP_RELAY_HARD_NAT_DEFAULT_ASSIST_DELAY_MS
+        );
+
+        let cfg = UdpRelayHardNatConfig::from_proto(&MessageField::some(P2PHardNatArgs {
+            mode: 2,
+            assist_delay_ms: 0,
+            ..Default::default()
+        }));
+        assert_eq!(cfg.mode, HardNatMode::Assist);
+        assert_eq!(
+            cfg.assist_delay_ms,
+            UDP_RELAY_HARD_NAT_DEFAULT_ASSIST_DELAY_MS
+        );
+
+        let cfg = UdpRelayHardNatConfig::from_proto(&MessageField::some(P2PHardNatArgs {
+            mode: 2,
+            assist_delay_ms: 250,
+            ..Default::default()
+        }));
+        assert_eq!(cfg.assist_delay_ms, 250);
     }
 
     #[tokio::test(flavor = "current_thread")]

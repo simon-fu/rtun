@@ -144,6 +144,7 @@ message P2PHardNatArgs {
     uint32 batch_interval_ms            = 6;
     uint32 ttl                          = 7;
     bool no_ttl                         = 8;
+    uint32 assist_delay_ms              = 9;
 }
 
 message QuicSocksArgs {
