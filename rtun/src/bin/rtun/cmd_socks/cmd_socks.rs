@@ -9,6 +9,10 @@ use parking_lot::Mutex;
 use rtun::{
     async_rt::spawn_with_name,
     channel::{ch_stream::ChStream, ChId, ChPair},
+    p2p::hard_nat::{
+        HARD_NAT_MAX_BATCH_INTERVAL_MS, HARD_NAT_MAX_INTERVAL_MS, HARD_NAT_MAX_SCAN_COUNT,
+        HARD_NAT_MAX_SOCKET_COUNT, HARD_NAT_MAX_TTL,
+    },
     proto::OpenSocksArgs,
     switch::{
         agent::ch_socks::run_socks5_conn_bridge,
@@ -56,17 +60,54 @@ fn resolve_quic_socks_hard_nat_config(args: &CmdArgs) -> Result<QuicSocksHardNat
     if args.p2p_hardnat_socket_count == 0 {
         bail!("p2p hardnat socket count must be >= 1");
     }
+    if args.p2p_hardnat_socket_count > HARD_NAT_MAX_SOCKET_COUNT {
+        bail!(
+            "p2p hardnat socket count too large [{}], max [{}]",
+            args.p2p_hardnat_socket_count,
+            HARD_NAT_MAX_SOCKET_COUNT
+        );
+    }
     if args.p2p_hardnat_scan_count == 0 {
         bail!("p2p hardnat scan count must be >= 1");
+    }
+    if args.p2p_hardnat_scan_count > HARD_NAT_MAX_SCAN_COUNT {
+        bail!(
+            "p2p hardnat scan count too large [{}], max [{}]",
+            args.p2p_hardnat_scan_count,
+            HARD_NAT_MAX_SCAN_COUNT
+        );
     }
     if interval_ms == 0 {
         bail!("p2p hardnat interval must be >= 1ms");
     }
+    if interval_ms > HARD_NAT_MAX_INTERVAL_MS {
+        bail!(
+            "p2p hardnat interval too large [{}ms], max [{}ms]",
+            interval_ms,
+            HARD_NAT_MAX_INTERVAL_MS
+        );
+    }
     if batch_interval_ms == 0 {
         bail!("p2p hardnat batch interval must be >= 1ms");
     }
+    if batch_interval_ms > HARD_NAT_MAX_BATCH_INTERVAL_MS {
+        bail!(
+            "p2p hardnat batch interval too large [{}ms], max [{}ms]",
+            batch_interval_ms,
+            HARD_NAT_MAX_BATCH_INTERVAL_MS
+        );
+    }
     if matches!(args.p2p_hardnat_ttl, Some(0)) {
         bail!("p2p hardnat ttl must be >= 1");
+    }
+    if let Some(ttl) = args.p2p_hardnat_ttl {
+        if ttl > HARD_NAT_MAX_TTL {
+            bail!(
+                "p2p hardnat ttl too large [{}], max [{}]",
+                ttl,
+                HARD_NAT_MAX_TTL
+            );
+        }
     }
 
     Ok(QuicSocksHardNatConfig {
@@ -1296,6 +1337,9 @@ mod regex_text {
 #[cfg(test)]
 mod hard_nat_cli_tests {
     use super::*;
+    use rtun::p2p::hard_nat::{
+        HARD_NAT_MAX_SCAN_COUNT, HARD_NAT_MAX_SOCKET_COUNT, HARD_NAT_MAX_TTL,
+    };
 
     #[test]
     fn quic_socks_hard_nat_cli_defaults_to_off() {
@@ -1346,5 +1390,44 @@ mod hard_nat_cli_tests {
         assert_eq!(cfg.batch_interval_ms, 4500);
         assert_eq!(cfg.ttl, Some(9));
         assert!(cfg.no_ttl);
+    }
+
+    #[test]
+    fn quic_socks_hard_nat_cli_rejects_values_above_limits() {
+        let socket_count = (HARD_NAT_MAX_SOCKET_COUNT + 1).to_string();
+        let args = CmdArgs::parse_from([
+            "socks",
+            "quic://rtun.example:9888",
+            "--p2p-hardnat-socket-count",
+            socket_count.as_str(),
+        ]);
+        let err = resolve_quic_socks_hard_nat_config(&args)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("socket count too large"));
+
+        let scan_count = (HARD_NAT_MAX_SCAN_COUNT + 1).to_string();
+        let args = CmdArgs::parse_from([
+            "socks",
+            "quic://rtun.example:9888",
+            "--p2p-hardnat-scan-count",
+            scan_count.as_str(),
+        ]);
+        let err = resolve_quic_socks_hard_nat_config(&args)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("scan count too large"));
+
+        let ttl = (HARD_NAT_MAX_TTL + 1).to_string();
+        let args = CmdArgs::parse_from([
+            "socks",
+            "quic://rtun.example:9888",
+            "--p2p-hardnat-ttl",
+            ttl.as_str(),
+        ]);
+        let err = resolve_quic_socks_hard_nat_config(&args)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ttl too large"));
     }
 }

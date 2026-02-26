@@ -32,7 +32,9 @@ use crate::{
     p2p::hard_nat::{
         derive_target_plan_from_ice, race_assist, resolve_role_plan, run_nat3_once, run_nat4_once,
         HardNatConnectedSocket, HardNatMode, HardNatRole, HardNatRoleHint, Nat3RunConfig,
-        Nat4RunConfig,
+        Nat4RunConfig, HARD_NAT_MAX_ASSIST_DELAY_MS, HARD_NAT_MAX_BATCH_INTERVAL_MS,
+        HARD_NAT_MAX_INTERVAL_MS, HARD_NAT_MAX_SCAN_COUNT, HARD_NAT_MAX_SOCKET_COUNT,
+        HARD_NAT_MAX_TTL,
     },
     proto::{
         open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, ExecAgentScriptArgs,
@@ -836,33 +838,64 @@ impl UdpRelayHardNatConfig {
             UDP_RELAY_HARD_NAT_DEFAULT_SOCKET_COUNT
         } else {
             args.socket_count
-        };
+        }
+        .min(HARD_NAT_MAX_SOCKET_COUNT);
         let scan_count = if args.scan_count == 0 {
             UDP_RELAY_HARD_NAT_DEFAULT_SCAN_COUNT
         } else {
             args.scan_count
-        };
+        }
+        .min(HARD_NAT_MAX_SCAN_COUNT);
         let interval_ms = if args.interval_ms == 0 {
             UDP_RELAY_HARD_NAT_DEFAULT_INTERVAL_MS
         } else {
             args.interval_ms
-        };
+        }
+        .min(HARD_NAT_MAX_INTERVAL_MS);
         let batch_interval_ms = if args.batch_interval_ms == 0 {
             UDP_RELAY_HARD_NAT_DEFAULT_BATCH_INTERVAL_MS
         } else {
             args.batch_interval_ms
-        };
+        }
+        .min(HARD_NAT_MAX_BATCH_INTERVAL_MS);
         let assist_delay_ms = if args.assist_delay_ms == 0 {
             UDP_RELAY_HARD_NAT_DEFAULT_ASSIST_DELAY_MS
         } else {
             args.assist_delay_ms
-        };
+        }
+        .min(HARD_NAT_MAX_ASSIST_DELAY_MS);
         let no_ttl = args.no_ttl;
         let ttl = if no_ttl || args.ttl == 0 {
             None
+        } else if args.ttl > HARD_NAT_MAX_TTL {
+            Some(HARD_NAT_MAX_TTL)
         } else {
             Some(args.ttl)
         };
+
+        if args.socket_count > HARD_NAT_MAX_SOCKET_COUNT
+            || args.scan_count > HARD_NAT_MAX_SCAN_COUNT
+            || args.interval_ms > HARD_NAT_MAX_INTERVAL_MS
+            || args.batch_interval_ms > HARD_NAT_MAX_BATCH_INTERVAL_MS
+            || args.assist_delay_ms > HARD_NAT_MAX_ASSIST_DELAY_MS
+            || (!no_ttl && args.ttl > HARD_NAT_MAX_TTL)
+        {
+            tracing::warn!(
+                "[agent_hardnat_diag] udp relay hard-nat args exceed safety limits; values were clamped: raw_socket_count={}, raw_scan_count={}, raw_interval_ms={}, raw_batch_interval_ms={}, raw_assist_delay_ms={}, raw_ttl={}, max_socket_count={}, max_scan_count={}, max_interval_ms={}, max_batch_interval_ms={}, max_assist_delay_ms={}, max_ttl={}",
+                args.socket_count,
+                args.scan_count,
+                args.interval_ms,
+                args.batch_interval_ms,
+                args.assist_delay_ms,
+                args.ttl,
+                HARD_NAT_MAX_SOCKET_COUNT,
+                HARD_NAT_MAX_SCAN_COUNT,
+                HARD_NAT_MAX_INTERVAL_MS,
+                HARD_NAT_MAX_BATCH_INTERVAL_MS,
+                HARD_NAT_MAX_ASSIST_DELAY_MS,
+                HARD_NAT_MAX_TTL,
+            );
+        }
 
         Self {
             mode,
@@ -1899,6 +1932,26 @@ mod tests {
             ..Default::default()
         }));
         assert_eq!(cfg.assist_delay_ms, 250);
+    }
+
+    #[test]
+    fn udp_relay_hard_nat_config_clamps_values_to_safety_limits() {
+        let cfg = UdpRelayHardNatConfig::from_proto(&MessageField::some(P2PHardNatArgs {
+            mode: 3,
+            socket_count: HARD_NAT_MAX_SOCKET_COUNT + 10,
+            scan_count: HARD_NAT_MAX_SCAN_COUNT + 10,
+            interval_ms: HARD_NAT_MAX_INTERVAL_MS + 1,
+            batch_interval_ms: HARD_NAT_MAX_BATCH_INTERVAL_MS + 1,
+            assist_delay_ms: HARD_NAT_MAX_ASSIST_DELAY_MS + 1,
+            ttl: HARD_NAT_MAX_TTL + 1,
+            ..Default::default()
+        }));
+        assert_eq!(cfg.socket_count, HARD_NAT_MAX_SOCKET_COUNT);
+        assert_eq!(cfg.scan_count, HARD_NAT_MAX_SCAN_COUNT);
+        assert_eq!(cfg.interval_ms, HARD_NAT_MAX_INTERVAL_MS);
+        assert_eq!(cfg.batch_interval_ms, HARD_NAT_MAX_BATCH_INTERVAL_MS);
+        assert_eq!(cfg.assist_delay_ms, HARD_NAT_MAX_ASSIST_DELAY_MS);
+        assert_eq!(cfg.ttl, Some(HARD_NAT_MAX_TTL));
     }
 
     #[tokio::test(flavor = "current_thread")]

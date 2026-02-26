@@ -27,6 +27,8 @@ use rtun::{
     p2p::hard_nat::{
         derive_target_plan_from_ice, race_assist, resolve_role_plan, run_nat3_once, run_nat4_once,
         HardNatConnectedSocket, HardNatRole, HardNatRoleHint, Nat3RunConfig, Nat4RunConfig,
+        HARD_NAT_MAX_ASSIST_DELAY_MS, HARD_NAT_MAX_BATCH_INTERVAL_MS, HARD_NAT_MAX_INTERVAL_MS,
+        HARD_NAT_MAX_SCAN_COUNT, HARD_NAT_MAX_SOCKET_COUNT, HARD_NAT_MAX_TTL,
     },
     proto::{
         open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, ExecAgentScriptArgs,
@@ -206,17 +208,61 @@ fn resolve_relay_udp_hard_nat_config(args: &CmdArgs) -> Result<RelayUdpHardNatCo
     if args.p2p_hardnat_socket_count == 0 {
         bail!("p2p hardnat socket count must be >= 1");
     }
+    if args.p2p_hardnat_socket_count > HARD_NAT_MAX_SOCKET_COUNT {
+        bail!(
+            "p2p hardnat socket count too large [{}], max [{}]",
+            args.p2p_hardnat_socket_count,
+            HARD_NAT_MAX_SOCKET_COUNT
+        );
+    }
     if args.p2p_hardnat_scan_count == 0 {
         bail!("p2p hardnat scan count must be >= 1");
+    }
+    if args.p2p_hardnat_scan_count > HARD_NAT_MAX_SCAN_COUNT {
+        bail!(
+            "p2p hardnat scan count too large [{}], max [{}]",
+            args.p2p_hardnat_scan_count,
+            HARD_NAT_MAX_SCAN_COUNT
+        );
     }
     if interval_ms == 0 {
         bail!("p2p hardnat interval must be >= 1ms");
     }
+    if interval_ms > HARD_NAT_MAX_INTERVAL_MS {
+        bail!(
+            "p2p hardnat interval too large [{}ms], max [{}ms]",
+            interval_ms,
+            HARD_NAT_MAX_INTERVAL_MS
+        );
+    }
     if batch_interval_ms == 0 {
         bail!("p2p hardnat batch interval must be >= 1ms");
     }
+    if batch_interval_ms > HARD_NAT_MAX_BATCH_INTERVAL_MS {
+        bail!(
+            "p2p hardnat batch interval too large [{}ms], max [{}ms]",
+            batch_interval_ms,
+            HARD_NAT_MAX_BATCH_INTERVAL_MS
+        );
+    }
+    if assist_delay_ms > HARD_NAT_MAX_ASSIST_DELAY_MS {
+        bail!(
+            "p2p hardnat assist delay too large [{}ms], max [{}ms]",
+            assist_delay_ms,
+            HARD_NAT_MAX_ASSIST_DELAY_MS
+        );
+    }
     if matches!(args.p2p_hardnat_ttl, Some(0)) {
         bail!("p2p hardnat ttl must be >= 1");
+    }
+    if let Some(ttl) = args.p2p_hardnat_ttl {
+        if ttl > HARD_NAT_MAX_TTL {
+            bail!(
+                "p2p hardnat ttl too large [{}], max [{}]",
+                ttl,
+                HARD_NAT_MAX_TTL
+            );
+        }
     }
 
     Ok(RelayUdpHardNatConfig {
@@ -5076,6 +5122,9 @@ mod tests {
     use crate::rest_proto::AgentInfo;
     use clap::Parser;
     use regex::Regex;
+    use rtun::p2p::hard_nat::{
+        HARD_NAT_MAX_SCAN_COUNT, HARD_NAT_MAX_SOCKET_COUNT, HARD_NAT_MAX_TTL,
+    };
     use std::time::{Duration, Instant};
 
     fn parse_cmd_args_for_test(extra: &[&str]) -> CmdArgs {
@@ -5154,6 +5203,30 @@ mod tests {
         assert_eq!(proto.assist_delay_ms, 222);
         assert_eq!(proto.ttl, 7);
         assert!(proto.no_ttl);
+    }
+
+    #[test]
+    fn relay_hard_nat_cli_rejects_values_above_limits() {
+        let socket_count = (HARD_NAT_MAX_SOCKET_COUNT + 1).to_string();
+        let args = parse_cmd_args_for_test(&["--p2p-hardnat-socket-count", &socket_count]);
+        let err = resolve_relay_udp_hard_nat_config(&args)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("socket count too large"));
+
+        let scan_count = (HARD_NAT_MAX_SCAN_COUNT + 1).to_string();
+        let args = parse_cmd_args_for_test(&["--p2p-hardnat-scan-count", &scan_count]);
+        let err = resolve_relay_udp_hard_nat_config(&args)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("scan count too large"));
+
+        let ttl = (HARD_NAT_MAX_TTL + 1).to_string();
+        let args = parse_cmd_args_for_test(&["--p2p-hardnat-ttl", &ttl]);
+        let err = resolve_relay_udp_hard_nat_config(&args)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ttl too large"));
     }
 
     #[test]

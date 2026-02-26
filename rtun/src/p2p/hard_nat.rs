@@ -23,6 +23,12 @@ use crate::{
 };
 
 pub const DEFAULT_PROBE_TEXT: &str = "nat hello";
+pub const HARD_NAT_MAX_SOCKET_COUNT: u32 = 1024;
+pub const HARD_NAT_MAX_SCAN_COUNT: u32 = 4096;
+pub const HARD_NAT_MAX_INTERVAL_MS: u32 = 60_000;
+pub const HARD_NAT_MAX_BATCH_INTERVAL_MS: u32 = 300_000;
+pub const HARD_NAT_MAX_ASSIST_DELAY_MS: u32 = 10_000;
+pub const HARD_NAT_MAX_TTL: u32 = 255;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HardNatRole {
@@ -263,15 +269,39 @@ impl Nat3RunConfig {
         if self.count == 0 {
             bail!("count must be > 0");
         }
+        if self.count > HARD_NAT_MAX_SCAN_COUNT as usize {
+            bail!(
+                "count too large: {} (max {})",
+                self.count,
+                HARD_NAT_MAX_SCAN_COUNT
+            );
+        }
         if self.interval.is_zero() {
             bail!("interval must be > 0");
+        }
+        if self.interval > Duration::from_millis(HARD_NAT_MAX_INTERVAL_MS as u64) {
+            bail!(
+                "interval too large: {}ms (max {}ms)",
+                self.interval.as_millis(),
+                HARD_NAT_MAX_INTERVAL_MS
+            );
         }
         if self.batch_interval.is_zero() {
             bail!("batch_interval must be > 0");
         }
+        if self.batch_interval > Duration::from_millis(HARD_NAT_MAX_BATCH_INTERVAL_MS as u64) {
+            bail!(
+                "batch_interval too large: {}ms (max {}ms)",
+                self.batch_interval.as_millis(),
+                HARD_NAT_MAX_BATCH_INTERVAL_MS
+            );
+        }
         if let Some(ttl) = self.ttl {
             if ttl == 0 {
                 bail!("ttl must be > 0");
+            }
+            if ttl > HARD_NAT_MAX_TTL {
+                bail!("ttl too large: {} (max {})", ttl, HARD_NAT_MAX_TTL);
             }
         }
         Ok(())
@@ -292,12 +322,29 @@ impl Nat4RunConfig {
         if self.count == 0 {
             bail!("count must be > 0");
         }
+        if self.count > HARD_NAT_MAX_SOCKET_COUNT as usize {
+            bail!(
+                "count too large: {} (max {})",
+                self.count,
+                HARD_NAT_MAX_SOCKET_COUNT
+            );
+        }
         if self.interval.is_zero() {
             bail!("interval must be > 0");
+        }
+        if self.interval > Duration::from_millis(HARD_NAT_MAX_INTERVAL_MS as u64) {
+            bail!(
+                "interval too large: {}ms (max {}ms)",
+                self.interval.as_millis(),
+                HARD_NAT_MAX_INTERVAL_MS
+            );
         }
         if let Some(ttl) = self.ttl {
             if ttl == 0 {
                 bail!("ttl must be > 0");
+            }
+            if ttl > HARD_NAT_MAX_TTL {
+                bail!("ttl too large: {} (max {})", ttl, HARD_NAT_MAX_TTL);
             }
         }
         Ok(())
@@ -829,6 +876,34 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("interval"));
+    }
+
+    #[test]
+    fn nat3_validate_rejects_excessive_scan_count() {
+        let cfg = Nat3RunConfig {
+            content: None,
+            target_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            count: (HARD_NAT_MAX_SCAN_COUNT as usize) + 1,
+            listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).to_string(),
+            ttl: None,
+            interval: Duration::from_millis(100),
+            batch_interval: Duration::from_millis(1000),
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max"));
+    }
+
+    #[test]
+    fn nat4_validate_rejects_excessive_ttl() {
+        let cfg = Nat4RunConfig {
+            content: None,
+            target: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+            count: 4,
+            ttl: Some(HARD_NAT_MAX_TTL + 1),
+            interval: Duration::from_millis(10),
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("ttl"));
     }
 
     #[test]
