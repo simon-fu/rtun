@@ -7,9 +7,9 @@ TODO:
     - ok IfWatcher 在 github 上取到空列表
 */
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::debug;
@@ -39,6 +39,40 @@ pub fn default_ice_servers() -> Vec<String> {
         .iter()
         .map(|x| (*x).to_string())
         .collect()
+}
+
+fn collect_host_candidates<I>(local_addr: SocketAddr, if_addrs: I) -> Result<Vec<Candidate>>
+where
+    I: IntoIterator<Item = IpAddr>,
+{
+    let mut candidates = Vec::new();
+    let mut skipped_invalid_count = 0;
+
+    for if_addr in if_addrs {
+        if (local_addr.is_ipv4() && if_addr.is_ipv4()) || (local_addr.is_ipv6() && if_addr.is_ipv6())
+        {
+            let host_addr = SocketAddr::new(if_addr, local_addr.port());
+            match Candidate::host(host_addr) {
+                Ok(candidate) => candidates.push(candidate),
+                Err(e) => {
+                    skipped_invalid_count += 1;
+                    tracing::warn!("skip invalid local ip [{}] [{}]", if_addr, e);
+                }
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        if skipped_invalid_count > 0 {
+            bail!(
+                "no valid local host ip candidate, skipped {} invalid ip(s)",
+                skipped_invalid_count
+            );
+        }
+        bail!("no valid local host ip candidate");
+    }
+
+    Ok(candidates)
 }
 
 #[derive(Debug, Default)]
@@ -321,17 +355,15 @@ impl IcePeer {
             //     }
             // }
 
+            let mut if_addrs = Vec::new();
             for r in ipnet_iter().await.with_context(|| "ipnet_iter failed")? {
                 let if_addr = r.with_context(|| "ipnet_iter next failed")?.addr();
-                if (local_addr.is_ipv4() && if_addr.is_ipv4())
-                    || (local_addr.is_ipv6() && if_addr.is_ipv6())
-                {
-                    candidates.push(Candidate::host(SocketAddr::new(
-                        if_addr,
-                        local_addr.port(),
-                    ))?);
-                }
+                if_addrs.push(if_addr);
             }
+            candidates.extend(
+                collect_host_candidates(local_addr, if_addrs)
+                    .with_context(|| "collect host candidates failed")?,
+            );
         } else {
             candidates.push(Candidate::host(local_addr).with_context(|| "host candidate failed")?);
         }
@@ -443,12 +475,39 @@ impl IceConn {
 
 #[cfg(test)]
 mod test {
+    use std::net::IpAddr;
+
     use crate::stun::async_udp::AsUdpSocket;
 
     use super::*;
     use anyhow::Result;
     use futures::{stream::FuturesUnordered, StreamExt};
     use tracing::debug;
+
+    #[test]
+    fn test_collect_host_candidates_skip_invalid_ip() {
+        let local_addr = "0.0.0.0:5000".parse().unwrap();
+        let if_addrs = vec![
+            "169.254.225.44".parse::<IpAddr>().unwrap(),
+            "192.168.1.11".parse::<IpAddr>().unwrap(),
+        ];
+
+        let candidates = collect_host_candidates(local_addr, if_addrs).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].addr(), "192.168.1.11:5000".parse().unwrap());
+    }
+
+    #[test]
+    fn test_collect_host_candidates_all_invalid_should_fail() {
+        let local_addr = "0.0.0.0:5000".parse().unwrap();
+        let if_addrs = vec![
+            "169.254.225.44".parse::<IpAddr>().unwrap(),
+            "224.0.0.10".parse::<IpAddr>().unwrap(),
+        ];
+
+        let err = collect_host_candidates(local_addr, if_addrs).unwrap_err();
+        assert!(format!("{err:#}").contains("no valid local host ip candidate"));
+    }
 
     #[tokio::test]
     async fn test_ice_peer_basic() -> Result<()> {
