@@ -155,12 +155,15 @@ rtun relay \
 - `--lock[=true|false]` / `--no-lock`：默认加锁
 - `--force_close[=true|false]`：默认 `false`
 - `--force_dl[=true|false]`：默认 `false`
-- `--cert <path>` + `--key <path>`：可选；未指定时自动生成并复用自签名证书
+- `--cert <path>` + `--key <path>`：可选；优先级最高
 
 说明：
 
 - `hy2` 脚本运行目录默认是 `~/.rtun/hy2`（可通过 `RTUN_HY2_HOME` 覆盖）。
+- TLS 证书来源优先级：`--cert/--key` > `RTUN_HY2_TLS_CERT_PEM` + `RTUN_HY2_TLS_KEY_PEM` > 自动生成并复用自签名证书。
+- `RTUN_HY2_TLS_CERT_PEM` 与 `RTUN_HY2_TLS_KEY_PEM` 需同时设置（适合通过 GitHub Secrets 注入）。
 - 自动证书路径：`~/.rtun/hy2/self_signed_certs/cert.pem` 与 `~/.rtun/hy2/self_signed_certs/key.pem`。
+- 启动日志会打印证书来源：`tls cert source [command-line|environment|generated]`。
 - 会下载指定平台二进制（支持 macOS arm64/amd64、Linux arm64/amd64），后台启动并写入 `hysteria.log`。
 - agent 执行脚本时使用 `sh <temp_script> <argv...>`，每个参数按独立 argv 传递，不做 shell 拼接。
 

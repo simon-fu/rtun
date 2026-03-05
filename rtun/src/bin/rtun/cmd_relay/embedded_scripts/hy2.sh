@@ -25,6 +25,7 @@ AUTO_CERT_FILE="${AUTO_CERT_DIR}/cert.pem"
 AUTO_KEY_FILE="${AUTO_CERT_DIR}/key.pem"
 
 LOCK_HELD="0"
+TLS_SOURCE=""
 
 usage() {
   cat <<'EOF'
@@ -44,7 +45,9 @@ Options:
   -h, --help                            Show help
 
 Notes:
-  - If --cert/--key are omitted, the script auto-generates and reuses self-signed cert/key.
+  - Priority: --cert/--key > RTUN_HY2_TLS_CERT_PEM+RTUN_HY2_TLS_KEY_PEM > auto-generated cert/key.
+  - RTUN_HY2_TLS_CERT_PEM / RTUN_HY2_TLS_KEY_PEM must be set together when used.
+  - If no cert input is provided, the script auto-generates and reuses self-signed cert/key.
   - Binary/log/config path: ${HOME}/.rtun/hy2 (or RTUN_HY2_HOME).
 EOF
 }
@@ -187,6 +190,39 @@ stop_pid() {
 
 ensure_tls_material() {
   if [ -n "$CERT_PATH" ] || [ -n "$KEY_PATH" ]; then
+    TLS_SOURCE="command-line"
+    return 0
+  fi
+
+  env_cert_pem="${RTUN_HY2_TLS_CERT_PEM:-}"
+  env_key_pem="${RTUN_HY2_TLS_KEY_PEM:-}"
+
+  if [ -n "$env_cert_pem" ] || [ -n "$env_key_pem" ]; then
+    if [ -z "$env_cert_pem" ] || [ -z "$env_key_pem" ]; then
+      err "RTUN_HY2_TLS_CERT_PEM and RTUN_HY2_TLS_KEY_PEM must be set together"
+      exit 2
+    fi
+
+    CERT_PATH="$AUTO_CERT_FILE"
+    KEY_PATH="$AUTO_KEY_FILE"
+    mkdir -p "$AUTO_CERT_DIR"
+
+    tmp_cert="$(mktemp "${TMPDIR:-/tmp}/rtun-hy2-cert.XXXXXX")"
+    tmp_key="$(mktemp "${TMPDIR:-/tmp}/rtun-hy2-key.XXXXXX")"
+    cleanup_tls_tmp() {
+      rm -f "$tmp_cert" "$tmp_key" >/dev/null 2>&1 || true
+    }
+
+    printf "%s\n" "$env_cert_pem" > "$tmp_cert"
+    printf "%s\n" "$env_key_pem" > "$tmp_key"
+
+    mv "$tmp_cert" "$CERT_PATH"
+    mv "$tmp_key" "$KEY_PATH"
+    chmod 600 "$KEY_PATH" >/dev/null 2>&1 || true
+    cleanup_tls_tmp
+
+    TLS_SOURCE="environment"
+    log "loaded cert/key from environment [$CERT_PATH] [$KEY_PATH]"
     return 0
   fi
 
@@ -194,6 +230,7 @@ ensure_tls_material() {
   KEY_PATH="$AUTO_KEY_FILE"
 
   if [ -s "$CERT_PATH" ] && [ -s "$KEY_PATH" ]; then
+    TLS_SOURCE="generated"
     log "reuse self-signed cert/key [$CERT_PATH] [$KEY_PATH]"
     return 0
   fi
@@ -224,6 +261,7 @@ ensure_tls_material() {
   mv "$tmp_key" "$KEY_PATH"
   chmod 600 "$KEY_PATH" >/dev/null 2>&1 || true
   cleanup_tls_tmp
+  TLS_SOURCE="generated"
   log "generated self-signed cert/key [$CERT_PATH] [$KEY_PATH]"
 }
 
@@ -406,6 +444,7 @@ else
 fi
 
 ensure_tls_material
+log "tls cert source [${TLS_SOURCE}]"
 
 ln -sf "$bin_path" "$bin_link"
 
