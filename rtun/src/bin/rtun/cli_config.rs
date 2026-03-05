@@ -34,6 +34,7 @@ pub fn prepare_argv(raw_argv: Vec<String>) -> Result<PreparedArgv> {
     let merged_argv = match find_subcommand_index(&base_argv) {
         Some((idx, "relay")) => merge_config_args(base_argv, idx, file_cfg.relay, "relay")?,
         Some((idx, "socks")) => merge_config_args(base_argv, idx, file_cfg.socks, "socks")?,
+        Some((idx, "shell")) => merge_config_args(base_argv, idx, file_cfg.shell, "shell")?,
         _ => base_argv,
     };
 
@@ -49,6 +50,8 @@ struct ConfigFile {
     relay: Option<CmdSection>,
     #[serde(default)]
     socks: Option<CmdSection>,
+    #[serde(default)]
+    shell: Option<CmdSection>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -356,6 +359,44 @@ args = ["--agent", "eq-agent"]
                 "-L",
                 "udp://0.0.0.0:15353?to=8.8.8.8:53",
                 "https://127.0.0.1:9888",
+            ]
+        );
+        assert_eq!(prepared.config_path, Some(config_path));
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_argv_inserts_shell_config_args_before_cli_args() -> Result<()> {
+        let config_path = write_temp_config(
+            "shell.toml",
+            r#"
+[shell]
+args = ["--agent", "cfg-shell-agent", "--secret", "from-config"]
+"#,
+        )?;
+
+        let raw = vec![
+            "rtun".to_string(),
+            "--config".to_string(),
+            config_path.to_string_lossy().to_string(),
+            "shell".to_string(),
+            "https://127.0.0.1:9888".to_string(),
+            "--secret".to_string(),
+            "from-cli".to_string(),
+        ];
+        let prepared = prepare_argv(raw)?;
+        assert_eq!(
+            prepared.argv,
+            vec![
+                "rtun",
+                "shell",
+                "--agent",
+                "cfg-shell-agent",
+                "--secret",
+                "from-config",
+                "https://127.0.0.1:9888",
+                "--secret",
+                "from-cli",
             ]
         );
         assert_eq!(prepared.config_path, Some(config_path));

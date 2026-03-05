@@ -24,7 +24,7 @@ rtun socks --listen 0.0.0.0:2080 "https://xxx.com:8888" --secret sec123
 - 支持入口：
   - `--config <path>` / `--config=<path>`
   - 环境变量 `RTUN_CONFIG`（当未传 `--config` 时生效）
-- 当前支持子命令：`relay`、`socks`
+- 当前支持子命令：`relay`、`socks`、`shell`
 - 优先级：`CLI 参数 > 配置文件参数 > clap 默认值`
 - 约束：配置中的 `args` 不允许再次包含 `--config`
 
@@ -45,6 +45,13 @@ args = [
   "--listen", "0.0.0.0:12080",
   "--secret", "sec123"
 ]
+
+[shell]
+args = [
+  "--agent", "^shell-prod$",
+  "--secret", "sec123",
+  "https://127.0.0.1:8888"
+]
 ```
 
 使用示例：
@@ -52,6 +59,7 @@ args = [
 ```bash
 rtun --config ./rtun.toml relay --secret override-by-cli
 RTUN_CONFIG=./rtun.toml rtun socks --secret override-by-cli
+RTUN_CONFIG=./rtun.toml rtun shell --secret override-by-cli
 ```
 
 ## Relay Subcommand
