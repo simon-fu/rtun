@@ -19,6 +19,41 @@ rtun agent pub "https://xxx.com:8888" --agent rtun --expire_in 60 --secret sec12
 rtun socks --listen 0.0.0.0:2080 "https://xxx.com:8888" --secret sec123
 ```
 
+## 配置文件（TOML）
+
+- 支持入口：
+  - `--config <path>` / `--config=<path>`
+  - 环境变量 `RTUN_CONFIG`（当未传 `--config` 时生效）
+- 当前支持子命令：`relay`、`socks`
+- 优先级：`CLI 参数 > 配置文件参数 > clap 默认值`
+- 约束：配置中的 `args` 不允许再次包含 `--config`
+
+示例：
+
+```toml
+[relay]
+args = [
+  "-L", "udp://0.0.0.0:15353?to=8.8.8.8:53",
+  "quic://127.0.0.1:8888",
+  "--secret", "sec123",
+  "--agent", "^relay-prod$"
+]
+
+[socks]
+args = [
+  "https://127.0.0.1:8888",
+  "--listen", "0.0.0.0:12080",
+  "--secret", "sec123"
+]
+```
+
+使用示例：
+
+```bash
+rtun --config ./rtun.toml relay --secret override-by-cli
+RTUN_CONFIG=./rtun.toml rtun socks --secret override-by-cli
+```
+
 ## Relay Subcommand
 
 `relay` 已实现，用于 UDP 端口通过底层 P2P 通道转发（不走现有 QUIC 隧道）。

@@ -57,6 +57,8 @@ pub mod cmd_bench;
 
 pub mod terminal;
 
+pub mod cli_config;
+
 pub mod client_ch_pty;
 
 pub mod rest_proto;
@@ -97,11 +99,13 @@ enum SubCmd {
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<()> {
-    let args = CmdArgs::parse();
+    let prepared = cli_config::prepare_argv(std::env::args().collect())?;
+    let merged_argv = prepared.argv;
+    let args = CmdArgs::parse_from(merged_argv.clone());
     match args.cmd {
         SubCmd::Shell(args) => cmd_shell::run(args),
         SubCmd::Socks(args) => cmd_socks::run(args),
-        SubCmd::Relay(args) => cmd_relay::run(args),
+        SubCmd::Relay(args) => cmd_relay::run(args, merged_argv),
         SubCmd::Agent(args) => cmd_agent::run(args),
         SubCmd::Local(args) => cmd_local::run(args),
         SubCmd::Udp(args) => cmd_udp::run(args),

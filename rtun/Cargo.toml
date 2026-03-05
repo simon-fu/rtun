@@ -65,6 +65,7 @@ tokio-tungstenite = { version = "=0.20.0", features = ["rustls-tls-webpki-roots"
 
 serde = { version = "=1.0.195", features = ["derive", "serde_derive"] }
 serde_json = "=1.0.111"
+toml = "=0.8.19"
 
 protobuf = { version = "=3.2.0", features = ["with-bytes"] }
 protobuf-json-mapping = "=3.2.0"

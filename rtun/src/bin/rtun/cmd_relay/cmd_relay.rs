@@ -295,9 +295,9 @@ fn next_open_connect_timeout(curr: Duration, tunnels: &[Option<RelayTunnel>]) ->
     }
 }
 
-pub fn run(args: CmdArgs) -> Result<()> {
+pub fn run(args: CmdArgs, argv: Vec<String>) -> Result<()> {
     init_relay_log(&args)?;
-    run_multi_thread(do_run(args))??;
+    run_multi_thread(do_run(args, argv))??;
     Ok(())
 }
 
@@ -1661,7 +1661,7 @@ fn format_millis(ms: u64) -> String {
     }
 }
 
-async fn do_run(args: CmdArgs) -> Result<()> {
+async fn do_run(args: CmdArgs, argv: Vec<String>) -> Result<()> {
     let tui_enabled = args.tui;
     let signal_url = url::Url::parse(&args.url).with_context(|| "invalid url")?;
     if !signal_url.scheme().eq_ignore_ascii_case("http")
@@ -1695,7 +1695,7 @@ async fn do_run(args: CmdArgs) -> Result<()> {
         args.agent_script_timeout
     };
     let agent_script_timeout = Duration::from_secs(agent_script_timeout_secs);
-    let agent_scripts = Arc::new(load_agent_scripts(&args)?);
+    let agent_scripts = Arc::new(load_agent_scripts(&args, &argv)?);
     if !agent_scripts.is_empty() {
         tracing::info!(
             "relay agent scripts enabled: count={}, timeout={}s, fail_policy={:?}",
@@ -4729,8 +4729,8 @@ impl RelayRule {
     }
 }
 
-fn load_agent_scripts(args: &CmdArgs) -> Result<Vec<RelayAgentScriptSpec>> {
-    let ordered_specs = collect_ordered_script_specs(args)?;
+fn load_agent_scripts(args: &CmdArgs, runtime_argv: &[String]) -> Result<Vec<RelayAgentScriptSpec>> {
+    let ordered_specs = collect_ordered_script_specs(args, runtime_argv)?;
     let mut scripts = Vec::with_capacity(ordered_specs.len());
     for cli_spec in ordered_specs {
         let content: Arc<[u8]> = match &cli_spec.source {
@@ -4761,7 +4761,10 @@ fn embedded_agent_script(name: &str) -> Result<Arc<[u8]>> {
     Ok(script.to_vec().into_boxed_slice().into())
 }
 
-fn collect_ordered_script_specs(args: &CmdArgs) -> Result<Vec<RelayAgentScriptCliSpec>> {
+fn collect_ordered_script_specs(
+    args: &CmdArgs,
+    runtime_argv: &[String],
+) -> Result<Vec<RelayAgentScriptCliSpec>> {
     let expected = args.agent_scripts.len() + args.agent_script_files.len();
     if expected == 0 {
         if !args.agent_script_arg.is_empty() || !args.agent_script_args.is_empty() {
@@ -4770,7 +4773,7 @@ fn collect_ordered_script_specs(args: &CmdArgs) -> Result<Vec<RelayAgentScriptCl
         return Ok(Vec::new());
     }
 
-    let parsed = parse_script_specs_from_argv()?;
+    let parsed = parse_script_specs_from_args(runtime_argv.iter().map(|x| x.as_str()))?;
     if parsed.len() == expected {
         return Ok(parsed);
     }
@@ -4797,11 +4800,6 @@ fn collect_ordered_script_specs(args: &CmdArgs) -> Result<Vec<RelayAgentScriptCl
         });
     }
     Ok(fallback)
-}
-
-fn parse_script_specs_from_argv() -> Result<Vec<RelayAgentScriptCliSpec>> {
-    let argv: Vec<String> = std::env::args().collect();
-    parse_script_specs_from_args(argv.iter().map(|x| x.as_str()))
 }
 
 fn parse_script_specs_from_args<'a, I>(args: I) -> Result<Vec<RelayAgentScriptCliSpec>>
@@ -5567,6 +5565,50 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("parse --agent-script-args failed"), "{msg}");
+    }
+
+    #[test]
+    fn collect_ordered_script_specs_should_follow_runtime_argv_order() {
+        let args = parse_cmd_args_for_test(&[
+            "--agent-script",
+            "bootstrap_env",
+            "--agent-script-file",
+            "./scripts/a.sh",
+            "--agent-script",
+            "noop",
+            "--agent-script-arg=--x=1",
+        ]);
+        let runtime_argv = vec![
+            "rtun".to_string(),
+            "relay".to_string(),
+            "-L".to_string(),
+            "udp://127.0.0.1:14433?to=127.0.0.1:4433".to_string(),
+            "https://127.0.0.1:9888".to_string(),
+            "--agent-script-file".to_string(),
+            "./scripts/a.sh".to_string(),
+            "--agent-script".to_string(),
+            "bootstrap_env".to_string(),
+            "--agent-script".to_string(),
+            "noop".to_string(),
+            "--agent-script-arg".to_string(),
+            "--x=1".to_string(),
+        ];
+
+        let specs = super::collect_ordered_script_specs(&args, &runtime_argv).unwrap();
+        assert_eq!(specs.len(), 3);
+        assert!(matches!(
+            &specs[0].source,
+            RelayAgentScriptSource::File { path } if path == std::path::Path::new("./scripts/a.sh")
+        ));
+        assert!(matches!(
+            &specs[1].source,
+            RelayAgentScriptSource::Embedded { name } if name == "bootstrap_env"
+        ));
+        assert!(matches!(
+            &specs[2].source,
+            RelayAgentScriptSource::Embedded { name } if name == "noop"
+        ));
+        assert_eq!(specs[2].argv, vec!["--x=1".to_string()]);
     }
 
     #[test]
