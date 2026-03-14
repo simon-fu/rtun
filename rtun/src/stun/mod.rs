@@ -17,5 +17,6 @@
 // pub mod attribute;
 
 pub mod async_udp;
+pub mod stun;
 
 // pub mod tun_peer;

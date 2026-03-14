@@ -17,9 +17,13 @@ use tracing::{debug, info, warn};
 use crate::{
     ice::{
         ice_candidate::{parse_candidate, CandidateKind},
-        ice_peer::IceArgs,
+        ice_peer::{default_ice_servers, IceArgs},
     },
     proto::P2PHardNatArgs,
+    stun::{
+        async_udp::{tokio_socket_bind, AsyncUdpSocket, TokioUdpSocket},
+        stun::{detect_nat_type3, BindingOutput, Config as StunConfig, NatType},
+    },
 };
 
 pub const DEFAULT_PROBE_TEXT: &str = "nat hello";
@@ -29,6 +33,7 @@ pub const HARD_NAT_MAX_INTERVAL_MS: u32 = 60_000;
 pub const HARD_NAT_MAX_BATCH_INTERVAL_MS: u32 = 300_000;
 pub const HARD_NAT_MAX_ASSIST_DELAY_MS: u32 = 10_000;
 pub const HARD_NAT_MAX_TTL: u32 = 255;
+const NAT3_STUN_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(800);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HardNatRole {
@@ -262,6 +267,8 @@ pub struct Nat3RunConfig {
     pub ttl: Option<u32>,
     pub interval: Duration,
     pub batch_interval: Duration,
+    pub discover_public_addr: bool,
+    pub stun_servers: Vec<String>,
 }
 
 impl Nat3RunConfig {
@@ -403,6 +410,96 @@ pub fn resolve_probe_text(content: Option<&str>) -> String {
     content.unwrap_or(DEFAULT_PROBE_TEXT).to_string()
 }
 
+fn resolve_nat3_stun_servers(
+    discover_public_addr: bool,
+    stun_servers: &[String],
+) -> Result<Vec<String>> {
+    if !discover_public_addr {
+        return Ok(Vec::new());
+    }
+
+    let servers = if stun_servers.is_empty() {
+        default_ice_servers()
+    } else {
+        stun_servers.to_vec()
+    };
+
+    let mut uniq = HashSet::new();
+    let mut normalized = Vec::new();
+    for server in servers {
+        let server = normalize_nat3_stun_server(&server)?;
+        if uniq.insert(server.clone()) {
+            normalized.push(server);
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalize_nat3_stun_server(server: &str) -> Result<String> {
+    if let Some(server) = server.strip_prefix("stun:") {
+        return Ok(server.to_string());
+    }
+    if server.starts_with("turn:") {
+        bail!("turn server is not supported for nat3 public address discovery: {server}");
+    }
+    Ok(server.to_string())
+}
+
+async fn discover_nat3_public_addr(
+    socket: TokioUdpSocket,
+    stun_servers: &[String],
+) -> Result<(TokioUdpSocket, BindingOutput)> {
+    detect_nat_type3(
+        socket,
+        stun_servers.iter().map(String::as_str),
+        StunConfig::default()
+            .with_min_success_response(2)
+            .with_transaction_timeout(NAT3_STUN_TRANSACTION_TIMEOUT),
+    )
+    .await
+    .with_context(|| "detect nat3 public address failed")
+}
+
+fn recommended_nat4_target_for_nat3_discovery(
+    mapped: &[SocketAddr],
+    nat_type: Option<NatType>,
+) -> Option<SocketAddr> {
+    match (nat_type, mapped) {
+        (Some(NatType::Cone), [mapped]) => Some(*mapped),
+        _ => None,
+    }
+}
+
+fn log_nat3_public_addr_discovery(local_addr: SocketAddr, output: &BindingOutput) {
+    let mapped = output.mapped_iter().collect::<Vec<_>>();
+    if mapped.is_empty() {
+        return;
+    }
+
+    let nat_type = match output.nat_type() {
+        Some(NatType::Cone) => "cone",
+        Some(NatType::Symmetric) => "symmetric",
+        None => "unknown",
+    };
+
+    info!("nat3 public address discovery local [{local_addr}] => mapped {mapped:?}, nat_type [{nat_type}]");
+
+    if let Some(target) = recommended_nat4_target_for_nat3_discovery(&mapped, output.nat_type()) {
+        info!(
+            "recommended peer command: rtun nat4 nat4 -t {}",
+            target
+        );
+    } else if output.nat_type().is_none() && mapped.len() == 1 {
+        warn!(
+            "single mapped address discovered for nat3 local [{local_addr}], but nat type is still unknown; skip recommended nat4 command until at least two STUN responses agree"
+        );
+    } else {
+        warn!(
+            "multiple mapped addresses discovered for nat3 local [{local_addr}]: {mapped:?}; nat4 manual test may be unstable"
+        );
+    }
+}
+
 pub fn encode_probe_token(role: HardNatRole, id: u64) -> String {
     format!("{}:{id:x}", role.as_str())
 }
@@ -450,10 +547,27 @@ pub async fn run_nat3_once(args: Nat3RunConfig) -> Result<HardNatConnectedSocket
     let ttl = args.ttl;
     let target_ip = args.target_ip;
     let start_at = Instant::now();
+    let stun_servers = resolve_nat3_stun_servers(args.discover_public_addr, &args.stun_servers)?;
 
-    let socket = UdpSocket::bind(&args.listen)
-        .await
-        .with_context(|| format!("failed to bind socket addr [{}]", args.listen))?;
+    let socket = if args.discover_public_addr {
+        let socket = tokio_socket_bind(&args.listen)
+            .await
+            .with_context(|| format!("failed to bind socket addr [{}]", args.listen))?;
+        let local_addr = socket
+            .local_addr()
+            .with_context(|| "get local address failed")?;
+        info!(
+            "discover nat3 public address using stun servers {:?} from [{local_addr}]",
+            stun_servers
+        );
+        let (socket, output) = discover_nat3_public_addr(socket, &stun_servers).await?;
+        log_nat3_public_addr_discovery(local_addr, &output);
+        socket.into_inner()
+    } else {
+        UdpSocket::bind(&args.listen)
+            .await
+            .with_context(|| format!("failed to bind socket addr [{}]", args.listen))?
+    };
 
     if let Some(ttl) = ttl {
         socket.set_ttl(ttl).with_context(|| "set ttl failed")?;
@@ -848,7 +962,58 @@ async fn send_conn_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::{Arc, Mutex};
+    use crate::stun::{
+        async_udp::{tokio_socket_bind, AsyncUdpSocket},
+        stun::{decode_message, try_binding_response_bytes},
+    };
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogWriter(SharedLogBuffer);
+
+    impl<'a> MakeWriter<'a> for SharedLogBuffer {
+        type Writer = SharedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogWriter(self.clone())
+        }
+    }
+
+    impl io::Write for SharedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .0
+                .lock()
+                .expect("lock shared log buffer")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs(f: impl FnOnce()) -> String {
+        let logs = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = logs
+            .0
+            .lock()
+            .expect("lock shared log buffer")
+            .clone();
+        String::from_utf8(bytes).expect("utf8 logs")
+    }
 
     #[test]
     fn nat3_validate_rejects_zero_count() {
@@ -860,6 +1025,8 @@ mod tests {
             ttl: None,
             interval: Duration::from_millis(100),
             batch_interval: Duration::from_millis(1000),
+            discover_public_addr: false,
+            stun_servers: Vec::new(),
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("count"));
@@ -888,6 +1055,8 @@ mod tests {
             ttl: None,
             interval: Duration::from_millis(100),
             batch_interval: Duration::from_millis(1000),
+            discover_public_addr: false,
+            stun_servers: Vec::new(),
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("max"));
@@ -993,6 +1162,230 @@ mod tests {
         assert_eq!(plan.usable_udp_candidates, 1);
         assert_eq!(plan.nat4_target, Some("127.0.0.1:40001".parse().unwrap()));
         assert_eq!(plan.nat3_target_ip, Some("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn resolve_nat3_stun_servers_uses_defaults_when_discovery_enabled_without_override() {
+        let servers = resolve_nat3_stun_servers(true, &[]).unwrap();
+        assert!(!servers.is_empty());
+        let defaults = crate::ice::ice_peer::default_ice_servers()
+            .into_iter()
+            .map(|server| server.trim_start_matches("stun:").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(servers, defaults);
+    }
+
+    #[test]
+    fn resolve_nat3_stun_servers_normalizes_stun_prefix_and_raw_host_port() {
+        let servers = resolve_nat3_stun_servers(
+            true,
+            &[
+                "stun:stun.miwifi.com:3478".to_string(),
+                "1.1.1.1:3478".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(servers, vec!["stun.miwifi.com:3478", "1.1.1.1:3478"]);
+    }
+
+    #[test]
+    fn resolve_nat3_stun_servers_deduplicates_identical_servers_after_normalization() {
+        let servers = resolve_nat3_stun_servers(
+            true,
+            &[
+                "stun:stun.miwifi.com:3478".to_string(),
+                "stun.miwifi.com:3478".to_string(),
+                "stun:stun.miwifi.com:3478".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(servers, vec!["stun.miwifi.com:3478"]);
+    }
+
+    #[test]
+    fn resolve_nat3_stun_servers_rejects_turn_scheme() {
+        let err = resolve_nat3_stun_servers(true, &["turn:1.1.1.1:3478".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("turn"), "{err}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discover_nat3_public_addr_reuses_socket_and_returns_mapping() -> Result<()> {
+        let stun_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let stun_addr = stun_socket.local_addr()?;
+        let stun_task = tokio::spawn(async move {
+            let mut buf = [0_u8; 2048];
+            loop {
+                let (len, from) = match stun_socket.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let req = match decode_message(&buf[..len]) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(rsp) = try_binding_response_bytes(&req, &from) {
+                    let _ = stun_socket.send_to(&rsp, from).await;
+                }
+            }
+        });
+
+        let socket = tokio_socket_bind("127.0.0.1:0").await?;
+        let local_addr = socket.local_addr()?;
+        let (socket, output) =
+            discover_nat3_public_addr(socket, &[stun_addr.to_string()]).await?;
+        let mapped = output.mapped_iter().collect::<Vec<_>>();
+
+        assert_eq!(socket.local_addr()?, local_addr);
+        assert_eq!(mapped, vec![local_addr]);
+
+        stun_task.abort();
+        let _ = stun_task.await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discover_nat3_public_addr_returns_after_bounded_wait_when_other_server_is_silent(
+    ) -> Result<()> {
+        let stun_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let stun_addr = stun_socket.local_addr()?;
+        let stun_task = tokio::spawn(async move {
+            let mut buf = [0_u8; 2048];
+            loop {
+                let (len, from) = match stun_socket.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let req = match decode_message(&buf[..len]) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(rsp) = try_binding_response_bytes(&req, &from) {
+                    let _ = stun_socket.send_to(&rsp, from).await;
+                }
+            }
+        });
+
+        let silent_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let silent_addr = silent_socket.local_addr()?;
+
+        let socket = tokio_socket_bind("127.0.0.1:0").await?;
+        let (_, output) = tokio::time::timeout(
+            Duration::from_millis(1500),
+            discover_nat3_public_addr(socket, &[stun_addr.to_string(), silent_addr.to_string()]),
+        )
+        .await
+        .with_context(|| "discover_nat3_public_addr timed out waiting for silent stun target")??;
+
+        assert_eq!(output.mapped_iter().count(), 1);
+
+        stun_task.abort();
+        let _ = stun_task.await;
+        drop(silent_socket);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discover_nat3_public_addr_waits_briefly_for_second_success_to_confirm_cone_nat(
+    ) -> Result<()> {
+        let stun_socket1 = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let stun_addr1 = stun_socket1.local_addr()?;
+        let stun_task1 = tokio::spawn(async move {
+            let mut buf = [0_u8; 2048];
+            loop {
+                let (len, from) = match stun_socket1.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let req = match decode_message(&buf[..len]) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(rsp) = try_binding_response_bytes(&req, &from) {
+                    let _ = stun_socket1.send_to(&rsp, from).await;
+                }
+            }
+        });
+
+        let stun_socket2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let stun_addr2 = stun_socket2.local_addr()?;
+        let stun_task2 = tokio::spawn(async move {
+            let mut buf = [0_u8; 2048];
+            loop {
+                let (len, from) = match stun_socket2.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let req = match decode_message(&buf[..len]) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(rsp) = try_binding_response_bytes(&req, &from) {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let _ = stun_socket2.send_to(&rsp, from).await;
+                }
+            }
+        });
+
+        let socket = tokio_socket_bind("127.0.0.1:0").await?;
+        let local_addr = socket.local_addr()?;
+        let (_, output) = tokio::time::timeout(
+            Duration::from_secs(1),
+            discover_nat3_public_addr(socket, &[stun_addr1.to_string(), stun_addr2.to_string()]),
+        )
+        .await
+        .with_context(|| "discover_nat3_public_addr timed out before second stun response")??;
+        let mapped = output.mapped_iter().collect::<Vec<_>>();
+
+        assert_eq!(output.nat_type(), Some(NatType::Cone), "{output:?}");
+        assert_eq!(
+            recommended_nat4_target_for_nat3_discovery(&mapped, output.nat_type()),
+            Some(local_addr)
+        );
+
+        stun_task1.abort();
+        let _ = stun_task1.await;
+        stun_task2.abort();
+        let _ = stun_task2.await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn log_nat3_public_addr_discovery_skips_recommendation_when_nat_type_unknown(
+    ) -> Result<()> {
+        let stun_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let stun_addr = stun_socket.local_addr()?;
+        let stun_task = tokio::spawn(async move {
+            let mut buf = [0_u8; 2048];
+            loop {
+                let (len, from) = match stun_socket.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let req = match decode_message(&buf[..len]) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(rsp) = try_binding_response_bytes(&req, &from) {
+                    let _ = stun_socket.send_to(&rsp, from).await;
+                }
+            }
+        });
+
+        let socket = tokio_socket_bind("127.0.0.1:0").await?;
+        let local_addr = socket.local_addr()?;
+        let (_, output) = discover_nat3_public_addr(socket, &[stun_addr.to_string()]).await?;
+
+        let logs = capture_logs(|| log_nat3_public_addr_discovery(local_addr, &output));
+        assert!(
+            !logs.contains("recommended peer command"),
+            "unexpected recommendation for unknown nat type: {logs}"
+        );
+
+        stun_task.abort();
+        let _ = stun_task.await;
+        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]

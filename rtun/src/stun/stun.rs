@@ -17,6 +17,7 @@ use tokio::{net::{ToSocketAddrs, lookup_host}, io::ReadBuf, time::Instant};
 pub struct Config {
     detect_all_server: bool,
     min_success_response: Option<usize>,
+    transaction_timeout: Option<Duration>,
     use_binding_fut: bool,
     username: Option<String>,
     password: Option<String>,
@@ -24,6 +25,20 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn with_min_success_response(self, min_success_response: usize) -> Self {
+        Self {
+            min_success_response: Some(min_success_response),
+            ..self
+        }
+    }
+
+    pub fn with_transaction_timeout(self, transaction_timeout: Duration) -> Self {
+        Self {
+            transaction_timeout: Some(transaction_timeout),
+            ..self
+        }
+    }
+
     pub fn with_username(self, username: String) -> Self {
         Self {
             username: Some(username),
@@ -264,6 +279,9 @@ where
     }
 
     pub fn set_config(&mut self, config: Config) {
+        if let Some(transaction_timeout) = config.transaction_timeout {
+            self.client.tsx_timeout = transaction_timeout;
+        }
         self.config = config;
     }
 
@@ -427,14 +445,17 @@ impl BindingOutput {
     }
 
     fn insert_unique(&mut self, addr: ReflexiveAddr) {
-
-        if let Some(exist) = self.mapped.get_mut(&addr.mapped) {
-            exist.insert(addr.target);
+        let inserted = if let Some(exist) = self.mapped.get_mut(&addr.mapped) {
+            exist.insert(addr.target)
         } else {
             self.mapped.insert(addr.mapped, [addr.target].into());
+            true
+        };
+
+        if inserted {
+            self.total += 1;
+            self.num_success += 1;
         }
-        self.total += 1;
-        self.num_success += 1;
     }
 
     // fn insert_unique(&mut self, addr: ReflexiveAddr) {
@@ -1072,6 +1093,24 @@ mod test {
         assert!(obj.is_nat_detect_done(), "{obj:?}") ;
         assert_eq!(obj.nat_type(), Some(NatType::Symmetric), "{obj:?}") ;
 
+    }
+
+    #[test]
+    fn test_nat_detect_output_ignores_duplicate_target_responses() {
+        let mut obj = BindingOutput::default();
+
+        obj.insert_unique(ReflexiveAddr {
+            target: "1.1.1.1:1".parse().unwrap(),
+            mapped: "9.9.9.9:9".parse().unwrap(),
+        });
+        obj.insert_unique(ReflexiveAddr {
+            target: "1.1.1.1:1".parse().unwrap(),
+            mapped: "9.9.9.9:9".parse().unwrap(),
+        });
+
+        assert_eq!(obj.target_iter().next().unwrap().count(), 1, "{obj:?}");
+        assert!(!obj.is_nat_detect_done(), "{obj:?}");
+        assert_eq!(obj.nat_type(), None, "{obj:?}");
     }
 
     #[test]
