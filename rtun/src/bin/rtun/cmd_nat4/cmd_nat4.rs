@@ -41,6 +41,7 @@ fn build_nat3_run_config(args: Nat3SendCmdArgs) -> Result<Nat3RunConfig> {
         interval: Duration::from_millis(args.interval),
         batch_interval: Duration::from_millis(args.batch_interval),
         discover_public_addr,
+        pause_after_discovery: args.pause_after_discovery,
         stun_servers: args.stun_servers,
     })
 }
@@ -123,6 +124,12 @@ pub struct Nat3SendCmdArgs {
     discover_public_addr: bool,
 
     #[clap(
+        long = "pause-after-discovery",
+        long_help = "pause after public address discovery logs and wait for Enter before probing"
+    )]
+    pause_after_discovery: bool,
+
+    #[clap(
         long = "stun-server",
         long_help = "stun server address, eg. stun:stun.miwifi.com:3478"
     )]
@@ -189,6 +196,13 @@ mod tests {
         assert!(dump.contains("discover_public_addr: true"), "{dump}");
         assert!(dump.contains("stun:stun.miwifi.com:3478"), "{dump}");
         assert!(dump.contains("1.1.1.1:3478"), "{dump}");
+    }
+
+    #[test]
+    fn nat3_cli_accepts_pause_after_discovery_flag() {
+        let args = parse_cmd_args_for_test(&["--pause-after-discovery"]);
+        let dump = format!("{args:?}");
+        assert!(dump.contains("pause_after_discovery: true"), "{dump}");
     }
 
     #[test]
