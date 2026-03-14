@@ -340,6 +340,7 @@ pub struct Nat4RunConfig {
     pub count: usize,
     pub ttl: Option<u32>,
     pub interval: Duration,
+    pub dump_public_addrs: bool,
 }
 
 impl Nat4RunConfig {
@@ -476,6 +477,50 @@ async fn discover_nat3_public_addr(
     )
     .await
     .with_context(|| "detect nat3 public address failed")
+}
+
+async fn discover_nat4_public_addr(
+    socket: TokioUdpSocket,
+    stun_servers: &[String],
+) -> Result<(TokioUdpSocket, Option<SocketAddr>)> {
+    let (socket, output) = detect_nat_type3(
+        socket,
+        stun_servers.iter().map(String::as_str),
+        StunConfig::default()
+            .with_min_success_response(1)
+            .with_transaction_timeout(NAT3_STUN_TRANSACTION_TIMEOUT),
+    )
+    .await
+    .with_context(|| "detect nat4 public address failed")?;
+
+    let mapped_addr = output.mapped_iter().next();
+    Ok((socket, mapped_addr))
+}
+
+async fn discover_nat4_public_addrs(
+    sockets: Vec<TokioUdpSocket>,
+    stun_servers: &[String],
+) -> Result<Vec<(TokioUdpSocket, Option<SocketAddr>)>> {
+    let mut discovered = Vec::with_capacity(sockets.len());
+    for socket in sockets {
+        discovered.push(discover_nat4_public_addr(socket, stun_servers).await?);
+    }
+    Ok(discovered)
+}
+
+fn log_nat4_public_addr_discovery(
+    index: usize,
+    local_addr: SocketAddr,
+    mapped_addr: Option<SocketAddr>,
+) {
+    match mapped_addr {
+        Some(mapped_addr) => debug!(
+            "nat4 public address discovery socket [{index}] local [{local_addr}] => mapped [{mapped_addr}]"
+        ),
+        None => debug!(
+            "nat4 public address discovery socket [{index}] local [{local_addr}] => mapped [none]"
+        ),
+    }
 }
 
 pub struct PreparedNat3Socket {
@@ -792,17 +837,45 @@ pub async fn run_nat4_once(args: Nat4RunConfig) -> Result<HardNatConnectedSocket
             .with_context(|| "ping_and_get_hops failed")?,
     };
 
-    let mut senders = Vec::with_capacity(args.count);
+    let nat4_discovery_stun_servers = if args.dump_public_addrs {
+        Some(resolve_nat3_stun_servers(true, &[])?)
+    } else {
+        None
+    };
+
+    let mut sender_parts = Vec::with_capacity(args.count);
     let mut recv_tasks = RecvTaskGuard::with_capacity(args.count);
 
     for _ in 0..args.count {
         let listen = "0.0.0.0:0";
-        let socket = UdpSocket::bind(listen)
+        let socket = tokio_socket_bind(listen)
             .await
             .with_context(|| format!("failed to bind socket addr [{}]", listen))?;
-
-        let socket = Arc::new(socket);
         let local = socket.local_addr()?;
+        sender_parts.push((socket, local));
+    }
+
+    let mut senders = Vec::with_capacity(args.count);
+    let sender_parts = if let Some(stun_servers) = nat4_discovery_stun_servers.as_ref() {
+        discover_nat4_public_addrs(
+            sender_parts.into_iter().map(|(socket, _)| socket).collect(),
+            stun_servers,
+        )
+        .await?
+        .into_iter()
+        .enumerate()
+        .map(|(index, (socket, mapped_addr))| {
+            let local = socket.local_addr()?;
+            log_nat4_public_addr_discovery(index, local, mapped_addr);
+            Ok((socket, local))
+        })
+        .collect::<Result<Vec<_>>>()?
+    } else {
+        sender_parts
+    };
+
+    for (socket, local) in sender_parts {
+        let socket = Arc::new(socket.into_inner());
 
         let recv_task = {
             let socket = socket.clone();
@@ -1141,6 +1214,7 @@ mod tests {
             count: 4,
             ttl: None,
             interval: Duration::ZERO,
+            dump_public_addrs: false,
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("interval"));
@@ -1190,6 +1264,7 @@ mod tests {
             count: 4,
             ttl: Some(HARD_NAT_MAX_TTL + 1),
             interval: Duration::from_millis(10),
+            dump_public_addrs: false,
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("ttl"));
@@ -1504,6 +1579,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn discover_nat4_public_addrs_reuses_each_socket_and_returns_mapped_ports() -> Result<()>
+    {
+        let stun_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let stun_addr = stun_socket.local_addr()?;
+        let stun_task = tokio::spawn(async move {
+            let mut buf = [0_u8; 2048];
+            loop {
+                let (len, from) = match stun_socket.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let req = match decode_message(&buf[..len]) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(rsp) = try_binding_response_bytes(&req, &from) {
+                    let _ = stun_socket.send_to(&rsp, from).await;
+                }
+            }
+        });
+
+        let socket1 = tokio_socket_bind("127.0.0.1:0").await?;
+        let local1 = socket1.local_addr()?;
+        let socket2 = tokio_socket_bind("127.0.0.1:0").await?;
+        let local2 = socket2.local_addr()?;
+
+        let discovered =
+            discover_nat4_public_addrs(vec![socket1, socket2], &[stun_addr.to_string()]).await?;
+
+        let mut mapped = discovered
+            .into_iter()
+            .map(|(socket, mapped_addr)| Ok((socket.local_addr()?, mapped_addr)))
+            .collect::<Result<Vec<_>>>()?;
+        mapped.sort_by_key(|(local_addr, _)| *local_addr);
+
+        let mut expected = vec![(local1, Some(local1)), (local2, Some(local2))];
+        expected.sort_by_key(|(local_addr, _)| *local_addr);
+
+        assert_eq!(mapped, expected);
+
+        stun_task.abort();
+        let _ = stun_task.await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn log_nat3_public_addr_discovery_skips_recommendation_when_nat_type_unknown(
     ) -> Result<()> {
         let stun_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
@@ -1593,6 +1714,7 @@ mod tests {
                 count: 1,
                 ttl: Some(1), // avoid ping dependency in tests
                 interval: Duration::from_millis(20),
+                dump_public_addrs: false,
             }),
         )
         .await

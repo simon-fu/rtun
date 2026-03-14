@@ -1341,6 +1341,7 @@ async fn open_udp_relay_hard_nat_socket(
                 count: hard_nat_cfg.socket_count as usize,
                 ttl,
                 interval,
+                dump_public_addrs: false,
             })
             .await
         }

@@ -58,6 +58,7 @@ async fn run_nat4(args: Nat4SendCmdArgs) -> Result<()> {
         count: args.count,
         ttl: args.ttl,
         interval: Duration::from_millis(args.interval),
+        dump_public_addrs: args.dump_public_addrs,
     };
     hard_nat::run_nat4(cfg).await
 }
@@ -162,6 +163,12 @@ pub struct Nat4SendCmdArgs {
         default_value = "1000"
     )]
     interval: u64,
+
+    #[clap(
+        long = "dump-public-addrs",
+        long_help = "discover and print each nat4 socket public mapped address before probing"
+    )]
+    dump_public_addrs: bool,
 }
 
 #[cfg(test)]
@@ -169,15 +176,21 @@ mod tests {
     use super::{build_nat3_run_config, CmdArgs};
     use clap::Parser;
 
-    fn parse_cmd_args_for_test(extra: &[&str]) -> CmdArgs {
+    fn parse_nat3_cmd_args_for_test(extra: &[&str]) -> CmdArgs {
         let mut argv = vec!["rtun", "nat3", "-t", "203.0.113.10"];
+        argv.extend_from_slice(extra);
+        CmdArgs::try_parse_from(argv).unwrap()
+    }
+
+    fn parse_nat4_cmd_args_for_test(extra: &[&str]) -> CmdArgs {
+        let mut argv = vec!["rtun", "nat4", "-t", "203.0.113.10:45678"];
         argv.extend_from_slice(extra);
         CmdArgs::try_parse_from(argv).unwrap()
     }
 
     #[test]
     fn nat3_cli_defaults_to_discovery_disabled_without_stun_servers() {
-        let args = parse_cmd_args_for_test(&[]);
+        let args = parse_nat3_cmd_args_for_test(&[]);
         let dump = format!("{args:?}");
         assert!(dump.contains("discover_public_addr: false"), "{dump}");
         assert!(dump.contains("stun_servers: []"), "{dump}");
@@ -185,7 +198,7 @@ mod tests {
 
     #[test]
     fn nat3_cli_accepts_discovery_flag_and_multiple_stun_servers() {
-        let args = parse_cmd_args_for_test(&[
+        let args = parse_nat3_cmd_args_for_test(&[
             "--discover-public-addr",
             "--stun-server",
             "stun:stun.miwifi.com:3478",
@@ -200,14 +213,15 @@ mod tests {
 
     #[test]
     fn nat3_cli_accepts_pause_after_discovery_flag() {
-        let args = parse_cmd_args_for_test(&["--pause-after-discovery"]);
+        let args = parse_nat3_cmd_args_for_test(&["--pause-after-discovery"]);
         let dump = format!("{args:?}");
         assert!(dump.contains("pause_after_discovery: true"), "{dump}");
     }
 
     #[test]
     fn nat3_cli_treats_stun_servers_as_discovery_enabled() {
-        let args = parse_cmd_args_for_test(&["--stun-server", "stun:stun.cloudflare.com:3478"]);
+        let args =
+            parse_nat3_cmd_args_for_test(&["--stun-server", "stun:stun.cloudflare.com:3478"]);
         let cfg = build_nat3_run_config(match args.cmd {
             super::SubCmd::Nat3(args) => args,
             super::SubCmd::Nat4(_) => unreachable!("expected nat3 subcommand"),
@@ -215,5 +229,12 @@ mod tests {
         .unwrap();
         assert!(cfg.discover_public_addr);
         assert_eq!(cfg.stun_servers, vec!["stun:stun.cloudflare.com:3478"]);
+    }
+
+    #[test]
+    fn nat4_cli_accepts_dump_public_addrs_flag() {
+        let args = parse_nat4_cmd_args_for_test(&["--dump-public-addrs"]);
+        let dump = format!("{args:?}");
+        assert!(dump.contains("dump_public_addrs: true"), "{dump}");
     }
 }
