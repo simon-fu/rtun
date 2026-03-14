@@ -34,6 +34,8 @@ pub const HARD_NAT_MAX_BATCH_INTERVAL_MS: u32 = 300_000;
 pub const HARD_NAT_MAX_ASSIST_DELAY_MS: u32 = 10_000;
 pub const HARD_NAT_MAX_TTL: u32 = 255;
 const NAT3_STUN_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(800);
+const NAT3_PAUSE_AFTER_DISCOVERY_PROMPT: &str =
+    "nat3 discovery finished, press Enter to start probing";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HardNatRole {
@@ -268,6 +270,7 @@ pub struct Nat3RunConfig {
     pub interval: Duration,
     pub batch_interval: Duration,
     pub discover_public_addr: bool,
+    pub pause_after_discovery: bool,
     pub stun_servers: Vec<String>,
 }
 
@@ -302,6 +305,9 @@ impl Nat3RunConfig {
                 self.batch_interval.as_millis(),
                 HARD_NAT_MAX_BATCH_INTERVAL_MS
             );
+        }
+        if self.pause_after_discovery && !self.discover_public_addr {
+            bail!("pause_after_discovery requires discover_public_addr");
         }
         if let Some(ttl) = self.ttl {
             if ttl == 0 {
@@ -485,10 +491,7 @@ fn log_nat3_public_addr_discovery(local_addr: SocketAddr, output: &BindingOutput
     info!("nat3 public address discovery local [{local_addr}] => mapped {mapped:?}, nat_type [{nat_type}]");
 
     if let Some(target) = recommended_nat4_target_for_nat3_discovery(&mapped, output.nat_type()) {
-        info!(
-            "recommended peer command: rtun nat4 nat4 -t {}",
-            target
-        );
+        info!("recommended peer command: rtun nat4 nat4 -t {}", target);
     } else if output.nat_type().is_none() && mapped.len() == 1 {
         warn!(
             "single mapped address discovered for nat3 local [{local_addr}], but nat type is still unknown; skip recommended nat4 command until at least two STUN responses agree"
@@ -498,6 +501,42 @@ fn log_nat3_public_addr_discovery(local_addr: SocketAddr, output: &BindingOutput
             "multiple mapped addresses discovered for nat3 local [{local_addr}]: {mapped:?}; nat4 manual test may be unstable"
         );
     }
+}
+
+fn wait_for_enter_after_discovery<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+where
+    R: std::io::BufRead,
+    W: std::io::Write,
+{
+    writeln!(writer, "{NAT3_PAUSE_AFTER_DISCOVERY_PROMPT}")
+        .with_context(|| "write pause prompt failed")?;
+    writer
+        .flush()
+        .with_context(|| "flush pause prompt failed")?;
+
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .with_context(|| "read pause confirmation failed")?;
+    Ok(())
+}
+
+async fn maybe_pause_after_discovery(pause_after_discovery: bool) -> Result<()> {
+    if !pause_after_discovery {
+        return Ok(());
+    }
+
+    tokio::task::spawn_blocking(|| -> Result<()> {
+        let stdin = std::io::stdin();
+        let stdout = std::io::stdout();
+        let mut reader = std::io::BufReader::new(stdin.lock());
+        let mut writer = stdout.lock();
+        wait_for_enter_after_discovery(&mut reader, &mut writer)
+    })
+    .await
+    .with_context(|| "pause-after-discovery task join failed")??;
+
+    Ok(())
 }
 
 pub fn encode_probe_token(role: HardNatRole, id: u64) -> String {
@@ -562,6 +601,7 @@ pub async fn run_nat3_once(args: Nat3RunConfig) -> Result<HardNatConnectedSocket
         );
         let (socket, output) = discover_nat3_public_addr(socket, &stun_servers).await?;
         log_nat3_public_addr_discovery(local_addr, &output);
+        maybe_pause_after_discovery(args.pause_after_discovery).await?;
         socket.into_inner()
     } else {
         UdpSocket::bind(&args.listen)
@@ -962,13 +1002,13 @@ async fn send_conn_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io;
-    use std::net::{Ipv4Addr, SocketAddrV4};
-    use std::sync::{Arc, Mutex};
     use crate::stun::{
         async_udp::{tokio_socket_bind, AsyncUdpSocket},
         stun::{decode_message, try_binding_response_bytes},
     };
+    use std::io::{self, Cursor};
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::MakeWriter;
 
     #[derive(Clone, Default)]
@@ -1007,11 +1047,7 @@ mod tests {
             .with_writer(logs.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, f);
-        let bytes = logs
-            .0
-            .lock()
-            .expect("lock shared log buffer")
-            .clone();
+        let bytes = logs.0.lock().expect("lock shared log buffer").clone();
         String::from_utf8(bytes).expect("utf8 logs")
     }
 
@@ -1026,6 +1062,7 @@ mod tests {
             interval: Duration::from_millis(100),
             batch_interval: Duration::from_millis(1000),
             discover_public_addr: false,
+            pause_after_discovery: false,
             stun_servers: Vec::new(),
         };
         let err = cfg.validate().unwrap_err().to_string();
@@ -1056,10 +1093,29 @@ mod tests {
             interval: Duration::from_millis(100),
             batch_interval: Duration::from_millis(1000),
             discover_public_addr: false,
+            pause_after_discovery: false,
             stun_servers: Vec::new(),
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("max"));
+    }
+
+    #[test]
+    fn pause_after_discovery_requires_discovery() {
+        let cfg = Nat3RunConfig {
+            content: None,
+            target_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            count: 4,
+            listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).to_string(),
+            ttl: None,
+            interval: Duration::from_millis(100),
+            batch_interval: Duration::from_millis(1000),
+            discover_public_addr: false,
+            pause_after_discovery: true,
+            stun_servers: Vec::new(),
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("discover_public_addr"), "{err}");
     }
 
     #[test]
@@ -1073,6 +1129,19 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("ttl"));
+    }
+
+    #[test]
+    fn pause_after_discovery_prompt_message() {
+        let mut input = Cursor::new(b"\n".to_vec());
+        let mut output = Vec::new();
+        wait_for_enter_after_discovery(&mut input, &mut output).unwrap();
+
+        let prompt = String::from_utf8(output).expect("utf8 prompt");
+        assert_eq!(
+            prompt,
+            "nat3 discovery finished, press Enter to start probing\n"
+        );
     }
 
     #[test]
@@ -1233,8 +1302,7 @@ mod tests {
 
         let socket = tokio_socket_bind("127.0.0.1:0").await?;
         let local_addr = socket.local_addr()?;
-        let (socket, output) =
-            discover_nat3_public_addr(socket, &[stun_addr.to_string()]).await?;
+        let (socket, output) = discover_nat3_public_addr(socket, &[stun_addr.to_string()]).await?;
         let mapped = output.mapped_iter().collect::<Vec<_>>();
 
         assert_eq!(socket.local_addr()?, local_addr);

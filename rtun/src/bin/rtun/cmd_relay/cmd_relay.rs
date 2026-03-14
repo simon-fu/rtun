@@ -2718,6 +2718,7 @@ async fn open_udp_relay_tunnel_hard_nat_socket(
                 interval,
                 batch_interval: Duration::from_millis(cfg.batch_interval_ms as u64),
                 discover_public_addr: false,
+                pause_after_discovery: false,
                 stun_servers: Vec::new(),
             })
             .await
