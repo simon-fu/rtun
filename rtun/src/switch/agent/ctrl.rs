@@ -30,11 +30,12 @@ use crate::{
         webrtc_ice_peer::{DtlsIceArgs, WebrtcIceConfig, WebrtcIcePeer},
     },
     p2p::hard_nat::{
-        derive_target_plan_from_ice, race_assist, resolve_role_plan, run_nat3_once, run_nat4_once,
-        HardNatConnectedSocket, HardNatMode, HardNatRole, HardNatRoleHint, Nat3RunConfig,
-        Nat4RunConfig, HARD_NAT_MAX_ASSIST_DELAY_MS, HARD_NAT_MAX_BATCH_INTERVAL_MS,
-        HARD_NAT_MAX_INTERVAL_MS, HARD_NAT_MAX_SCAN_COUNT, HARD_NAT_MAX_SOCKET_COUNT,
-        HARD_NAT_MAX_TTL,
+        derive_target_plan_from_ice_with_explicit_nat4_target, prepare_nat3_public_target,
+        race_assist, resolve_role_plan, run_nat3_once, run_nat3_once_with_prebound_socket,
+        run_nat4_once, HardNatConnectedSocket, HardNatMode, HardNatRole, HardNatRoleHint,
+        Nat3RunConfig, Nat4RunConfig, PreparedNat3Socket, HARD_NAT_MAX_ASSIST_DELAY_MS,
+        HARD_NAT_MAX_BATCH_INTERVAL_MS, HARD_NAT_MAX_INTERVAL_MS, HARD_NAT_MAX_SCAN_COUNT,
+        HARD_NAT_MAX_SOCKET_COUNT, HARD_NAT_MAX_TTL,
     },
     proto::{
         open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, ExecAgentScriptArgs,
@@ -682,6 +683,7 @@ async fn handle_udp_relay(
             format_udp_relay_hard_nat_args(&remote_args.hard_nat, hard_nat_cfg.mode),
         );
     }
+    let remote_hard_nat_target = parse_udp_relay_hard_nat_target_addr(&remote_args)?;
     let remote_ice: IceArgs = remote_args
         .ice
         .take()
@@ -708,6 +710,38 @@ async fn handle_udp_relay(
 
     let uid = peer.uid();
     let local_ice = peer.server_gather(remote_ice.clone()).await?;
+    let local_role_plan = resolve_role_plan(hard_nat_cfg.role_hint, false);
+    let local_prepared_nat3 = if (hard_nat_cfg.is_force() || hard_nat_cfg.is_assist())
+        && local_role_plan.local_role == HardNatRole::Nat3
+    {
+        match prepare_nat3_public_target("0.0.0.0:0", &[]).await {
+            Ok(Some(prepared)) => {
+                tracing::warn!(
+                    "[agent_hardnat_diag] prepared nat3 public target [{}] for local_role=nat3",
+                    prepared.nat4_target
+                );
+                Some(prepared)
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "[agent_hardnat_diag] nat3 public target discovery did not confirm a reusable mapped address; fallback to ICE-derived target"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[agent_hardnat_diag] nat3 public target discovery failed; fallback to ICE-derived target, err [{e:#}]"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let local_hard_nat_target_addr = local_prepared_nat3
+        .as_ref()
+        .map(|prepared| prepared.nat4_target.to_string())
+        .unwrap_or_default();
     tracing::warn!(
         "[relay_agent_diag] starting udp relay tunnel {uid}, local {local_ice:?}, remote {remote_ice:?}, target [{target_addr}], idle {:?}, max_payload {}, codec {}",
         idle_timeout,
@@ -719,7 +753,9 @@ async fn handle_udp_relay(
         let r = if hard_nat_cfg.is_force() {
             udp_relay_task_hard_nat(
                 remote_ice,
+                remote_hard_nat_target,
                 hard_nat_cfg,
+                local_prepared_nat3,
                 target_addr,
                 idle_timeout,
                 max_payload,
@@ -731,7 +767,9 @@ async fn handle_udp_relay(
             udp_relay_task_assist(
                 peer,
                 remote_ice,
+                remote_hard_nat_target,
                 hard_nat_cfg,
+                local_prepared_nat3,
                 target_addr,
                 idle_timeout,
                 max_payload,
@@ -772,6 +810,7 @@ async fn handle_udp_relay(
                 idle_timeout_secs: idle_timeout.as_secs().min(u32::MAX as u64) as u32,
                 max_payload: max_payload as u32,
                 obfs_seed: codec.obfs_seed,
+                hard_nat_target_addr: local_hard_nat_target_addr.into(),
                 ..Default::default()
             })),
             ..Default::default()
@@ -973,6 +1012,22 @@ fn format_udp_relay_hard_nat_args(
     )
 }
 
+fn parse_udp_relay_hard_nat_target_addr(args: &UdpRelayArgs) -> Result<Option<SocketAddr>> {
+    if args.hard_nat_target_addr.is_empty() {
+        return Ok(None);
+    }
+
+    args.hard_nat_target_addr
+        .parse()
+        .map(Some)
+        .with_context(|| {
+            format!(
+                "invalid udp relay hard-nat target [{}]",
+                args.hard_nat_target_addr
+            )
+        })
+}
+
 async fn udp_relay_task(
     mut peer: IcePeer,
     target_addr: SocketAddr,
@@ -1028,7 +1083,9 @@ enum UdpRelayAssistSocket {
 async fn udp_relay_task_assist(
     mut peer: IcePeer,
     remote_ice: IceArgs,
+    remote_hard_nat_target: Option<SocketAddr>,
     hard_nat_cfg: UdpRelayHardNatConfig,
+    local_prepared_nat3: Option<PreparedNat3Socket>,
     target_addr: SocketAddr,
     idle_timeout: Duration,
     max_payload: usize,
@@ -1058,15 +1115,20 @@ async fn udp_relay_task_assist(
     };
 
     let hard_nat_fut = async move {
-        let hard_nat_conn =
-            open_udp_relay_hard_nat_socket(remote_ice_for_hard_nat, hard_nat_cfg, false)
-                .await
-                .with_context(|| {
-                    format!(
-                        "udp relay hard-nat connect failed, target [{}]",
-                        target_addr
-                    )
-                })?;
+        let hard_nat_conn = open_udp_relay_hard_nat_socket(
+            remote_ice_for_hard_nat,
+            remote_hard_nat_target,
+            hard_nat_cfg,
+            false,
+            local_prepared_nat3,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "udp relay hard-nat connect failed, target [{}]",
+                target_addr
+            )
+        })?;
         let HardNatConnectedSocket {
             role,
             socket,
@@ -1157,21 +1219,29 @@ async fn udp_relay_task_assist(
 
 async fn udp_relay_task_hard_nat(
     remote_ice: IceArgs,
+    remote_hard_nat_target: Option<SocketAddr>,
     hard_nat_cfg: UdpRelayHardNatConfig,
+    local_prepared_nat3: Option<PreparedNat3Socket>,
     target_addr: SocketAddr,
     idle_timeout: Duration,
     max_payload: usize,
     codec: UdpRelayCodec,
     shared_flows: SharedRelayFlows,
 ) -> Result<()> {
-    let hard_nat_conn = open_udp_relay_hard_nat_socket(remote_ice, hard_nat_cfg, false)
-        .await
-        .with_context(|| {
-            format!(
-                "udp relay hard-nat connect failed, target [{}]",
-                target_addr
-            )
-        })?;
+    let hard_nat_conn = open_udp_relay_hard_nat_socket(
+        remote_ice,
+        remote_hard_nat_target,
+        hard_nat_cfg,
+        false,
+        local_prepared_nat3,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "udp relay hard-nat connect failed, target [{}]",
+            target_addr
+        )
+    })?;
     let HardNatConnectedSocket {
         role,
         socket,
@@ -1213,11 +1283,14 @@ async fn udp_relay_task_hard_nat(
 
 async fn open_udp_relay_hard_nat_socket(
     remote_ice: IceArgs,
+    remote_hard_nat_target: Option<SocketAddr>,
     hard_nat_cfg: UdpRelayHardNatConfig,
     is_initiator: bool,
+    local_prepared_nat3: Option<PreparedNat3Socket>,
 ) -> Result<HardNatConnectedSocket> {
     let role_plan = resolve_role_plan(hard_nat_cfg.role_hint, is_initiator);
-    let target_plan = derive_target_plan_from_ice(&remote_ice);
+    let target_plan =
+        derive_target_plan_from_ice_with_explicit_nat4_target(&remote_ice, remote_hard_nat_target);
     tracing::warn!(
         "[agent_hardnat_diag] udp relay hard-nat planning: local_role={}, remote_role={}, parsed_candidates={}, usable_udp_candidates={}, nat3_target_ip={:?}, nat4_target={:?}, socket_count={}, scan_count={}, interval={}ms, batch_interval={}ms, ttl={}",
         role_plan.local_role.as_str(),
@@ -1240,7 +1313,7 @@ async fn open_udp_relay_hard_nat_socket(
             let target_ip = target_plan
                 .nat3_target_ip
                 .with_context(|| "hard-nat nat3 target ip missing from remote ICE")?;
-            run_nat3_once(Nat3RunConfig {
+            let args = Nat3RunConfig {
                 content: None,
                 target_ip,
                 count: hard_nat_cfg.scan_count as usize,
@@ -1250,8 +1323,12 @@ async fn open_udp_relay_hard_nat_socket(
                 batch_interval: Duration::from_millis(hard_nat_cfg.batch_interval_ms as u64),
                 discover_public_addr: false,
                 stun_servers: Vec::new(),
-            })
-            .await
+            };
+            if let Some(prepared_nat3) = local_prepared_nat3 {
+                run_nat3_once_with_prebound_socket(args, prepared_nat3.socket).await
+            } else {
+                run_nat3_once(args).await
+            }
         }
         HardNatRole::Nat4 => {
             let target = target_plan
@@ -1954,6 +2031,18 @@ mod tests {
         assert_eq!(cfg.batch_interval_ms, HARD_NAT_MAX_BATCH_INTERVAL_MS);
         assert_eq!(cfg.assist_delay_ms, HARD_NAT_MAX_ASSIST_DELAY_MS);
         assert_eq!(cfg.ttl, Some(HARD_NAT_MAX_TTL));
+    }
+
+    #[test]
+    fn parse_udp_relay_hard_nat_target_addr_rejects_invalid_socket_addr() {
+        let args = UdpRelayArgs {
+            hard_nat_target_addr: "203.0.113.20:not-a-port".into(),
+            ..Default::default()
+        };
+        let err = parse_udp_relay_hard_nat_target_addr(&args)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid udp relay hard-nat target"));
     }
 
     #[tokio::test(flavor = "current_thread")]

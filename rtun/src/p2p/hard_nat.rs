@@ -228,6 +228,18 @@ pub fn derive_target_plan_from_ice(remote: &IceArgs) -> HardNatTargetPlan {
     }
 }
 
+pub fn derive_target_plan_from_ice_with_explicit_nat4_target(
+    remote: &IceArgs,
+    explicit_nat4_target: Option<SocketAddr>,
+) -> HardNatTargetPlan {
+    let mut plan = derive_target_plan_from_ice(remote);
+    if let Some(target) = explicit_nat4_target {
+        plan.nat3_target_ip = Some(target.ip());
+        plan.nat4_target = Some(target);
+    }
+    plan
+}
+
 fn candidate_priority_key(kind: CandidateKind, addr: SocketAddr) -> (u8, u8) {
     let public_rank = if is_public_ip(addr.ip()) { 0 } else { 1 };
     let kind_rank = match kind {
@@ -460,6 +472,41 @@ async fn discover_nat3_public_addr(
     .with_context(|| "detect nat3 public address failed")
 }
 
+pub struct PreparedNat3Socket {
+    pub socket: UdpSocket,
+    pub nat4_target: SocketAddr,
+}
+
+pub async fn prepare_nat3_public_target(
+    listen: &str,
+    stun_servers: &[String],
+) -> Result<Option<PreparedNat3Socket>> {
+    let stun_servers = resolve_nat3_stun_servers(true, stun_servers)?;
+    let socket = tokio_socket_bind(listen)
+        .await
+        .with_context(|| format!("failed to bind socket addr [{listen}]"))?;
+    let local_addr = socket
+        .local_addr()
+        .with_context(|| "get local address failed")?;
+    info!(
+        "discover nat3 public address using stun servers {:?} from [{local_addr}]",
+        stun_servers
+    );
+    let (socket, output) = discover_nat3_public_addr(socket, &stun_servers).await?;
+    log_nat3_public_addr_discovery(local_addr, &output);
+
+    let mapped = output.mapped_iter().collect::<Vec<_>>();
+    let Some(nat4_target) = recommended_nat4_target_for_nat3_discovery(&mapped, output.nat_type())
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(PreparedNat3Socket {
+        socket: socket.into_inner(),
+        nat4_target,
+    }))
+}
+
 fn recommended_nat4_target_for_nat3_discovery(
     mapped: &[SocketAddr],
     nat_type: Option<NatType>,
@@ -485,10 +532,7 @@ fn log_nat3_public_addr_discovery(local_addr: SocketAddr, output: &BindingOutput
     info!("nat3 public address discovery local [{local_addr}] => mapped {mapped:?}, nat_type [{nat_type}]");
 
     if let Some(target) = recommended_nat4_target_for_nat3_discovery(&mapped, output.nat_type()) {
-        info!(
-            "recommended peer command: rtun nat4 nat4 -t {}",
-            target
-        );
+        info!("recommended peer command: rtun nat4 nat4 -t {}", target);
     } else if output.nat_type().is_none() && mapped.len() == 1 {
         warn!(
             "single mapped address discovered for nat3 local [{local_addr}], but nat type is still unknown; skip recommended nat4 command until at least two STUN responses agree"
@@ -540,6 +584,20 @@ pub async fn run_nat3(args: Nat3RunConfig) -> Result<()> {
 }
 
 pub async fn run_nat3_once(args: Nat3RunConfig) -> Result<HardNatConnectedSocket> {
+    run_nat3_once_with_socket(args, None).await
+}
+
+pub async fn run_nat3_once_with_prebound_socket(
+    args: Nat3RunConfig,
+    socket: UdpSocket,
+) -> Result<HardNatConnectedSocket> {
+    run_nat3_once_with_socket(args, Some(socket)).await
+}
+
+async fn run_nat3_once_with_socket(
+    args: Nat3RunConfig,
+    prebound_socket: Option<UdpSocket>,
+) -> Result<HardNatConnectedSocket> {
     args.validate()?;
 
     let interval = args.interval;
@@ -547,9 +605,12 @@ pub async fn run_nat3_once(args: Nat3RunConfig) -> Result<HardNatConnectedSocket
     let ttl = args.ttl;
     let target_ip = args.target_ip;
     let start_at = Instant::now();
-    let stun_servers = resolve_nat3_stun_servers(args.discover_public_addr, &args.stun_servers)?;
 
-    let socket = if args.discover_public_addr {
+    let socket = if let Some(socket) = prebound_socket {
+        socket
+    } else if args.discover_public_addr {
+        let stun_servers =
+            resolve_nat3_stun_servers(args.discover_public_addr, &args.stun_servers)?;
         let socket = tokio_socket_bind(&args.listen)
             .await
             .with_context(|| format!("failed to bind socket addr [{}]", args.listen))?;
@@ -962,13 +1023,13 @@ async fn send_conn_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io;
-    use std::net::{Ipv4Addr, SocketAddrV4};
-    use std::sync::{Arc, Mutex};
     use crate::stun::{
         async_udp::{tokio_socket_bind, AsyncUdpSocket},
         stun::{decode_message, try_binding_response_bytes},
     };
+    use std::io;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::MakeWriter;
 
     #[derive(Clone, Default)]
@@ -987,7 +1048,7 @@ mod tests {
     impl io::Write for SharedLogWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0
-                .0
+                 .0
                 .lock()
                 .expect("lock shared log buffer")
                 .extend_from_slice(buf);
@@ -1007,11 +1068,7 @@ mod tests {
             .with_writer(logs.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, f);
-        let bytes = logs
-            .0
-            .lock()
-            .expect("lock shared log buffer")
-            .clone();
+        let bytes = logs.0.lock().expect("lock shared log buffer").clone();
         String::from_utf8(bytes).expect("utf8 logs")
     }
 
@@ -1165,6 +1222,26 @@ mod tests {
     }
 
     #[test]
+    fn derive_target_plan_prefers_explicit_nat4_target_over_ice_candidate() {
+        let args = IceArgs {
+            ufrag: "u".into(),
+            pwd: "p".into(),
+            candidates: vec![
+                "candidate:1 1 udp 1694498559 198.51.100.10 40001 typ srflx raddr 0.0.0.0 rport 9"
+                    .into(),
+            ],
+        };
+
+        let explicit_target: SocketAddr = "203.0.113.20:54321".parse().unwrap();
+        let plan =
+            derive_target_plan_from_ice_with_explicit_nat4_target(&args, Some(explicit_target));
+        assert_eq!(plan.parsed_candidates, 1);
+        assert_eq!(plan.usable_udp_candidates, 1);
+        assert_eq!(plan.nat3_target_ip, Some(explicit_target.ip()));
+        assert_eq!(plan.nat4_target, Some(explicit_target));
+    }
+
+    #[test]
     fn resolve_nat3_stun_servers_uses_defaults_when_discovery_enabled_without_override() {
         let servers = resolve_nat3_stun_servers(true, &[]).unwrap();
         assert!(!servers.is_empty());
@@ -1233,8 +1310,7 @@ mod tests {
 
         let socket = tokio_socket_bind("127.0.0.1:0").await?;
         let local_addr = socket.local_addr()?;
-        let (socket, output) =
-            discover_nat3_public_addr(socket, &[stun_addr.to_string()]).await?;
+        let (socket, output) = discover_nat3_public_addr(socket, &[stun_addr.to_string()]).await?;
         let mapped = output.mapped_iter().collect::<Vec<_>>();
 
         assert_eq!(socket.local_addr()?, local_addr);

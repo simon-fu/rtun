@@ -158,6 +158,7 @@ message UdpRelayArgs {
     uint32 max_payload                  = 4;
     uint32 obfs_seed                    = 5;
     P2PHardNatArgs hard_nat             = 6;
+    string hard_nat_target_addr         = 7;
 }
 
 message P2PDtlsArgs {
