@@ -23,6 +23,9 @@ use tokio::net::UdpSocket;
 use crate::rest_proto::{make_pub_url, make_ws_scheme};
 use crate::secret::token_gen;
 
+const DEFAULT_UDP_ECHO_ADDR_ENV_VAR: &str = "RTUN_AGENT_DEFAULT_UDP_ECHO_ADDR";
+const DEFAULT_UDP_ECHO_ADDR: &str = "127.0.0.1:12345";
+
 pub async fn run(args0: CmdArgs) -> Result<()> {
     start_default_udp_echo_task().await?;
 
@@ -104,10 +107,7 @@ pub async fn run(args0: CmdArgs) -> Result<()> {
 }
 
 async fn start_default_udp_echo_task() -> Result<()> {
-    const DEFAULT_UDP_ECHO_ADDR: &str = "127.0.0.1:12345";
-    let addr: SocketAddr = DEFAULT_UDP_ECHO_ADDR
-        .parse()
-        .with_context(|| format!("invalid default udp echo addr [{DEFAULT_UDP_ECHO_ADDR}]"))?;
+    let addr = resolve_default_udp_echo_addr()?;
     let socket = UdpSocket::bind(addr)
         .await
         .with_context(|| format!("default udp echo bind failed [{addr}]"))?;
@@ -125,6 +125,19 @@ async fn start_default_udp_echo_task() -> Result<()> {
     });
 
     Ok(())
+}
+
+fn resolve_default_udp_echo_addr() -> Result<SocketAddr> {
+    let raw_addr = std::env::var(DEFAULT_UDP_ECHO_ADDR_ENV_VAR)
+        .ok()
+        .unwrap_or_else(|| DEFAULT_UDP_ECHO_ADDR.to_string());
+
+    raw_addr.parse().with_context(|| {
+        format!(
+            "invalid default udp echo addr [{raw_addr}] from env [{}]",
+            DEFAULT_UDP_ECHO_ADDR_ENV_VAR
+        )
+    })
 }
 
 async fn run_default_udp_echo_task(addr: SocketAddr, socket: UdpSocket) -> Result<()> {
@@ -368,4 +381,91 @@ pub struct CmdArgs {
         long_help = "skip quic tls certificate verification (quic:// only)"
     )]
     quic_insecure: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        resolve_default_udp_echo_addr, start_default_udp_echo_task, DEFAULT_UDP_ECHO_ADDR,
+        DEFAULT_UDP_ECHO_ADDR_ENV_VAR,
+    };
+    use anyhow::Result;
+    use std::{
+        net::UdpSocket as StdUdpSocket,
+        sync::{Mutex, OnceLock},
+    };
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvRestore {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                old: std::env::var(key).ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_default_udp_echo_addr_uses_default_when_env_missing() -> Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::new(DEFAULT_UDP_ECHO_ADDR_ENV_VAR);
+        unsafe {
+            std::env::remove_var(DEFAULT_UDP_ECHO_ADDR_ENV_VAR);
+        }
+
+        assert_eq!(
+            resolve_default_udp_echo_addr()?,
+            DEFAULT_UDP_ECHO_ADDR.parse()?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_default_udp_echo_task_uses_default_addr_without_env_override() -> Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::new(DEFAULT_UDP_ECHO_ADDR_ENV_VAR);
+        unsafe {
+            std::env::remove_var(DEFAULT_UDP_ECHO_ADDR_ENV_VAR);
+        }
+
+        let _occupied = StdUdpSocket::bind(DEFAULT_UDP_ECHO_ADDR)?;
+        let err = start_default_udp_echo_task()
+            .await
+            .expect_err("default addr should stay in use");
+        assert!(err.to_string().contains("default udp echo bind failed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_default_udp_echo_task_allows_env_override_of_default_addr() -> Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::new(DEFAULT_UDP_ECHO_ADDR_ENV_VAR);
+        unsafe {
+            std::env::set_var(DEFAULT_UDP_ECHO_ADDR_ENV_VAR, "127.0.0.1:0");
+        }
+
+        let _occupied = StdUdpSocket::bind(DEFAULT_UDP_ECHO_ADDR)?;
+        start_default_udp_echo_task()
+            .await
+            .expect("env override should avoid the busy default addr");
+        Ok(())
+    }
 }
