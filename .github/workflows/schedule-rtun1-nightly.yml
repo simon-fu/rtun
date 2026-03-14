@@ -45,6 +45,8 @@ jobs:
       env:
         RTUN_HY2_TLS_CERT_PEM: ${{ secrets.RTUN_HY2_TLS_CERT_PEM }}
         RTUN_HY2_TLS_KEY_PEM:  ${{ secrets.RTUN_HY2_TLS_KEY_PEM }}
+        MY_RTUN1_SECRET: ${{ secrets.MY_RTUN1_SECRET }}
+        MY_RTUN1_URL: ${{ secrets.MY_RTUN1_URL }}
       run: |
         cd run-rtun
         
