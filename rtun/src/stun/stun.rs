@@ -1,17 +1,34 @@
-
-use std::{net::SocketAddr, time::Duration, collections::{HashMap, VecDeque, HashSet}, task::{self, Poll}, pin::Pin, io};
-use anyhow::{Result, Context, anyhow};
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use futures::{stream::FuturesUnordered, StreamExt, channel::oneshot, Future, FutureExt, ready};
+use futures::{channel::oneshot, ready, stream::FuturesUnordered, Future, FutureExt, StreamExt};
 use quinn::udp::Transmit;
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    task::{self, Poll},
+    time::Duration,
+};
 
 use crate::stun::async_udp::udp_state;
 
-use super::async_udp::{AsyncUdpSocket, tokio_socket_bind, AsUdpSocket, TokioUdpSocket};
+use super::async_udp::{tokio_socket_bind, AsUdpSocket, AsyncUdpSocket, TokioUdpSocket};
+use bytecodec::{DecodeExt, EncodeExt};
 use rand::Rng;
-use stun_codec::{Message, MessageClass, rfc5389::{methods::BINDING, Attribute, attributes::{Software, XorMappedAddress, MappedAddress, Username}}, TransactionId, MessageEncoder, MessageDecoder, Method};
-use bytecodec::{EncodeExt, DecodeExt};
-use tokio::{net::{ToSocketAddrs, lookup_host}, io::ReadBuf, time::Instant};
+use stun_codec::{
+    rfc5389::{
+        attributes::{MappedAddress, Software, Username, XorMappedAddress},
+        methods::BINDING,
+        Attribute,
+    },
+    Message, MessageClass, MessageDecoder, MessageEncoder, Method, TransactionId,
+};
+use tokio::{
+    io::ReadBuf,
+    net::{lookup_host, ToSocketAddrs},
+    time::Instant,
+};
 
 #[derive(Debug, Default)]
 pub struct Config {
@@ -75,15 +92,15 @@ pub struct Binding<U> {
 
 // impl<U> Default for Binding<U> {
 //     fn default() -> Binding<U> {
-//         Binding { 
-//             config: Default::default(), 
+//         Binding {
+//             config: Default::default(),
 //             socket: Option::<U>::None,
 //         }
 //     }
 // }
 
 impl Binding<TokioUdpSocket> {
-    pub async fn bind<A>(addr: A) -> Result<Binding<TokioUdpSocket>> 
+    pub async fn bind<A>(addr: A) -> Result<Binding<TokioUdpSocket>>
     where
         A: tokio::net::ToSocketAddrs,
     {
@@ -93,22 +110,18 @@ impl Binding<TokioUdpSocket> {
 }
 
 impl<U> Binding<U> {
-
     pub fn with_socket(socket: U) -> Self {
-        Self { 
-            socket, 
+        Self {
+            socket,
             config: Default::default(),
         }
     }
 
     pub fn with_config(socket: U, config: Config) -> Binding<U> {
-        Self { 
-            socket, 
-            config,
-        }
+        Self { socket, config }
     }
 
-    // pub async fn bind<A>(addr: A) -> Result<Binding<BoxUdpSocket>> 
+    // pub async fn bind<A>(addr: A) -> Result<Binding<BoxUdpSocket>>
     // where
     //     A: tokio::net::ToSocketAddrs,
     // {
@@ -117,8 +130,8 @@ impl<U> Binding<U> {
     // }
 
     // fn socket<U1>(self, socket: U1) -> Binding<U1> {
-    //     Binding { 
-    //         socket: Some(socket), 
+    //     Binding {
+    //         socket: Some(socket),
     //         config: self.config,
     //     }
     // }
@@ -147,7 +160,7 @@ impl<U> Binding<U> {
     //     }
     // }
 
-    pub async fn exec<I, A>(self, servers: I) -> Result<(U, BindingOutput)> 
+    pub async fn exec<I, A>(self, servers: I) -> Result<(U, BindingOutput)>
     where
         U: AsyncUdpSocket + Unpin,
         I: Iterator<Item = A>,
@@ -156,7 +169,7 @@ impl<U> Binding<U> {
         self.do_exec(servers).await
     }
 
-    async fn do_exec<I, A>(self, servers: I) -> Result<(U, BindingOutput)> 
+    async fn do_exec<I, A>(self, servers: I) -> Result<(U, BindingOutput)>
     where
         U: AsyncUdpSocket + Unpin,
         I: Iterator<Item = A>,
@@ -169,52 +182,50 @@ impl<U> Binding<U> {
 
         let mut detect = BindingExec::from_socket(socket);
         detect.set_config(self.config);
-    
+
         for server in servers {
             detect.lookup_futures.push(lookup_host(server));
         }
-    
+
         while !detect.is_done() {
             detect.run_one().await?;
         }
-    
+
         detect.into_result()
     }
 }
 
-
-
-
-
-pub const STUN_SERVERS: [&'static str; 3] =  [
+pub const STUN_SERVERS: [&'static str; 3] = [
     "stun1.l.google.com:19302",
     "stun2.l.google.com:19302",
     "stun.qq.com:3478",
 ];
 
-
 pub async fn detect_nat_type1<U: AsyncUdpSocket + Unpin>(socket: U) -> Result<(U, BindingOutput)> {
     run_detect(socket, STUN_SERVERS.iter(), Default::default()).await
 }
 
-pub async fn detect_nat_type2<I, A>(servers: I, config: Config) -> Result<BindingOutput> 
+pub async fn detect_nat_type2<I, A>(servers: I, config: Config) -> Result<BindingOutput>
 where
     I: Iterator<Item = A>,
     A: ToSocketAddrs,
 {
     let socket = tokio_socket_bind("0.0.0.0:0").await?;
-    run_detect(socket, servers, config).await.map(|x|x.1)
+    run_detect(socket, servers, config).await.map(|x| x.1)
 }
 
-
-pub async fn detect_nat_type3<U, I, A>(socket: U, servers: I, config: Config) -> Result<(U, BindingOutput)> 
+pub async fn detect_nat_type3<U, I, A>(
+    socket: U,
+    servers: I,
+    config: Config,
+) -> Result<(U, BindingOutput)>
 where
     U: AsyncUdpSocket + Unpin,
     I: Iterator<Item = A>,
     A: ToSocketAddrs,
 {
     // let socket = Arc::new(UdpSocketExt::bind("0.0.0.0:0").await?);
-    run_detect(socket, servers,  config).await
+    run_detect(socket, servers, config).await
     // let mut detect = DetectNat::from_socket(socket);
     // detect.set_config(config);
 
@@ -225,7 +236,11 @@ where
     // detect.run().await
 }
 
-async fn run_detect<U, I, A>(socket: U, servers: I, mut config: Config) -> Result<(U, BindingOutput)> 
+async fn run_detect<U, I, A>(
+    socket: U,
+    servers: I,
+    mut config: Config,
+) -> Result<(U, BindingOutput)>
 where
     U: AsyncUdpSocket + Unpin,
     I: Iterator<Item = A>,
@@ -254,7 +269,7 @@ pub struct BindingExec<U, Fut1> {
     client: StunClient<U>,
 
     ctx: DetectContext,
-    
+
     lookup_futures: FuturesUnordered<Fut1>,
 
     binding_futures: FuturesUnordered<TransactionFuture>,
@@ -262,7 +277,7 @@ pub struct BindingExec<U, Fut1> {
     config: Config,
 }
 
-impl<U, Fut1, I1> BindingExec<U, Fut1> 
+impl<U, Fut1, I1> BindingExec<U, Fut1>
 where
     U: AsyncUdpSocket + Unpin,
     Fut1: Future<Output = io::Result<I1>>,
@@ -291,16 +306,16 @@ where
 
     pub fn is_done(&self) -> bool {
         if self.is_empty() {
-            return true
+            return true;
         }
 
         if !self.config.detect_all_server {
             let min_success = self.config.min_success_response.unwrap_or(1);
             if self.ctx.output.num_success >= min_success {
-                return true
+                return true;
             }
         }
-        
+
         false
     }
 
@@ -323,8 +338,8 @@ where
                     Err(e) => {
                         self.ctx.error = Some(e.into());
                         // continue;
-                        return Ok(())
-                    },
+                        return Ok(());
+                    }
                 };
 
                 if self.config.use_binding_fut {
@@ -339,10 +354,10 @@ where
                         let _r = self.client.req_transaction(req, target);
                     }
                 }
-            },
-            None => {},
+            }
+            None => {}
         }
-        return Ok(())
+        return Ok(());
     }
 
     pub async fn run_one(&mut self) -> Result<()> {
@@ -367,9 +382,7 @@ where
 
         Ok(())
     }
-
 }
-
 
 #[derive(Debug, Default)]
 struct DetectContext {
@@ -380,22 +393,29 @@ struct DetectContext {
 impl DetectContext {
     fn handle_bind_result(&mut self, result: TransactionResult) {
         match self.handle_bind_result_(result) {
-            Ok(_r) => {},
+            Ok(_r) => {}
             Err(e) => self.error = Some(e),
         }
     }
 
     fn handle_bind_result_(&mut self, result: TransactionResult) -> Result<()> {
         let rsp = result?;
-        let map_addr1 = rsp.response.get_attribute::<XorMappedAddress>().map(|x|x.address());
-        let map_addr3 = rsp.response.get_attribute::<MappedAddress>().map(|x|x.address());
-        let map_addr = map_addr1.or(map_addr3)
-        .with_context(||"no mapped addr")?;
-        self.output.insert_unique(ReflexiveAddr { target: rsp.remote_addr, mapped: map_addr });
+        let map_addr1 = rsp
+            .response
+            .get_attribute::<XorMappedAddress>()
+            .map(|x| x.address());
+        let map_addr3 = rsp
+            .response
+            .get_attribute::<MappedAddress>()
+            .map(|x| x.address());
+        let map_addr = map_addr1.or(map_addr3).with_context(|| "no mapped addr")?;
+        self.output.insert_unique(ReflexiveAddr {
+            target: rsp.remote_addr,
+            mapped: map_addr,
+        });
         Ok(())
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct ReflexiveAddr {
@@ -405,7 +425,7 @@ pub struct ReflexiveAddr {
 
 #[derive(Debug, Default, Clone)]
 pub struct BindingOutput {
-    // addrs: Vec<ReflexiveAddr>, 
+    // addrs: Vec<ReflexiveAddr>,
     mapped: HashMap<SocketAddr, HashSet<SocketAddr>>, // reflexive -> targets
     total: usize,
     num_success: usize,
@@ -434,13 +454,14 @@ impl BindingOutput {
     //     // self.addrs.pop().map(|x|x.mapped)
     // }
 
-    pub fn mapped_iter<'a>(&'a self) -> impl Iterator<Item = SocketAddr> + 'a  {
-        self.mapped.iter().map(|x|x.0.clone())
+    pub fn mapped_iter<'a>(&'a self) -> impl Iterator<Item = SocketAddr> + 'a {
+        self.mapped.iter().map(|x| x.0.clone())
     }
 
-    pub fn target_iter<'a>(&'a self) -> impl Iterator<Item = impl Iterator<Item = SocketAddr>  + 'a > + 'a  {
-        let rrr = self.mapped.iter()
-        .map(|x|x.1.iter().map(|x|x.clone()));
+    pub fn target_iter<'a>(
+        &'a self,
+    ) -> impl Iterator<Item = impl Iterator<Item = SocketAddr> + 'a> + 'a {
+        let rrr = self.mapped.iter().map(|x| x.1.iter().map(|x| x.clone()));
         rrr
     }
 
@@ -465,7 +486,7 @@ impl BindingOutput {
     //         Some(_x) => { }
 
     //         None => {
-    //             self.num_differences += 1; 
+    //             self.num_differences += 1;
     //         },
     //     }
 
@@ -483,7 +504,6 @@ impl BindingOutput {
     //         self.insert_unique(addr);
     //     }
     // }
-
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -491,9 +511,6 @@ pub enum NatType {
     Symmetric,
     Cone,
 }
-
-
-
 
 type TransactionMap = HashMap<TransactionId, Option<TransactionReq>>;
 
@@ -504,15 +521,15 @@ pub struct StunClient<U> {
     next_retry_time: Instant,
     tsx_timeout: Duration,
     delay: Pin<Box<tokio::time::Sleep>>,
-    
+
     transactions: TransactionMap,
     exec_outputs: VecDeque<ExecOutput>,
 }
 
-impl<U: AsyncUdpSocket + Unpin > StunClient<U> {
+impl<U: AsyncUdpSocket + Unpin> StunClient<U> {
     pub fn from_socket(socket: U) -> Self {
         Self {
-            delay: Box::pin(tokio::time::sleep(Duration::MAX/2)), 
+            delay: Box::pin(tokio::time::sleep(Duration::MAX / 2)),
             tsx_timeout: Duration::from_secs(10),
             next_retry_time: Instant::now(),
             buf: vec![0; 1700],
@@ -536,28 +553,32 @@ impl<U: AsyncUdpSocket + Unpin > StunClient<U> {
         self.software = Some(Software::new(software)?);
         Ok(self)
     }
-    
-    pub fn transaction(&mut self, req: Message<Attribute>, target: SocketAddr) -> TransactionFuture {
-        let (tx, rx) = oneshot::channel(); 
+
+    pub fn transaction(
+        &mut self,
+        req: Message<Attribute>,
+        target: SocketAddr,
+    ) -> TransactionFuture {
+        let (tx, rx) = oneshot::channel();
         let r = self.kick_transaction(req, target);
         match r {
-            Ok(mut req) => { 
+            Ok(mut req) => {
                 req.tx = Some(tx);
-                self.transactions.insert(req.request.transaction_id(), Some(req));
-            },
+                self.transactions
+                    .insert(req.request.transaction_id(), Some(req));
+            }
             Err(e) => {
                 let _r = tx.send(Err(e.into()));
-            },
+            }
         }
 
-        TransactionFuture {
-            rx,
-        }
+        TransactionFuture { rx }
     }
 
     pub fn req_transaction(&mut self, req: Message<Attribute>, target: SocketAddr) -> Result<()> {
         let req = self.kick_transaction(req, target)?;
-        self.transactions.insert(req.request.transaction_id(), Some(req));
+        self.transactions
+            .insert(req.request.transaction_id(), Some(req));
         Ok(())
     }
 
@@ -580,17 +601,20 @@ impl<U: AsyncUdpSocket + Unpin > StunClient<U> {
     //     Ok(())
     // }
 
-    fn kick_transaction(&mut self, mut req: Message<Attribute>, target: SocketAddr) -> Result<TransactionReq> {
-
+    fn kick_transaction(
+        &mut self,
+        mut req: Message<Attribute>,
+        target: SocketAddr,
+    ) -> Result<TransactionReq> {
         // let tsx_id = rand::thread_rng().gen::<[u8; 12]>();
         // let tsx_id = TransactionId::new(tsx_id);
-        
+
         // let mut req = Message::new(MessageClass::Request, BINDING, tsx_id);
 
         if let Some(software) = self.software.as_ref() {
             req.add_attribute(Attribute::Software(software.clone()));
         }
-        
+
         let mut encoder = MessageEncoder::new();
         let data: Bytes = encoder.encode_into_bytes(req.clone())?.into();
 
@@ -608,7 +632,6 @@ impl<U: AsyncUdpSocket + Unpin > StunClient<U> {
         }
 
         Ok(req)
-
     }
 
     pub fn is_empty(&self) -> bool {
@@ -618,14 +641,13 @@ impl<U: AsyncUdpSocket + Unpin > StunClient<U> {
     pub fn exec<'a>(&'a mut self) -> ExecFuture<'a, U> {
         let next = self.next_retry_time();
         self.delay.as_mut().reset(next);
-        ExecFuture { 
+        ExecFuture {
             // delay: Box::pin(self.next_retry_sleep()),
-            client: self, 
+            client: self,
         }
     }
 
     fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<io::Error> {
-
         loop {
             let mut buf = ReadBuf::new(&mut self.buf);
 
@@ -635,61 +657,63 @@ impl<U: AsyncUdpSocket + Unpin > StunClient<U> {
                     match r {
                         Ok(remote_addr) => {
                             let data = buf.filled();
-    
+
                             if data.len() == 0 {
-                                return Poll::Ready(io::Error::from(io::ErrorKind::UnexpectedEof))
+                                return Poll::Ready(io::Error::from(io::ErrorKind::UnexpectedEof));
                             }
-    
+
                             let msg: Message<Attribute> = match decode_message(data) {
                                 Ok(msg) => msg,
                                 Err(_e) => return Poll::Pending, // drop invalid packet
                             };
-    
+
                             if let Some(data) = try_binding_response_bytes(&msg, &remote_addr) {
                                 let _r = self.socket.set_ttl(64);
-                                let _r = self.socket.as_socket().try_send_to(data.into(), remote_addr);
-    
+                                let _r = self
+                                    .socket
+                                    .as_socket()
+                                    .try_send_to(data.into(), remote_addr);
                             } else {
                                 let r = process_recv_data(&mut self.transactions, msg, remote_addr);
                                 match r {
                                     Some(output) => {
                                         self.exec_outputs.push_back(output);
-                                    },
-                                    None => {},
+                                    }
+                                    None => {}
                                 }
                             }
 
                             continue;
-                        },
+                        }
                         Err(e) => return Poll::Ready(e),
                     }
-                },
+                }
                 Poll::Pending => return Poll::Pending,
-        }
-
-        
+            }
         }
     }
 
-    fn process_tick(&mut self,) {
+    fn process_tick(&mut self) {
         let now = Instant::now();
 
         self.transactions.retain(|_k, tsx| {
             if let Some(tsx) = tsx {
                 if now < tsx.deadline {
-                    let _r = self.socket.as_socket().try_send_to(tsx.data.clone(), tsx.target);
-                    return true
-                } 
+                    let _r = self
+                        .socket
+                        .as_socket()
+                        .try_send_to(tsx.data.clone(), tsx.target);
+                    return true;
+                }
             }
-            
+
             if let Some(tsx) = tsx.take() {
-                if let Some(output) =  tsx.finish(Err(anyhow!("transaction timeout"))) {
+                if let Some(output) = tsx.finish(Err(anyhow!("transaction timeout"))) {
                     self.exec_outputs.push_back(output);
                 }
             }
 
             false
-
         });
         // for (_id, tsx) in self.transactions.iter() {
         //     let _r = self.socket.try_send_to_with(&tsx.data, tsx.target, false);
@@ -698,7 +722,7 @@ impl<U: AsyncUdpSocket + Unpin > StunClient<U> {
     }
 
     fn update_next_retry_time(&mut self) {
-        self.next_retry_time =  Instant::now() + Duration::from_millis(200);
+        self.next_retry_time = Instant::now() + Duration::from_millis(200);
     }
 
     fn next_retry_time(&self) -> Instant {
@@ -721,7 +745,6 @@ impl<U: AsyncUdpSocket + Unpin > StunClient<U> {
     //         Duration::MAX/2
     //     }
     // }
-
 }
 
 type TransactionResult = Result<TransactionRsp>;
@@ -742,11 +765,9 @@ impl Future for TransactionFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
         let r = self.rx.poll_unpin(cx);
         match r {
-            Poll::Ready(r) => {
-                match r {
-                    Ok(r) => Poll::Ready(r),
-                    Err(e) => Poll::Ready(Err(e.into())),
-                }
+            Poll::Ready(r) => match r {
+                Ok(r) => Poll::Ready(r),
+                Err(e) => Poll::Ready(Err(e.into())),
             },
             Poll::Pending => Poll::Pending,
         }
@@ -766,12 +787,12 @@ impl TransactionReq {
         let tsx = self;
         if let Some(tx) = tsx.tx {
             let _r = tx.send(result);
-            return None
-        } else  {
+            return None;
+        } else {
             return Some(ExecOutput {
                 result,
                 request: tsx.request,
-            })
+            });
         }
     }
 }
@@ -790,24 +811,23 @@ pub struct ExecFuture<'a, U> {
 
 type PollOutput = Result<ExecOutput>;
 
-impl<'a, U> Future for ExecFuture<'a, U> 
+impl<'a, U> Future for ExecFuture<'a, U>
 where
     U: AsyncUdpSocket + Unpin,
 {
     type Output = PollOutput;
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-
         let self0 = self.get_mut();
 
         if let Some(output) = self0.client.exec_outputs.pop_front() {
-            return Poll::Ready(Ok(output))
+            return Poll::Ready(Ok(output));
         }
 
         let r = self0.client.poll_recv(cx);
         match r {
             Poll::Ready(e) => return Poll::Ready(Err(e.into())),
-            Poll::Pending => {},
+            Poll::Pending => {}
         }
 
         match self0.client.delay.poll_unpin(cx) {
@@ -816,20 +836,23 @@ where
 
                 let next = self0.client.next_retry_time();
                 self0.client.delay.as_mut().reset(next);
-            },
-            Poll::Pending => {},
+            }
+            Poll::Pending => {}
         }
 
         if let Some(output) = self0.client.exec_outputs.pop_front() {
-            return Poll::Ready(Ok(output))
+            return Poll::Ready(Ok(output));
         }
 
         Poll::Pending
     }
 }
 
-fn process_recv_data(transactions: &mut TransactionMap, msg: Message<Attribute>, remote_addr: SocketAddr) -> Option<ExecOutput> {
-
+fn process_recv_data(
+    transactions: &mut TransactionMap,
+    msg: Message<Attribute>,
+    remote_addr: SocketAddr,
+) -> Option<ExecOutput> {
     // let msg: Message<Attribute> = match decode_message(data) {
     //     Ok(msg) => msg,
     //     Err(_e) => return None, // drop invalid packet
@@ -842,28 +865,37 @@ fn process_recv_data(transactions: &mut TransactionMap, msg: Message<Attribute>,
                 remote_addr,
             };
 
-            return tsx.finish(Ok(rsp))
+            return tsx.finish(Ok(rsp));
         }
     }
     None
 }
 
-pub fn try_binding_response_bytes(req: &Message<Attribute>, remote_addr: &SocketAddr) -> Option<Vec<u8>> {
+pub fn try_binding_response_bytes(
+    req: &Message<Attribute>,
+    remote_addr: &SocketAddr,
+) -> Option<Vec<u8>> {
     if let Some(rsp) = try_binding_response(req, remote_addr) {
-        return encode_message(rsp).ok()
-    } 
+        return encode_message(rsp).ok();
+    }
     None
 }
 
-fn try_binding_response(req: &Message<Attribute>, remote_addr: &SocketAddr) -> Option<Message<Attribute>> {
+fn try_binding_response(
+    req: &Message<Attribute>,
+    remote_addr: &SocketAddr,
+) -> Option<Message<Attribute>> {
     if req.class() == MessageClass::Request {
         if req.method() == BINDING {
-            let mut rsp = Message::new(MessageClass::SuccessResponse, BINDING, req.transaction_id());
+            let mut rsp =
+                Message::new(MessageClass::SuccessResponse, BINDING, req.transaction_id());
             for attr in req.attributes() {
                 rsp.add_attribute(attr.clone());
             }
-            rsp.add_attribute(Attribute::XorMappedAddress(XorMappedAddress::new(*remote_addr)));
-            return Some(rsp)
+            rsp.add_attribute(Attribute::XorMappedAddress(XorMappedAddress::new(
+                *remote_addr,
+            )));
+            return Some(rsp);
         }
     }
     None
@@ -884,8 +916,9 @@ fn encode_message(msg: Message<Attribute>) -> Result<Vec<u8>> {
 pub fn decode_message(data: &[u8]) -> Result<Message<Attribute>> {
     let mut decoder = MessageDecoder::<Attribute>::new();
 
-    decoder.decode_from_bytes(data)?
-    .map_err(|e|anyhow!("{e:?}"))
+    decoder
+        .decode_from_bytes(data)?
+        .map_err(|e| anyhow!("{e:?}"))
 }
 
 fn try_parse_message(data: &[u8]) -> Option<Message<Attribute>> {
@@ -899,12 +932,11 @@ fn try_parse_message(data: &[u8]) -> Option<Message<Attribute>> {
     // > |0 0|     STUN Message Type     |         Message Length        |
     // > +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
     if data[0] & 0xC0 != 0 {
-        return None
+        return None;
     }
 
     decode_message(data).ok()
 }
-
 
 #[derive(Debug)]
 pub struct StunSocket<U> {
@@ -913,9 +945,7 @@ pub struct StunSocket<U> {
 
 impl<U> StunSocket<U> {
     pub fn new(socket: U) -> Self {
-        Self { 
-            socket, 
-        }
+        Self { socket }
     }
 }
 
@@ -936,7 +966,6 @@ impl<U: AsyncUdpSocket> AsyncUdpSocket for StunSocket<U> {
         bufs: &mut [io::IoSliceMut<'_>],
         meta: &mut [quinn::udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
-
         loop {
             let r = ready!(self.socket.poll_recv(cx, bufs, meta));
             if let Ok(num) = &r {
@@ -945,13 +974,11 @@ impl<U: AsyncUdpSocket> AsyncUdpSocket for StunSocket<U> {
                     let len = meta[n].len;
                     let data = &bufs[n][..len];
                     let addr = &meta[n].addr;
-                    
+
                     let r = try_parse_message(data);
                     match r {
                         Some(msg) => {
-
                             if let Some(data) = try_binding_response_bytes(&msg, addr) {
-
                                 let transmits = [Transmit {
                                     destination: addr.clone(),
                                     ecn: None,
@@ -959,28 +986,27 @@ impl<U: AsyncUdpSocket> AsyncUdpSocket for StunSocket<U> {
                                     segment_size: None,
                                     src_ip: None,
                                 }];
-                        
+
                                 let r = self.poll_send(udp_state(), cx, &transmits);
                                 let _r = ready!(r);
-                            } 
-                        }, 
+                            }
+                        }
                         None => {
                             if index != n {
                                 meta.swap(index, n);
                                 bufs.swap(index, n);
                             }
                             index += 1;
-                        },
+                        }
                     }
                 }
                 if index > 0 {
-                    return Poll::Ready(Ok(index))
+                    return Poll::Ready(Ok(index));
                 }
             } else {
-                return Poll::Ready(r)
+                return Poll::Ready(r);
             }
         }
-        
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -991,7 +1017,6 @@ impl<U: AsyncUdpSocket> AsyncUdpSocket for StunSocket<U> {
         self.socket.set_ttl(ttl)
     }
 }
-
 
 #[cfg(test)]
 mod test {
@@ -1006,93 +1031,88 @@ mod test {
     #[test]
     fn test_nat_detect_output_cone() {
         let mut obj = BindingOutput::default();
-        assert!(obj.is_empty(), "{obj:?}") ;
-        assert!(!obj.is_nat_detect_done(), "{obj:?}") ;
-        assert_eq!(obj.nat_type(), None, "{obj:?}") ;
+        assert!(obj.is_empty(), "{obj:?}");
+        assert!(!obj.is_nat_detect_done(), "{obj:?}");
+        assert_eq!(obj.nat_type(), None, "{obj:?}");
 
         obj.insert_unique(ReflexiveAddr {
             target: "1.1.1.1:1".parse().unwrap(),
             mapped: "9.9.9.9:9".parse().unwrap(),
         });
 
-        assert!(!obj.is_empty(), "{obj:?}") ;
-        assert!(!obj.is_nat_detect_done(), "{obj:?}") ;
-        assert_eq!(obj.nat_type(), None, "{obj:?}") ;
-
+        assert!(!obj.is_empty(), "{obj:?}");
+        assert!(!obj.is_nat_detect_done(), "{obj:?}");
+        assert_eq!(obj.nat_type(), None, "{obj:?}");
 
         obj.insert_unique(ReflexiveAddr {
             target: "2.2.2.2:2".parse().unwrap(),
             mapped: "9.9.9.9:9".parse().unwrap(),
         });
 
-        assert!(!obj.is_empty(), "{obj:?}") ;
-        assert!(obj.is_nat_detect_done(), "{obj:?}") ;
-        assert_eq!(obj.nat_type(), Some(NatType::Cone), "{obj:?}") ;
-
+        assert!(!obj.is_empty(), "{obj:?}");
+        assert!(obj.is_nat_detect_done(), "{obj:?}");
+        assert_eq!(obj.nat_type(), Some(NatType::Cone), "{obj:?}");
     }
 
     #[test]
     fn test_nat_detect_output_symmetric() {
         let mut obj = BindingOutput::default();
-        assert!(obj.is_empty(), "{obj:?}") ;
-        assert!(!obj.is_nat_detect_done(), "{obj:?}") ;
-        assert_eq!(obj.nat_type(), None, "{obj:?}") ;
+        assert!(obj.is_empty(), "{obj:?}");
+        assert!(!obj.is_nat_detect_done(), "{obj:?}");
+        assert_eq!(obj.nat_type(), None, "{obj:?}");
 
         obj.insert_unique(ReflexiveAddr {
             target: "1.1.1.1:1".parse().unwrap(),
             mapped: "9.9.9.9:9".parse().unwrap(),
         });
 
-        assert!(!obj.is_empty(), "{obj:?}") ;
-        assert!(!obj.is_nat_detect_done(), "{obj:?}") ;
-        assert_eq!(obj.nat_type(), None, "{obj:?}") ;
-
+        assert!(!obj.is_empty(), "{obj:?}");
+        assert!(!obj.is_nat_detect_done(), "{obj:?}");
+        assert_eq!(obj.nat_type(), None, "{obj:?}");
 
         obj.insert_unique(ReflexiveAddr {
             target: "3.3.3.3:3".parse().unwrap(),
             mapped: "8.8.8.8:8".parse().unwrap(),
         });
 
-        assert!(!obj.is_empty(), "{obj:?}") ;
-        assert!(obj.is_nat_detect_done(), "{obj:?}") ;
-        assert_eq!(obj.nat_type(), Some(NatType::Symmetric), "{obj:?}") ;
+        assert!(!obj.is_empty(), "{obj:?}");
+        assert!(obj.is_nat_detect_done(), "{obj:?}");
+        assert_eq!(obj.nat_type(), Some(NatType::Symmetric), "{obj:?}");
     }
 
     #[test]
     fn test_nat_detect_output_combine() {
         let mut obj = BindingOutput::default();
-        assert!(obj.is_empty(), "{obj:?}") ;
-        assert!(!obj.is_nat_detect_done(), "{obj:?}") ;
-        assert_eq!(obj.nat_type(), None, "{obj:?}") ;
+        assert!(obj.is_empty(), "{obj:?}");
+        assert!(!obj.is_nat_detect_done(), "{obj:?}");
+        assert_eq!(obj.nat_type(), None, "{obj:?}");
 
         obj.insert_unique(ReflexiveAddr {
             target: "1.1.1.1:1".parse().unwrap(),
             mapped: "9.9.9.9:9".parse().unwrap(),
         });
 
-        assert!(!obj.is_empty(), "{obj:?}") ;
-        assert!(!obj.is_nat_detect_done(), "{obj:?}") ;
-        assert_eq!(obj.nat_type(), None, "{obj:?}") ;
-
+        assert!(!obj.is_empty(), "{obj:?}");
+        assert!(!obj.is_nat_detect_done(), "{obj:?}");
+        assert_eq!(obj.nat_type(), None, "{obj:?}");
 
         obj.insert_unique(ReflexiveAddr {
             target: "2.2.2.2:2".parse().unwrap(),
             mapped: "9.9.9.9:9".parse().unwrap(),
         });
 
-        assert!(!obj.is_empty(), "{obj:?}") ;
-        assert!(obj.is_nat_detect_done(), "{obj:?}") ;
-        assert_eq!(obj.nat_type(), Some(NatType::Cone), "{obj:?}") ;
+        assert!(!obj.is_empty(), "{obj:?}");
+        assert!(obj.is_nat_detect_done(), "{obj:?}");
+        assert_eq!(obj.nat_type(), Some(NatType::Cone), "{obj:?}");
 
         obj.insert_unique(ReflexiveAddr {
             target: "3.3.3.3:3".parse().unwrap(),
             mapped: "8.8.8.8:8".parse().unwrap(),
         });
 
-        assert!(!obj.is_empty(), "{obj:?}") ;
-        assert!(obj.is_nat_detect_done(), "{obj:?}") ;
-        assert_eq!(obj.nat_type(), Some(NatType::Symmetric), "{obj:?}") ;
-
+        assert!(!obj.is_empty(), "{obj:?}");
+        assert!(obj.is_nat_detect_done(), "{obj:?}");
+        assert_eq!(obj.nat_type(), Some(NatType::Symmetric), "{obj:?}");
     }
 
     #[test]
@@ -1139,7 +1159,6 @@ mod test {
             encode_message(msg).unwrap()
         };
 
-
         {
             let data = &right_data[..];
             let decoded_msg = decode_message(data).unwrap();
@@ -1155,16 +1174,11 @@ mod test {
             let r = decode_integrity.check_short_term_credential(&pwd);
             assert!(r.is_err(), "{r:?}");
         }
-
     }
-
-
 }
-
 
 #[tokio::test]
 async fn test_stun() {
-
     let stun_servers = [
         // "100.110.119.120:3478", // none exist ip:port
         "none-exist-host-zytYad132.com:3478", // none exist domain
@@ -1177,16 +1191,23 @@ async fn test_stun() {
 
     // let socket = Arc::new(UdpSocketExt::bind("0.0.0.0:0").await.unwrap());
 
-    let addrs = detect_nat_type2(stun_servers.into_iter(), Config::default()).await.unwrap();
+    let addrs = detect_nat_type2(stun_servers.into_iter(), Config::default())
+        .await
+        .unwrap();
     println!("");
     println!("detect quick: {addrs:?}");
     println!("nat type: {:?}", addrs.nat_type());
 
-    let addrs = detect_nat_type2(stun_servers.into_iter(), Config { 
-        detect_all_server: true, 
-        use_binding_fut: false,
-        ..Default::default()
-    }).await.unwrap();
+    let addrs = detect_nat_type2(
+        stun_servers.into_iter(),
+        Config {
+            detect_all_server: true,
+            use_binding_fut: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     println!("");
     println!("detect all: {addrs:?}");
     println!("nat type: {:?}", addrs.nat_type());
