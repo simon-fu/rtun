@@ -649,7 +649,7 @@ pub async fn run_nat3_once(args: Nat3RunConfig) -> Result<HardNatConnectedSocket
                 break;
             }
 
-            info!("sent num [{num}]: [{local}] => [{target_ip}]");
+            debug!("sent num [{num}]: [{local}] => [{target_ip}]");
             tokio::time::sleep(interval).await;
         }
     }
