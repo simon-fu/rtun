@@ -22,7 +22,10 @@ use crate::{
     proto::P2PHardNatArgs,
     stun::{
         async_udp::{tokio_socket_bind, AsyncUdpSocket, TokioUdpSocket},
-        stun::{detect_nat_type3, BindingOutput, Config as StunConfig, NatType},
+        stun::{
+            detect_nat_type3, detect_nat_type3_with_recovery, BindingOutput,
+            Config as StunConfig, NatType,
+        },
     },
 };
 
@@ -483,17 +486,19 @@ async fn discover_nat4_public_addr(
     socket: TokioUdpSocket,
     stun_servers: &[String],
 ) -> Result<(TokioUdpSocket, Option<SocketAddr>)> {
-    let (socket, output) = detect_nat_type3(
+    let (socket, output) = detect_nat_type3_with_recovery(
         socket,
         stun_servers.iter().map(String::as_str),
         StunConfig::default()
             .with_min_success_response(1)
             .with_transaction_timeout(NAT3_STUN_TRANSACTION_TIMEOUT),
     )
-    .await
-    .with_context(|| "detect nat4 public address failed")?;
+    .await;
 
-    let mapped_addr = output.mapped_iter().next();
+    let mapped_addr = output
+        .with_context(|| "detect nat4 public address failed")
+        .ok()
+        .and_then(|output| output.mapped_iter().next());
     Ok((socket, mapped_addr))
 }
 
@@ -1615,6 +1620,56 @@ mod tests {
         mapped.sort_by_key(|(local_addr, _)| *local_addr);
 
         let mut expected = vec![(local1, Some(local1)), (local2, Some(local2))];
+        expected.sort_by_key(|(local_addr, _)| *local_addr);
+
+        assert_eq!(mapped, expected);
+
+        stun_task.abort();
+        let _ = stun_task.await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discover_nat4_public_addrs_keeps_sockets_when_a_stun_probe_times_out() -> Result<()>
+    {
+        let stun_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let stun_addr = stun_socket.local_addr()?;
+
+        let socket1 = tokio_socket_bind("127.0.0.1:0").await?;
+        let local1 = socket1.local_addr()?;
+        let socket2 = tokio_socket_bind("127.0.0.1:0").await?;
+        let local2 = socket2.local_addr()?;
+
+        let stun_task = tokio::spawn(async move {
+            let mut buf = [0_u8; 2048];
+            loop {
+                let (len, from) = match stun_socket.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let req = match decode_message(&buf[..len]) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if from != local2 {
+                    continue;
+                }
+                if let Some(rsp) = try_binding_response_bytes(&req, &from) {
+                    let _ = stun_socket.send_to(&rsp, from).await;
+                }
+            }
+        });
+
+        let discovered =
+            discover_nat4_public_addrs(vec![socket1, socket2], &[stun_addr.to_string()]).await?;
+
+        let mut mapped = discovered
+            .into_iter()
+            .map(|(socket, mapped_addr)| Ok((socket.local_addr()?, mapped_addr)))
+            .collect::<Result<Vec<_>>>()?;
+        mapped.sort_by_key(|(local_addr, _)| *local_addr);
+
+        let mut expected = vec![(local1, None), (local2, Some(local2))];
         expected.sort_by_key(|(local_addr, _)| *local_addr);
 
         assert_eq!(mapped, expected);

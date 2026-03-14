@@ -29,6 +29,7 @@ use tokio::{
     net::{lookup_host, ToSocketAddrs},
     time::Instant,
 };
+use tracing::debug;
 
 #[derive(Debug, Default)]
 pub struct Config {
@@ -202,7 +203,7 @@ pub const STUN_SERVERS: [&'static str; 3] = [
 ];
 
 pub async fn detect_nat_type1<U: AsyncUdpSocket + Unpin>(socket: U) -> Result<(U, BindingOutput)> {
-    run_detect(socket, STUN_SERVERS.iter(), Default::default()).await
+    detect_nat_type3(socket, STUN_SERVERS.iter(), Default::default()).await
 }
 
 pub async fn detect_nat_type2<I, A>(servers: I, config: Config) -> Result<BindingOutput>
@@ -211,7 +212,7 @@ where
     A: ToSocketAddrs,
 {
     let socket = tokio_socket_bind("0.0.0.0:0").await?;
-    run_detect(socket, servers, config).await.map(|x| x.1)
+    detect_nat_type3(socket, servers, config).await.map(|x| x.1)
 }
 
 pub async fn detect_nat_type3<U, I, A>(
@@ -224,23 +225,15 @@ where
     I: Iterator<Item = A>,
     A: ToSocketAddrs,
 {
-    // let socket = Arc::new(UdpSocketExt::bind("0.0.0.0:0").await?);
-    run_detect(socket, servers, config).await
-    // let mut detect = DetectNat::from_socket(socket);
-    // detect.set_config(config);
-
-    // for server in servers {
-    //     detect.lookup_futures.push(lookup_host(server));
-    // }
-
-    // detect.run().await
+    let (socket, output) = detect_nat_type3_with_recovery(socket, servers, config).await;
+    Ok((socket, output?))
 }
 
-async fn run_detect<U, I, A>(
+pub async fn detect_nat_type3_with_recovery<U, I, A>(
     socket: U,
     servers: I,
     mut config: Config,
-) -> Result<(U, BindingOutput)>
+) -> (U, Result<BindingOutput>)
 where
     U: AsyncUdpSocket + Unpin,
     I: Iterator<Item = A>,
@@ -259,10 +252,13 @@ where
     }
 
     while !detect.is_done() {
-        detect.run_one().await?;
+        if let Err(e) = detect.run_one().await {
+            detect.ctx.error = Some(e);
+            break;
+        }
     }
 
-    detect.into_result()
+    detect.into_result_with_socket()
 }
 
 pub struct BindingExec<U, Fut1> {
@@ -330,6 +326,18 @@ where
         }
     }
 
+    pub fn into_result_with_socket(self) -> (U, Result<BindingOutput>) {
+        let result = match self.ctx.output.is_empty() {
+            true => match self.ctx.error {
+                Some(e) => Err(e),
+                None => Err(anyhow!("lookup host but empty addr list")),
+            },
+            false => Ok(self.ctx.output),
+        };
+
+        (self.client.into_socket(), result)
+    }
+
     fn process_lookup_result(&mut self, r: Option<io::Result<I1>>) -> Result<()> {
         match r {
             Some(next) => {
@@ -344,12 +352,14 @@ where
 
                 if self.config.use_binding_fut {
                     for target in iter {
+                        debug!("stun resolved target [{target}]");
                         let req = self.config.gen_bind_req()?;
                         let fut = self.client.transaction(req, target);
                         self.binding_futures.push(fut);
                     }
                 } else {
                     for target in iter {
+                        debug!("stun resolved target [{target}]");
                         let req = self.config.gen_bind_req()?;
                         let _r = self.client.req_transaction(req, target);
                     }
@@ -409,6 +419,10 @@ impl DetectContext {
             .get_attribute::<MappedAddress>()
             .map(|x| x.address());
         let map_addr = map_addr1.or(map_addr3).with_context(|| "no mapped addr")?;
+        debug!(
+            "stun binding response remote [{}] => mapped [{}]",
+            rsp.remote_addr, map_addr
+        );
         self.output.insert_unique(ReflexiveAddr {
             target: rsp.remote_addr,
             mapped: map_addr,
@@ -618,7 +632,14 @@ impl<U: AsyncUdpSocket + Unpin> StunClient<U> {
         let mut encoder = MessageEncoder::new();
         let data: Bytes = encoder.encode_into_bytes(req.clone())?.into();
 
-        let _r = self.socket.as_socket().try_send_to(data.clone(), target);
+        match self.socket.as_socket().try_send_to(data.clone(), target) {
+            Ok(sent_bytes) => {
+                debug!("stun send initial [{}] bytes to [{target}]", sent_bytes);
+            }
+            Err(e) => {
+                debug!("stun send initial to [{target}] failed [{e:?}]");
+            }
+        }
         let req = TransactionReq {
             deadline: Instant::now() + self.tsx_timeout,
             tx: None,
@@ -699,15 +720,24 @@ impl<U: AsyncUdpSocket + Unpin> StunClient<U> {
         self.transactions.retain(|_k, tsx| {
             if let Some(tsx) = tsx {
                 if now < tsx.deadline {
-                    let _r = self
+                    match self
                         .socket
                         .as_socket()
-                        .try_send_to(tsx.data.clone(), tsx.target);
+                        .try_send_to(tsx.data.clone(), tsx.target)
+                    {
+                        Ok(sent_bytes) => {
+                            debug!("stun retry [{}] bytes to [{}]", sent_bytes, tsx.target);
+                        }
+                        Err(e) => {
+                            debug!("stun retry to [{}] failed [{e:?}]", tsx.target);
+                        }
+                    }
                     return true;
                 }
             }
 
             if let Some(tsx) = tsx.take() {
+                debug!("stun transaction timed out for [{}]", tsx.target);
                 if let Some(output) = tsx.finish(Err(anyhow!("transaction timeout"))) {
                     self.exec_outputs.push_back(output);
                 }
