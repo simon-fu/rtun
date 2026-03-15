@@ -372,6 +372,7 @@ async fn entity_open_p2p(
     rpc_rx: &mut mpsc::Receiver<CtrlRpcPacket>,
     args: P2PArgs,
 ) -> Result<OpenP2PResponse> {
+    tracing::debug!("ctrl_client: sending open_p2p request");
     send_legacy_rpc_request(
         ctrl_tx,
         C2ARequest {
@@ -381,8 +382,10 @@ async fn entity_open_p2p(
         "send open p2p failed",
     )
     .await?;
+    tracing::debug!("ctrl_client: open_p2p request sent, waiting response");
 
     let packet = recv_ctrl_rpc_packet(rpc_rx, "recv open p2p response failed").await?;
+    tracing::debug!("ctrl_client: received open_p2p response packet");
     decode_open_p2p_response(packet, "parse open p2p response failed")
 }
 

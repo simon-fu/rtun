@@ -2500,8 +2500,30 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
     let hard_nat_rx = if udp_relay_hard_nat.is_off() {
         None
     } else {
+        tracing::debug!(
+            "[relay_hardnat_diag] subscribing hard-nat control before open_p2p: mode={}, role={}, target=[{}]",
+            udp_relay_hard_nat.mode.as_str(),
+            udp_relay_hard_nat.role.as_str(),
+            target,
+        );
         Some(ctrl.subscribe_hard_nat_control().await?)
     };
+    if hard_nat_rx.is_some() {
+        tracing::debug!(
+            "[relay_hardnat_diag] subscribed hard-nat control before open_p2p: mode={}, role={}, target=[{}]",
+            udp_relay_hard_nat.mode.as_str(),
+            udp_relay_hard_nat.role.as_str(),
+            target,
+        );
+    }
+    tracing::debug!(
+        "[relay_hardnat_diag] sending open_p2p for udp relay: target=[{}], idle_timeout_secs={}, max_payload={}, hardnat_mode={}, hardnat_role={}",
+        target,
+        idle_timeout_secs,
+        max_payload,
+        udp_relay_hard_nat.mode.as_str(),
+        udp_relay_hard_nat.role.as_str(),
+    );
     let rsp = ctrl
         .open_p2p(P2PArgs {
             p2p_args: Some(P2p_args::UdpRelay(UdpRelayArgs {
@@ -2521,6 +2543,12 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
             ..Default::default()
         })
         .await?;
+    tracing::debug!(
+        "[relay_hardnat_diag] received open_p2p response for udp relay: target=[{}], hardnat_mode={}, hardnat_role={}",
+        target,
+        udp_relay_hard_nat.mode.as_str(),
+        udp_relay_hard_nat.role.as_str(),
+    );
 
     let rsp = rsp.open_p2p_rsp.with_context(|| "no open_p2p_rsp")?;
     let (remote_ice, codec, remote_hard_nat_target, remote_hard_nat_session) = match rsp {

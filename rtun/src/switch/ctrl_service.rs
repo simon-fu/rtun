@@ -267,6 +267,7 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
             }
 
             C2a_req_args::OpenP2p(args) => {
+                tracing::debug!("ctrl_service: received open_p2p request");
                 let r = agent.open_p2p(args).await;
 
                 // let r = handle_open_p2p(args).await;
@@ -274,6 +275,7 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                     Ok(rsp) => rsp,
                     Err(e) => make_open_p2p_response_error(e),
                 };
+                tracing::debug!("ctrl_service: agent open_p2p finished, sending response");
 
                 send_ctrl_rpc_response(
                     ctrl_tx,
@@ -284,6 +286,7 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                     wrapped,
                 )
                 .await?;
+                tracing::debug!("ctrl_service: open_p2p response sent");
             }
 
             C2a_req_args::ExecAgentScript(args) => {
