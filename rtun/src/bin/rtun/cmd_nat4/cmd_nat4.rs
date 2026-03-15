@@ -43,6 +43,7 @@ fn build_nat3_run_config(args: Nat3SendCmdArgs) -> Result<Nat3RunConfig> {
         discover_public_addr,
         pause_after_discovery: args.pause_after_discovery,
         hold_batch_until_enter: args.hold_batch_until_enter,
+        debug_converge_lease: args.debug_converge_lease,
         stun_servers: args.stun_servers,
     })
 }
@@ -67,6 +68,7 @@ fn build_nat4_run_config(args: Nat4SendCmdArgs) -> Result<Nat4RunConfig> {
         dump_public_addrs: args.dump_public_addrs,
         debug_keep_recv: args.debug_keep_recv,
         debug_promote_hit_ttl: args.debug_promote_hit_ttl,
+        debug_converge_lease: args.debug_converge_lease,
     })
 }
 
@@ -144,6 +146,12 @@ pub struct Nat3SendCmdArgs {
     hold_batch_until_enter: bool,
 
     #[clap(
+        long = "debug-converge-lease",
+        long_help = "enable experimental warming and lease-based converge state machine for manual nat debugging"
+    )]
+    debug_converge_lease: bool,
+
+    #[clap(
         long = "stun-server",
         long_help = "stun server address, eg. stun:stun.miwifi.com:3478"
     )]
@@ -194,6 +202,12 @@ pub struct Nat4SendCmdArgs {
         long_help = "when debug-keep-recv is enabled, promote the hit socket outgoing ttl to this value after its first valid packet"
     )]
     debug_promote_hit_ttl: Option<u32>,
+
+    #[clap(
+        long = "debug-converge-lease",
+        long_help = "enable experimental warming and lease-based converge state machine for manual nat debugging"
+    )]
+    debug_converge_lease: bool,
 }
 
 #[cfg(test)]
@@ -251,6 +265,13 @@ mod tests {
     }
 
     #[test]
+    fn nat3_cli_accepts_debug_converge_lease_flag() {
+        let args = parse_nat3_cmd_args_for_test(&["--debug-converge-lease"]);
+        let dump = format!("{args:?}");
+        assert!(dump.contains("debug_converge_lease: true"), "{dump}");
+    }
+
+    #[test]
     fn nat3_cli_treats_stun_servers_as_discovery_enabled() {
         let args =
             parse_nat3_cmd_args_for_test(&["--stun-server", "stun:stun.cloudflare.com:3478"]);
@@ -286,6 +307,13 @@ mod tests {
     }
 
     #[test]
+    fn nat4_cli_accepts_debug_converge_lease_flag() {
+        let args = parse_nat4_cmd_args_for_test(&["--debug-keep-recv", "--debug-converge-lease"]);
+        let dump = format!("{args:?}");
+        assert!(dump.contains("debug_converge_lease: true"), "{dump}");
+    }
+
+    #[test]
     fn nat4_cli_builds_debug_keep_recv_config() {
         let args = parse_nat4_cmd_args_for_test(&["--debug-keep-recv"]);
         let cfg = build_nat4_run_config(match args.cmd {
@@ -306,5 +334,27 @@ mod tests {
         })
         .unwrap();
         assert_eq!(cfg.debug_promote_hit_ttl, Some(64));
+    }
+
+    #[test]
+    fn nat3_cli_builds_debug_converge_lease_config() {
+        let args = parse_nat3_cmd_args_for_test(&["--debug-converge-lease"]);
+        let cfg = build_nat3_run_config(match args.cmd {
+            super::SubCmd::Nat3(args) => args,
+            super::SubCmd::Nat4(_) => unreachable!("expected nat3 subcommand"),
+        })
+        .unwrap();
+        assert!(cfg.debug_converge_lease);
+    }
+
+    #[test]
+    fn nat4_cli_builds_debug_converge_lease_config() {
+        let args = parse_nat4_cmd_args_for_test(&["--debug-keep-recv", "--debug-converge-lease"]);
+        let cfg = build_nat4_run_config(match args.cmd {
+            super::SubCmd::Nat4(args) => args,
+            super::SubCmd::Nat3(_) => unreachable!("expected nat4 subcommand"),
+        })
+        .unwrap();
+        assert!(cfg.debug_converge_lease);
     }
 }

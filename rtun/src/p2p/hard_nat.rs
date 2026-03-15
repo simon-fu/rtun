@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -23,8 +26,8 @@ use crate::{
     stun::{
         async_udp::{tokio_socket_bind, AsyncUdpSocket, TokioUdpSocket},
         stun::{
-            detect_nat_type3, detect_nat_type3_with_recovery, BindingOutput,
-            Config as StunConfig, NatType,
+            detect_nat_type3, detect_nat_type3_with_recovery, BindingOutput, Config as StunConfig,
+            NatType,
         },
     },
 };
@@ -38,6 +41,14 @@ pub const HARD_NAT_MAX_ASSIST_DELAY_MS: u32 = 10_000;
 pub const HARD_NAT_MAX_TTL: u32 = 255;
 #[cfg(test)]
 const HARD_NAT_KEEP_RECV_PROMOTED_TTL: u32 = 64;
+pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_WARM_DRAIN_MS: u64 = 300;
+pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_PROBING_WINDOW_MS: u64 = 1_500;
+pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_PROBE_HIT_N1: u32 = 2;
+pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_SILENT_BARRIER_MS: u64 = 500;
+pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_QUIET_DRAIN_MS: u64 = 300;
+pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_VALIDATION_HIT_N2: u32 = 2;
+pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_VALIDATION_WINDOW_MS: u64 = 2_500;
+pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_COOLDOWN_MS: u64 = 1_000;
 const NAT3_STUN_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(800);
 const NAT3_PAUSE_AFTER_DISCOVERY_PROMPT: &str =
     "nat3 discovery finished, press Enter to start probing";
@@ -65,6 +76,704 @@ pub enum HardNatMode {
     Fallback,
     Assist,
     Force,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeToken {
+    pub role: HardNatRole,
+    pub socket_id: u64,
+    pub generation: u64,
+    pub seq: u64,
+}
+
+pub fn encode_probe_token(token: ProbeToken) -> String {
+    format!(
+        "hn1 {} {:x} {:x} {:x}",
+        token.role.as_str(),
+        token.socket_id,
+        token.generation,
+        token.seq
+    )
+}
+
+pub fn decode_probe_token(token: &str) -> Option<ProbeToken> {
+    let mut parts = token.split_ascii_whitespace();
+    if parts.next()? != "hn1" {
+        return None;
+    }
+
+    let role = match parts.next()? {
+        "nat3" => HardNatRole::Nat3,
+        "nat4" => HardNatRole::Nat4,
+        _ => return None,
+    };
+    let socket_id = u64::from_str_radix(parts.next()?, 16).ok()?;
+    let generation = u64::from_str_radix(parts.next()?, 16).ok()?;
+    let seq = u64::from_str_radix(parts.next()?, 16).ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    Some(ProbeToken {
+        role,
+        socket_id,
+        generation,
+        seq,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbePacketKind {
+    Content,
+    Token(ProbeToken),
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecvProbeAction {
+    Ignore,
+    AcceptContent,
+    AcceptNat4TokenEcho(ProbeToken),
+    EchoNat4Token(ProbeToken),
+}
+
+impl RecvProbeAction {
+    fn is_valid_probe(self) -> bool {
+        !matches!(self, Self::Ignore)
+    }
+
+    fn should_echo(self) -> bool {
+        matches!(self, Self::EchoNat4Token(_))
+    }
+}
+
+fn classify_probe_packet(packet: &[u8], text: &str) -> ProbePacketKind {
+    if packet == text.as_bytes() {
+        return ProbePacketKind::Content;
+    }
+
+    let Some(packet) = std::str::from_utf8(packet).ok() else {
+        return ProbePacketKind::Unknown;
+    };
+
+    decode_probe_token(packet)
+        .map(ProbePacketKind::Token)
+        .unwrap_or(ProbePacketKind::Unknown)
+}
+
+fn decide_recv_probe_action(
+    role: HardNatRole,
+    debug_converge_lease: bool,
+    packet: &[u8],
+    text: &str,
+) -> RecvProbeAction {
+    match classify_probe_packet(packet, text) {
+        ProbePacketKind::Content => RecvProbeAction::AcceptContent,
+        ProbePacketKind::Token(token) if !debug_converge_lease => RecvProbeAction::Ignore,
+        ProbePacketKind::Token(token) => match (role, token.role) {
+            (HardNatRole::Nat3, HardNatRole::Nat4) => RecvProbeAction::EchoNat4Token(token),
+            (HardNatRole::Nat4, HardNatRole::Nat4) => RecvProbeAction::AcceptNat4TokenEcho(token),
+            _ => RecvProbeAction::Ignore,
+        },
+        ProbePacketKind::Unknown => RecvProbeAction::Ignore,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualConvergePhase {
+    Warming,
+    Probing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nat4SocketPhase {
+    Warming,
+    Probing,
+    Candidate,
+    PendingQuiet { generation: u64 },
+    LeaseOwnerValidating { generation: u64 },
+    Silent { generation: u64 },
+    Cooldown,
+    Connected { generation: u64 },
+}
+
+#[derive(Debug, Clone)]
+pub struct ManualConvergeConfig {
+    pub enabled: bool,
+    pub interval: Duration,
+    pub warm_drain: Duration,
+    pub probe_hit_n1: u32,
+    pub probe_window: Duration,
+    pub validation_hit_n2: u32,
+    pub validation_window: Duration,
+    pub cooldown: Duration,
+    pub silent_barrier: Duration,
+    pub quiet_drain: Duration,
+}
+
+impl ManualConvergeConfig {
+    pub fn disabled(interval: Duration) -> Self {
+        Self {
+            enabled: false,
+            interval,
+            warm_drain: Duration::from_millis(HARD_NAT_MANUAL_CONVERGE_DEFAULT_WARM_DRAIN_MS),
+            probe_hit_n1: HARD_NAT_MANUAL_CONVERGE_DEFAULT_PROBE_HIT_N1,
+            probe_window: Duration::from_millis(HARD_NAT_MANUAL_CONVERGE_DEFAULT_PROBING_WINDOW_MS)
+                .max(interval.saturating_mul(3)),
+            validation_hit_n2: HARD_NAT_MANUAL_CONVERGE_DEFAULT_VALIDATION_HIT_N2,
+            validation_window: Duration::from_millis(
+                HARD_NAT_MANUAL_CONVERGE_DEFAULT_VALIDATION_WINDOW_MS,
+            )
+            .max(interval.saturating_mul(3)),
+            cooldown: Duration::from_millis(HARD_NAT_MANUAL_CONVERGE_DEFAULT_COOLDOWN_MS)
+                .max(interval),
+            silent_barrier: Duration::from_millis(
+                HARD_NAT_MANUAL_CONVERGE_DEFAULT_SILENT_BARRIER_MS,
+            )
+            .min(interval),
+            quiet_drain: Duration::from_millis(HARD_NAT_MANUAL_CONVERGE_DEFAULT_QUIET_DRAIN_MS)
+                .min(interval),
+        }
+    }
+
+    pub fn for_debug_lease(interval: Duration) -> Self {
+        Self {
+            enabled: true,
+            interval,
+            warm_drain: Duration::from_millis(HARD_NAT_MANUAL_CONVERGE_DEFAULT_WARM_DRAIN_MS)
+                .min(interval),
+            probe_hit_n1: HARD_NAT_MANUAL_CONVERGE_DEFAULT_PROBE_HIT_N1,
+            probe_window: Duration::from_millis(HARD_NAT_MANUAL_CONVERGE_DEFAULT_PROBING_WINDOW_MS)
+                .max(interval.saturating_mul(3)),
+            validation_hit_n2: HARD_NAT_MANUAL_CONVERGE_DEFAULT_VALIDATION_HIT_N2,
+            validation_window: Duration::from_millis(
+                HARD_NAT_MANUAL_CONVERGE_DEFAULT_VALIDATION_WINDOW_MS,
+            )
+            .max(interval.saturating_mul(3)),
+            cooldown: Duration::from_millis(HARD_NAT_MANUAL_CONVERGE_DEFAULT_COOLDOWN_MS)
+                .max(interval),
+            silent_barrier: Duration::from_millis(
+                HARD_NAT_MANUAL_CONVERGE_DEFAULT_SILENT_BARRIER_MS,
+            )
+            .min(interval),
+            quiet_drain: Duration::from_millis(HARD_NAT_MANUAL_CONVERGE_DEFAULT_QUIET_DRAIN_MS)
+                .min(interval),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Nat4ProbeSocketState {
+    pub socket_id: u64,
+    pub phase: Nat4SocketPhase,
+    pub probe_hit_count: u32,
+    pub probe_window_started_at: Option<Instant>,
+    pub last_probe_hit_at: Option<Instant>,
+    pub validating_started_at: Option<Instant>,
+    pub validation_echo_count: u32,
+    pub last_validation_sent_seq: Option<u64>,
+    pub last_validation_matched_seq: Option<u64>,
+    pub cooldown_until: Option<Instant>,
+    pub next_seq: u64,
+}
+
+impl Nat4ProbeSocketState {
+    fn new(socket_id: u64) -> Self {
+        Self {
+            socket_id,
+            phase: Nat4SocketPhase::Warming,
+            probe_hit_count: 0,
+            probe_window_started_at: None,
+            last_probe_hit_at: None,
+            validating_started_at: None,
+            validation_echo_count: 0,
+            last_validation_sent_seq: None,
+            last_validation_matched_seq: None,
+            cooldown_until: None,
+            next_seq: 0,
+        }
+    }
+
+    fn reset_probe_window(&mut self) {
+        self.probe_hit_count = 0;
+        self.probe_window_started_at = None;
+        self.last_probe_hit_at = None;
+    }
+
+    fn reset_validation_state(&mut self) {
+        self.validating_started_at = None;
+        self.validation_echo_count = 0;
+        self.last_validation_sent_seq = None;
+        self.last_validation_matched_seq = None;
+    }
+}
+
+#[derive(Debug)]
+pub struct ManualConvergeCoordinator {
+    phase: ManualConvergePhase,
+    total_sockets: usize,
+    cfg: ManualConvergeConfig,
+    warm_ready: HashSet<u64>,
+    warm_ready_at: Option<Instant>,
+    sockets: HashMap<u64, Nat4ProbeSocketState>,
+    current_generation: u64,
+    lease_owner: Option<u64>,
+    quiet_expected: HashSet<u64>,
+    quiet_ready: HashSet<u64>,
+    quiet_started_at: Option<Instant>,
+    quiet_completed_at: Option<Instant>,
+}
+
+impl ManualConvergeCoordinator {
+    pub fn new(total_sockets: usize, interval: Duration, warm_drain: Duration) -> Self {
+        Self {
+            phase: ManualConvergePhase::Warming,
+            total_sockets,
+            cfg: ManualConvergeConfig {
+                enabled: true,
+                interval,
+                warm_drain,
+                probe_hit_n1: HARD_NAT_MANUAL_CONVERGE_DEFAULT_PROBE_HIT_N1,
+                probe_window: Duration::from_millis(
+                    HARD_NAT_MANUAL_CONVERGE_DEFAULT_PROBING_WINDOW_MS,
+                )
+                .max(interval.saturating_mul(3)),
+                validation_hit_n2: HARD_NAT_MANUAL_CONVERGE_DEFAULT_VALIDATION_HIT_N2,
+                validation_window: Duration::from_millis(
+                    HARD_NAT_MANUAL_CONVERGE_DEFAULT_VALIDATION_WINDOW_MS,
+                )
+                .max(interval.saturating_mul(3)),
+                cooldown: Duration::from_millis(HARD_NAT_MANUAL_CONVERGE_DEFAULT_COOLDOWN_MS)
+                    .max(interval),
+                silent_barrier: Duration::from_millis(
+                    HARD_NAT_MANUAL_CONVERGE_DEFAULT_SILENT_BARRIER_MS,
+                )
+                .min(interval),
+                quiet_drain: Duration::from_millis(HARD_NAT_MANUAL_CONVERGE_DEFAULT_QUIET_DRAIN_MS)
+                    .min(interval),
+            },
+            warm_ready: HashSet::with_capacity(total_sockets),
+            warm_ready_at: None,
+            sockets: HashMap::with_capacity(total_sockets),
+            current_generation: 0,
+            lease_owner: None,
+            quiet_expected: HashSet::with_capacity(total_sockets.saturating_sub(1)),
+            quiet_ready: HashSet::with_capacity(total_sockets.saturating_sub(1)),
+            quiet_started_at: None,
+            quiet_completed_at: None,
+        }
+    }
+
+    pub fn phase(&self) -> ManualConvergePhase {
+        self.phase
+    }
+
+    pub fn mark_warm_done(&mut self, socket_id: u64, now: Instant) -> Option<Instant> {
+        self.ensure_socket(socket_id);
+        self.warm_ready.insert(socket_id);
+        if self.warm_ready.len() == self.total_sockets && self.warm_ready_at.is_none() {
+            self.warm_ready_at = Some(now);
+        }
+        self.warm_ready_at
+    }
+
+    pub fn finish_warming(&mut self, now: Instant) -> bool {
+        if self.phase == ManualConvergePhase::Probing {
+            return true;
+        }
+
+        let Some(ready_at) = self.warm_ready_at else {
+            return false;
+        };
+        if self.warm_ready.len() != self.total_sockets {
+            return false;
+        }
+        if now.duration_since(ready_at) < self.cfg.warm_drain {
+            return false;
+        }
+
+        self.phase = ManualConvergePhase::Probing;
+        for socket in self.sockets.values_mut() {
+            if socket.phase == Nat4SocketPhase::Warming {
+                socket.phase = Nat4SocketPhase::Probing;
+            }
+        }
+        true
+    }
+
+    pub fn record_probe_hit(&mut self, socket_id: u64, now: Instant) -> bool {
+        let global_phase = self.phase;
+        let cfg = self.cfg.clone();
+        let socket = self.ensure_socket(socket_id);
+        if global_phase != ManualConvergePhase::Probing {
+            return false;
+        }
+        if !matches!(
+            socket.phase,
+            Nat4SocketPhase::Probing | Nat4SocketPhase::Candidate
+        ) {
+            return false;
+        }
+
+        let should_reset_window = socket
+            .probe_window_started_at
+            .map(|started_at| now.duration_since(started_at) > cfg.probe_window)
+            .unwrap_or(true);
+        if should_reset_window {
+            socket.probe_hit_count = 0;
+            socket.probe_window_started_at = Some(now);
+        }
+
+        socket.last_probe_hit_at = Some(now);
+        socket.probe_hit_count += 1;
+        if socket.phase == Nat4SocketPhase::Probing && socket.probe_hit_count >= cfg.probe_hit_n1 {
+            socket.phase = Nat4SocketPhase::Candidate;
+            debug!(
+                "manual converge socket [{socket_id}] candidate ready: probe_hit_count [{}], probe_window [{:?}]",
+                socket.probe_hit_count, cfg.probe_window
+            );
+        }
+        true
+    }
+
+    pub fn socket_phase(&self, socket_id: u64) -> Option<Nat4SocketPhase> {
+        self.sockets.get(&socket_id).map(|x| x.phase)
+    }
+
+    pub fn socket_probe_hit_count(&self, socket_id: u64) -> Option<u32> {
+        self.sockets.get(&socket_id).map(|x| x.probe_hit_count)
+    }
+
+    pub fn lease_owner(&self) -> Option<u64> {
+        self.lease_owner
+    }
+
+    pub fn try_acquire_lease(&mut self, socket_id: u64, now: Instant) -> Option<u64> {
+        if self.lease_owner.is_some() {
+            return None;
+        }
+        if self.phase != ManualConvergePhase::Probing {
+            return None;
+        }
+        if self.socket_phase(socket_id) != Some(Nat4SocketPhase::Candidate) {
+            return None;
+        }
+
+        self.current_generation += 1;
+        let generation = self.current_generation;
+        self.lease_owner = Some(socket_id);
+        self.quiet_expected.clear();
+        self.quiet_ready.clear();
+        self.quiet_started_at = Some(now);
+        self.quiet_completed_at = None;
+
+        for (id, socket) in self.sockets.iter_mut() {
+            if *id == socket_id {
+                socket.reset_validation_state();
+                socket.phase = Nat4SocketPhase::PendingQuiet { generation };
+            } else {
+                socket.reset_validation_state();
+                socket.phase = Nat4SocketPhase::Silent { generation };
+                self.quiet_expected.insert(*id);
+            }
+        }
+
+        if self.quiet_expected.is_empty() {
+            self.quiet_completed_at = Some(now);
+        }
+
+        debug!(
+            "manual converge lease granted: owner [{socket_id}], generation [{generation}], quiet_expected [{}]",
+            self.quiet_expected.len()
+        );
+        Some(generation)
+    }
+
+    pub fn mark_silent_ready(&mut self, socket_id: u64, generation: u64, now: Instant) -> bool {
+        if self.current_generation != generation {
+            return false;
+        }
+        if self.lease_owner == Some(socket_id) {
+            return false;
+        }
+        if self.socket_phase(socket_id) != Some(Nat4SocketPhase::Silent { generation }) {
+            return false;
+        }
+        if !self.quiet_expected.contains(&socket_id) {
+            return false;
+        }
+
+        let inserted = self.quiet_ready.insert(socket_id);
+        if inserted {
+            debug!(
+                "manual converge silent ready: socket [{socket_id}], generation [{generation}], ready [{}/{}]",
+                self.quiet_ready.len(),
+                self.quiet_expected.len()
+            );
+        }
+        if self.quiet_ready.len() == self.quiet_expected.len() && self.quiet_completed_at.is_none()
+        {
+            self.quiet_completed_at = Some(now);
+            debug!(
+                "manual converge quiet barrier ready: generation [{generation}], sockets [{}]",
+                self.quiet_ready.len()
+            );
+        }
+        inserted
+    }
+
+    pub fn advance_pending_quiet(&mut self, now: Instant) -> Option<u64> {
+        let owner = self.lease_owner?;
+        let generation = self.current_generation;
+        if self.socket_phase(owner) == Some(Nat4SocketPhase::LeaseOwnerValidating { generation }) {
+            return Some(generation);
+        }
+        if self.socket_phase(owner) != Some(Nat4SocketPhase::PendingQuiet { generation }) {
+            return None;
+        }
+
+        if self.quiet_completed_at.is_none() {
+            let quiet_started_at = self.quiet_started_at?;
+            if now.duration_since(quiet_started_at) < self.cfg.silent_barrier {
+                return None;
+            }
+            self.quiet_completed_at = Some(now);
+            debug!(
+                "manual converge quiet barrier timeout: generation [{generation}], ready [{}/{}]",
+                self.quiet_ready.len(),
+                self.quiet_expected.len()
+            );
+        }
+
+        let quiet_completed_at = self.quiet_completed_at?;
+        if now.duration_since(quiet_completed_at) < self.cfg.quiet_drain {
+            return None;
+        }
+
+        if let Some(owner_socket) = self.sockets.get_mut(&owner) {
+            owner_socket.phase = Nat4SocketPhase::LeaseOwnerValidating { generation };
+            owner_socket.validating_started_at = Some(now);
+            owner_socket.validation_echo_count = 0;
+            owner_socket.last_validation_sent_seq = None;
+            owner_socket.last_validation_matched_seq = None;
+        }
+        debug!(
+            "manual converge owner enter validating: owner [{owner}], generation [{generation}]"
+        );
+        Some(generation)
+    }
+
+    pub fn record_validation_echo(
+        &mut self,
+        socket_id: u64,
+        token: ProbeToken,
+        now: Instant,
+    ) -> bool {
+        let cfg = self.cfg.clone();
+        let socket = self.ensure_socket(socket_id);
+        let generation = match socket.phase {
+            Nat4SocketPhase::LeaseOwnerValidating { generation } => generation,
+            _ => return false,
+        };
+        let Some(validating_started_at) = socket.validating_started_at else {
+            return false;
+        };
+        if token.role != HardNatRole::Nat4
+            || token.socket_id != socket_id
+            || token.generation != generation
+        {
+            return false;
+        }
+        if now.duration_since(validating_started_at) > cfg.validation_window {
+            return false;
+        }
+        let Some(last_validation_sent_seq) = socket.last_validation_sent_seq else {
+            return false;
+        };
+        if token.seq > last_validation_sent_seq {
+            return false;
+        }
+        if socket
+            .last_validation_matched_seq
+            .map(|last| token.seq <= last)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+
+        socket.last_validation_matched_seq = Some(token.seq);
+        socket.validation_echo_count += 1;
+        debug!(
+            "manual converge validation echo matched: socket [{socket_id}], generation [{generation}], seq [{}], matched [{}/{}]",
+            token.seq, socket.validation_echo_count, cfg.validation_hit_n2
+        );
+        if socket.validation_echo_count >= cfg.validation_hit_n2 {
+            socket.phase = Nat4SocketPhase::Connected { generation };
+            debug!(
+                "manual converge final connected selected: owner [{socket_id}], generation [{generation}]"
+            );
+        }
+        true
+    }
+
+    fn advance_runtime(&mut self, now: Instant) {
+        self.advance_cooldowns(now);
+        self.advance_validating(now);
+        let _ = self.advance_pending_quiet(now);
+    }
+
+    fn advance_validating(&mut self, now: Instant) {
+        let Some(owner) = self.lease_owner else {
+            return;
+        };
+        let Some(socket) = self.sockets.get(&owner) else {
+            return;
+        };
+        let generation = match socket.phase {
+            Nat4SocketPhase::LeaseOwnerValidating { generation } => generation,
+            Nat4SocketPhase::Connected { .. } => return,
+            _ => return,
+        };
+        let Some(validating_started_at) = socket.validating_started_at else {
+            return;
+        };
+        if now.duration_since(validating_started_at) < self.cfg.validation_window {
+            return;
+        }
+        if socket.validation_echo_count >= self.cfg.validation_hit_n2 {
+            return;
+        }
+
+        self.release_failed_lease(owner, generation, now);
+    }
+
+    fn advance_cooldowns(&mut self, now: Instant) {
+        for socket in self.sockets.values_mut() {
+            if socket.phase != Nat4SocketPhase::Cooldown {
+                continue;
+            }
+            let Some(cooldown_until) = socket.cooldown_until else {
+                continue;
+            };
+            if now < cooldown_until {
+                continue;
+            }
+
+            socket.phase = Nat4SocketPhase::Probing;
+            socket.cooldown_until = None;
+            socket.reset_probe_window();
+            socket.reset_validation_state();
+            debug!(
+                "manual converge cooldown expired: socket [{}]",
+                socket.socket_id
+            );
+        }
+    }
+
+    fn release_failed_lease(&mut self, owner: u64, generation: u64, now: Instant) {
+        self.lease_owner = None;
+        self.quiet_expected.clear();
+        self.quiet_ready.clear();
+        self.quiet_started_at = None;
+        self.quiet_completed_at = None;
+
+        for (socket_id, socket) in self.sockets.iter_mut() {
+            socket.reset_validation_state();
+            if *socket_id == owner {
+                socket.phase = Nat4SocketPhase::Cooldown;
+                socket.cooldown_until = Some(now + self.cfg.cooldown);
+                socket.reset_probe_window();
+            } else if matches!(
+                socket.phase,
+                Nat4SocketPhase::Silent { .. }
+                    | Nat4SocketPhase::PendingQuiet { .. }
+                    | Nat4SocketPhase::LeaseOwnerValidating { .. }
+            ) {
+                socket.phase = Nat4SocketPhase::Probing;
+                socket.reset_probe_window();
+            }
+        }
+        debug!(
+            "manual converge owner validating failed: owner [{owner}], generation [{generation}], cooldown [{:?}]",
+            self.cfg.cooldown
+        );
+    }
+
+    fn next_send_token(&mut self, socket_id: u64) -> Option<ProbeToken> {
+        let socket = self.ensure_socket(socket_id);
+        let generation = match socket.phase {
+            Nat4SocketPhase::Probing | Nat4SocketPhase::Candidate => 0,
+            Nat4SocketPhase::LeaseOwnerValidating { generation }
+            | Nat4SocketPhase::Connected { generation } => generation,
+            _ => return None,
+        };
+        let seq = socket.next_seq;
+        socket.next_seq += 1;
+        if matches!(
+            socket.phase,
+            Nat4SocketPhase::LeaseOwnerValidating { .. } | Nat4SocketPhase::Connected { .. }
+        ) {
+            socket.last_validation_sent_seq = Some(seq);
+        }
+
+        Some(ProbeToken {
+            role: HardNatRole::Nat4,
+            socket_id,
+            generation,
+            seq,
+        })
+    }
+
+    fn ensure_socket(&mut self, socket_id: u64) -> &mut Nat4ProbeSocketState {
+        self.sockets
+            .entry(socket_id)
+            .or_insert_with(|| Nat4ProbeSocketState::new(socket_id))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Nat4SendPlan {
+    socket_id: u64,
+    should_send: bool,
+    token: Option<ProbeToken>,
+}
+
+fn plan_nat4_manual_converge_send_step(
+    coordinator: &mut ManualConvergeCoordinator,
+    socket_ids: &[u64],
+    now: Instant,
+) -> Vec<Nat4SendPlan> {
+    coordinator.advance_runtime(now);
+
+    if coordinator.lease_owner().is_none() {
+        for socket_id in socket_ids {
+            if coordinator.socket_phase(*socket_id) == Some(Nat4SocketPhase::Candidate)
+                && coordinator.try_acquire_lease(*socket_id, now).is_some()
+            {
+                break;
+            }
+        }
+    }
+
+    for socket_id in socket_ids {
+        if let Some(Nat4SocketPhase::Silent { generation }) = coordinator.socket_phase(*socket_id) {
+            let _ = coordinator.mark_silent_ready(*socket_id, generation, now);
+        }
+    }
+
+    coordinator.advance_runtime(now);
+
+    socket_ids
+        .iter()
+        .map(|socket_id| {
+            let token = coordinator.next_send_token(*socket_id);
+            Nat4SendPlan {
+                socket_id: *socket_id,
+                should_send: token.is_some(),
+                token,
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,6 +1000,7 @@ pub struct Nat3RunConfig {
     pub discover_public_addr: bool,
     pub pause_after_discovery: bool,
     pub hold_batch_until_enter: bool,
+    pub debug_converge_lease: bool,
     pub stun_servers: Vec<String>,
 }
 
@@ -351,6 +1061,7 @@ pub struct Nat4RunConfig {
     pub dump_public_addrs: bool,
     pub debug_keep_recv: bool,
     pub debug_promote_hit_ttl: Option<u32>,
+    pub debug_converge_lease: bool,
 }
 
 impl Nat4RunConfig {
@@ -397,6 +1108,9 @@ impl Nat4RunConfig {
                     HARD_NAT_MAX_TTL
                 );
             }
+        }
+        if self.debug_converge_lease && !self.debug_keep_recv {
+            bail!("debug_converge_lease requires debug_keep_recv");
         }
         Ok(())
     }
@@ -627,8 +1341,7 @@ where
     R: std::io::BufRead,
     W: std::io::Write,
 {
-    writeln!(writer, "{prompt}")
-        .with_context(|| "write pause prompt failed")?;
+    writeln!(writer, "{prompt}").with_context(|| "write pause prompt failed")?;
     writer
         .flush()
         .with_context(|| "flush pause prompt failed")?;
@@ -672,21 +1385,6 @@ async fn maybe_pause_after_discovery(pause_after_discovery: bool) -> Result<()> 
     .with_context(|| "pause-after-discovery task join failed")??;
 
     Ok(())
-}
-
-pub fn encode_probe_token(role: HardNatRole, id: u64) -> String {
-    format!("{}:{id:x}", role.as_str())
-}
-
-pub fn decode_probe_token(token: &str) -> Option<(HardNatRole, u64)> {
-    let (role, id) = token.split_once(':')?;
-    let role = match role {
-        "nat3" => HardNatRole::Nat3,
-        "nat4" => HardNatRole::Nat4,
-        _ => return None,
-    };
-    let id = u64::from_str_radix(id, 16).ok()?;
-    Some((role, id))
 }
 
 pub fn half_hops_from_ping_ttl(ttl: u32) -> Option<u32> {
@@ -763,11 +1461,17 @@ async fn run_nat3_once_with_socket(
 
     let recv_task = {
         let socket = socket.clone();
-        let text = text.clone();
         let shared = shared.clone();
+        let opts = RecvLoopOptions {
+            role: HardNatRole::Nat3,
+            expected_text: text.clone(),
+            promote_hit_ttl: None,
+            debug_converge_lease: args.debug_converge_lease,
+            manual_converge_socket: None,
+        };
 
         tokio::spawn(async move {
-            let r = recv_loop(socket, text.as_str(), &shared, None).await;
+            let r = recv_loop(socket, &shared, opts).await;
             info!("recv finished [{r:?}]");
         })
     };
@@ -822,10 +1526,16 @@ async fn run_nat3_hold_batch_until_enter(args: Nat3RunConfig) -> Result<()> {
 
     let recv_task = {
         let socket = socket.clone();
-        let text = text.clone();
         let shared = shared.clone();
+        let opts = RecvLoopOptions {
+            role: HardNatRole::Nat3,
+            expected_text: text.clone(),
+            promote_hit_ttl: None,
+            debug_converge_lease: args.debug_converge_lease,
+            manual_converge_socket: None,
+        };
         tokio::spawn(async move {
-            let r = recv_loop(socket, text.as_str(), &shared, None).await;
+            let r = recv_loop(socket, &shared, opts).await;
             info!("recv finished [{r:?}]");
         })
     };
@@ -921,15 +1631,56 @@ async fn run_nat4_keep_recv(args: Nat4RunConfig) -> Result<()> {
     let _recv_tasks = runtime.recv_tasks;
     let senders = runtime.senders;
     let interval = runtime.interval;
+    let manual_converge = runtime.manual_converge;
+
+    if let Some(coordinator) = manual_converge.as_ref() {
+        loop {
+            let entered = coordinator.lock().finish_warming(Instant::now());
+            if entered {
+                debug!("manual converge enter probing");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20).min(interval)).await;
+        }
+    }
 
     loop {
-        for sender in &senders {
-            sender.send_one().await?;
+        let plans = if let Some(coordinator) = manual_converge.as_ref() {
+            let socket_ids = senders
+                .iter()
+                .map(|sender| sender.socket_id)
+                .collect::<Vec<_>>();
+            let mut state = coordinator.lock();
+            plan_nat4_manual_converge_send_step(&mut state, &socket_ids, Instant::now())
+        } else {
+            senders
+                .iter()
+                .map(|sender| Nat4SendPlan {
+                    socket_id: sender.socket_id,
+                    should_send: true,
+                    token: None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut sent = 0usize;
+        for (sender, plan) in senders.iter().zip(plans.iter()) {
+            debug_assert_eq!(sender.socket_id, plan.socket_id);
+            if !plan.should_send {
+                continue;
+            }
+            if let Some(token) = plan.token {
+                sender.send_token(token).await?;
+            } else {
+                sender.send_one().await?;
+            }
+            sent += 1;
         }
 
         debug!(
-            "nat4 debug keep-recv send target [{}], num [{}], ttl [{:?}]",
+            "nat4 debug keep-recv send target [{}], sent [{}], total [{}], ttl [{:?}]",
             target,
+            sent,
             senders.len(),
             ttl
         );
@@ -944,7 +1695,8 @@ async fn prepare_nat3_socket(
     let socket = if let Some(socket) = prebound_socket {
         socket
     } else if args.discover_public_addr {
-        let stun_servers = resolve_nat3_stun_servers(args.discover_public_addr, &args.stun_servers)?;
+        let stun_servers =
+            resolve_nat3_stun_servers(args.discover_public_addr, &args.stun_servers)?;
         let socket = tokio_socket_bind(&args.listen)
             .await
             .with_context(|| format!("failed to bind socket addr [{}]", args.listen))?;
@@ -1035,6 +1787,7 @@ struct Nat4ProbeRuntime {
     shared: Arc<Shared>,
     senders: Vec<UdpSender>,
     recv_tasks: RecvTaskGuard,
+    manual_converge: Option<Arc<Mutex<ManualConvergeCoordinator>>>,
 }
 
 async fn prepare_nat4_probe_runtime(args: &Nat4RunConfig) -> Result<Nat4ProbeRuntime> {
@@ -1045,6 +1798,16 @@ async fn prepare_nat4_probe_runtime(args: &Nat4RunConfig) -> Result<Nat4ProbeRun
     let text = Arc::new(resolve_probe_text(args.content.as_deref()));
     let shared = Arc::new(Shared {
         connecteds: Default::default(),
+    });
+    let manual_converge_cfg = args
+        .debug_converge_lease
+        .then(|| ManualConvergeConfig::for_debug_lease(interval));
+    let manual_converge = manual_converge_cfg.as_ref().map(|cfg| {
+        Arc::new(Mutex::new(ManualConvergeCoordinator::new(
+            args.count,
+            interval,
+            cfg.warm_drain,
+        )))
     });
 
     let ttl = match args.ttl {
@@ -1063,6 +1826,13 @@ async fn prepare_nat4_probe_runtime(args: &Nat4RunConfig) -> Result<Nat4ProbeRun
 
     let mut sender_parts = Vec::with_capacity(args.count);
     let mut recv_tasks = RecvTaskGuard::with_capacity(args.count);
+
+    if let Some(cfg) = manual_converge_cfg.as_ref() {
+        debug!(
+            "manual converge warming start: sockets [{}], warm_drain [{:?}]",
+            args.count, cfg.warm_drain
+        );
+    }
 
     for _ in 0..args.count {
         let listen = "0.0.0.0:0";
@@ -1092,27 +1862,60 @@ async fn prepare_nat4_probe_runtime(args: &Nat4RunConfig) -> Result<Nat4ProbeRun
     };
 
     let mut senders = Vec::with_capacity(args.count);
-    for (socket, local) in sender_parts {
+    for (socket_id, (socket, local)) in sender_parts.into_iter().enumerate() {
+        let socket_id = socket_id as u64;
         let socket = Arc::new(socket.into_inner());
         let recv_task = {
             let socket = socket.clone();
-            let text = text.clone();
             let shared = shared.clone();
+            let opts = RecvLoopOptions {
+                role: HardNatRole::Nat4,
+                expected_text: text.clone(),
+                promote_hit_ttl: debug_promote_hit_ttl,
+                debug_converge_lease: args.debug_converge_lease,
+                manual_converge_socket: manual_converge.as_ref().map(|coordinator| {
+                    ManualConvergeRecvState {
+                        socket_id,
+                        coordinator: coordinator.clone(),
+                    }
+                }),
+            };
             tokio::spawn(async move {
-                let r = recv_loop(socket, text.as_str(), &shared, debug_promote_hit_ttl).await;
+                let r = recv_loop(socket, &shared, opts).await;
                 info!("recv finished [{r:?}]");
             })
         };
         recv_tasks.push(recv_task);
 
         let sender = UdpSender {
+            socket_id,
             socket: socket.clone(),
-            text: text.clone(),
+            payload: if args.debug_converge_lease {
+                ProbePayload::Nat4Token {
+                    socket_id,
+                    generation: 0,
+                    next_seq: AtomicU64::new(0),
+                }
+            } else {
+                ProbePayload::Plain(text.clone())
+            },
             target,
             local,
         };
 
-        if let Some(ttl) = ttl {
+        if args.debug_converge_lease {
+            sender
+                .warm_up(ttl)
+                .await
+                .with_context(|| "warm_up failed")?;
+            if let Some(coordinator) = manual_converge.as_ref() {
+                let ready_at = coordinator.lock().mark_warm_done(socket_id, Instant::now());
+                debug!("manual converge socket [{socket_id}] warming done [{local}]");
+                if let Some(ready_at) = ready_at {
+                    debug!("manual converge warm barrier ready at [{ready_at:?}]");
+                }
+            }
+        } else if let Some(ttl) = ttl {
             sender
                 .prepare_ttl(ttl)
                 .await
@@ -1130,6 +1933,7 @@ async fn prepare_nat4_probe_runtime(args: &Nat4RunConfig) -> Result<Nat4ProbeRun
         shared,
         senders,
         recv_tasks,
+        manual_converge,
     })
 }
 
@@ -1191,11 +1995,25 @@ async fn ping_host(host: IpAddr) -> Result<Option<u32>> {
     Ok(None)
 }
 
+#[derive(Clone)]
+struct ManualConvergeRecvState {
+    socket_id: u64,
+    coordinator: Arc<Mutex<ManualConvergeCoordinator>>,
+}
+
+#[derive(Clone)]
+struct RecvLoopOptions {
+    role: HardNatRole,
+    expected_text: Arc<String>,
+    promote_hit_ttl: Option<u32>,
+    debug_converge_lease: bool,
+    manual_converge_socket: Option<ManualConvergeRecvState>,
+}
+
 async fn recv_loop(
     socket: Arc<UdpSocket>,
-    text: &str,
     shared: &Arc<Shared>,
-    promote_hit_ttl: Option<u32>,
+    opts: RecvLoopOptions,
 ) -> Result<()> {
     let local = socket
         .local_addr()
@@ -1209,9 +2027,15 @@ async fn recv_loop(
             .await
             .with_context(|| "recv_from failed")?;
         let packet = &buf[..len];
-        if packet == text.as_bytes() {
+        let action = decide_recv_probe_action(
+            opts.role,
+            opts.debug_converge_lease,
+            packet,
+            opts.expected_text.as_str(),
+        );
+        if action.is_valid_probe() {
             if !ttl_promoted {
-                if let Some(ttl) = promote_hit_ttl {
+                if let Some(ttl) = opts.promote_hit_ttl {
                     socket
                         .set_ttl(ttl)
                         .with_context(|| format!("set recv-loop promoted ttl [{ttl}] failed"))?;
@@ -1221,8 +2045,35 @@ async fn recv_loop(
                     );
                 }
             }
+            if action.should_echo() {
+                socket
+                    .send_to(packet, from)
+                    .await
+                    .with_context(|| "echo probe token failed")?;
+                debug!("echo probe token [{local}] => [{from}], bytes [{len}]");
+            }
+            if let Some(manual) = opts.manual_converge_socket.as_ref() {
+                let now = Instant::now();
+                let mut coordinator = manual.coordinator.lock();
+                if let RecvProbeAction::AcceptNat4TokenEcho(token) = action {
+                    let _ = coordinator.record_validation_echo(manual.socket_id, token, now);
+                }
+                let _ = coordinator.record_probe_hit(manual.socket_id, now);
+            }
             let old = shared.connecteds.lock().insert(from, socket.clone());
-            info!("recv text [{local}] <= [{from}], text [{text}]");
+            match action {
+                RecvProbeAction::AcceptContent => {
+                    info!(
+                        "recv text [{local}] <= [{from}], text [{}]",
+                        opts.expected_text.as_str()
+                    );
+                }
+                RecvProbeAction::AcceptNat4TokenEcho(token)
+                | RecvProbeAction::EchoNat4Token(token) => {
+                    debug!("recv probe token [{local}] <= [{from}], token [{token:?}]");
+                }
+                RecvProbeAction::Ignore => {}
+            }
             if old.is_none() {
                 info!("connected from target [{from:?}]");
             }
@@ -1269,17 +2120,55 @@ impl Drop for RecvTaskGuard {
 }
 
 struct UdpSender {
+    socket_id: u64,
     socket: Arc<UdpSocket>,
     target: SocketAddr,
-    text: Arc<String>,
+    payload: ProbePayload,
     local: SocketAddr,
+}
+
+enum ProbePayload {
+    Plain(Arc<String>),
+    Nat4Token {
+        socket_id: u64,
+        generation: u64,
+        next_seq: AtomicU64,
+    },
+}
+
+impl ProbePayload {
+    fn next_text(&self) -> String {
+        match self {
+            Self::Plain(text) => text.to_string(),
+            Self::Nat4Token {
+                socket_id,
+                generation,
+                next_seq,
+            } => encode_probe_token(ProbeToken {
+                role: HardNatRole::Nat4,
+                socket_id: *socket_id,
+                generation: *generation,
+                seq: next_seq.fetch_add(1, Ordering::Relaxed),
+            }),
+        }
+    }
 }
 
 impl UdpSender {
     async fn send_one(&self) -> Result<()> {
+        let payload = self.payload.next_text();
+        self.send_payload(&payload).await
+    }
+
+    async fn send_token(&self, token: ProbeToken) -> Result<()> {
+        let payload = encode_probe_token(token);
+        self.send_payload(&payload).await
+    }
+
+    async fn send_payload(&self, payload: &str) -> Result<()> {
         let len = self
             .socket
-            .send_to(self.text.as_bytes(), self.target)
+            .send_to(payload.as_bytes(), self.target)
             .await
             .with_context(|| "send_to failed")?;
         debug!(
@@ -1287,6 +2176,20 @@ impl UdpSender {
             self.local, self.target
         );
         Ok(())
+    }
+
+    async fn warm_up(&self, max_ttl: Option<u32>) -> Result<()> {
+        if let Some(max_ttl) = max_ttl {
+            for ttl in 1..=max_ttl {
+                self.socket
+                    .set_ttl(ttl)
+                    .with_context(|| format!("failed to set_ttl [{ttl}]"))?;
+                self.send_one().await?;
+            }
+            return Ok(());
+        }
+
+        self.send_one().await
     }
 
     async fn prepare_ttl(&self, max_ttl: u32) -> Result<()> {
@@ -1416,6 +2319,7 @@ mod tests {
             discover_public_addr: false,
             pause_after_discovery: false,
             hold_batch_until_enter: false,
+            debug_converge_lease: false,
             stun_servers: Vec::new(),
         };
         let err = cfg.validate().unwrap_err().to_string();
@@ -1433,6 +2337,7 @@ mod tests {
             dump_public_addrs: false,
             debug_keep_recv: false,
             debug_promote_hit_ttl: None,
+            debug_converge_lease: false,
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("interval"));
@@ -1451,6 +2356,7 @@ mod tests {
             discover_public_addr: false,
             pause_after_discovery: false,
             hold_batch_until_enter: false,
+            debug_converge_lease: false,
             stun_servers: Vec::new(),
         };
         let err = cfg.validate().unwrap_err().to_string();
@@ -1470,6 +2376,7 @@ mod tests {
             discover_public_addr: false,
             pause_after_discovery: true,
             hold_batch_until_enter: false,
+            debug_converge_lease: false,
             stun_servers: Vec::new(),
         };
         let err = cfg.validate().unwrap_err().to_string();
@@ -1487,6 +2394,7 @@ mod tests {
             dump_public_addrs: false,
             debug_keep_recv: false,
             debug_promote_hit_ttl: None,
+            debug_converge_lease: false,
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("ttl"));
@@ -1503,6 +2411,7 @@ mod tests {
             dump_public_addrs: false,
             debug_keep_recv: false,
             debug_promote_hit_ttl: Some(64),
+            debug_converge_lease: false,
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("debug_keep_recv"), "{err}");
@@ -1536,10 +2445,530 @@ mod tests {
 
     #[test]
     fn probe_token_roundtrip() {
-        let s = encode_probe_token(HardNatRole::Nat4, 0x1234_abcd);
-        let (role, id) = decode_probe_token(&s).unwrap();
-        assert_eq!(role, HardNatRole::Nat4);
-        assert_eq!(id, 0x1234_abcd);
+        let s = encode_probe_token(ProbeToken {
+            role: HardNatRole::Nat4,
+            socket_id: 0x1234_abcd,
+            generation: 0x55,
+            seq: 0x77,
+        });
+        let token = decode_probe_token(&s).unwrap();
+        assert_eq!(
+            token,
+            ProbeToken {
+                role: HardNatRole::Nat4,
+                socket_id: 0x1234_abcd,
+                generation: 0x55,
+                seq: 0x77,
+            }
+        );
+    }
+
+    #[test]
+    fn probe_token_rejects_invalid_prefix() {
+        assert!(decode_probe_token("nat4:1234").is_none());
+        assert!(decode_probe_token("hn0 nat4 1 2 3").is_none());
+    }
+
+    #[test]
+    fn warm_barrier_waits_for_all_sockets_before_probing() {
+        let mut state = ManualConvergeCoordinator::new(
+            2,
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+        );
+        let now = Instant::now();
+
+        assert!(state.mark_warm_done(0, now).is_none());
+        assert_eq!(state.mark_warm_done(1, now), Some(now));
+        assert!(!state.finish_warming(now + Duration::from_millis(99)));
+        assert_eq!(state.phase(), ManualConvergePhase::Warming);
+        assert!(state.finish_warming(now + Duration::from_millis(100)));
+        assert_eq!(state.phase(), ManualConvergePhase::Probing);
+    }
+
+    #[test]
+    fn warming_ignores_probe_hits_until_probing() {
+        let mut state =
+            ManualConvergeCoordinator::new(1, Duration::from_millis(10), Duration::from_millis(10));
+        let now = Instant::now();
+
+        assert!(!state.record_probe_hit(7, now));
+        assert_eq!(state.socket_phase(7), Some(Nat4SocketPhase::Warming));
+
+        assert_eq!(state.mark_warm_done(7, now), Some(now));
+        assert!(!state.record_probe_hit(7, now + Duration::from_millis(5)));
+        assert!(state.finish_warming(now + Duration::from_millis(10)));
+        assert!(state.record_probe_hit(7, now + Duration::from_millis(11)));
+        assert_eq!(state.socket_phase(7), Some(Nat4SocketPhase::Probing));
+        assert_eq!(state.socket_probe_hit_count(7), Some(1));
+    }
+
+    #[test]
+    fn probing_promotes_socket_to_candidate_after_n1_hits_within_t1() {
+        let mut state =
+            ManualConvergeCoordinator::new(1, Duration::from_millis(100), Duration::from_millis(0));
+        let now = Instant::now();
+        assert_eq!(state.mark_warm_done(3, now), Some(now));
+        assert!(state.finish_warming(now));
+
+        assert!(state.record_probe_hit(3, now + Duration::from_millis(10)));
+        assert_eq!(state.socket_phase(3), Some(Nat4SocketPhase::Probing));
+        assert_eq!(state.socket_probe_hit_count(3), Some(1));
+
+        assert!(state.record_probe_hit(3, now + Duration::from_millis(20)));
+        assert_eq!(state.socket_phase(3), Some(Nat4SocketPhase::Candidate));
+        assert_eq!(state.socket_probe_hit_count(3), Some(2));
+    }
+
+    #[test]
+    fn probing_resets_hit_window_after_t1_expires() {
+        let mut state =
+            ManualConvergeCoordinator::new(1, Duration::from_millis(100), Duration::from_millis(0));
+        let now = Instant::now();
+        assert_eq!(state.mark_warm_done(3, now), Some(now));
+        assert!(state.finish_warming(now));
+
+        assert!(state.record_probe_hit(3, now + Duration::from_millis(10)));
+        assert!(state.record_probe_hit(3, now + Duration::from_millis(1600)));
+        assert_eq!(state.socket_phase(3), Some(Nat4SocketPhase::Probing));
+        assert_eq!(state.socket_probe_hit_count(3), Some(1));
+
+        assert!(state.record_probe_hit(3, now + Duration::from_millis(1700)));
+        assert_eq!(state.socket_phase(3), Some(Nat4SocketPhase::Candidate));
+        assert_eq!(state.socket_probe_hit_count(3), Some(2));
+    }
+
+    #[test]
+    fn probing_hit_count_is_tracked_independently_per_socket() {
+        let mut state =
+            ManualConvergeCoordinator::new(2, Duration::from_millis(100), Duration::from_millis(0));
+        let now = Instant::now();
+        assert_eq!(state.mark_warm_done(1, now), None);
+        assert_eq!(state.mark_warm_done(2, now), Some(now));
+        assert!(state.finish_warming(now));
+
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(10)));
+        assert!(state.record_probe_hit(2, now + Duration::from_millis(20)));
+        assert_eq!(state.socket_phase(1), Some(Nat4SocketPhase::Probing));
+        assert_eq!(state.socket_phase(2), Some(Nat4SocketPhase::Probing));
+
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(30)));
+        assert_eq!(state.socket_phase(1), Some(Nat4SocketPhase::Candidate));
+        assert_eq!(state.socket_phase(2), Some(Nat4SocketPhase::Probing));
+        assert_eq!(state.socket_probe_hit_count(1), Some(2));
+        assert_eq!(state.socket_probe_hit_count(2), Some(1));
+    }
+
+    #[test]
+    fn lease_grant_allows_only_one_owner_at_a_time() {
+        let mut state =
+            ManualConvergeCoordinator::new(2, Duration::from_millis(100), Duration::from_millis(0));
+        let now = Instant::now();
+        assert_eq!(state.mark_warm_done(1, now), None);
+        assert_eq!(state.mark_warm_done(2, now), Some(now));
+        assert!(state.finish_warming(now));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(10)));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(20)));
+        assert!(state.record_probe_hit(2, now + Duration::from_millis(10)));
+        assert!(state.record_probe_hit(2, now + Duration::from_millis(20)));
+
+        let generation = state.try_acquire_lease(1, now + Duration::from_millis(30));
+        assert_eq!(generation, Some(1));
+        assert_eq!(state.lease_owner(), Some(1));
+        assert_eq!(
+            state.socket_phase(1),
+            Some(Nat4SocketPhase::PendingQuiet { generation: 1 })
+        );
+        assert_eq!(
+            state.socket_phase(2),
+            Some(Nat4SocketPhase::Silent { generation: 1 })
+        );
+        assert_eq!(
+            state.try_acquire_lease(2, now + Duration::from_millis(31)),
+            None
+        );
+        assert_eq!(state.lease_owner(), Some(1));
+    }
+
+    #[test]
+    fn quiet_barrier_ignores_old_generation_silent_ready() {
+        let mut state =
+            ManualConvergeCoordinator::new(2, Duration::from_millis(100), Duration::from_millis(0));
+        let now = Instant::now();
+        assert_eq!(state.mark_warm_done(1, now), None);
+        assert_eq!(state.mark_warm_done(2, now), Some(now));
+        assert!(state.finish_warming(now));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(10)));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(20)));
+
+        let generation = state
+            .try_acquire_lease(1, now + Duration::from_millis(30))
+            .expect("lease granted");
+        assert_eq!(generation, 1);
+        assert!(!state.mark_silent_ready(2, generation + 1, now + Duration::from_millis(31)));
+        assert_eq!(
+            state.socket_phase(1),
+            Some(Nat4SocketPhase::PendingQuiet { generation: 1 })
+        );
+        assert!(state.mark_silent_ready(2, generation, now + Duration::from_millis(32)));
+    }
+
+    #[test]
+    fn quiet_barrier_waits_for_ready_or_timeout_before_validating() {
+        let mut state =
+            ManualConvergeCoordinator::new(2, Duration::from_millis(100), Duration::from_millis(0));
+        let now = Instant::now();
+        assert_eq!(state.mark_warm_done(1, now), None);
+        assert_eq!(state.mark_warm_done(2, now), Some(now));
+        assert!(state.finish_warming(now));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(10)));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(20)));
+
+        let generation = state
+            .try_acquire_lease(1, now + Duration::from_millis(30))
+            .expect("lease granted");
+        assert_eq!(
+            state.advance_pending_quiet(now + Duration::from_millis(31)),
+            None
+        );
+        assert!(state.mark_silent_ready(2, generation, now + Duration::from_millis(32)));
+        assert_eq!(
+            state.advance_pending_quiet(now + Duration::from_millis(40)),
+            None
+        );
+        assert_eq!(
+            state.advance_pending_quiet(now + Duration::from_millis(140)),
+            Some(generation)
+        );
+        assert_eq!(
+            state.socket_phase(1),
+            Some(Nat4SocketPhase::LeaseOwnerValidating { generation })
+        );
+    }
+
+    #[test]
+    fn manual_converge_send_step_keeps_probing_sockets_sending_before_candidate() {
+        let mut state =
+            ManualConvergeCoordinator::new(2, Duration::from_millis(1), Duration::from_millis(0));
+        let now = Instant::now();
+        assert_eq!(state.mark_warm_done(1, now), None);
+        assert_eq!(state.mark_warm_done(2, now), Some(now));
+        assert!(state.finish_warming(now));
+
+        let plans = plan_nat4_manual_converge_send_step(
+            &mut state,
+            &[1, 2],
+            now + Duration::from_millis(1),
+        );
+
+        assert_eq!(
+            plans,
+            vec![
+                Nat4SendPlan {
+                    socket_id: 1,
+                    should_send: true,
+                    token: Some(ProbeToken {
+                        role: HardNatRole::Nat4,
+                        socket_id: 1,
+                        generation: 0,
+                        seq: 0,
+                    }),
+                },
+                Nat4SendPlan {
+                    socket_id: 2,
+                    should_send: true,
+                    token: Some(ProbeToken {
+                        role: HardNatRole::Nat4,
+                        socket_id: 2,
+                        generation: 0,
+                        seq: 0,
+                    }),
+                },
+            ]
+        );
+        assert_eq!(state.lease_owner(), None);
+        assert_eq!(state.socket_phase(1), Some(Nat4SocketPhase::Probing));
+        assert_eq!(state.socket_phase(2), Some(Nat4SocketPhase::Probing));
+    }
+
+    #[test]
+    fn manual_converge_send_step_grants_lease_and_silences_non_owner_sockets() {
+        let mut state =
+            ManualConvergeCoordinator::new(2, Duration::from_millis(1), Duration::from_millis(0));
+        let now = Instant::now();
+        assert_eq!(state.mark_warm_done(1, now), None);
+        assert_eq!(state.mark_warm_done(2, now), Some(now));
+        assert!(state.finish_warming(now));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(1)));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(2)));
+
+        let plans = plan_nat4_manual_converge_send_step(
+            &mut state,
+            &[1, 2],
+            now + Duration::from_millis(3),
+        );
+
+        assert_eq!(
+            plans,
+            vec![
+                Nat4SendPlan {
+                    socket_id: 1,
+                    should_send: false,
+                    token: None,
+                },
+                Nat4SendPlan {
+                    socket_id: 2,
+                    should_send: false,
+                    token: None,
+                },
+            ]
+        );
+        assert_eq!(state.lease_owner(), Some(1));
+        assert_eq!(
+            state.socket_phase(1),
+            Some(Nat4SocketPhase::PendingQuiet { generation: 1 })
+        );
+        assert_eq!(
+            state.socket_phase(2),
+            Some(Nat4SocketPhase::Silent { generation: 1 })
+        );
+    }
+
+    #[test]
+    fn manual_converge_send_step_only_sends_owner_after_quiet_barrier() {
+        let mut state =
+            ManualConvergeCoordinator::new(2, Duration::from_millis(1), Duration::from_millis(0));
+        let now = Instant::now();
+        assert_eq!(state.mark_warm_done(1, now), None);
+        assert_eq!(state.mark_warm_done(2, now), Some(now));
+        assert!(state.finish_warming(now));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(1)));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(2)));
+
+        let _ = plan_nat4_manual_converge_send_step(
+            &mut state,
+            &[1, 2],
+            now + Duration::from_millis(3),
+        );
+        let plans = plan_nat4_manual_converge_send_step(
+            &mut state,
+            &[1, 2],
+            now + Duration::from_millis(4),
+        );
+
+        assert_eq!(
+            plans,
+            vec![
+                Nat4SendPlan {
+                    socket_id: 1,
+                    should_send: true,
+                    token: Some(ProbeToken {
+                        role: HardNatRole::Nat4,
+                        socket_id: 1,
+                        generation: 1,
+                        seq: 0,
+                    }),
+                },
+                Nat4SendPlan {
+                    socket_id: 2,
+                    should_send: false,
+                    token: None,
+                },
+            ]
+        );
+        assert_eq!(state.lease_owner(), Some(1));
+        assert_eq!(
+            state.socket_phase(1),
+            Some(Nat4SocketPhase::LeaseOwnerValidating { generation: 1 })
+        );
+        assert_eq!(
+            state.socket_phase(2),
+            Some(Nat4SocketPhase::Silent { generation: 1 })
+        );
+    }
+
+    #[test]
+    fn validation_echo_promotes_owner_to_connected_after_n2_matches() {
+        let mut state =
+            ManualConvergeCoordinator::new(2, Duration::from_millis(1), Duration::from_millis(0));
+        let now = Instant::now();
+        assert_eq!(state.mark_warm_done(1, now), None);
+        assert_eq!(state.mark_warm_done(2, now), Some(now));
+        assert!(state.finish_warming(now));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(1)));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(2)));
+
+        let _ = plan_nat4_manual_converge_send_step(
+            &mut state,
+            &[1, 2],
+            now + Duration::from_millis(3),
+        );
+        let plans = plan_nat4_manual_converge_send_step(
+            &mut state,
+            &[1, 2],
+            now + Duration::from_millis(4),
+        );
+        let token0 = plans[0].token.expect("first validation token");
+        assert!(state.record_validation_echo(1, token0, now + Duration::from_millis(4)));
+        assert_eq!(
+            state.socket_phase(1),
+            Some(Nat4SocketPhase::LeaseOwnerValidating { generation: 1 })
+        );
+
+        let plans = plan_nat4_manual_converge_send_step(
+            &mut state,
+            &[1, 2],
+            now + Duration::from_millis(5),
+        );
+        let token1 = plans[0].token.expect("second validation token");
+        assert!(state.record_validation_echo(1, token1, now + Duration::from_millis(5)));
+        assert_eq!(
+            state.socket_phase(1),
+            Some(Nat4SocketPhase::Connected { generation: 1 })
+        );
+    }
+
+    #[test]
+    fn validation_echo_rejects_wrong_generation_or_unseen_seq() {
+        let mut state =
+            ManualConvergeCoordinator::new(2, Duration::from_millis(1), Duration::from_millis(0));
+        let now = Instant::now();
+        assert_eq!(state.mark_warm_done(1, now), None);
+        assert_eq!(state.mark_warm_done(2, now), Some(now));
+        assert!(state.finish_warming(now));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(1)));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(2)));
+
+        let _ = plan_nat4_manual_converge_send_step(
+            &mut state,
+            &[1, 2],
+            now + Duration::from_millis(3),
+        );
+        let plans = plan_nat4_manual_converge_send_step(
+            &mut state,
+            &[1, 2],
+            now + Duration::from_millis(4),
+        );
+        let token = plans[0].token.expect("validation token");
+        assert!(!state.record_validation_echo(
+            1,
+            ProbeToken {
+                generation: token.generation + 1,
+                ..token
+            },
+            now + Duration::from_millis(4)
+        ));
+        assert!(!state.record_validation_echo(
+            1,
+            ProbeToken {
+                seq: token.seq + 9,
+                ..token
+            },
+            now + Duration::from_millis(4)
+        ));
+        assert_eq!(
+            state.socket_phase(1),
+            Some(Nat4SocketPhase::LeaseOwnerValidating { generation: 1 })
+        );
+    }
+
+    #[test]
+    fn validation_timeout_releases_lease_and_recovers_after_cooldown() {
+        let mut state =
+            ManualConvergeCoordinator::new(2, Duration::from_millis(1), Duration::from_millis(0));
+        let now = Instant::now();
+        assert_eq!(state.mark_warm_done(1, now), None);
+        assert_eq!(state.mark_warm_done(2, now), Some(now));
+        assert!(state.finish_warming(now));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(1)));
+        assert!(state.record_probe_hit(1, now + Duration::from_millis(2)));
+
+        let _ = plan_nat4_manual_converge_send_step(
+            &mut state,
+            &[1, 2],
+            now + Duration::from_millis(3),
+        );
+        let _ = plan_nat4_manual_converge_send_step(
+            &mut state,
+            &[1, 2],
+            now + Duration::from_millis(4),
+        );
+
+        let plans = plan_nat4_manual_converge_send_step(
+            &mut state,
+            &[1, 2],
+            now + Duration::from_millis(2_600),
+        );
+        assert_eq!(state.lease_owner(), None);
+        assert_eq!(plans[0].should_send, false);
+        assert_eq!(plans[1].should_send, true);
+        assert_eq!(state.socket_phase(1), Some(Nat4SocketPhase::Cooldown));
+        assert_eq!(state.socket_phase(2), Some(Nat4SocketPhase::Probing));
+
+        let plans = plan_nat4_manual_converge_send_step(
+            &mut state,
+            &[1, 2],
+            now + Duration::from_millis(3_700),
+        );
+        assert_eq!(plans[0].should_send, true);
+        assert_eq!(plans[1].should_send, true);
+        assert_eq!(state.socket_phase(1), Some(Nat4SocketPhase::Probing));
+        assert_eq!(state.socket_phase(2), Some(Nat4SocketPhase::Probing));
+    }
+
+    #[test]
+    fn nat3_debug_converge_lease_echoes_nat4_tokens() {
+        let token = ProbeToken {
+            role: HardNatRole::Nat4,
+            socket_id: 0x1a,
+            generation: 0x3,
+            seq: 0x2f,
+        };
+        let payload = encode_probe_token(token);
+
+        assert_eq!(
+            decide_recv_probe_action(
+                HardNatRole::Nat3,
+                true,
+                payload.as_bytes(),
+                DEFAULT_PROBE_TEXT
+            ),
+            RecvProbeAction::EchoNat4Token(token)
+        );
+    }
+
+    #[test]
+    fn nat4_debug_converge_lease_accepts_echoed_nat4_tokens() {
+        let token = ProbeToken {
+            role: HardNatRole::Nat4,
+            socket_id: 0x22,
+            generation: 0x8,
+            seq: 0x99,
+        };
+        let payload = encode_probe_token(token);
+
+        assert_eq!(
+            decide_recv_probe_action(
+                HardNatRole::Nat4,
+                true,
+                payload.as_bytes(),
+                DEFAULT_PROBE_TEXT
+            ),
+            RecvProbeAction::AcceptNat4TokenEcho(token)
+        );
+    }
+
+    #[test]
+    fn debug_converge_lease_still_accepts_plain_probe_text() {
+        assert_eq!(
+            decide_recv_probe_action(
+                HardNatRole::Nat4,
+                true,
+                DEFAULT_PROBE_TEXT.as_bytes(),
+                DEFAULT_PROBE_TEXT
+            ),
+            RecvProbeAction::AcceptContent
+        );
     }
 
     #[test]
@@ -1876,8 +3305,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn discover_nat4_public_addrs_keeps_sockets_when_a_stun_probe_times_out() -> Result<()>
-    {
+    async fn discover_nat4_public_addrs_keeps_sockets_when_a_stun_probe_times_out() -> Result<()> {
         let stun_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
         let stun_addr = stun_socket.local_addr()?;
 
@@ -2018,6 +3446,7 @@ mod tests {
                 dump_public_addrs: false,
                 debug_keep_recv: false,
                 debug_promote_hit_ttl: None,
+                debug_converge_lease: false,
             }),
         )
         .await
@@ -2075,22 +3504,24 @@ mod tests {
         let recv_task = {
             let socket = socket.clone();
             let shared = shared.clone();
-            tokio::spawn(async move {
-                recv_loop(
-                    socket,
-                    DEFAULT_PROBE_TEXT,
-                    &shared,
-                    Some(HARD_NAT_KEEP_RECV_PROMOTED_TTL),
-                )
-                .await
-            })
+            let opts = RecvLoopOptions {
+                role: HardNatRole::Nat4,
+                expected_text: Arc::new(DEFAULT_PROBE_TEXT.to_string()),
+                promote_hit_ttl: Some(HARD_NAT_KEEP_RECV_PROMOTED_TTL),
+                debug_converge_lease: false,
+                manual_converge_socket: None,
+            };
+            tokio::spawn(async move { recv_loop(socket, &shared, opts).await })
         };
 
-        sender.send_to(DEFAULT_PROBE_TEXT.as_bytes(), local_addr).await?;
+        sender
+            .send_to(DEFAULT_PROBE_TEXT.as_bytes(), local_addr)
+            .await?;
 
         tokio::time::timeout(Duration::from_millis(300), async {
             loop {
-                if shared.has_connected() && socket.ttl().ok() == Some(HARD_NAT_KEEP_RECV_PROMOTED_TTL)
+                if shared.has_connected()
+                    && socket.ttl().ok() == Some(HARD_NAT_KEEP_RECV_PROMOTED_TTL)
                 {
                     break;
                 }

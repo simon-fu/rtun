@@ -1324,6 +1324,7 @@ async fn open_udp_relay_hard_nat_socket(
                 discover_public_addr: false,
                 pause_after_discovery: false,
                 hold_batch_until_enter: false,
+                debug_converge_lease: false,
                 stun_servers: Vec::new(),
             };
             if let Some(prepared_nat3) = local_prepared_nat3 {
@@ -1345,6 +1346,7 @@ async fn open_udp_relay_hard_nat_socket(
                 dump_public_addrs: false,
                 debug_keep_recv: false,
                 debug_promote_hit_ttl: None,
+                debug_converge_lease: false,
             })
             .await
         }
