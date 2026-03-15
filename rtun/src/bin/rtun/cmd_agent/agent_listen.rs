@@ -13,7 +13,7 @@ use rtun::{
     async_rt::spawn_with_name,
     channel::{ChId, ChPair},
     huid::{gen_huid::gen_huid, HUId},
-    proto::KickDownArgs,
+    proto::{HardNatControlEnvelope, KickDownArgs},
     switch::{
         agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker},
         ctrl_client,
@@ -928,6 +928,36 @@ async fn run_sub_agent<H1: CtrlHandler>(
     run_sub_agent_stream(ctrl, uid, WsStreamAxum::new(socket.split()).split()).await
 }
 
+async fn build_sub_agent_hard_nat_control_rx<H1: CtrlHandler>(
+    ctrl: &CtrlInvoker<H1>,
+) -> Result<mpsc::Receiver<HardNatControlEnvelope>> {
+    let mut sub = ctrl.subscribe_hard_nat_control().await?;
+    let (tx, rx) = mpsc::channel(16);
+
+    spawn_with_name("sub-agent-hardnat-bridge", async move {
+        loop {
+            match sub.recv().await {
+                Ok(env) => {
+                    if tx.send(env).await.is_err() {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        "sub agent hard-nat control bridge lagged, skipped [{skipped}] messages"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    tracing::debug!("sub agent hard-nat control bridge closed");
+                    return;
+                }
+            }
+        }
+    });
+
+    Ok(rx)
+}
+
 async fn run_sub_agent_stream<H1, S1, S2>(
     ctrl: CtrlInvoker<H1>,
     uid: HUId,
@@ -940,11 +970,11 @@ where
 {
     let mut session = make_switch_pair(uid, stream).await?;
     let switch = session.clone_invoker();
+    let hard_nat_rx = build_sub_agent_hard_nat_control_rx(&ctrl).await?;
 
     let ctrl_ch_id = ChId(0);
     let (ctrl_tx, ctrl_rx) = ChPair::new(ctrl_ch_id).split();
     let ctrl_tx = switch.add_channel(ctrl_ch_id, ctrl_tx).await?;
-    let (_hard_nat_tx, hard_nat_rx) = mpsc::channel(16);
 
     spawn_ctrl_service(
         uid,
@@ -1051,4 +1081,50 @@ pub struct CmdArgs {
 
     #[clap(long = "disable-bridge-ch", long_help = "disable bridge channel")]
     disable_bridge_ch: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtun::{
+        huid::gen_huid::gen_huid,
+        proto::{hard_nat_control_envelope, HardNatControlEnvelope, HardNatLeaseKeepAlive},
+        switch::agent::ctrl::make_agent_ctrl,
+    };
+    use tokio::{
+        sync::mpsc::error::TryRecvError,
+        time::{timeout, Duration},
+    };
+
+    #[tokio::test]
+    async fn build_sub_agent_hard_nat_control_rx_forwards_controls_without_closing() {
+        let mut agent = make_agent_ctrl(gen_huid()).await.unwrap();
+        let ctrl = agent.clone_ctrl();
+        let mut rx = build_sub_agent_hard_nat_control_rx(&ctrl).await.unwrap();
+
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        let env = HardNatControlEnvelope {
+            session_id: 9,
+            seq: 3,
+            role_from: 2,
+            msg: Some(hard_nat_control_envelope::Msg::LeaseKeepAlive(
+                HardNatLeaseKeepAlive {
+                    lease_timeout_ms: 2500,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        ctrl.recv_hard_nat_control(env.clone()).await.unwrap();
+
+        let got = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, env);
+
+        agent.shutdown().await;
+        agent.wait_for_completed().await.unwrap();
+    }
 }
