@@ -49,7 +49,8 @@ where
     let mut skipped_invalid_count = 0;
 
     for if_addr in if_addrs {
-        if (local_addr.is_ipv4() && if_addr.is_ipv4()) || (local_addr.is_ipv6() && if_addr.is_ipv6())
+        if (local_addr.is_ipv4() && if_addr.is_ipv4())
+            || (local_addr.is_ipv6() && if_addr.is_ipv6())
         {
             let host_addr = SocketAddr::new(if_addr, local_addr.port());
             match Candidate::host(host_addr) {
