@@ -2,6 +2,12 @@ name: Build Nightly
 
 on:
   workflow_dispatch: # 手动触发
+    inputs:
+      publish:
+        description: 发布 nightly release
+        type: boolean
+        required: false
+        default: true
   push:
     branches:
       - main  # 仅在推送到 main 分支时触发
@@ -12,13 +18,15 @@ concurrency:
 
 jobs:
   build:
-    name: Build release Executable (${{ matrix.os }})
+    name: Build release Executable (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
           - os: macos-latest
             target: x86_64-apple-darwin
           - os: macos-latest
@@ -64,6 +72,7 @@ jobs:
           path: ./rtun-${{ matrix.target }}${{ env.BINARY_EXTENSION }}
 
   release:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publish == 'true' }}
     needs: build
     runs-on: ubuntu-latest
     steps:

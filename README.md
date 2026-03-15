@@ -467,8 +467,10 @@ GitHub Actions: `.github/workflows/build-nightly.yml`
 
 - 推送到 `main` 分支时自动触发编译（`push`）
 - 也支持手动触发（`workflow_dispatch`）
-- 编译 3 个目标：
+- 手动触发支持 `publish` 开关，默认会发布；设为 `false` 时只保留本次 Actions 运行的 artifacts，不更新 `nightly`
+- 编译 4 个目标：
   - `x86_64-unknown-linux-musl`
+  - `aarch64-unknown-linux-musl`
   - `x86_64-apple-darwin`
   - `aarch64-apple-darwin`
 - 发布到固定的 `nightly` 预发布（`tag_name: nightly`）
