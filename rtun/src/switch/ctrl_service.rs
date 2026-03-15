@@ -8,8 +8,9 @@ use crate::{
     huid::HUId,
     proto::{
         c2arequest::C2a_req_args, make_open_p2p_response_error, make_open_shell_response_error,
-        make_open_shell_response_ok, make_response_status_ok, C2ARequest, ExecAgentScriptResult,
-        KickDownArgs, Pong,
+        make_open_shell_response_ok, make_response_status_ok, ctrl_channel_packet,
+        ctrl_rpc_response, C2ARequest, CtrlChannelPacket, CtrlRpcResponse,
+        ExecAgentScriptResult, HardNatControlEnvelope, KickDownArgs, Pong,
     },
 };
 use bytes::Bytes;
@@ -42,6 +43,63 @@ pub enum ExitReason {
     KickDown(KickDownArgs),
 }
 
+#[derive(Debug)]
+enum DecodedCtrlServicePacket {
+    LegacyRpc(C2ARequest),
+    WrappedRpc(C2ARequest),
+    HardNatControl(HardNatControlEnvelope),
+}
+
+fn decode_ctrl_service_packet(payload: &[u8]) -> Result<DecodedCtrlServicePacket> {
+    let wrapped = CtrlChannelPacket::parse_from_bytes(payload)?;
+    match wrapped.body {
+        Some(ctrl_channel_packet::Body::RpcRequest(req)) => Ok(DecodedCtrlServicePacket::WrappedRpc(req)),
+        Some(ctrl_channel_packet::Body::HardNatControl(env)) => {
+            Ok(DecodedCtrlServicePacket::HardNatControl(env))
+        }
+        Some(ctrl_channel_packet::Body::RpcResponse(_)) => {
+            bail!("unexpected rpc response on ctrl service")
+        }
+        None => {
+            let legacy = C2ARequest::parse_from_bytes(payload)?;
+            Ok(DecodedCtrlServicePacket::LegacyRpc(legacy))
+        }
+    }
+}
+
+fn encode_ctrl_rpc_response_packet(rsp: CtrlRpcResponse, wrapped: bool) -> Result<Bytes> {
+    if wrapped {
+        return Ok(CtrlChannelPacket {
+            body: Some(ctrl_channel_packet::Body::RpcResponse(rsp)),
+            ..Default::default()
+        }
+        .write_to_bytes()?
+        .into());
+    }
+
+    let bytes = match rsp.body.with_context(|| "no ctrl rpc response body")? {
+        ctrl_rpc_response::Body::OpenChannel(msg) => msg.write_to_bytes()?,
+        ctrl_rpc_response::Body::Status(msg) => msg.write_to_bytes()?,
+        ctrl_rpc_response::Body::Pong(msg) => msg.write_to_bytes()?,
+        ctrl_rpc_response::Body::OpenP2p(msg) => msg.write_to_bytes()?,
+        ctrl_rpc_response::Body::ExecAgentScript(msg) => msg.write_to_bytes()?,
+    };
+    Ok(bytes.into())
+}
+
+async fn send_ctrl_rpc_response(
+    ctrl_tx: &ChSender,
+    rsp: CtrlRpcResponse,
+    wrapped: bool,
+) -> Result<()> {
+    let data = encode_ctrl_rpc_response_packet(rsp, wrapped)?;
+    ctrl_tx
+        .send_data(data)
+        .await
+        .map_err(|_x| anyhow!("send data fail"))?;
+    Ok(())
+}
+
 async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
     agent: &CtrlInvoker<H1>,
     switch: &SwitchInvoker<H2>,
@@ -67,9 +125,16 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
             }
         };
 
-        let cmd = C2ARequest::parse_from_bytes(&packet.payload)?
-            .c2a_req_args
-            .with_context(|| "no c2a_req_args")?;
+        let (req, wrapped) = match decode_ctrl_service_packet(&packet.payload)? {
+            DecodedCtrlServicePacket::LegacyRpc(req) => (req, false),
+            DecodedCtrlServicePacket::WrappedRpc(req) => (req, true),
+            DecodedCtrlServicePacket::HardNatControl(env) => {
+                tracing::debug!("recv hardnat control before runtime hooked: {:?}", env);
+                bail!("hardnat control not supported yet")
+            }
+        };
+
+        let cmd = req.c2a_req_args.with_context(|| "no c2a_req_args")?;
         match cmd {
             C2a_req_args::OpenSell(args) => {
                 let ch_id = args
@@ -87,10 +152,15 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                     Err(e) => (make_open_shell_response_error(e), None),
                 };
 
-                ctrl_tx
-                    .send_data(rsp.write_to_bytes()?.into())
-                    .await
-                    .map_err(|_x| anyhow!("send data fail"))?;
+                send_ctrl_rpc_response(
+                    ctrl_tx,
+                    CtrlRpcResponse {
+                        body: Some(ctrl_rpc_response::Body::OpenChannel(rsp)),
+                        ..Default::default()
+                    },
+                    wrapped,
+                )
+                .await?;
 
                 if let Some(ch_tx) = ch_tx {
                     switch.add_channel(ch_id, ch_tx).await?;
@@ -113,10 +183,15 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                     Err(e) => (make_open_shell_response_error(e), None),
                 };
 
-                ctrl_tx
-                    .send_data(rsp.write_to_bytes()?.into())
-                    .await
-                    .map_err(|_x| anyhow!("send data fail"))?;
+                send_ctrl_rpc_response(
+                    ctrl_tx,
+                    CtrlRpcResponse {
+                        body: Some(ctrl_rpc_response::Body::OpenChannel(rsp)),
+                        ..Default::default()
+                    },
+                    wrapped,
+                )
+                .await?;
 
                 if let Some(ch_tx) = ch_tx {
                     switch.add_channel(ch_id, ch_tx).await?;
@@ -127,15 +202,15 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                 // tracing::debug!("recv closing ch req {}", args);
                 let _r = switch.remove_channel(ChId(args.ch_id)).await?;
 
-                let rsp = make_response_status_ok();
-
-                let data: Bytes = rsp.write_to_bytes()?.into();
-                // tracing::debug!("send closing ch rsp len {}", data.len());
-
-                ctrl_tx
-                    .send_data(data)
-                    .await
-                    .map_err(|_x| anyhow!("send data fail"))?;
+                send_ctrl_rpc_response(
+                    ctrl_tx,
+                    CtrlRpcResponse {
+                        body: Some(ctrl_rpc_response::Body::Status(make_response_status_ok())),
+                        ..Default::default()
+                    },
+                    wrapped,
+                )
+                .await?;
                 // tracing::debug!("send closing ch ok");
             }
 
@@ -145,20 +220,27 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                     ..Default::default()
                 };
 
-                let data: Bytes = rsp.write_to_bytes()?.into();
-                ctrl_tx
-                    .send_data(data)
-                    .await
-                    .map_err(|_x| anyhow!("send data fail"))?;
+                send_ctrl_rpc_response(
+                    ctrl_tx,
+                    CtrlRpcResponse {
+                        body: Some(ctrl_rpc_response::Body::Pong(rsp)),
+                        ..Default::default()
+                    },
+                    wrapped,
+                )
+                .await?;
             }
 
             C2a_req_args::KickDown(args) => {
-                let rsp = make_response_status_ok();
-                let data: Bytes = rsp.write_to_bytes()?.into();
-                ctrl_tx
-                    .send_data(data)
-                    .await
-                    .map_err(|_x| anyhow!("send data fail"))?;
+                send_ctrl_rpc_response(
+                    ctrl_tx,
+                    CtrlRpcResponse {
+                        body: Some(ctrl_rpc_response::Body::Status(make_response_status_ok())),
+                        ..Default::default()
+                    },
+                    wrapped,
+                )
+                .await?;
 
                 tracing::warn!("recv kick down {args}");
                 return Ok(ExitReason::KickDown(args));
@@ -173,11 +255,15 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                     Err(e) => make_open_p2p_response_error(e),
                 };
 
-                let data: Bytes = rsp.write_to_bytes()?.into();
-                ctrl_tx
-                    .send_data(data)
-                    .await
-                    .map_err(|_x| anyhow!("send data fail"))?;
+                send_ctrl_rpc_response(
+                    ctrl_tx,
+                    CtrlRpcResponse {
+                        body: Some(ctrl_rpc_response::Body::OpenP2p(rsp)),
+                        ..Default::default()
+                    },
+                    wrapped,
+                )
+                .await?;
             }
 
             C2a_req_args::ExecAgentScript(args) => {
@@ -190,13 +276,353 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
                         ..Default::default()
                     },
                 };
-                let data: Bytes = rsp.write_to_bytes()?.into();
-                ctrl_tx
-                    .send_data(data)
-                    .await
-                    .map_err(|_x| anyhow!("send data fail"))?;
+                send_ctrl_rpc_response(
+                    ctrl_tx,
+                    CtrlRpcResponse {
+                        body: Some(ctrl_rpc_response::Body::ExecAgentScript(rsp)),
+                        ..Default::default()
+                    },
+                    wrapped,
+                )
+                .await?;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        actor_service::{
+            handle_first_none, handle_msg_none, handle_next_none, start_actor, wait_next_none,
+            ActorEntity, AsyncHandler,
+        },
+        channel::{CHANNEL_SIZE, ChReceiver, ChSender, ChTx},
+        switch::{
+            entity_watch::{CtrlGuard, OpWatch, WatchResult},
+            invoker_ctrl::{
+                CloseChannelResult, OpCloseChannel, OpExecAgentScript, OpExecAgentScriptResult,
+                OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult, OpOpenShell,
+                OpOpenShellResult, OpOpenSocks, OpOpenSocksResult,
+            },
+            invoker_switch::{AddChannelResult, ReqAddChannel, ReqGetMuxTx, ReqGetMuxTxResult, ReqRemoveChannel, RemoveChannelResult},
+        },
+    };
+    use crate::proto::{
+        c2arequest::C2a_req_args, ctrl_channel_packet, ctrl_rpc_response, CtrlChannelPacket,
+        CtrlRpcResponse, OpenP2PResponse, P2PArgs, ResponseStatus,
+    };
+    use protobuf::Message;
+    use tokio::{sync::mpsc, time::timeout};
+
+    struct TestCtrlEntity {
+        guard: CtrlGuard,
+    }
+
+    impl ActorEntity for TestCtrlEntity {
+        type Next = ();
+        type Msg = ();
+        type Result = Result<()>;
+
+        fn into_result(self, result: Result<()>) -> Self::Result {
+            result
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpWatch> for TestCtrlEntity {
+        type Response = WatchResult;
+
+        async fn handle(&mut self, _req: OpWatch) -> Self::Response {
+            Ok(self.guard.watch())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpCloseChannel> for TestCtrlEntity {
+        type Response = CloseChannelResult;
+
+        async fn handle(&mut self, _req: OpCloseChannel) -> Self::Response {
+            anyhow::bail!("unexpected close_channel")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpOpenShell> for TestCtrlEntity {
+        type Response = OpOpenShellResult;
+
+        async fn handle(&mut self, _req: OpOpenShell) -> Self::Response {
+            anyhow::bail!("unexpected open_shell")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpOpenSocks> for TestCtrlEntity {
+        type Response = OpOpenSocksResult;
+
+        async fn handle(&mut self, _req: OpOpenSocks) -> Self::Response {
+            anyhow::bail!("unexpected open_socks")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpKickDown> for TestCtrlEntity {
+        type Response = OpKickDownResult;
+
+        async fn handle(&mut self, _req: OpKickDown) -> Self::Response {
+            anyhow::bail!("unexpected kick_down")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpOpenP2P> for TestCtrlEntity {
+        type Response = OpOpenP2PResult;
+
+        async fn handle(&mut self, _req: OpOpenP2P) -> Self::Response {
+            anyhow::bail!("unexpected open_p2p")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpExecAgentScript> for TestCtrlEntity {
+        type Response = OpExecAgentScriptResult;
+
+        async fn handle(&mut self, _req: OpExecAgentScript) -> Self::Response {
+            anyhow::bail!("unexpected exec_agent_script")
+        }
+    }
+
+    impl CtrlHandler for TestCtrlEntity {}
+
+    struct TestSwitchEntity {
+        guard: CtrlGuard,
+        mux_tx: ChTx,
+    }
+
+    impl ActorEntity for TestSwitchEntity {
+        type Next = ();
+        type Msg = ();
+        type Result = Result<()>;
+
+        fn into_result(self, result: Result<()>) -> Self::Result {
+            result
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<ReqAddChannel> for TestSwitchEntity {
+        type Response = AddChannelResult;
+
+        async fn handle(&mut self, req: ReqAddChannel) -> Self::Response {
+            Ok(req.1)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<ReqRemoveChannel> for TestSwitchEntity {
+        type Response = RemoveChannelResult;
+
+        async fn handle(&mut self, _req: ReqRemoveChannel) -> Self::Response {
+            Ok(true)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<ReqGetMuxTx> for TestSwitchEntity {
+        type Response = ReqGetMuxTxResult;
+
+        async fn handle(&mut self, _req: ReqGetMuxTx) -> Self::Response {
+            Ok(self.mux_tx.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpWatch> for TestSwitchEntity {
+        type Response = WatchResult;
+
+        async fn handle(&mut self, _req: OpWatch) -> Self::Response {
+            Ok(self.guard.watch())
+        }
+    }
+
+    impl SwitchHanlder for TestSwitchEntity {}
+
+    fn spawn_test_ctrl() -> crate::actor_service::ActorHandle<TestCtrlEntity> {
+        start_actor(
+            "test-ctrl-service-agent".into(),
+            TestCtrlEntity {
+                guard: CtrlGuard::new(),
+            },
+            handle_first_none,
+            wait_next_none,
+            handle_next_none,
+            handle_msg_none,
+        )
+    }
+
+    fn spawn_test_switch() -> crate::actor_service::ActorHandle<TestSwitchEntity> {
+        let (mux_tx, _mux_rx) = mpsc::channel(CHANNEL_SIZE);
+        start_actor(
+            "test-ctrl-service-switch".into(),
+            TestSwitchEntity {
+                guard: CtrlGuard::new(),
+                mux_tx,
+            },
+            handle_first_none,
+            wait_next_none,
+            handle_next_none,
+            handle_msg_none,
+        )
+    }
+
+    fn make_duplex_ctrl_pair(ch_id: ChId) -> (ChPair, ChPair) {
+        let (client_to_service_tx, client_to_service_rx) = mpsc::channel(CHANNEL_SIZE);
+        let (service_to_client_tx, service_to_client_rx) = mpsc::channel(CHANNEL_SIZE);
+
+        let service = ChPair {
+            tx: ChSender::new(ch_id, service_to_client_tx),
+            rx: ChReceiver::new(client_to_service_rx),
+        };
+        let client = ChPair {
+            tx: ChSender::new(ch_id, client_to_service_tx),
+            rx: ChReceiver::new(service_to_client_rx),
+        };
+        (service, client)
+    }
+
+    #[test]
+    fn decode_ctrl_service_packet_accepts_legacy_and_wrapped_rpc_request() {
+        let legacy_req = C2ARequest {
+            c2a_req_args: Some(C2a_req_args::Ping(crate::proto::Ping {
+                timestamp: 7,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let decoded = decode_ctrl_service_packet(&legacy_req.write_to_bytes().unwrap()).unwrap();
+        assert!(matches!(decoded, DecodedCtrlServicePacket::LegacyRpc(_)));
+
+        let wrapped_req = CtrlChannelPacket {
+            body: Some(ctrl_channel_packet::Body::RpcRequest(legacy_req)),
+            ..Default::default()
+        };
+        let decoded = decode_ctrl_service_packet(&wrapped_req.write_to_bytes().unwrap()).unwrap();
+        assert!(matches!(decoded, DecodedCtrlServicePacket::WrappedRpc(_)));
+    }
+
+    #[test]
+    fn encode_ctrl_rpc_response_packet_preserves_wrapped_mode() {
+        let rsp = CtrlRpcResponse {
+            body: Some(ctrl_rpc_response::Body::OpenP2p(OpenP2PResponse {
+                open_p2p_rsp: Some(crate::proto::open_p2presponse::Open_p2p_rsp::Args(
+                    P2PArgs::default(),
+                )),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let wrapped = encode_ctrl_rpc_response_packet(rsp.clone(), true).unwrap();
+        let wrapped = CtrlChannelPacket::parse_from_bytes(&wrapped).unwrap();
+        assert!(matches!(
+            wrapped.body,
+            Some(ctrl_channel_packet::Body::RpcResponse(_))
+        ));
+
+        let raw = encode_ctrl_rpc_response_packet(
+            CtrlRpcResponse {
+                body: Some(ctrl_rpc_response::Body::Status(ResponseStatus {
+                    code: 0,
+                    reason: "ok".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+        let raw = ResponseStatus::parse_from_bytes(&raw).unwrap();
+        assert_eq!(raw.code, 0);
+        assert_eq!(raw.reason, "ok".into());
+    }
+
+    #[tokio::test]
+    async fn ctrl_loop_full_replies_raw_pong_to_legacy_ping() {
+        let ctrl_handle = spawn_test_ctrl();
+        let switch_handle = spawn_test_switch();
+        let ctrl = CtrlInvoker::new(ctrl_handle.invoker().clone());
+        let switch = SwitchInvoker::new(switch_handle.invoker().clone());
+        let (mut service_pair, mut client_pair) = make_duplex_ctrl_pair(ChId(1));
+
+        let service = tokio::spawn(async move { ctrl_loop_full(&ctrl, &switch, &mut service_pair).await });
+
+        let req = C2ARequest {
+            c2a_req_args: Some(C2a_req_args::Ping(crate::proto::Ping {
+                timestamp: 123,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        client_pair
+            .tx
+            .send_data(req.write_to_bytes().unwrap().into())
+            .await
+            .unwrap();
+
+        let rsp = timeout(Duration::from_secs(1), client_pair.rx.recv_packet())
+            .await
+            .unwrap()
+            .unwrap();
+        let pong = Pong::parse_from_bytes(&rsp.payload).unwrap();
+        assert_eq!(pong.timestamp, 123);
+
+        drop(client_pair.tx);
+        assert!(service.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn ctrl_loop_full_replies_wrapped_pong_to_wrapped_ping() {
+        let ctrl_handle = spawn_test_ctrl();
+        let switch_handle = spawn_test_switch();
+        let ctrl = CtrlInvoker::new(ctrl_handle.invoker().clone());
+        let switch = SwitchInvoker::new(switch_handle.invoker().clone());
+        let (mut service_pair, mut client_pair) = make_duplex_ctrl_pair(ChId(1));
+
+        let service = tokio::spawn(async move { ctrl_loop_full(&ctrl, &switch, &mut service_pair).await });
+
+        let req = CtrlChannelPacket {
+            body: Some(ctrl_channel_packet::Body::RpcRequest(C2ARequest {
+                c2a_req_args: Some(C2a_req_args::Ping(crate::proto::Ping {
+                    timestamp: 456,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        client_pair
+            .tx
+            .send_data(req.write_to_bytes().unwrap().into())
+            .await
+            .unwrap();
+
+        let rsp = timeout(Duration::from_secs(1), client_pair.rx.recv_packet())
+            .await
+            .unwrap()
+            .unwrap();
+        let rsp = CtrlChannelPacket::parse_from_bytes(&rsp.payload).unwrap();
+        let pong = match rsp.body {
+            Some(ctrl_channel_packet::Body::RpcResponse(CtrlRpcResponse {
+                body: Some(ctrl_rpc_response::Body::Pong(pong)),
+                ..
+            })) => pong,
+            other => panic!("unexpected wrapped response: {other:?}"),
+        };
+        assert_eq!(pong.timestamp, 456);
+
+        drop(client_pair.tx);
+        assert!(service.await.unwrap().is_err());
     }
 }
 

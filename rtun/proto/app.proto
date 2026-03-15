@@ -200,6 +200,84 @@ message OpenP2PResponse {
     }
 }
 
+message HardNatStartBatch {
+    uint64 batch_id                    = 1;
+    uint32 nat3_addr_index             = 2;
+    uint32 nat4_ip_index               = 3;
+    repeated uint32 ports              = 4;
+}
+
+message HardNatAdvanceNat4Ip {
+    uint64 batch_id                    = 1;
+    uint32 next_nat4_ip_index          = 2;
+}
+
+message HardNatAdvanceNat3Addr {
+    uint64 batch_id                    = 1;
+    uint32 next_nat3_addr_index        = 2;
+}
+
+message HardNatNextBatch {
+    uint64 next_batch_id               = 1;
+    uint32 nat3_addr_index             = 2;
+    uint32 nat4_ip_index               = 3;
+    repeated uint32 ports              = 4;
+}
+
+message HardNatLeaseKeepAlive {
+    uint32 lease_timeout_ms            = 1;
+}
+
+message HardNatConnected {
+    string selected_nat3_addr          = 1;
+    string selected_nat4_ip            = 2;
+    uint32 selected_port               = 3;
+    uint32 restore_ttl                 = 4;
+}
+
+message HardNatAbort {
+    string reason                      = 1;
+}
+
+message HardNatAck {
+    uint64 acked_seq                   = 1;
+    uint32 state                       = 2;
+}
+
+message HardNatControlEnvelope {
+    uint64 session_id                  = 1;
+    uint64 seq                         = 2;
+    uint32 role_from                   = 3;
+    oneof msg {
+        HardNatStartBatch start_batch          = 10;
+        HardNatAdvanceNat4Ip advance_nat4_ip   = 11;
+        HardNatAdvanceNat3Addr advance_nat3_addr = 12;
+        HardNatNextBatch next_batch            = 13;
+        HardNatLeaseKeepAlive lease_keep_alive = 14;
+        HardNatConnected connected             = 15;
+        HardNatAbort abort                     = 16;
+        HardNatAck ack                         = 17;
+    }
+}
+
+message CtrlRpcResponse {
+    oneof body {
+        OpenChannelResponse open_channel = 1;
+        ResponseStatus status           = 2;
+        Pong pong                       = 3;
+        OpenP2PResponse open_p2p        = 4;
+        ExecAgentScriptResult exec_agent_script = 5;
+    }
+}
+
+message CtrlChannelPacket {
+    oneof body {
+        C2ARequest rpc_request          = 1;
+        CtrlRpcResponse rpc_response    = 2;
+        HardNatControlEnvelope hard_nat_control = 3;
+    }
+}
+
 message OpenChannelRequest {
     oneof open_ch_req {
         uint64 ch_id                    = 1; // request channel id
