@@ -42,25 +42,31 @@ fn build_nat3_run_config(args: Nat3SendCmdArgs) -> Result<Nat3RunConfig> {
         batch_interval: Duration::from_millis(args.batch_interval),
         discover_public_addr,
         pause_after_discovery: args.pause_after_discovery,
+        hold_batch_until_enter: args.hold_batch_until_enter,
         stun_servers: args.stun_servers,
     })
 }
 
 async fn run_nat4(args: Nat4SendCmdArgs) -> Result<()> {
+    let cfg = build_nat4_run_config(args)?;
+    hard_nat::run_nat4(cfg).await
+}
+
+fn build_nat4_run_config(args: Nat4SendCmdArgs) -> Result<Nat4RunConfig> {
     let target: SocketAddr = args
         .target
         .parse()
         .with_context(|| "invalid target address")?;
 
-    let cfg = Nat4RunConfig {
+    Ok(Nat4RunConfig {
         content: args.content,
         target,
         count: args.count,
         ttl: args.ttl,
         interval: Duration::from_millis(args.interval),
         dump_public_addrs: args.dump_public_addrs,
-    };
-    hard_nat::run_nat4(cfg).await
+        debug_keep_recv: args.debug_keep_recv,
+    })
 }
 
 #[derive(Parser, Debug)]
@@ -131,6 +137,12 @@ pub struct Nat3SendCmdArgs {
     pause_after_discovery: bool,
 
     #[clap(
+        long = "hold-batch-until-enter",
+        long_help = "keep probing the current random port batch until Enter is pressed, then reroll targets"
+    )]
+    hold_batch_until_enter: bool,
+
+    #[clap(
         long = "stun-server",
         long_help = "stun server address, eg. stun:stun.miwifi.com:3478"
     )]
@@ -169,11 +181,17 @@ pub struct Nat4SendCmdArgs {
         long_help = "discover and print each nat4 socket public mapped address before probing"
     )]
     dump_public_addrs: bool,
+
+    #[clap(
+        long = "debug-keep-recv",
+        long_help = "keep all nat4 probe sockets receiving and sending without switching into connected mode"
+    )]
+    debug_keep_recv: bool,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_nat3_run_config, CmdArgs};
+    use super::{build_nat3_run_config, build_nat4_run_config, CmdArgs};
     use clap::Parser;
 
     fn parse_nat3_cmd_args_for_test(extra: &[&str]) -> CmdArgs {
@@ -219,6 +237,13 @@ mod tests {
     }
 
     #[test]
+    fn nat3_cli_accepts_hold_batch_until_enter_flag() {
+        let args = parse_nat3_cmd_args_for_test(&["--hold-batch-until-enter"]);
+        let dump = format!("{args:?}");
+        assert!(dump.contains("hold_batch_until_enter: true"), "{dump}");
+    }
+
+    #[test]
     fn nat3_cli_treats_stun_servers_as_discovery_enabled() {
         let args =
             parse_nat3_cmd_args_for_test(&["--stun-server", "stun:stun.cloudflare.com:3478"]);
@@ -236,5 +261,23 @@ mod tests {
         let args = parse_nat4_cmd_args_for_test(&["--dump-public-addrs"]);
         let dump = format!("{args:?}");
         assert!(dump.contains("dump_public_addrs: true"), "{dump}");
+    }
+
+    #[test]
+    fn nat4_cli_accepts_debug_keep_recv_flag() {
+        let args = parse_nat4_cmd_args_for_test(&["--debug-keep-recv"]);
+        let dump = format!("{args:?}");
+        assert!(dump.contains("debug_keep_recv: true"), "{dump}");
+    }
+
+    #[test]
+    fn nat4_cli_builds_debug_keep_recv_config() {
+        let args = parse_nat4_cmd_args_for_test(&["--debug-keep-recv"]);
+        let cfg = build_nat4_run_config(match args.cmd {
+            super::SubCmd::Nat4(args) => args,
+            super::SubCmd::Nat3(_) => unreachable!("expected nat4 subcommand"),
+        })
+        .unwrap();
+        assert!(cfg.debug_keep_recv);
     }
 }

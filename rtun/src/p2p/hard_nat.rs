@@ -39,6 +39,8 @@ pub const HARD_NAT_MAX_TTL: u32 = 255;
 const NAT3_STUN_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(800);
 const NAT3_PAUSE_AFTER_DISCOVERY_PROMPT: &str =
     "nat3 discovery finished, press Enter to start probing";
+const NAT3_HOLD_BATCH_UNTIL_ENTER_PROMPT: &str =
+    "nat3 batch probing active, press Enter to reroll target ports";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HardNatRole {
@@ -286,6 +288,7 @@ pub struct Nat3RunConfig {
     pub batch_interval: Duration,
     pub discover_public_addr: bool,
     pub pause_after_discovery: bool,
+    pub hold_batch_until_enter: bool,
     pub stun_servers: Vec<String>,
 }
 
@@ -344,6 +347,7 @@ pub struct Nat4RunConfig {
     pub ttl: Option<u32>,
     pub interval: Duration,
     pub dump_public_addrs: bool,
+    pub debug_keep_recv: bool,
 }
 
 impl Nat4RunConfig {
@@ -600,12 +604,12 @@ fn log_nat3_public_addr_discovery(local_addr: SocketAddr, output: &BindingOutput
     }
 }
 
-fn wait_for_enter_after_discovery<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+fn wait_for_enter_prompt<R, W>(reader: &mut R, writer: &mut W, prompt: &str) -> Result<()>
 where
     R: std::io::BufRead,
     W: std::io::Write,
 {
-    writeln!(writer, "{NAT3_PAUSE_AFTER_DISCOVERY_PROMPT}")
+    writeln!(writer, "{prompt}")
         .with_context(|| "write pause prompt failed")?;
     writer
         .flush()
@@ -616,6 +620,22 @@ where
         .read_line(&mut line)
         .with_context(|| "read pause confirmation failed")?;
     Ok(())
+}
+
+fn wait_for_enter_after_discovery<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+where
+    R: std::io::BufRead,
+    W: std::io::Write,
+{
+    wait_for_enter_prompt(reader, writer, NAT3_PAUSE_AFTER_DISCOVERY_PROMPT)
+}
+
+fn wait_for_enter_before_nat3_batch_reroll<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+where
+    R: std::io::BufRead,
+    W: std::io::Write,
+{
+    wait_for_enter_prompt(reader, writer, NAT3_HOLD_BATCH_UNTIL_ENTER_PROMPT)
 }
 
 async fn maybe_pause_after_discovery(pause_after_discovery: bool) -> Result<()> {
@@ -669,6 +689,10 @@ pub fn half_hops_from_ping_ttl(ttl: u32) -> Option<u32> {
 }
 
 pub async fn run_nat3(args: Nat3RunConfig) -> Result<()> {
+    if args.hold_batch_until_enter {
+        return run_nat3_hold_batch_until_enter(args).await;
+    }
+
     let interval = args.interval;
     let text = resolve_probe_text(args.content.as_deref());
     let conn = run_nat3_once(args).await?;
@@ -691,6 +715,9 @@ async fn run_nat3_once_with_socket(
     prebound_socket: Option<UdpSocket>,
 ) -> Result<HardNatConnectedSocket> {
     args.validate()?;
+    if args.hold_batch_until_enter {
+        bail!("hold_batch_until_enter is only supported by run_nat3");
+    }
 
     let interval = args.interval;
     let batch_interval = args.batch_interval;
@@ -698,30 +725,7 @@ async fn run_nat3_once_with_socket(
     let target_ip = args.target_ip;
     let start_at = Instant::now();
 
-    let socket = if let Some(socket) = prebound_socket {
-        socket
-    } else if args.discover_public_addr {
-        let stun_servers =
-            resolve_nat3_stun_servers(args.discover_public_addr, &args.stun_servers)?;
-        let socket = tokio_socket_bind(&args.listen)
-            .await
-            .with_context(|| format!("failed to bind socket addr [{}]", args.listen))?;
-        let local_addr = socket
-            .local_addr()
-            .with_context(|| "get local address failed")?;
-        info!(
-            "discover nat3 public address using stun servers {:?} from [{local_addr}]",
-            stun_servers
-        );
-        let (socket, output) = discover_nat3_public_addr(socket, &stun_servers).await?;
-        log_nat3_public_addr_discovery(local_addr, &output);
-        maybe_pause_after_discovery(args.pause_after_discovery).await?;
-        socket.into_inner()
-    } else {
-        UdpSocket::bind(&args.listen)
-            .await
-            .with_context(|| format!("failed to bind socket addr [{}]", args.listen))?
-    };
+    let socket = prepare_nat3_socket(&args, prebound_socket).await?;
 
     if let Some(ttl) = ttl {
         socket.set_ttl(ttl).with_context(|| "set ttl failed")?;
@@ -758,46 +762,11 @@ async fn run_nat3_once_with_socket(
 
     while !has_recv {
         let start_time = Instant::now();
-        let mut targets = Vec::with_capacity(args.count);
-
-        for _ in 0..args.count {
-            loop {
-                let port = rand::thread_rng().gen_range(1024..=u16::MAX);
-
-                if try_ports.len() >= max_ports {
-                    try_ports.clear();
-                }
-
-                if !try_ports.contains(&port) {
-                    try_ports.insert(port);
-                    let target = SocketAddr::new(target_ip, port);
-                    targets.push(target);
-                    break;
-                }
-            }
-            num += 1;
-        }
+        let targets =
+            build_nat3_target_batch(args.count, target_ip, &mut try_ports, max_ports, &mut num);
 
         while start_time.elapsed() < batch_interval {
-            for target in &targets {
-                has_recv = shared.has_connected();
-                if has_recv {
-                    break;
-                }
-
-                let sent_bytes = socket
-                    .send_to(text.as_bytes(), target)
-                    .await
-                    .with_context(|| "send failed")?;
-                if sent_bytes == text.as_bytes().len() {
-                    debug!("=> [{target}, {sent_bytes}]: [{text}]");
-                } else {
-                    warn!(
-                        "No.{num}: sent partial {sent_bytes} < {}",
-                        text.as_bytes().len()
-                    );
-                }
-            }
+            has_recv = send_nat3_batch_once(&socket, &text, &targets, &shared, num, true).await?;
 
             if has_recv {
                 break;
@@ -815,7 +784,70 @@ async fn run_nat3_once_with_socket(
     Ok(first)
 }
 
+async fn run_nat3_hold_batch_until_enter(args: Nat3RunConfig) -> Result<()> {
+    args.validate()?;
+
+    let interval = args.interval;
+    let target_ip = args.target_ip;
+    let socket = prepare_nat3_socket(&args, None).await?;
+
+    if let Some(ttl) = args.ttl {
+        socket.set_ttl(ttl).with_context(|| "set ttl failed")?;
+        debug!("set ttl [{ttl}]");
+    }
+
+    let socket = Arc::new(socket);
+    let text = Arc::new(resolve_probe_text(args.content.as_deref()));
+    let shared = Arc::new(Shared {
+        connecteds: Default::default(),
+    });
+
+    let recv_task = {
+        let socket = socket.clone();
+        let text = text.clone();
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            let r = recv_loop(socket, text.as_str(), &shared).await;
+            info!("recv finished [{r:?}]");
+        })
+    };
+    let _recv_tasks = RecvTaskGuard::new(vec![recv_task]);
+
+    let mut num = 0_usize;
+    let max_ports = 50000;
+    let mut try_ports = HashSet::with_capacity(max_ports);
+
+    loop {
+        let targets =
+            build_nat3_target_batch(args.count, target_ip, &mut try_ports, max_ports, &mut num);
+        let reroll_task = tokio::task::spawn_blocking(|| -> Result<()> {
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            let mut reader = std::io::BufReader::new(stdin.lock());
+            let mut writer = stdout.lock();
+            wait_for_enter_before_nat3_batch_reroll(&mut reader, &mut writer)
+        });
+
+        loop {
+            let _ = send_nat3_batch_once(&socket, &text, &targets, &shared, num, false).await?;
+
+            if reroll_task.is_finished() {
+                reroll_task
+                    .await
+                    .with_context(|| "hold-batch-until-enter task join failed")??;
+                break;
+            }
+
+            tokio::time::sleep(interval).await;
+        }
+    }
+}
+
 pub async fn run_nat4(args: Nat4RunConfig) -> Result<()> {
+    if args.debug_keep_recv {
+        return run_nat4_keep_recv(args).await;
+    }
+
     let interval = args.interval;
     let text = resolve_probe_text(args.content.as_deref());
     let conn = run_nat4_once(args).await?;
@@ -824,13 +856,175 @@ pub async fn run_nat4(args: Nat4RunConfig) -> Result<()> {
 
 pub async fn run_nat4_once(args: Nat4RunConfig) -> Result<HardNatConnectedSocket> {
     args.validate()?;
+    if args.debug_keep_recv {
+        bail!("debug_keep_recv is only supported by run_nat4");
+    }
 
+    let runtime = prepare_nat4_probe_runtime(&args).await?;
+    let target = runtime.target;
+    let ttl = runtime.ttl;
+
+    let mut has_recv = false;
+
+    while !has_recv {
+        for sender in &runtime.senders {
+            if runtime.shared.has_connected() {
+                has_recv = true;
+                break;
+            }
+
+            sender.send_one().await?;
+        }
+
+        info!(
+            "send target [{}], num [{}], ttl [{:?}]",
+            target,
+            runtime.senders.len(),
+            ttl
+        );
+
+        tokio::time::sleep(runtime.interval).await;
+    }
+
+    let first = runtime
+        .shared
+        .first_connected_conn(HardNatRole::Nat4, runtime.start_at)
+        .with_context(|| "missing connected target")?;
+    runtime.recv_tasks.abort_and_wait().await;
+    Ok(first)
+}
+
+async fn run_nat4_keep_recv(args: Nat4RunConfig) -> Result<()> {
+    args.validate()?;
+
+    let runtime = prepare_nat4_probe_runtime(&args).await?;
+    let target = runtime.target;
+    let ttl = runtime.ttl;
+    let _recv_tasks = runtime.recv_tasks;
+    let senders = runtime.senders;
+    let interval = runtime.interval;
+
+    loop {
+        for sender in &senders {
+            sender.send_one().await?;
+        }
+
+        debug!(
+            "nat4 debug keep-recv send target [{}], num [{}], ttl [{:?}]",
+            target,
+            senders.len(),
+            ttl
+        );
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn prepare_nat3_socket(
+    args: &Nat3RunConfig,
+    prebound_socket: Option<UdpSocket>,
+) -> Result<UdpSocket> {
+    let socket = if let Some(socket) = prebound_socket {
+        socket
+    } else if args.discover_public_addr {
+        let stun_servers = resolve_nat3_stun_servers(args.discover_public_addr, &args.stun_servers)?;
+        let socket = tokio_socket_bind(&args.listen)
+            .await
+            .with_context(|| format!("failed to bind socket addr [{}]", args.listen))?;
+        let local_addr = socket
+            .local_addr()
+            .with_context(|| "get local address failed")?;
+        info!(
+            "discover nat3 public address using stun servers {:?} from [{local_addr}]",
+            stun_servers
+        );
+        let (socket, output) = discover_nat3_public_addr(socket, &stun_servers).await?;
+        log_nat3_public_addr_discovery(local_addr, &output);
+        maybe_pause_after_discovery(args.pause_after_discovery).await?;
+        socket.into_inner()
+    } else {
+        UdpSocket::bind(&args.listen)
+            .await
+            .with_context(|| format!("failed to bind socket addr [{}]", args.listen))?
+    };
+
+    Ok(socket)
+}
+
+fn build_nat3_target_batch(
+    count: usize,
+    target_ip: IpAddr,
+    try_ports: &mut HashSet<u16>,
+    max_ports: usize,
+    num: &mut usize,
+) -> Vec<SocketAddr> {
+    let mut targets = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        loop {
+            let port = rand::thread_rng().gen_range(1024..=u16::MAX);
+
+            if try_ports.len() >= max_ports {
+                try_ports.clear();
+            }
+
+            if !try_ports.contains(&port) {
+                try_ports.insert(port);
+                targets.push(SocketAddr::new(target_ip, port));
+                break;
+            }
+        }
+        *num += 1;
+    }
+
+    targets
+}
+
+async fn send_nat3_batch_once(
+    socket: &Arc<UdpSocket>,
+    text: &str,
+    targets: &[SocketAddr],
+    shared: &Arc<Shared>,
+    num: usize,
+    stop_on_connected: bool,
+) -> Result<bool> {
+    for target in targets {
+        if stop_on_connected && shared.has_connected() {
+            return Ok(true);
+        }
+
+        let sent_bytes = socket
+            .send_to(text.as_bytes(), target)
+            .await
+            .with_context(|| "send failed")?;
+        if sent_bytes == text.as_bytes().len() {
+            debug!("=> [{target}, {sent_bytes}]: [{text}]");
+        } else {
+            warn!(
+                "No.{num}: sent partial {sent_bytes} < {}",
+                text.as_bytes().len()
+            );
+        }
+    }
+
+    Ok(stop_on_connected && shared.has_connected())
+}
+
+struct Nat4ProbeRuntime {
+    target: SocketAddr,
+    interval: Duration,
+    ttl: Option<u32>,
+    start_at: Instant,
+    shared: Arc<Shared>,
+    senders: Vec<UdpSender>,
+    recv_tasks: RecvTaskGuard,
+}
+
+async fn prepare_nat4_probe_runtime(args: &Nat4RunConfig) -> Result<Nat4ProbeRuntime> {
     let target = args.target;
     let interval = args.interval;
     let start_at = Instant::now();
 
     let text = Arc::new(resolve_probe_text(args.content.as_deref()));
-
     let shared = Arc::new(Shared {
         connecteds: Default::default(),
     });
@@ -860,7 +1054,6 @@ pub async fn run_nat4_once(args: Nat4RunConfig) -> Result<HardNatConnectedSocket
         sender_parts.push((socket, local));
     }
 
-    let mut senders = Vec::with_capacity(args.count);
     let sender_parts = if let Some(stun_servers) = nat4_discovery_stun_servers.as_ref() {
         discover_nat4_public_addrs(
             sender_parts.into_iter().map(|(socket, _)| socket).collect(),
@@ -879,14 +1072,13 @@ pub async fn run_nat4_once(args: Nat4RunConfig) -> Result<HardNatConnectedSocket
         sender_parts
     };
 
+    let mut senders = Vec::with_capacity(args.count);
     for (socket, local) in sender_parts {
         let socket = Arc::new(socket.into_inner());
-
         let recv_task = {
             let socket = socket.clone();
             let text = text.clone();
             let shared = shared.clone();
-
             tokio::spawn(async move {
                 let r = recv_loop(socket, text.as_str(), &shared).await;
                 info!("recv finished [{r:?}]");
@@ -911,33 +1103,15 @@ pub async fn run_nat4_once(args: Nat4RunConfig) -> Result<HardNatConnectedSocket
         senders.push(sender);
     }
 
-    let mut has_recv = false;
-
-    while !has_recv {
-        for sender in &mut senders {
-            if shared.has_connected() {
-                has_recv = true;
-                break;
-            }
-
-            sender.send_one().await?;
-        }
-
-        info!(
-            "send target [{}], num [{}], ttl [{:?}]",
-            target,
-            senders.len(),
-            ttl
-        );
-
-        tokio::time::sleep(interval).await;
-    }
-
-    let first = shared
-        .first_connected_conn(HardNatRole::Nat4, start_at)
-        .with_context(|| "missing connected target")?;
-    recv_tasks.abort_and_wait().await;
-    Ok(first)
+    Ok(Nat4ProbeRuntime {
+        target,
+        interval,
+        ttl,
+        start_at,
+        shared,
+        senders,
+        recv_tasks,
+    })
 }
 
 async fn ping_and_half_hops(host: IpAddr) -> Result<Option<u32>> {
@@ -1205,6 +1379,7 @@ mod tests {
             batch_interval: Duration::from_millis(1000),
             discover_public_addr: false,
             pause_after_discovery: false,
+            hold_batch_until_enter: false,
             stun_servers: Vec::new(),
         };
         let err = cfg.validate().unwrap_err().to_string();
@@ -1220,6 +1395,7 @@ mod tests {
             ttl: None,
             interval: Duration::ZERO,
             dump_public_addrs: false,
+            debug_keep_recv: false,
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("interval"));
@@ -1237,6 +1413,7 @@ mod tests {
             batch_interval: Duration::from_millis(1000),
             discover_public_addr: false,
             pause_after_discovery: false,
+            hold_batch_until_enter: false,
             stun_servers: Vec::new(),
         };
         let err = cfg.validate().unwrap_err().to_string();
@@ -1255,6 +1432,7 @@ mod tests {
             batch_interval: Duration::from_millis(1000),
             discover_public_addr: false,
             pause_after_discovery: true,
+            hold_batch_until_enter: false,
             stun_servers: Vec::new(),
         };
         let err = cfg.validate().unwrap_err().to_string();
@@ -1270,6 +1448,7 @@ mod tests {
             ttl: Some(HARD_NAT_MAX_TTL + 1),
             interval: Duration::from_millis(10),
             dump_public_addrs: false,
+            debug_keep_recv: false,
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("ttl"));
@@ -1285,6 +1464,19 @@ mod tests {
         assert_eq!(
             prompt,
             "nat3 discovery finished, press Enter to start probing\n"
+        );
+    }
+
+    #[test]
+    fn hold_batch_until_enter_prompt_message() {
+        let mut input = Cursor::new(b"\n".to_vec());
+        let mut output = Vec::new();
+        wait_for_enter_before_nat3_batch_reroll(&mut input, &mut output).unwrap();
+
+        let prompt = String::from_utf8(output).expect("utf8 prompt");
+        assert_eq!(
+            prompt,
+            "nat3 batch probing active, press Enter to reroll target ports\n"
         );
     }
 
@@ -1770,6 +1962,7 @@ mod tests {
                 ttl: Some(1), // avoid ping dependency in tests
                 interval: Duration::from_millis(20),
                 dump_public_addrs: false,
+                debug_keep_recv: false,
             }),
         )
         .await
