@@ -10,6 +10,10 @@ use clap::Parser;
 use futures::{stream::SplitStream, StreamExt};
 use parking_lot::Mutex;
 use rtun::{
+    actor_service::{
+        handle_first_none, handle_msg_none, handle_next_none, start_actor, wait_next_none,
+        ActorEntity, ActorHandle, AsyncHandler,
+    },
     async_rt::spawn_with_name,
     channel::{ChId, ChPair},
     huid::{gen_huid::gen_huid, HUId},
@@ -18,7 +22,15 @@ use rtun::{
         agent::ctrl::{make_agent_ctrl, AgentCtrlInvoker},
         ctrl_client,
         ctrl_service::spawn_ctrl_service,
-        invoker_ctrl::{CtrlHandler, CtrlInvoker},
+        entity_watch::{OpWatch, WatchResult},
+        invoker_ctrl::{
+            CloseChannelResult, CtrlHandler, CtrlInvoker, OpCloseChannel, OpExecAgentScript,
+            OpExecAgentScriptResult, OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult,
+            OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult,
+            OpRecvHardNatControl, OpRecvHardNatControlResult, OpSendHardNatControl,
+            OpSendHardNatControlResult, OpSubscribeHardNatControl,
+            OpSubscribeHardNatControlResult,
+        },
         session_stream::make_stream_session,
         switch_pair::{make_switch_pair, SwitchPairEntity},
         switch_sink::PacketSink,
@@ -958,6 +970,124 @@ async fn build_sub_agent_hard_nat_control_rx<H1: CtrlHandler>(
     Ok(rx)
 }
 
+struct SubAgentCtrlProxy<H: CtrlHandler> {
+    upstream: CtrlInvoker<H>,
+}
+
+impl<H: CtrlHandler> ActorEntity for SubAgentCtrlProxy<H> {
+    type Next = ();
+    type Msg = ();
+    type Result = ();
+
+    fn into_result(self, _result: Result<()>) -> Self::Result {}
+}
+
+#[async_trait::async_trait]
+impl<H: CtrlHandler> AsyncHandler<OpWatch> for SubAgentCtrlProxy<H> {
+    type Response = WatchResult;
+
+    async fn handle(&mut self, _req: OpWatch) -> Self::Response {
+        self.upstream.watch().await
+    }
+}
+
+#[async_trait::async_trait]
+impl<H: CtrlHandler> AsyncHandler<OpCloseChannel> for SubAgentCtrlProxy<H> {
+    type Response = CloseChannelResult;
+
+    async fn handle(&mut self, req: OpCloseChannel) -> Self::Response {
+        self.upstream.close_channel(req.0).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<H: CtrlHandler> AsyncHandler<OpOpenShell> for SubAgentCtrlProxy<H> {
+    type Response = OpOpenShellResult;
+
+    async fn handle(&mut self, req: OpOpenShell) -> Self::Response {
+        self.upstream.open_shell(req.0, req.1).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<H: CtrlHandler> AsyncHandler<OpOpenSocks> for SubAgentCtrlProxy<H> {
+    type Response = OpOpenSocksResult;
+
+    async fn handle(&mut self, req: OpOpenSocks) -> Self::Response {
+        self.upstream.open_socks(req.0, req.1).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<H: CtrlHandler> AsyncHandler<OpKickDown> for SubAgentCtrlProxy<H> {
+    type Response = OpKickDownResult;
+
+    async fn handle(&mut self, req: OpKickDown) -> Self::Response {
+        self.upstream.kick_down(req.0).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<H: CtrlHandler> AsyncHandler<OpOpenP2P> for SubAgentCtrlProxy<H> {
+    type Response = OpOpenP2PResult;
+
+    async fn handle(&mut self, req: OpOpenP2P) -> Self::Response {
+        self.upstream.open_p2p(req.0).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<H: CtrlHandler> AsyncHandler<OpExecAgentScript> for SubAgentCtrlProxy<H> {
+    type Response = OpExecAgentScriptResult;
+
+    async fn handle(&mut self, req: OpExecAgentScript) -> Self::Response {
+        self.upstream.exec_agent_script(req.0).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<H: CtrlHandler> AsyncHandler<OpSendHardNatControl> for SubAgentCtrlProxy<H> {
+    type Response = OpSendHardNatControlResult;
+
+    async fn handle(&mut self, req: OpSendHardNatControl) -> Self::Response {
+        self.upstream.send_hard_nat_control(req.0).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<H: CtrlHandler> AsyncHandler<OpSubscribeHardNatControl> for SubAgentCtrlProxy<H> {
+    type Response = OpSubscribeHardNatControlResult;
+
+    async fn handle(&mut self, _req: OpSubscribeHardNatControl) -> Self::Response {
+        self.upstream.subscribe_hard_nat_control().await
+    }
+}
+
+#[async_trait::async_trait]
+impl<H: CtrlHandler> AsyncHandler<OpRecvHardNatControl> for SubAgentCtrlProxy<H> {
+    type Response = OpRecvHardNatControlResult;
+
+    async fn handle(&mut self, req: OpRecvHardNatControl) -> Self::Response {
+        self.upstream.send_hard_nat_control(req.0).await
+    }
+}
+
+impl<H: CtrlHandler> CtrlHandler for SubAgentCtrlProxy<H> {}
+
+fn spawn_sub_agent_ctrl_proxy<H: CtrlHandler>(
+    uid: HUId,
+    upstream: CtrlInvoker<H>,
+) -> ActorHandle<SubAgentCtrlProxy<H>> {
+    start_actor(
+        format!("sub-agent-ctrl-proxy-{uid}"),
+        SubAgentCtrlProxy { upstream },
+        handle_first_none,
+        wait_next_none,
+        handle_next_none,
+        handle_msg_none,
+    )
+}
+
 async fn run_sub_agent_stream<H1, S1, S2>(
     ctrl: CtrlInvoker<H1>,
     uid: HUId,
@@ -971,6 +1101,7 @@ where
     let mut session = make_switch_pair(uid, stream).await?;
     let switch = session.clone_invoker();
     let hard_nat_rx = build_sub_agent_hard_nat_control_rx(&ctrl).await?;
+    let proxy = spawn_sub_agent_ctrl_proxy(uid, ctrl);
 
     let ctrl_ch_id = ChId(0);
     let (ctrl_tx, ctrl_rx) = ChPair::new(ctrl_ch_id).split();
@@ -978,7 +1109,7 @@ where
 
     spawn_ctrl_service(
         uid,
-        ctrl,
+        CtrlInvoker::new(proxy.invoker().clone()),
         switch,
         ChPair {
             tx: ctrl_tx,
@@ -1087,14 +1218,114 @@ pub struct CmdArgs {
 mod tests {
     use super::*;
     use rtun::{
+        channel::ChPacket,
         huid::gen_huid::gen_huid,
         proto::{hard_nat_control_envelope, HardNatControlEnvelope, HardNatLeaseKeepAlive},
-        switch::agent::ctrl::make_agent_ctrl,
+        switch::{
+            agent::ctrl::make_agent_ctrl,
+            session_stream::make_stream_session,
+            switch_sink::{PacketSink, SinkError},
+            switch_source::{PacketSource, StreamError, StreamPacket},
+        },
+    };
+    use futures::{Sink, Stream};
+    use protobuf::Message;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
     };
     use tokio::{
-        sync::mpsc::error::TryRecvError,
+        sync::mpsc::{self, error::TryRecvError, UnboundedReceiver, UnboundedSender},
         time::{timeout, Duration},
     };
+    use tokio_stream::wrappers::UnboundedReceiverStream;
+
+    struct TestPacketSink {
+        tx: UnboundedSender<Vec<u8>>,
+    }
+
+    impl Sink<ChPacket> for TestPacketSink {
+        type Error = SinkError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: ChPacket) -> Result<(), Self::Error> {
+            let data = rtun::proto::RawPacket {
+                ch_id: item.ch_id.0,
+                payload: item.payload,
+                ..Default::default()
+            }
+            .write_to_bytes()?;
+            self.tx
+                .send(data)
+                .map_err(|_| anyhow::anyhow!("test packet sink closed"))?;
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl PacketSink for TestPacketSink {}
+
+    struct TestPacketSource {
+        rx: UnboundedReceiverStream<Vec<u8>>,
+    }
+
+    impl Stream for TestPacketSource {
+        type Item = Result<StreamPacket, StreamError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            match Pin::new(&mut self.rx).poll_next(cx) {
+                Poll::Ready(Some(packet)) => Poll::Ready(Some(Ok(packet))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl PacketSource for TestPacketSource {}
+
+    fn make_test_packet_stream_pair(
+    ) -> (
+        (TestPacketSink, TestPacketSource),
+        (TestPacketSink, TestPacketSource),
+    ) {
+        let (a_to_b_tx, a_to_b_rx): (UnboundedSender<Vec<u8>>, UnboundedReceiver<Vec<u8>>) =
+            mpsc::unbounded_channel();
+        let (b_to_a_tx, b_to_a_rx): (UnboundedSender<Vec<u8>>, UnboundedReceiver<Vec<u8>>) =
+            mpsc::unbounded_channel();
+
+        let a = (
+            TestPacketSink { tx: a_to_b_tx },
+            TestPacketSource {
+                rx: UnboundedReceiverStream::new(b_to_a_rx),
+            },
+        );
+        let b = (
+            TestPacketSink { tx: b_to_a_tx },
+            TestPacketSource {
+                rx: UnboundedReceiverStream::new(a_to_b_rx),
+            },
+        );
+        (a, b)
+    }
 
     #[tokio::test]
     async fn build_sub_agent_hard_nat_control_rx_forwards_controls_without_closing() {
@@ -1126,5 +1357,73 @@ mod tests {
 
         agent.shutdown().await;
         agent.wait_for_completed().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_sub_agent_stream_forwards_downstream_hardnat_control_to_upstream_outbound() {
+        let mut upstream_agent = make_agent_ctrl(gen_huid()).await.unwrap();
+        let upstream_ctrl = upstream_agent.clone_ctrl();
+        let upstream_ctrl_for_assert = upstream_ctrl.clone();
+        let (upstream_out_tx, mut upstream_out_rx) = mpsc::channel(1);
+        upstream_agent
+            .set_hard_nat_outbound(upstream_out_tx)
+            .await
+            .unwrap();
+
+        let (server_stream, client_stream) = make_test_packet_stream_pair();
+        let sub_task = tokio::spawn(run_sub_agent_stream(upstream_ctrl, gen_huid(), server_stream));
+        let downstream = make_stream_session(client_stream, false).await.unwrap();
+        let downstream_ctrl = downstream.ctrl_client().clone_invoker();
+
+        let env = HardNatControlEnvelope {
+            session_id: 23,
+            seq: 5,
+            role_from: 1,
+            msg: Some(hard_nat_control_envelope::Msg::LeaseKeepAlive(
+                HardNatLeaseKeepAlive {
+                    lease_timeout_ms: 2500,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        downstream_ctrl.send_hard_nat_control(env.clone()).await.unwrap();
+
+        let got = timeout(Duration::from_secs(1), upstream_out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, env);
+
+        let env_from_upstream = HardNatControlEnvelope {
+            session_id: 24,
+            seq: 6,
+            role_from: 2,
+            msg: Some(hard_nat_control_envelope::Msg::LeaseKeepAlive(
+                HardNatLeaseKeepAlive {
+                    lease_timeout_ms: 2600,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let mut downstream_sub = downstream_ctrl.subscribe_hard_nat_control().await.unwrap();
+        upstream_ctrl_for_assert
+            .recv_hard_nat_control(env_from_upstream.clone())
+            .await
+            .unwrap();
+        let got = timeout(Duration::from_secs(1), downstream_sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, env_from_upstream);
+
+        downstream.ctrl_client().shutdown().await;
+        drop(downstream);
+        sub_task.abort();
+        let _ = sub_task.await;
+
+        upstream_agent.shutdown().await;
+        upstream_agent.wait_for_completed().await.unwrap();
     }
 }
