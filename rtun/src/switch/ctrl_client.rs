@@ -42,6 +42,9 @@ use super::{
 pub type CtrlClientSession<H> = CtrlClient<Entity<H>>;
 pub type CtrlClientInvoker<H> = CtrlInvoker<Entity<H>>;
 
+const CTRL_CLIENT_PING_INTERVAL: Duration = Duration::from_secs(10);
+const CTRL_CLIENT_PING_TIMEOUT: Duration = Duration::from_millis(90 * 1000);
+
 pub struct CtrlClient<H: SwitchHanlder> {
     handle: ActorHandle<Entity<H>>,
 }
@@ -99,6 +102,7 @@ pub async fn make_ctrl_client<H: SwitchHanlder>(
         guard: CtrlGuard::new(),
         switch_watch,
         disable_bridge_ch,
+        next_ping_at: tokio::time::Instant::now() + CTRL_CLIENT_PING_INTERVAL,
     };
 
     let handle = start_actor(
@@ -572,6 +576,8 @@ impl<H: SwitchHanlder> AsyncHandler<OpSendHardNatControl> for Entity<H> {
     type Response = OpSendHardNatControlResult;
 
     async fn handle(&mut self, req: OpSendHardNatControl) -> Self::Response {
+        send_due_ping(self).await?;
+
         let data = CtrlChannelPacket {
             body: Some(ctrl_channel_packet::Body::HardNatControl(req.0)),
             ..Default::default()
@@ -632,6 +638,7 @@ pub struct Entity<H: SwitchHanlder> {
     guard: CtrlGuard,
     switch_watch: CtrlWatch,
     disable_bridge_ch: bool,
+    next_ping_at: tokio::time::Instant,
 }
 
 // impl<H: SwitchHanlder> Entity<H> {
@@ -649,14 +656,51 @@ pub enum Next {
 }
 
 async fn wait_next<H: SwitchHanlder>(entity: &mut Entity<H>) -> Next {
-    let duration = Duration::from_secs(10);
+    if tokio::time::Instant::now() >= entity.next_ping_at {
+        return Next::Ping;
+    }
     tokio::select! {
         _r = entity.switch_watch.watch() => Next::SwitchGone,
         event = entity.event_rx.recv() => match event {
             Some(CtrlEvent::CtrlChBroken) | None => Next::CtrlChBroken,
         },
-        _r = tokio::time::sleep(duration) => Next::Ping,
+        _r = tokio::time::sleep_until(entity.next_ping_at) => Next::Ping,
     }
+}
+
+async fn send_due_ping<H: SwitchHanlder>(entity: &mut Entity<H>) -> Result<()> {
+    let now = tokio::time::Instant::now();
+    if now < entity.next_ping_at {
+        return Ok(());
+    }
+
+    let r = tokio::time::timeout(
+        CTRL_CLIENT_PING_TIMEOUT,
+        entity_ping(
+            &entity.ctrl_tx,
+            &mut entity.rpc_rx,
+            Ping {
+                timestamp: Local::now().timestamp_millis(),
+                ..Default::default()
+            },
+        ),
+    )
+    .await;
+    entity.next_ping_at = tokio::time::Instant::now() + CTRL_CLIENT_PING_INTERVAL;
+
+    match r {
+        Ok(r) => {
+            let pong = r?;
+            let elapsed = Local::now().timestamp_millis() - pong.timestamp;
+            tracing::debug!("ping/pong latency {elapsed} ms\r");
+        }
+        Err(_elapsed) => {
+            tracing::warn!("ping/pong timeout {CTRL_CLIENT_PING_TIMEOUT:?}, shutdown switch\r");
+            entity.switch.shutdown().await;
+        }
+    }
+
+    Ok(())
 }
 
 async fn handle_next<H: SwitchHanlder>(entity: &mut Entity<H>, next: Next) -> Result<Action> {
@@ -668,39 +712,7 @@ async fn handle_next<H: SwitchHanlder>(entity: &mut Entity<H>, next: Next) -> Re
             tracing::debug!("ctrl channel broken");
         }
         Next::Ping => {
-            let timeout = Duration::from_millis(90 * 1000);
-            let r = tokio::time::timeout(
-                timeout,
-                entity_ping(
-                    &entity.ctrl_tx,
-                    &mut entity.rpc_rx,
-                    Ping {
-                        timestamp: Local::now().timestamp_millis(),
-                        ..Default::default()
-                    },
-                ),
-            )
-            .await;
-
-            match r {
-                Ok(r) => {
-                    let pong = r?;
-                    let elapsed = Local::now().timestamp_millis() - pong.timestamp;
-                    tracing::debug!("ping/pong latency {elapsed} ms\r");
-                }
-                Err(_elapsed) => {
-                    tracing::warn!("ping/pong timeout {timeout:?}, shutdown switch\r");
-                    entity.switch.shutdown().await
-                }
-            }
-
-            // let pong = c2a_ping(&mut entity.pair, Ping {
-            //     timestamp: Local::now().timestamp_millis(),
-            //     ..Default::default()
-            // }).await?;
-            // let elapsed = Local::now().timestamp_millis() - pong.timestamp;
-            // tracing::debug!("ping/pong elapsed {elapsed} ms\r");
-
+            send_due_ping(entity).await?;
             return Ok(Action::None);
         }
     }
@@ -927,7 +939,7 @@ mod tests {
         huid::gen_huid::gen_huid,
         proto::{
             ctrl_channel_packet, hard_nat_control_envelope, open_p2presponse, CtrlChannelPacket,
-            HardNatControlEnvelope, HardNatLeaseKeepAlive,
+            HardNatControlEnvelope, HardNatLeaseKeepAlive, Pong,
         },
         switch::{
             entity_watch::{CtrlGuard, OpWatch, WatchResult},
@@ -1134,6 +1146,76 @@ mod tests {
         };
         assert_eq!(got, control);
 
+        ctrl.shutdown_and_waitfor().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ctrl_client_still_sends_ping_while_hardnat_control_ops_keep_arriving() {
+        let switch_handle = spawn_test_switch();
+        let switch = SwitchInvoker::new(switch_handle.invoker().clone());
+        let (client_pair, mut remote_pair) = make_duplex_ctrl_pair(ChId(9));
+        let mut ctrl = make_ctrl_client(gen_huid(), client_pair, switch, false)
+            .await
+            .unwrap();
+        let invoker = ctrl.clone_invoker();
+        let (ping_tx, mut ping_rx) = mpsc::channel(1);
+
+        let remote = tokio::spawn(async move {
+            loop {
+                let packet = remote_pair.rx.recv_packet().await.unwrap();
+                let req = match C2ARequest::parse_from_bytes(&packet.payload) {
+                    Ok(req) => req,
+                    Err(_) => continue,
+                };
+                let Some(C2a_req_args::Ping(args)) = req.c2a_req_args else {
+                    continue;
+                };
+                remote_pair
+                    .tx
+                    .send_data(
+                        Pong {
+                            timestamp: args.timestamp,
+                            ..Default::default()
+                        }
+                        .write_to_bytes()
+                        .unwrap()
+                        .into(),
+                    )
+                    .await
+                    .unwrap();
+                ping_tx.send(()).await.unwrap();
+                return;
+            }
+        });
+
+        let control = HardNatControlEnvelope {
+            session_id: 99,
+            seq: 1,
+            role_from: 1,
+            msg: Some(hard_nat_control_envelope::Msg::LeaseKeepAlive(
+                HardNatLeaseKeepAlive {
+                    lease_timeout_ms: 9000,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        let mut saw_ping = false;
+        for _ in 0..12 {
+            invoker.send_hard_nat_control(control.clone()).await.unwrap();
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            if ping_rx.try_recv().is_ok() {
+                saw_ping = true;
+                break;
+            }
+        }
+
+        assert!(saw_ping, "ctrl client should keep sending ping under hard-nat traffic");
+
+        remote.await.unwrap();
         ctrl.shutdown_and_waitfor().await.unwrap();
     }
 }
