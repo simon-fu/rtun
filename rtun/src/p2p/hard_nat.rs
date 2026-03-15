@@ -14,6 +14,7 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 use rand::Rng as _;
 use tokio::net::UdpSocket;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -45,6 +46,8 @@ pub const HARD_NAT_MAX_ASSIST_DELAY_MS: u32 = 10_000;
 pub const HARD_NAT_MAX_TTL: u32 = 255;
 pub const HARD_NAT_PROTO_VERSION: u32 = 1;
 pub const HARD_NAT_DEFAULT_CONNECTED_TTL: u32 = 64;
+pub const HARD_NAT_DEFAULT_LEASE_TIMEOUT_MS: u32 = 10_000;
+pub const HARD_NAT_DEFAULT_KEEPALIVE_INTERVAL_MS: u32 = 1_000;
 #[cfg(test)]
 const HARD_NAT_KEEP_RECV_PROMOTED_TTL: u32 = 64;
 pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_WARM_DRAIN_MS: u64 = 300;
@@ -988,6 +991,20 @@ impl HardNatSessionParams {
         self
     }
 
+    pub fn lease_timeout(&self) -> Duration {
+        duration_from_ms_or_default(
+            self.lease_timeout_ms,
+            Duration::from_millis(HARD_NAT_DEFAULT_LEASE_TIMEOUT_MS as u64),
+        )
+    }
+
+    pub fn keepalive_interval(&self) -> Duration {
+        duration_from_ms_or_default(
+            self.keepalive_interval_ms,
+            Duration::from_millis(HARD_NAT_DEFAULT_KEEPALIVE_INTERVAL_MS as u64),
+        )
+    }
+
     pub fn write_to_proto(&self, args: &mut P2PHardNatArgs) {
         args.proto_version = self.proto_version;
         args.session_id = self.session_id;
@@ -1439,6 +1456,52 @@ fn hard_nat_role_proto_value(role: HardNatRole) -> u32 {
     match role {
         HardNatRole::Nat3 => 1,
         HardNatRole::Nat4 => 2,
+    }
+}
+
+fn hard_nat_executor_state_value(phase: HardNatExecutorPhase) -> u32 {
+    match phase {
+        HardNatExecutorPhase::Idle => 0,
+        HardNatExecutorPhase::Leased => 1,
+        HardNatExecutorPhase::ExecutingBatch(_) | HardNatExecutorPhase::WaitingNextCommand(_) => 2,
+        HardNatExecutorPhase::Connected => 3,
+        HardNatExecutorPhase::Expired => 4,
+        HardNatExecutorPhase::Aborted => 5,
+    }
+}
+
+fn build_hard_nat_ack(
+    session_id: u64,
+    seq: u64,
+    acked_seq: u64,
+    state: u32,
+) -> HardNatControlEnvelope {
+    HardNatControlEnvelope {
+        session_id,
+        seq,
+        role_from: hard_nat_role_proto_value(HardNatRole::Nat3),
+        msg: Some(hard_nat_control_envelope::Msg::Ack(HardNatAck {
+            acked_seq,
+            state,
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+}
+
+async fn recv_hard_nat_control(
+    control_rx: &mut broadcast::Receiver<HardNatControlEnvelope>,
+) -> Result<HardNatControlEnvelope> {
+    loop {
+        match control_rx.recv().await {
+            Ok(env) => return Ok(env),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!("hard-nat control receiver lagged, skipped [{skipped}] messages");
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                bail!("hard-nat control channel closed");
+            }
+        }
     }
 }
 
@@ -1952,6 +2015,253 @@ pub fn half_hops_from_ping_ttl(ttl: u32) -> Option<u32> {
     }
 }
 
+pub async fn run_nat3_controlled_once<SendControl, SendControlFut>(
+    args: Nat3RunConfig,
+    session: HardNatSessionParams,
+    control_rx: &mut broadcast::Receiver<HardNatControlEnvelope>,
+    send_control: SendControl,
+) -> Result<HardNatConnectedSocket>
+where
+    SendControl: FnMut(HardNatControlEnvelope) -> SendControlFut,
+    SendControlFut: Future<Output = Result<()>>,
+{
+    run_nat3_controlled_once_with_socket(args, session, None, control_rx, send_control).await
+}
+
+pub async fn run_nat3_controlled_once_with_prebound_socket<SendControl, SendControlFut>(
+    args: Nat3RunConfig,
+    session: HardNatSessionParams,
+    socket: UdpSocket,
+    control_rx: &mut broadcast::Receiver<HardNatControlEnvelope>,
+    send_control: SendControl,
+) -> Result<HardNatConnectedSocket>
+where
+    SendControl: FnMut(HardNatControlEnvelope) -> SendControlFut,
+    SendControlFut: Future<Output = Result<()>>,
+{
+    run_nat3_controlled_once_with_socket(args, session, Some(socket), control_rx, send_control)
+        .await
+}
+
+async fn run_nat3_controlled_once_with_socket<SendControl, SendControlFut>(
+    args: Nat3RunConfig,
+    session: HardNatSessionParams,
+    prebound_socket: Option<UdpSocket>,
+    control_rx: &mut broadcast::Receiver<HardNatControlEnvelope>,
+    mut send_control: SendControl,
+) -> Result<HardNatConnectedSocket>
+where
+    SendControl: FnMut(HardNatControlEnvelope) -> SendControlFut,
+    SendControlFut: Future<Output = Result<()>>,
+{
+    args.validate()?;
+    if args.hold_batch_until_enter {
+        bail!("hold_batch_until_enter is only supported by run_nat3");
+    }
+
+    let socket = prepare_nat3_socket(&args, prebound_socket).await?;
+    if let Some(ttl) = args.ttl {
+        socket.set_ttl(ttl).with_context(|| "set ttl failed")?;
+        debug!("set ttl [{ttl}]");
+    }
+
+    let socket = Arc::new(socket);
+    let text = Arc::new(resolve_probe_text(args.content.as_deref()));
+    let shared = Arc::new(Shared {
+        connecteds: Default::default(),
+    });
+
+    let recv_task = {
+        let socket = socket.clone();
+        let shared = shared.clone();
+        let opts = RecvLoopOptions {
+            role: HardNatRole::Nat3,
+            expected_text: text.clone(),
+            promote_hit_ttl: None,
+            debug_converge_lease: args.debug_converge_lease,
+            manual_converge_socket: None,
+        };
+        tokio::spawn(async move {
+            let r = recv_loop(socket, &shared, opts).await;
+            info!("recv finished [{r:?}]");
+        })
+    };
+    let recv_tasks = RecvTaskGuard::new(vec![recv_task]);
+
+    let mut executor = HardNatExecutor::new(session.session_id, session.lease_timeout());
+    let mut ack_seq = 1_u64;
+    let mut send_tick = tokio::time::interval(args.interval);
+    send_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut status_tick = tokio::time::interval(Duration::from_millis(10).min(args.interval));
+    status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let start_at = Instant::now();
+
+    loop {
+        if executor.phase() == HardNatExecutorPhase::Connected && shared.has_connected() {
+            let first = shared
+                .first_connected_conn(HardNatRole::Nat3, start_at)
+                .with_context(|| "missing connected target after nat3 controlled connect")?;
+            recv_tasks.abort_and_wait().await;
+            return Ok(first);
+        }
+
+        let lease_deadline = executor.lease_deadline();
+        let lease_sleep = async move {
+            if let Some(deadline) = lease_deadline {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            } else {
+                futures::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            env = recv_hard_nat_control(control_rx) => {
+                let abort_reason = match &env {
+                    Ok(HardNatControlEnvelope {
+                        msg: Some(hard_nat_control_envelope::Msg::Abort(msg)),
+                        ..
+                    }) => Some(msg.reason.to_string()),
+                    _ => None,
+                };
+                let env = env?;
+                let acked_seq = env.seq;
+                let apply = executor.apply_control(env, Instant::now());
+                if apply == HardNatControlApply::Applied {
+                    let ack = build_hard_nat_ack(
+                        session.session_id,
+                        ack_seq,
+                        acked_seq,
+                        hard_nat_executor_state_value(executor.phase()),
+                    );
+                    ack_seq += 1;
+                    send_control(ack).await?;
+                    if let Some(reason) = abort_reason {
+                        recv_tasks.abort_and_wait().await;
+                        bail!("hard-nat nat3 aborted: {reason}");
+                    }
+                }
+            }
+            _ = status_tick.tick() => {}
+            _ = send_tick.tick(), if matches!(executor.phase(), HardNatExecutorPhase::ExecutingBatch(_) | HardNatExecutorPhase::WaitingNextCommand(_)) => {
+                if let Some(cursor) = executor.current_cursor() {
+                    let targets = cursor
+                        .ports
+                        .iter()
+                        .map(|port| SocketAddr::new(args.target_ip, *port as u16))
+                        .collect::<Vec<_>>();
+                    let _ = send_nat3_batch_once(&socket, &text, &targets, &shared, 0, false).await?;
+                }
+            }
+            _ = lease_sleep => {
+                if executor.expire_if_needed(Instant::now()) {
+                    recv_tasks.abort_and_wait().await;
+                    bail!("hard-nat nat3 lease expired");
+                }
+            }
+        }
+    }
+}
+
+pub async fn run_nat4_controlled_once<SendControl, SendControlFut>(
+    args: Nat4RunConfig,
+    session: HardNatSessionParams,
+    start_batch_ports: Vec<u32>,
+    selected_nat4_ip: Option<String>,
+    mut send_control: SendControl,
+) -> Result<HardNatConnectedSocket>
+where
+    SendControl: FnMut(HardNatControlEnvelope) -> SendControlFut,
+    SendControlFut: Future<Output = Result<()>>,
+{
+    args.validate()?;
+    if args.debug_keep_recv {
+        bail!("debug_keep_recv is only supported by run_nat4");
+    }
+
+    let mut scheduler = HardNatScheduler::new(HardNatSchedulerConfig {
+        session_id: session.session_id,
+        nat4_ip_count: session.nat4_candidate_ips.len().max(1),
+        nat3_addr_count: session.nat3_public_addrs.len().max(1),
+        lease_timeout: session.lease_timeout(),
+    });
+
+    let start_batch = scheduler.start_batch(start_batch_ports)?;
+    send_control(start_batch).await?;
+
+    let runtime = match prepare_nat4_probe_runtime(&args).await {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            if let Ok(abort) = scheduler.abort(format!("{err:#}")) {
+                let _ = send_control(abort).await;
+            }
+            return Err(err);
+        }
+    };
+    let mut probe_tick = tokio::time::interval(runtime.interval);
+    probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut keepalive_tick = tokio::time::interval(session.keepalive_interval());
+    keepalive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let _ = keepalive_tick.tick().await;
+
+    let mut probe_due = true;
+    let result: Result<HardNatConnectedSocket> = async {
+        loop {
+            if probe_due {
+                for sender in &runtime.senders {
+                    if runtime.shared.has_connected() {
+                        break;
+                    }
+                    sender.send_one().await?;
+                }
+                probe_due = false;
+            }
+
+            if runtime.shared.has_connected() {
+                break;
+            }
+
+            tokio::select! {
+                _ = probe_tick.tick() => {
+                    probe_due = true;
+                }
+                _ = keepalive_tick.tick() => {
+                    send_control(scheduler.lease_keepalive()).await?;
+                }
+            }
+        }
+
+        let first = runtime
+            .shared
+            .first_connected_conn(HardNatRole::Nat4, runtime.start_at)
+            .with_context(|| "missing connected target after nat4 controlled connect")?;
+
+        let selected_nat4_ip = selected_nat4_ip
+            .clone()
+            .or_else(|| session.nat4_candidate_ips.first().cloned())
+            .unwrap_or_default();
+        let connected = scheduler.connected(
+            args.target.to_string(),
+            selected_nat4_ip,
+            first.remote_addr.port() as u32,
+            session.connected_ttl.max(HARD_NAT_DEFAULT_CONNECTED_TTL),
+        )?;
+        send_control(connected).await?;
+        Ok(first)
+    }
+    .await;
+
+    runtime.recv_tasks.abort_and_wait().await;
+    match result {
+        Ok(first) => Ok(first),
+        Err(err) => {
+            if let Ok(abort) = scheduler.abort(format!("{err:#}")) {
+                let _ = send_control(abort).await;
+            }
+            Err(err)
+        }
+    }
+}
+
 pub async fn run_nat3(args: Nat3RunConfig) -> Result<()> {
     if args.hold_batch_until_enter {
         return run_nat3_hold_batch_until_enter(args).await;
@@ -2304,6 +2614,18 @@ fn build_nat3_target_batch(
     }
 
     targets
+}
+
+pub fn build_random_port_batch(count: usize) -> Vec<u32> {
+    let mut ports = Vec::with_capacity(count);
+    let mut seen = HashSet::with_capacity(count);
+    while ports.len() < count {
+        let port = rand::thread_rng().gen_range(1024..=u16::MAX);
+        if seen.insert(port) {
+            ports.push(port as u32);
+        }
+    }
+    ports
 }
 
 async fn send_nat3_batch_once(
@@ -2831,6 +3153,7 @@ mod tests {
     use std::io::{self, Cursor};
     use std::net::{Ipv4Addr, SocketAddrV4};
     use std::sync::{Arc, Mutex};
+    use tokio::sync::{broadcast, mpsc};
     use tracing_subscriber::fmt::MakeWriter;
 
     #[derive(Clone, Default)]
@@ -4594,5 +4917,304 @@ mod tests {
 
         assert_eq!(winner, AssistWinner::HardNat);
         assert_eq!(value, "hardnat-ok");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_nat3_controlled_once_uses_start_batch_and_connected_control() -> Result<()> {
+        let peer = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer_addr = peer.local_addr()?;
+        let (control_tx, _) = broadcast::channel(16);
+        let mut control_rx = control_tx.subscribe();
+        let (ack_tx, mut ack_rx) = mpsc::channel(16);
+
+        let session = HardNatSessionParams {
+            proto_version: HARD_NAT_PROTO_VERSION,
+            session_id: 88,
+            lease_timeout_ms: 3_000,
+            keepalive_interval_ms: 300,
+            batch_port_count: 1,
+            connected_ttl: HARD_NAT_DEFAULT_CONNECTED_TTL,
+            ..Default::default()
+        };
+
+        let nat3_task = tokio::spawn(async move {
+            run_nat3_controlled_once(
+                Nat3RunConfig {
+                    content: None,
+                    target_ip: peer_addr.ip(),
+                    count: 1,
+                    listen: "127.0.0.1:0".into(),
+                    ttl: None,
+                    interval: Duration::from_millis(30),
+                    batch_interval: Duration::from_millis(200),
+                    discover_public_addr: false,
+                    pause_after_discovery: false,
+                    hold_batch_until_enter: false,
+                    debug_converge_lease: false,
+                    stun_servers: Vec::new(),
+                },
+                session,
+                &mut control_rx,
+                move |env| {
+                    let ack_tx = ack_tx.clone();
+                    async move {
+                        ack_tx
+                            .send(env)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("send hardnat ack failed: {e}"))?;
+                        Ok(())
+                    }
+                },
+            )
+            .await
+        });
+
+        control_tx
+            .send(hard_nat_start_batch_env(
+                88,
+                1,
+                1,
+                0,
+                0,
+                &[peer_addr.port() as u32],
+            ))
+            .unwrap();
+
+        let start_ack = tokio::time::timeout(Duration::from_secs(1), ack_rx.recv())
+            .await
+            .with_context(|| "timed out waiting for nat3 start-batch ack")?
+            .with_context(|| "nat3 start-batch ack channel closed")?;
+        match start_ack.msg {
+            Some(crate::proto::hard_nat_control_envelope::Msg::Ack(msg)) => {
+                assert_eq!(start_ack.session_id, 88);
+                assert_eq!(msg.acked_seq, 1);
+            }
+            other => panic!("unexpected nat3 start-batch ack: {other:?}"),
+        }
+
+        let mut buf = [0_u8; 256];
+        let (len, from) = tokio::time::timeout(Duration::from_secs(1), peer.recv_from(&mut buf))
+            .await
+            .with_context(|| "timed out waiting for nat3 probe packet")??;
+        assert_eq!(&buf[..len], DEFAULT_PROBE_TEXT.as_bytes());
+        peer.send_to(DEFAULT_PROBE_TEXT.as_bytes(), from).await?;
+
+        control_tx.send(hard_nat_connected_env(88, 2)).unwrap();
+
+        let connected_ack = tokio::time::timeout(Duration::from_secs(1), ack_rx.recv())
+            .await
+            .with_context(|| "timed out waiting for nat3 connected ack")?
+            .with_context(|| "nat3 connected ack channel closed")?;
+        match connected_ack.msg {
+            Some(crate::proto::hard_nat_control_envelope::Msg::Ack(msg)) => {
+                assert_eq!(connected_ack.session_id, 88);
+                assert_eq!(msg.acked_seq, 2);
+            }
+            other => panic!("unexpected nat3 connected ack: {other:?}"),
+        }
+
+        let conn = tokio::time::timeout(Duration::from_secs(1), nat3_task)
+            .await
+            .with_context(|| "timed out waiting for controlled nat3 task")???;
+        assert_eq!(conn.role, HardNatRole::Nat3);
+        assert_eq!(conn.remote_addr, peer_addr);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_nat3_controlled_once_returns_after_abort_control() -> Result<()> {
+        let peer = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer_addr = peer.local_addr()?;
+        let (control_tx, _) = broadcast::channel(16);
+        let mut control_rx = control_tx.subscribe();
+        let (ack_tx, mut ack_rx) = mpsc::channel(16);
+
+        let session = HardNatSessionParams {
+            proto_version: HARD_NAT_PROTO_VERSION,
+            session_id: 188,
+            lease_timeout_ms: 3_000,
+            keepalive_interval_ms: 300,
+            batch_port_count: 1,
+            connected_ttl: HARD_NAT_DEFAULT_CONNECTED_TTL,
+            ..Default::default()
+        };
+
+        let nat3_task = tokio::spawn(async move {
+            run_nat3_controlled_once(
+                Nat3RunConfig {
+                    content: None,
+                    target_ip: peer_addr.ip(),
+                    count: 1,
+                    listen: "127.0.0.1:0".into(),
+                    ttl: None,
+                    interval: Duration::from_millis(30),
+                    batch_interval: Duration::from_millis(200),
+                    discover_public_addr: false,
+                    pause_after_discovery: false,
+                    hold_batch_until_enter: false,
+                    debug_converge_lease: false,
+                    stun_servers: Vec::new(),
+                },
+                session,
+                &mut control_rx,
+                move |env| {
+                    let ack_tx = ack_tx.clone();
+                    async move {
+                        ack_tx
+                            .send(env)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("send hardnat ack failed: {e}"))?;
+                        Ok(())
+                    }
+                },
+            )
+            .await
+        });
+
+        control_tx
+            .send(hard_nat_start_batch_env(
+                188,
+                1,
+                1,
+                0,
+                0,
+                &[peer_addr.port() as u32],
+            ))
+            .unwrap();
+        let start_ack = tokio::time::timeout(Duration::from_secs(1), ack_rx.recv())
+            .await
+            .with_context(|| "timed out waiting for nat3 start-batch ack")?
+            .with_context(|| "nat3 start-batch ack channel closed")?;
+        match start_ack.msg {
+            Some(crate::proto::hard_nat_control_envelope::Msg::Ack(msg)) => {
+                assert_eq!(msg.acked_seq, 1);
+            }
+            other => panic!("unexpected nat3 start-batch ack: {other:?}"),
+        }
+
+        control_tx.send(hard_nat_abort_env(188, 2)).unwrap();
+        let abort_ack = tokio::time::timeout(Duration::from_secs(1), ack_rx.recv())
+            .await
+            .with_context(|| "timed out waiting for nat3 abort ack")?
+            .with_context(|| "nat3 abort ack channel closed")?;
+        match abort_ack.msg {
+            Some(crate::proto::hard_nat_control_envelope::Msg::Ack(msg)) => {
+                assert_eq!(msg.acked_seq, 2);
+            }
+            other => panic!("unexpected nat3 abort ack: {other:?}"),
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(1), nat3_task)
+            .await
+            .with_context(|| "timed out waiting for controlled nat3 abort")??;
+        let err = match result {
+            Ok(conn) => bail!(
+                "nat3 controlled helper should return error after abort, got remote [{}]",
+                conn.remote_addr
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("abort"),
+            "unexpected nat3 abort error: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_nat4_controlled_once_sends_start_keepalive_and_connected_control() -> Result<()> {
+        let peer = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer_addr = peer.local_addr()?;
+        let (control_tx, mut control_rx) = mpsc::channel(16);
+
+        let peer_task = tokio::spawn(async move {
+            let mut buf = [0_u8; 256];
+            let (len, from) = peer.recv_from(&mut buf).await?;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            peer.send_to(&buf[..len], from).await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let session = HardNatSessionParams {
+            proto_version: HARD_NAT_PROTO_VERSION,
+            session_id: 99,
+            lease_timeout_ms: 1_000,
+            keepalive_interval_ms: 40,
+            batch_port_count: 2,
+            connected_ttl: HARD_NAT_DEFAULT_CONNECTED_TTL,
+            nat4_candidate_ips: vec!["127.0.0.1".into()],
+            ..Default::default()
+        };
+
+        let conn = run_nat4_controlled_once(
+            Nat4RunConfig {
+                content: None,
+                target: peer_addr,
+                count: 1,
+                ttl: Some(4),
+                interval: Duration::from_millis(30),
+                dump_public_addrs: false,
+                debug_keep_recv: false,
+                debug_promote_hit_ttl: None,
+                debug_converge_lease: false,
+            },
+            session,
+            vec![41001, 41002],
+            Some("127.0.0.1".into()),
+            move |env| {
+                let control_tx = control_tx.clone();
+                async move {
+                    control_tx
+                        .send(env)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("send hardnat control failed: {e}"))?;
+                    Ok(())
+                }
+            },
+        )
+        .await?;
+
+        peer_task.await??;
+
+        let first = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+            .await
+            .with_context(|| "timed out waiting for nat4 start-batch control")?
+            .with_context(|| "nat4 control channel closed before start-batch")?;
+        match first.msg {
+            Some(crate::proto::hard_nat_control_envelope::Msg::StartBatch(msg)) => {
+                assert_eq!(first.session_id, 99);
+                assert_eq!(msg.batch_id, 1);
+                assert_eq!(msg.ports, vec![41001, 41002]);
+            }
+            other => panic!("unexpected first nat4 control msg: {other:?}"),
+        }
+
+        let mut saw_keepalive = false;
+        loop {
+            let env = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+                .await
+                .with_context(|| "timed out waiting for nat4 follow-up control")?
+                .with_context(|| "nat4 control channel closed before connected")?;
+            match env.msg {
+                Some(crate::proto::hard_nat_control_envelope::Msg::LeaseKeepAlive(msg)) => {
+                    assert_eq!(env.session_id, 99);
+                    assert_eq!(msg.lease_timeout_ms, 1_000);
+                    saw_keepalive = true;
+                }
+                Some(crate::proto::hard_nat_control_envelope::Msg::Connected(msg)) => {
+                    assert!(saw_keepalive, "expected at least one keepalive before connected");
+                    assert_eq!(env.session_id, 99);
+                    assert_eq!(msg.selected_nat3_addr.to_string(), peer_addr.to_string());
+                    assert_eq!(msg.selected_nat4_ip.to_string(), "127.0.0.1");
+                    assert_eq!(msg.restore_ttl, HARD_NAT_DEFAULT_CONNECTED_TTL);
+                    break;
+                }
+                other => panic!("unexpected nat4 follow-up control msg: {other:?}"),
+            }
+        }
+
+        assert_eq!(conn.role, HardNatRole::Nat4);
+        assert_eq!(conn.remote_addr, peer_addr);
+        Ok(())
     }
 }

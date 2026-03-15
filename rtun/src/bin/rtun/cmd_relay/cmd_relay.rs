@@ -25,17 +25,18 @@ use rtun::{
     hex::BinStrLine,
     ice::ice_peer::{default_ice_servers, IceArgs, IceConfig, IcePeer},
     p2p::hard_nat::{
+        build_random_port_batch, collect_udp_candidate_ips_from_ice,
         derive_target_plan_from_ice_with_explicit_nat4_target, prepare_nat3_public_target,
-        race_assist, resolve_role_plan, run_nat3_once, run_nat3_once_with_prebound_socket,
-        run_nat4_once, HardNatConnectedSocket, HardNatRole, HardNatRoleHint,
-        HardNatSessionParams, Nat3RunConfig, Nat4RunConfig, PreparedNat3Socket,
-        HARD_NAT_MAX_ASSIST_DELAY_MS,
+        race_assist, resolve_role_plan, run_nat3_controlled_once,
+        run_nat3_controlled_once_with_prebound_socket, run_nat4_controlled_once,
+        HardNatConnectedSocket, HardNatRole, HardNatRoleHint, HardNatSessionParams, Nat3RunConfig,
+        Nat4RunConfig, PreparedNat3Socket, HARD_NAT_MAX_ASSIST_DELAY_MS,
         HARD_NAT_MAX_BATCH_INTERVAL_MS, HARD_NAT_MAX_INTERVAL_MS, HARD_NAT_MAX_SCAN_COUNT,
         HARD_NAT_MAX_SOCKET_COUNT, HARD_NAT_MAX_TTL,
     },
     proto::{
         open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, ExecAgentScriptArgs,
-        ExecAgentScriptResult, P2PArgs, P2PHardNatArgs, UdpRelayArgs,
+        ExecAgentScriptResult, HardNatControlEnvelope, P2PArgs, P2PHardNatArgs, UdpRelayArgs,
     },
     switch::{
         invoker_ctrl::{CtrlHandler, CtrlInvoker},
@@ -2421,6 +2422,9 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
 
     let local_ice = peer.client_gather().await?;
     let local_codec = UdpRelayCodec::new(gen_udp_relay_obfs_seed());
+    let local_nat4_ip = collect_udp_candidate_ips_from_ice(&local_ice)
+        .into_iter()
+        .next();
     let local_role_plan = resolve_role_plan(udp_relay_hard_nat.role_hint(), true);
     let local_prepared_nat3 = if (udp_relay_hard_nat.is_force() || udp_relay_hard_nat.is_assist())
         && local_role_plan.local_role == HardNatRole::Nat3
@@ -2492,6 +2496,12 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
             target,
         );
     }
+    let local_hard_nat = build_udp_relay_hard_nat_args(udp_relay_hard_nat);
+    let hard_nat_rx = if udp_relay_hard_nat.is_off() {
+        None
+    } else {
+        Some(ctrl.subscribe_hard_nat_control().await?)
+    };
     let rsp = ctrl
         .open_p2p(P2PArgs {
             p2p_args: Some(P2p_args::UdpRelay(UdpRelayArgs {
@@ -2500,7 +2510,7 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
                 idle_timeout_secs,
                 max_payload: max_payload as u32,
                 obfs_seed: local_codec.obfs_seed,
-                hard_nat: build_udp_relay_hard_nat_args(udp_relay_hard_nat),
+                hard_nat: local_hard_nat.clone(),
                 hard_nat_target_addr: local_prepared_nat3
                     .as_ref()
                     .map(|prepared| prepared.nat4_target.to_string())
@@ -2513,7 +2523,7 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
         .await?;
 
     let rsp = rsp.open_p2p_rsp.with_context(|| "no open_p2p_rsp")?;
-    let (remote_ice, codec, remote_hard_nat_target) = match rsp {
+    let (remote_ice, codec, remote_hard_nat_target, remote_hard_nat_session) = match rsp {
         Open_p2p_rsp::Args(mut args) => {
             if !args.has_udp_relay() {
                 bail!("no udp relay args");
@@ -2521,12 +2531,19 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
             let mut relay_args = args.take_udp_relay();
             let codec = UdpRelayCodec::new(relay_args.obfs_seed);
             let remote_hard_nat_target = parse_udp_relay_hard_nat_target_addr(&relay_args)?;
+            let mut remote_hard_nat_session = relay_args
+                .hard_nat
+                .as_ref()
+                .map(HardNatSessionParams::from_proto)
+                .unwrap_or_default()
+                .with_batch_port_count(udp_relay_hard_nat.scan_count);
+            remote_hard_nat_session.apply_defaults_if_missing();
             let remote_ice: IceArgs = relay_args
                 .ice
                 .take()
                 .with_context(|| "no ice in udp relay args")?
                 .into();
-            (remote_ice, codec, remote_hard_nat_target)
+            (remote_ice, codec, remote_hard_nat_target, remote_hard_nat_session)
         }
         Open_p2p_rsp::Status(s) => {
             bail!("open p2p but {s:?}");
@@ -2538,10 +2555,14 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
 
     let socket = if udp_relay_hard_nat.is_force() {
         let hard_nat_conn = open_udp_relay_tunnel_hard_nat_socket(
+            ctrl,
             udp_relay_hard_nat,
+            remote_hard_nat_session.clone(),
+            local_nat4_ip.clone(),
             &remote_ice,
             remote_hard_nat_target,
             local_prepared_nat3,
+            hard_nat_rx,
         )
         .await
         .with_context(|| format!("udp relay hard-nat connect failed, target [{}]", target))?;
@@ -2569,12 +2590,16 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
         socket
     } else if udp_relay_hard_nat.is_assist() {
         open_udp_relay_tunnel_assist_socket(
+            ctrl,
             &mut peer,
             remote_ice.clone(),
             remote_hard_nat_target,
             target,
             udp_relay_hard_nat,
+            remote_hard_nat_session,
+            local_nat4_ip,
             local_prepared_nat3,
+            hard_nat_rx,
         )
         .await?
     } else {
@@ -2641,13 +2666,17 @@ enum RelayAssistOpenSocket {
     },
 }
 
-async fn open_udp_relay_tunnel_assist_socket(
+async fn open_udp_relay_tunnel_assist_socket<H: CtrlHandler>(
+    ctrl: &CtrlInvoker<H>,
     peer: &mut IcePeer,
     remote_ice: IceArgs,
     remote_hard_nat_target: Option<SocketAddr>,
     target: SocketAddr,
     cfg: RelayUdpHardNatConfig,
+    hard_nat_session: HardNatSessionParams,
+    local_nat4_ip: Option<String>,
     local_prepared_nat3: Option<PreparedNat3Socket>,
+    hard_nat_rx: Option<broadcast::Receiver<HardNatControlEnvelope>>,
 ) -> Result<Arc<UdpSocket>> {
     let assist_started_at = Instant::now();
     let remote_ice_for_ice = remote_ice.clone();
@@ -2674,10 +2703,14 @@ async fn open_udp_relay_tunnel_assist_socket(
 
     let hard_nat_fut = async move {
         let hard_nat_conn = open_udp_relay_tunnel_hard_nat_socket(
+            ctrl,
             cfg,
+            hard_nat_session,
+            local_nat4_ip,
             &remote_ice_for_hard_nat,
             remote_hard_nat_target,
             local_prepared_nat3,
+            hard_nat_rx,
         )
         .await
         .with_context(|| format!("udp relay hard-nat connect failed, target [{}]", target))?;
@@ -2752,11 +2785,15 @@ async fn open_udp_relay_tunnel_assist_socket(
     }
 }
 
-async fn open_udp_relay_tunnel_hard_nat_socket(
+async fn open_udp_relay_tunnel_hard_nat_socket<H: CtrlHandler>(
+    ctrl: &CtrlInvoker<H>,
     cfg: RelayUdpHardNatConfig,
+    hard_nat_session: HardNatSessionParams,
+    local_nat4_ip: Option<String>,
     remote_ice: &IceArgs,
     remote_hard_nat_target: Option<SocketAddr>,
     local_prepared_nat3: Option<PreparedNat3Socket>,
+    mut hard_nat_rx: Option<broadcast::Receiver<HardNatControlEnvelope>>,
 ) -> Result<HardNatConnectedSocket> {
     let role_plan = resolve_role_plan(cfg.role_hint(), true);
     let target_plan =
@@ -2797,27 +2834,67 @@ async fn open_udp_relay_tunnel_hard_nat_socket(
                 debug_converge_lease: false,
                 stun_servers: Vec::new(),
             };
+            let rx = hard_nat_rx
+                .as_mut()
+                .with_context(|| "missing hard-nat control receiver for relay nat3 role")?;
             if let Some(prepared_nat3) = local_prepared_nat3 {
-                run_nat3_once_with_prebound_socket(args, prepared_nat3.socket).await
+                run_nat3_controlled_once_with_prebound_socket(
+                    args,
+                    hard_nat_session,
+                    prepared_nat3.socket,
+                    rx,
+                    {
+                        let ctrl = ctrl.clone();
+                        move |env| {
+                            let ctrl = ctrl.clone();
+                            async move { ctrl.send_hard_nat_control(env).await }
+                        }
+                    },
+                )
+                .await
             } else {
-                run_nat3_once(args).await
+                run_nat3_controlled_once(args, hard_nat_session, rx, {
+                    let ctrl = ctrl.clone();
+                    move |env| {
+                        let ctrl = ctrl.clone();
+                        async move { ctrl.send_hard_nat_control(env).await }
+                    }
+                })
+                .await
             }
         }
         HardNatRole::Nat4 => {
             let target = target_plan
                 .nat4_target
                 .with_context(|| "hard-nat nat4 target socket missing from remote ICE")?;
-            run_nat4_once(Nat4RunConfig {
-                content: None,
-                target,
-                count: cfg.socket_count as usize,
-                ttl,
-                interval,
-                dump_public_addrs: false,
-                debug_keep_recv: false,
-                debug_promote_hit_ttl: None,
-                debug_converge_lease: false,
-            })
+            let batch_count = if hard_nat_session.batch_port_count == 0 {
+                cfg.scan_count as usize
+            } else {
+                hard_nat_session.batch_port_count as usize
+            };
+            run_nat4_controlled_once(
+                Nat4RunConfig {
+                    content: None,
+                    target,
+                    count: cfg.socket_count as usize,
+                    ttl,
+                    interval,
+                    dump_public_addrs: false,
+                    debug_keep_recv: false,
+                    debug_promote_hit_ttl: None,
+                    debug_converge_lease: false,
+                },
+                hard_nat_session,
+                build_random_port_batch(batch_count),
+                local_nat4_ip,
+                {
+                    let ctrl = ctrl.clone();
+                    move |env| {
+                        let ctrl = ctrl.clone();
+                        async move { ctrl.send_hard_nat_control(env).await }
+                    }
+                },
+            )
             .await
         }
     }

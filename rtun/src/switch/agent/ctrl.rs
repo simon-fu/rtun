@@ -30,13 +30,14 @@ use crate::{
         webrtc_ice_peer::{DtlsIceArgs, WebrtcIceConfig, WebrtcIcePeer},
     },
     p2p::hard_nat::{
-        collect_udp_candidate_ips_from_ice,
+        build_random_port_batch, collect_udp_candidate_ips_from_ice,
         derive_target_plan_from_ice_with_explicit_nat4_target, prepare_nat3_public_target,
-        race_assist, resolve_role_plan, run_nat3_once, run_nat3_once_with_prebound_socket,
-        run_nat4_once, HardNatConnectedSocket, HardNatMode, HardNatRole, HardNatRoleHint,
-        HardNatSessionParams, Nat3RunConfig, Nat4RunConfig, PreparedNat3Socket,
-        HARD_NAT_MAX_ASSIST_DELAY_MS, HARD_NAT_MAX_BATCH_INTERVAL_MS, HARD_NAT_MAX_INTERVAL_MS,
-        HARD_NAT_MAX_SCAN_COUNT, HARD_NAT_MAX_SOCKET_COUNT, HARD_NAT_MAX_TTL,
+        race_assist, resolve_role_plan, run_nat3_controlled_once,
+        run_nat3_controlled_once_with_prebound_socket, run_nat4_controlled_once,
+        HardNatConnectedSocket, HardNatMode, HardNatRole, HardNatRoleHint, HardNatSessionParams,
+        Nat3RunConfig, Nat4RunConfig, PreparedNat3Socket, HARD_NAT_MAX_ASSIST_DELAY_MS,
+        HARD_NAT_MAX_BATCH_INTERVAL_MS, HARD_NAT_MAX_INTERVAL_MS, HARD_NAT_MAX_SCAN_COUNT,
+        HARD_NAT_MAX_SOCKET_COUNT, HARD_NAT_MAX_TTL,
     },
     proto::{
         open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, ExecAgentScriptArgs,
@@ -292,7 +293,12 @@ impl AsyncHandler<OpOpenP2P> for Entity {
                 return handle_quic_socks(self.socks_server.clone(), args).await;
             }
             P2p_args::UdpRelay(args) => {
-                return handle_udp_relay(self.udp_relay_flows.clone(), args).await
+                let ctrl = self
+                    .weak
+                    .as_ref()
+                    .and_then(|weak| weak.upgrade())
+                    .with_context(|| "agent ctrl invoker unavailable for udp relay")?;
+                return handle_udp_relay(ctrl, self.udp_relay_flows.clone(), args).await;
             }
             P2p_args::QuicThrput(args) => return handle_quic_throughput(args).await,
             P2p_args::WebrtcThrput(args) => return handle_webrtc_throughput(args).await,
@@ -736,6 +742,7 @@ struct SharedRelayFlow {
 }
 
 async fn handle_udp_relay(
+    ctrl: AgentCtrlInvoker,
     shared_flows: SharedRelayFlows,
     mut remote_args: UdpRelayArgs,
 ) -> Result<OpenP2PResponse> {
@@ -783,6 +790,9 @@ async fn handle_udp_relay(
 
     let uid = peer.uid();
     let local_ice = peer.server_gather(remote_ice.clone()).await?;
+    let local_nat4_ip = collect_udp_candidate_ips_from_ice(&local_ice)
+        .into_iter()
+        .next();
     let local_role_plan = resolve_role_plan(hard_nat_cfg.role_hint, false);
     let local_prepared_nat3 = if (hard_nat_cfg.is_force() || hard_nat_cfg.is_assist())
         && local_role_plan.local_role == HardNatRole::Nat3
@@ -811,6 +821,18 @@ async fn handle_udp_relay(
     } else {
         None
     };
+    let mut runtime_hard_nat_session = remote_args
+        .hard_nat
+        .as_ref()
+        .map(HardNatSessionParams::from_proto)
+        .unwrap_or_default()
+        .with_batch_port_count(hard_nat_cfg.scan_count);
+    runtime_hard_nat_session.apply_defaults_if_missing();
+    let hard_nat_rx = if hard_nat_cfg.mode == HardNatMode::Off {
+        None
+    } else {
+        Some(ctrl.subscribe_hard_nat_control().await?)
+    };
     let local_hard_nat_target_addr = local_prepared_nat3
         .as_ref()
         .map(|prepared| prepared.nat4_target.to_string())
@@ -830,10 +852,14 @@ async fn handle_udp_relay(
     spawn_with_name(format!("udp-relay-{uid}"), async move {
         let r = if hard_nat_cfg.is_force() {
             udp_relay_task_hard_nat(
+                ctrl.clone(),
                 remote_ice,
                 remote_hard_nat_target,
                 hard_nat_cfg,
+                runtime_hard_nat_session,
+                local_nat4_ip,
                 local_prepared_nat3,
+                hard_nat_rx,
                 target_addr,
                 idle_timeout,
                 max_payload,
@@ -843,11 +869,15 @@ async fn handle_udp_relay(
             .await
         } else if hard_nat_cfg.is_assist() {
             udp_relay_task_assist(
+                ctrl.clone(),
                 peer,
                 remote_ice,
                 remote_hard_nat_target,
                 hard_nat_cfg,
+                runtime_hard_nat_session,
+                local_nat4_ip,
                 local_prepared_nat3,
+                hard_nat_rx,
                 target_addr,
                 idle_timeout,
                 max_payload,
@@ -1160,11 +1190,15 @@ enum UdpRelayAssistSocket {
 }
 
 async fn udp_relay_task_assist(
+    ctrl: AgentCtrlInvoker,
     mut peer: IcePeer,
     remote_ice: IceArgs,
     remote_hard_nat_target: Option<SocketAddr>,
     hard_nat_cfg: UdpRelayHardNatConfig,
+    hard_nat_session: HardNatSessionParams,
+    local_nat4_ip: Option<String>,
     local_prepared_nat3: Option<PreparedNat3Socket>,
+    hard_nat_rx: Option<broadcast::Receiver<HardNatControlEnvelope>>,
     target_addr: SocketAddr,
     idle_timeout: Duration,
     max_payload: usize,
@@ -1195,11 +1229,15 @@ async fn udp_relay_task_assist(
 
     let hard_nat_fut = async move {
         let hard_nat_conn = open_udp_relay_hard_nat_socket(
+            &ctrl,
             remote_ice_for_hard_nat,
             remote_hard_nat_target,
             hard_nat_cfg,
+            hard_nat_session,
+            local_nat4_ip,
             false,
             local_prepared_nat3,
+            hard_nat_rx,
         )
         .await
         .with_context(|| {
@@ -1297,10 +1335,14 @@ async fn udp_relay_task_assist(
 }
 
 async fn udp_relay_task_hard_nat(
+    ctrl: AgentCtrlInvoker,
     remote_ice: IceArgs,
     remote_hard_nat_target: Option<SocketAddr>,
     hard_nat_cfg: UdpRelayHardNatConfig,
+    hard_nat_session: HardNatSessionParams,
+    local_nat4_ip: Option<String>,
     local_prepared_nat3: Option<PreparedNat3Socket>,
+    hard_nat_rx: Option<broadcast::Receiver<HardNatControlEnvelope>>,
     target_addr: SocketAddr,
     idle_timeout: Duration,
     max_payload: usize,
@@ -1308,11 +1350,15 @@ async fn udp_relay_task_hard_nat(
     shared_flows: SharedRelayFlows,
 ) -> Result<()> {
     let hard_nat_conn = open_udp_relay_hard_nat_socket(
+        &ctrl,
         remote_ice,
         remote_hard_nat_target,
         hard_nat_cfg,
+        hard_nat_session,
+        local_nat4_ip,
         false,
         local_prepared_nat3,
+        hard_nat_rx,
     )
     .await
     .with_context(|| {
@@ -1361,11 +1407,15 @@ async fn udp_relay_task_hard_nat(
 }
 
 async fn open_udp_relay_hard_nat_socket(
+    ctrl: &AgentCtrlInvoker,
     remote_ice: IceArgs,
     remote_hard_nat_target: Option<SocketAddr>,
     hard_nat_cfg: UdpRelayHardNatConfig,
+    hard_nat_session: HardNatSessionParams,
+    local_nat4_ip: Option<String>,
     is_initiator: bool,
     local_prepared_nat3: Option<PreparedNat3Socket>,
+    mut hard_nat_rx: Option<broadcast::Receiver<HardNatControlEnvelope>>,
 ) -> Result<HardNatConnectedSocket> {
     let role_plan = resolve_role_plan(hard_nat_cfg.role_hint, is_initiator);
     let target_plan =
@@ -1406,27 +1456,67 @@ async fn open_udp_relay_hard_nat_socket(
                 debug_converge_lease: false,
                 stun_servers: Vec::new(),
             };
+            let rx = hard_nat_rx
+                .as_mut()
+                .with_context(|| "missing hard-nat control receiver for agent nat3 role")?;
             if let Some(prepared_nat3) = local_prepared_nat3 {
-                run_nat3_once_with_prebound_socket(args, prepared_nat3.socket).await
+                run_nat3_controlled_once_with_prebound_socket(
+                    args,
+                    hard_nat_session,
+                    prepared_nat3.socket,
+                    rx,
+                    {
+                        let ctrl = ctrl.clone();
+                        move |env| {
+                            let ctrl = ctrl.clone();
+                            async move { ctrl.send_hard_nat_control(env).await }
+                        }
+                    },
+                )
+                .await
             } else {
-                run_nat3_once(args).await
+                run_nat3_controlled_once(args, hard_nat_session, rx, {
+                    let ctrl = ctrl.clone();
+                    move |env| {
+                        let ctrl = ctrl.clone();
+                        async move { ctrl.send_hard_nat_control(env).await }
+                    }
+                })
+                .await
             }
         }
         HardNatRole::Nat4 => {
             let target = target_plan
                 .nat4_target
                 .with_context(|| "hard-nat nat4 target socket missing from remote ICE")?;
-            run_nat4_once(Nat4RunConfig {
-                content: None,
-                target,
-                count: hard_nat_cfg.socket_count as usize,
-                ttl,
-                interval,
-                dump_public_addrs: false,
-                debug_keep_recv: false,
-                debug_promote_hit_ttl: None,
-                debug_converge_lease: false,
-            })
+            let batch_count = if hard_nat_session.batch_port_count == 0 {
+                hard_nat_cfg.scan_count as usize
+            } else {
+                hard_nat_session.batch_port_count as usize
+            };
+            run_nat4_controlled_once(
+                Nat4RunConfig {
+                    content: None,
+                    target,
+                    count: hard_nat_cfg.socket_count as usize,
+                    ttl,
+                    interval,
+                    dump_public_addrs: false,
+                    debug_keep_recv: false,
+                    debug_promote_hit_ttl: None,
+                    debug_converge_lease: false,
+                },
+                hard_nat_session,
+                build_random_port_batch(batch_count),
+                local_nat4_ip,
+                {
+                    let ctrl = ctrl.clone();
+                    move |env| {
+                        let ctrl = ctrl.clone();
+                        async move { ctrl.send_hard_nat_control(env).await }
+                    }
+                },
+            )
             .await
         }
     }
