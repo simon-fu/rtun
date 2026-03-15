@@ -36,6 +36,8 @@ pub const HARD_NAT_MAX_INTERVAL_MS: u32 = 60_000;
 pub const HARD_NAT_MAX_BATCH_INTERVAL_MS: u32 = 300_000;
 pub const HARD_NAT_MAX_ASSIST_DELAY_MS: u32 = 10_000;
 pub const HARD_NAT_MAX_TTL: u32 = 255;
+#[cfg(test)]
+const HARD_NAT_KEEP_RECV_PROMOTED_TTL: u32 = 64;
 const NAT3_STUN_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(800);
 const NAT3_PAUSE_AFTER_DISCOVERY_PROMPT: &str =
     "nat3 discovery finished, press Enter to start probing";
@@ -348,6 +350,7 @@ pub struct Nat4RunConfig {
     pub interval: Duration,
     pub dump_public_addrs: bool,
     pub debug_keep_recv: bool,
+    pub debug_promote_hit_ttl: Option<u32>,
 }
 
 impl Nat4RunConfig {
@@ -378,6 +381,21 @@ impl Nat4RunConfig {
             }
             if ttl > HARD_NAT_MAX_TTL {
                 bail!("ttl too large: {} (max {})", ttl, HARD_NAT_MAX_TTL);
+            }
+        }
+        if let Some(ttl) = self.debug_promote_hit_ttl {
+            if !self.debug_keep_recv {
+                bail!("debug_promote_hit_ttl requires debug_keep_recv");
+            }
+            if ttl == 0 {
+                bail!("debug_promote_hit_ttl must be > 0");
+            }
+            if ttl > HARD_NAT_MAX_TTL {
+                bail!(
+                    "debug_promote_hit_ttl too large: {} (max {})",
+                    ttl,
+                    HARD_NAT_MAX_TTL
+                );
             }
         }
         Ok(())
@@ -749,7 +767,7 @@ async fn run_nat3_once_with_socket(
         let shared = shared.clone();
 
         tokio::spawn(async move {
-            let r = recv_loop(socket, text.as_str(), &shared).await;
+            let r = recv_loop(socket, text.as_str(), &shared, None).await;
             info!("recv finished [{r:?}]");
         })
     };
@@ -807,7 +825,7 @@ async fn run_nat3_hold_batch_until_enter(args: Nat3RunConfig) -> Result<()> {
         let text = text.clone();
         let shared = shared.clone();
         tokio::spawn(async move {
-            let r = recv_loop(socket, text.as_str(), &shared).await;
+            let r = recv_loop(socket, text.as_str(), &shared, None).await;
             info!("recv finished [{r:?}]");
         })
     };
@@ -1041,6 +1059,7 @@ async fn prepare_nat4_probe_runtime(args: &Nat4RunConfig) -> Result<Nat4ProbeRun
     } else {
         None
     };
+    let debug_promote_hit_ttl = args.debug_promote_hit_ttl;
 
     let mut sender_parts = Vec::with_capacity(args.count);
     let mut recv_tasks = RecvTaskGuard::with_capacity(args.count);
@@ -1080,7 +1099,7 @@ async fn prepare_nat4_probe_runtime(args: &Nat4RunConfig) -> Result<Nat4ProbeRun
             let text = text.clone();
             let shared = shared.clone();
             tokio::spawn(async move {
-                let r = recv_loop(socket, text.as_str(), &shared).await;
+                let r = recv_loop(socket, text.as_str(), &shared, debug_promote_hit_ttl).await;
                 info!("recv finished [{r:?}]");
             })
         };
@@ -1172,12 +1191,18 @@ async fn ping_host(host: IpAddr) -> Result<Option<u32>> {
     Ok(None)
 }
 
-async fn recv_loop(socket: Arc<UdpSocket>, text: &str, shared: &Arc<Shared>) -> Result<()> {
+async fn recv_loop(
+    socket: Arc<UdpSocket>,
+    text: &str,
+    shared: &Arc<Shared>,
+    promote_hit_ttl: Option<u32>,
+) -> Result<()> {
     let local = socket
         .local_addr()
         .with_context(|| "get local address failed")?;
 
     let mut buf = vec![0_u8; 1700];
+    let mut ttl_promoted = false;
     loop {
         let (len, from) = socket
             .recv_from(&mut buf)
@@ -1185,6 +1210,17 @@ async fn recv_loop(socket: Arc<UdpSocket>, text: &str, shared: &Arc<Shared>) -> 
             .with_context(|| "recv_from failed")?;
         let packet = &buf[..len];
         if packet == text.as_bytes() {
+            if !ttl_promoted {
+                if let Some(ttl) = promote_hit_ttl {
+                    socket
+                        .set_ttl(ttl)
+                        .with_context(|| format!("set recv-loop promoted ttl [{ttl}] failed"))?;
+                    ttl_promoted = true;
+                    debug!(
+                        "promoted recv socket ttl [{local}] => [{ttl}] after first valid packet from [{from}]"
+                    );
+                }
+            }
             let old = shared.connecteds.lock().insert(from, socket.clone());
             info!("recv text [{local}] <= [{from}], text [{text}]");
             if old.is_none() {
@@ -1396,6 +1432,7 @@ mod tests {
             interval: Duration::ZERO,
             dump_public_addrs: false,
             debug_keep_recv: false,
+            debug_promote_hit_ttl: None,
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("interval"));
@@ -1449,9 +1486,26 @@ mod tests {
             interval: Duration::from_millis(10),
             dump_public_addrs: false,
             debug_keep_recv: false,
+            debug_promote_hit_ttl: None,
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("ttl"));
+    }
+
+    #[test]
+    fn nat4_validate_rejects_debug_promote_hit_ttl_without_debug_keep_recv() {
+        let cfg = Nat4RunConfig {
+            content: None,
+            target: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+            count: 4,
+            ttl: Some(4),
+            interval: Duration::from_millis(10),
+            dump_public_addrs: false,
+            debug_keep_recv: false,
+            debug_promote_hit_ttl: Some(64),
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("debug_keep_recv"), "{err}");
     }
 
     #[test]
@@ -1963,6 +2017,7 @@ mod tests {
                 interval: Duration::from_millis(20),
                 dump_public_addrs: false,
                 debug_keep_recv: false,
+                debug_promote_hit_ttl: None,
             }),
         )
         .await
@@ -2004,6 +2059,49 @@ mod tests {
 
         echo_task.abort();
         let _ = echo_task.await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recv_loop_promotes_socket_ttl_on_first_valid_packet() -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        socket.set_ttl(1)?;
+        let local_addr = socket.local_addr()?;
+        let sender = UdpSocket::bind("127.0.0.1:0").await?;
+        let shared = Arc::new(Shared {
+            connecteds: Default::default(),
+        });
+
+        let recv_task = {
+            let socket = socket.clone();
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                recv_loop(
+                    socket,
+                    DEFAULT_PROBE_TEXT,
+                    &shared,
+                    Some(HARD_NAT_KEEP_RECV_PROMOTED_TTL),
+                )
+                .await
+            })
+        };
+
+        sender.send_to(DEFAULT_PROBE_TEXT.as_bytes(), local_addr).await?;
+
+        tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                if shared.has_connected() && socket.ttl().ok() == Some(HARD_NAT_KEEP_RECV_PROMOTED_TTL)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .with_context(|| "recv loop did not promote ttl in time")?;
+
+        recv_task.abort();
+        let _ = recv_task.await;
         Ok(())
     }
 

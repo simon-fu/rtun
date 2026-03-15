@@ -2809,6 +2809,7 @@ async fn open_udp_relay_tunnel_hard_nat_socket(
                 interval,
                 dump_public_addrs: false,
                 debug_keep_recv: false,
+                debug_promote_hit_ttl: None,
             })
             .await
         }

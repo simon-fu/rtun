@@ -66,6 +66,7 @@ fn build_nat4_run_config(args: Nat4SendCmdArgs) -> Result<Nat4RunConfig> {
         interval: Duration::from_millis(args.interval),
         dump_public_addrs: args.dump_public_addrs,
         debug_keep_recv: args.debug_keep_recv,
+        debug_promote_hit_ttl: args.debug_promote_hit_ttl,
     })
 }
 
@@ -187,6 +188,12 @@ pub struct Nat4SendCmdArgs {
         long_help = "keep all nat4 probe sockets receiving and sending without switching into connected mode"
     )]
     debug_keep_recv: bool,
+
+    #[clap(
+        long = "debug-promote-hit-ttl",
+        long_help = "when debug-keep-recv is enabled, promote the hit socket outgoing ttl to this value after its first valid packet"
+    )]
+    debug_promote_hit_ttl: Option<u32>,
 }
 
 #[cfg(test)]
@@ -271,6 +278,14 @@ mod tests {
     }
 
     #[test]
+    fn nat4_cli_accepts_debug_promote_hit_ttl_flag() {
+        let args =
+            parse_nat4_cmd_args_for_test(&["--debug-keep-recv", "--debug-promote-hit-ttl", "64"]);
+        let dump = format!("{args:?}");
+        assert!(dump.contains("debug_promote_hit_ttl: Some(64)"), "{dump}");
+    }
+
+    #[test]
     fn nat4_cli_builds_debug_keep_recv_config() {
         let args = parse_nat4_cmd_args_for_test(&["--debug-keep-recv"]);
         let cfg = build_nat4_run_config(match args.cmd {
@@ -279,5 +294,17 @@ mod tests {
         })
         .unwrap();
         assert!(cfg.debug_keep_recv);
+    }
+
+    #[test]
+    fn nat4_cli_builds_debug_promote_hit_ttl_config() {
+        let args =
+            parse_nat4_cmd_args_for_test(&["--debug-keep-recv", "--debug-promote-hit-ttl", "64"]);
+        let cfg = build_nat4_run_config(match args.cmd {
+            super::SubCmd::Nat4(args) => args,
+            super::SubCmd::Nat3(_) => unreachable!("expected nat4 subcommand"),
+        })
+        .unwrap();
+        assert_eq!(cfg.debug_promote_hit_ttl, Some(64));
     }
 }
