@@ -22,7 +22,11 @@ use crate::{
         ice_candidate::{parse_candidate, CandidateKind},
         ice_peer::{default_ice_servers, IceArgs},
     },
-    proto::P2PHardNatArgs,
+    proto::{
+        hard_nat_control_envelope, HardNatAbort, HardNatAck, HardNatAdvanceNat3Addr,
+        HardNatAdvanceNat4Ip, HardNatConnected, HardNatControlEnvelope, HardNatLeaseKeepAlive,
+        HardNatNextBatch, HardNatStartBatch, P2PHardNatArgs,
+    },
     stun::{
         async_udp::{tokio_socket_bind, AsyncUdpSocket, TokioUdpSocket},
         stun::{
@@ -1005,6 +1009,436 @@ impl HardNatSessionParams {
             .cloned()
             .map(Into::into)
             .collect();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HardNatBatchCursor {
+    pub batch_id: u64,
+    pub nat3_addr_index: u32,
+    pub nat4_ip_index: u32,
+    pub ports: Vec<u32>,
+}
+
+impl HardNatBatchCursor {
+    fn from_start_batch(msg: &HardNatStartBatch) -> Self {
+        Self {
+            batch_id: msg.batch_id,
+            nat3_addr_index: msg.nat3_addr_index,
+            nat4_ip_index: msg.nat4_ip_index,
+            ports: msg.ports.clone(),
+        }
+    }
+
+    fn from_next_batch(msg: &HardNatNextBatch) -> Self {
+        Self {
+            batch_id: msg.next_batch_id,
+            nat3_addr_index: msg.nat3_addr_index,
+            nat4_ip_index: msg.nat4_ip_index,
+            ports: msg.ports.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardNatSchedulerConfig {
+    pub session_id: u64,
+    pub nat4_ip_count: usize,
+    pub nat3_addr_count: usize,
+    pub lease_timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HardNatSchedulerPhase {
+    Init,
+    ProbingBatch,
+    Connected,
+    Aborted,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum HardNatSchedulerAdvance {
+    Send(HardNatControlEnvelope),
+    NeedNextBatch { next_batch_id: u64 },
+}
+
+#[derive(Debug, Clone)]
+pub struct HardNatScheduler {
+    config: HardNatSchedulerConfig,
+    phase: HardNatSchedulerPhase,
+    cursor: Option<HardNatBatchCursor>,
+    next_seq: u64,
+    last_acked_seq: u64,
+}
+
+impl HardNatScheduler {
+    pub fn new(config: HardNatSchedulerConfig) -> Self {
+        Self {
+            config: HardNatSchedulerConfig {
+                nat4_ip_count: config.nat4_ip_count.max(1),
+                nat3_addr_count: config.nat3_addr_count.max(1),
+                ..config
+            },
+            phase: HardNatSchedulerPhase::Init,
+            cursor: None,
+            next_seq: 1,
+            last_acked_seq: 0,
+        }
+    }
+
+    pub fn phase(&self) -> HardNatSchedulerPhase {
+        self.phase.clone()
+    }
+
+    pub fn start_batch(&mut self, ports: Vec<u32>) -> Result<HardNatControlEnvelope> {
+        self.start_batch_inner(1, ports, false)
+    }
+
+    pub fn start_next_batch(&mut self, ports: Vec<u32>) -> Result<HardNatControlEnvelope> {
+        let next_batch_id = self
+            .cursor
+            .as_ref()
+            .map(|cursor| cursor.batch_id + 1)
+            .unwrap_or(1);
+        self.start_batch_inner(next_batch_id, ports, true)
+    }
+
+    pub fn advance_after_timeout(&mut self) -> Option<HardNatSchedulerAdvance> {
+        if self.phase != HardNatSchedulerPhase::ProbingBatch {
+            return None;
+        }
+        let msg = {
+            let cursor = self.cursor.as_mut()?;
+            if cursor.nat4_ip_index + 1 < self.config.nat4_ip_count as u32 {
+                cursor.nat4_ip_index += 1;
+                Some(hard_nat_control_envelope::Msg::AdvanceNat4Ip(
+                    HardNatAdvanceNat4Ip {
+                        batch_id: cursor.batch_id,
+                        next_nat4_ip_index: cursor.nat4_ip_index,
+                        ..Default::default()
+                    },
+                ))
+            } else if cursor.nat3_addr_index + 1 < self.config.nat3_addr_count as u32 {
+                cursor.nat3_addr_index += 1;
+                cursor.nat4_ip_index = 0;
+                Some(hard_nat_control_envelope::Msg::AdvanceNat3Addr(
+                    HardNatAdvanceNat3Addr {
+                        batch_id: cursor.batch_id,
+                        next_nat3_addr_index: cursor.nat3_addr_index,
+                        ..Default::default()
+                    },
+                ))
+            } else {
+                None
+            }
+        };
+
+        if let Some(msg) = msg {
+            return Some(HardNatSchedulerAdvance::Send(self.next_control(msg)));
+        }
+
+        let cursor = self.cursor.as_ref()?;
+        Some(HardNatSchedulerAdvance::NeedNextBatch {
+            next_batch_id: cursor.batch_id + 1,
+        })
+    }
+
+    pub fn lease_keepalive(&mut self) -> HardNatControlEnvelope {
+        self.next_control(hard_nat_control_envelope::Msg::LeaseKeepAlive(
+            HardNatLeaseKeepAlive {
+                lease_timeout_ms: duration_ms_u32(self.config.lease_timeout),
+                ..Default::default()
+            },
+        ))
+    }
+
+    pub fn connected(
+        &mut self,
+        selected_nat3_addr: String,
+        selected_nat4_ip: String,
+        selected_port: u32,
+        restore_ttl: u32,
+    ) -> Result<HardNatControlEnvelope> {
+        self.phase = HardNatSchedulerPhase::Connected;
+        Ok(self.next_control(hard_nat_control_envelope::Msg::Connected(
+            HardNatConnected {
+                selected_nat3_addr: selected_nat3_addr.into(),
+                selected_nat4_ip: selected_nat4_ip.into(),
+                selected_port,
+                restore_ttl,
+                ..Default::default()
+            },
+        )))
+    }
+
+    pub fn abort(&mut self, reason: impl Into<String>) -> Result<HardNatControlEnvelope> {
+        self.phase = HardNatSchedulerPhase::Aborted;
+        Ok(
+            self.next_control(hard_nat_control_envelope::Msg::Abort(HardNatAbort {
+                reason: reason.into().into(),
+                ..Default::default()
+            })),
+        )
+    }
+
+    pub fn apply_ack(&mut self, env: HardNatControlEnvelope) -> bool {
+        if env.session_id != self.config.session_id {
+            return false;
+        }
+        let Some(hard_nat_control_envelope::Msg::Ack(HardNatAck { acked_seq, .. })) = env.msg
+        else {
+            return false;
+        };
+        let last_sent_seq = self.next_seq.saturating_sub(1);
+        if acked_seq == 0 || acked_seq > last_sent_seq || acked_seq <= self.last_acked_seq {
+            return false;
+        }
+        self.last_acked_seq = acked_seq;
+        true
+    }
+
+    fn start_batch_inner(
+        &mut self,
+        batch_id: u64,
+        ports: Vec<u32>,
+        is_next_batch: bool,
+    ) -> Result<HardNatControlEnvelope> {
+        let cursor = HardNatBatchCursor {
+            batch_id,
+            nat3_addr_index: 0,
+            nat4_ip_index: 0,
+            ports: ports.clone(),
+        };
+        self.cursor = Some(cursor);
+        self.phase = HardNatSchedulerPhase::ProbingBatch;
+        let msg = if is_next_batch {
+            hard_nat_control_envelope::Msg::NextBatch(HardNatNextBatch {
+                next_batch_id: batch_id,
+                nat3_addr_index: 0,
+                nat4_ip_index: 0,
+                ports,
+                ..Default::default()
+            })
+        } else {
+            hard_nat_control_envelope::Msg::StartBatch(HardNatStartBatch {
+                batch_id,
+                nat3_addr_index: 0,
+                nat4_ip_index: 0,
+                ports,
+                ..Default::default()
+            })
+        };
+        Ok(self.next_control(msg))
+    }
+
+    fn next_control(&mut self, msg: hard_nat_control_envelope::Msg) -> HardNatControlEnvelope {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        HardNatControlEnvelope {
+            session_id: self.config.session_id,
+            seq,
+            role_from: hard_nat_role_proto_value(HardNatRole::Nat4),
+            msg: Some(msg),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HardNatExecutorPhase {
+    Idle,
+    Leased,
+    ExecutingBatch(HardNatBatchCursor),
+    WaitingNextCommand(HardNatBatchCursor),
+    Connected,
+    Expired,
+    Aborted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardNatControlApply {
+    Applied,
+    IgnoredSession,
+    IgnoredSeq,
+    IgnoredTerminal,
+    IgnoredMessage,
+}
+
+#[derive(Debug, Clone)]
+pub struct HardNatExecutor {
+    session_id: u64,
+    default_lease_timeout: Duration,
+    last_seq: u64,
+    lease_deadline: Option<Instant>,
+    phase: HardNatExecutorPhase,
+}
+
+impl HardNatExecutor {
+    pub fn new(session_id: u64, lease_timeout: Duration) -> Self {
+        Self {
+            session_id,
+            default_lease_timeout: lease_timeout,
+            last_seq: 0,
+            lease_deadline: None,
+            phase: HardNatExecutorPhase::Idle,
+        }
+    }
+
+    pub fn phase(&self) -> HardNatExecutorPhase {
+        self.phase.clone()
+    }
+
+    pub fn lease_deadline(&self) -> Option<Instant> {
+        self.lease_deadline
+    }
+
+    pub fn mark_waiting_for_next_command(&mut self) {
+        if let HardNatExecutorPhase::ExecutingBatch(cursor) = &self.phase {
+            self.phase = HardNatExecutorPhase::WaitingNextCommand(cursor.clone());
+        }
+    }
+
+    pub fn expire_if_needed(&mut self, now: Instant) -> bool {
+        if matches!(
+            self.phase,
+            HardNatExecutorPhase::Connected
+                | HardNatExecutorPhase::Expired
+                | HardNatExecutorPhase::Aborted
+        ) {
+            return false;
+        }
+
+        let Some(deadline) = self.lease_deadline else {
+            return false;
+        };
+        if now < deadline {
+            return false;
+        }
+
+        self.phase = HardNatExecutorPhase::Expired;
+        self.lease_deadline = None;
+        true
+    }
+
+    pub fn apply_control(
+        &mut self,
+        env: HardNatControlEnvelope,
+        now: Instant,
+    ) -> HardNatControlApply {
+        if env.session_id != self.session_id {
+            return HardNatControlApply::IgnoredSession;
+        }
+        if env.seq <= self.last_seq {
+            return HardNatControlApply::IgnoredSeq;
+        }
+        if matches!(
+            self.phase,
+            HardNatExecutorPhase::Connected
+                | HardNatExecutorPhase::Expired
+                | HardNatExecutorPhase::Aborted
+        ) {
+            return HardNatControlApply::IgnoredTerminal;
+        }
+
+        let Some(msg) = env.msg else {
+            return HardNatControlApply::IgnoredMessage;
+        };
+
+        self.last_seq = env.seq;
+        match msg {
+            hard_nat_control_envelope::Msg::StartBatch(msg) => {
+                self.phase = HardNatExecutorPhase::ExecutingBatch(
+                    HardNatBatchCursor::from_start_batch(&msg),
+                );
+                self.refresh_lease_deadline(now, self.default_lease_timeout);
+                HardNatControlApply::Applied
+            }
+            hard_nat_control_envelope::Msg::AdvanceNat4Ip(msg) => {
+                let mut cursor = self.current_cursor().unwrap_or(HardNatBatchCursor {
+                    batch_id: msg.batch_id,
+                    nat3_addr_index: 0,
+                    nat4_ip_index: 0,
+                    ports: Vec::new(),
+                });
+                cursor.batch_id = msg.batch_id;
+                cursor.nat4_ip_index = msg.next_nat4_ip_index;
+                self.phase = HardNatExecutorPhase::ExecutingBatch(cursor);
+                self.refresh_lease_deadline(now, self.default_lease_timeout);
+                HardNatControlApply::Applied
+            }
+            hard_nat_control_envelope::Msg::AdvanceNat3Addr(msg) => {
+                let mut cursor = self.current_cursor().unwrap_or(HardNatBatchCursor {
+                    batch_id: msg.batch_id,
+                    nat3_addr_index: 0,
+                    nat4_ip_index: 0,
+                    ports: Vec::new(),
+                });
+                cursor.batch_id = msg.batch_id;
+                cursor.nat3_addr_index = msg.next_nat3_addr_index;
+                cursor.nat4_ip_index = 0;
+                self.phase = HardNatExecutorPhase::ExecutingBatch(cursor);
+                self.refresh_lease_deadline(now, self.default_lease_timeout);
+                HardNatControlApply::Applied
+            }
+            hard_nat_control_envelope::Msg::NextBatch(msg) => {
+                self.phase =
+                    HardNatExecutorPhase::ExecutingBatch(HardNatBatchCursor::from_next_batch(&msg));
+                self.refresh_lease_deadline(now, self.default_lease_timeout);
+                HardNatControlApply::Applied
+            }
+            hard_nat_control_envelope::Msg::LeaseKeepAlive(msg) => {
+                let lease_timeout =
+                    duration_from_ms_or_default(msg.lease_timeout_ms, self.default_lease_timeout);
+                if self.phase == HardNatExecutorPhase::Idle {
+                    self.phase = HardNatExecutorPhase::Leased;
+                }
+                self.refresh_lease_deadline(now, lease_timeout);
+                HardNatControlApply::Applied
+            }
+            hard_nat_control_envelope::Msg::Connected(_) => {
+                self.phase = HardNatExecutorPhase::Connected;
+                self.lease_deadline = None;
+                HardNatControlApply::Applied
+            }
+            hard_nat_control_envelope::Msg::Abort(_) => {
+                self.phase = HardNatExecutorPhase::Aborted;
+                self.lease_deadline = None;
+                HardNatControlApply::Applied
+            }
+            hard_nat_control_envelope::Msg::Ack(_) => HardNatControlApply::IgnoredMessage,
+        }
+    }
+
+    fn current_cursor(&self) -> Option<HardNatBatchCursor> {
+        match &self.phase {
+            HardNatExecutorPhase::ExecutingBatch(cursor)
+            | HardNatExecutorPhase::WaitingNextCommand(cursor) => Some(cursor.clone()),
+            _ => None,
+        }
+    }
+
+    fn refresh_lease_deadline(&mut self, now: Instant, lease_timeout: Duration) {
+        self.lease_deadline = Some(now + lease_timeout);
+    }
+}
+
+fn duration_ms_u32(duration: Duration) -> u32 {
+    duration.as_millis().min(u32::MAX as u128) as u32
+}
+
+fn duration_from_ms_or_default(value: u32, default: Duration) -> Duration {
+    if value == 0 {
+        default
+    } else {
+        Duration::from_millis(value as u64)
+    }
+}
+
+fn hard_nat_role_proto_value(role: HardNatRole) -> u32 {
+    match role {
+        HardNatRole::Nat3 => 1,
+        HardNatRole::Nat4 => 2,
     }
 }
 
@@ -3224,6 +3658,324 @@ mod tests {
 
         let got = HardNatSessionParams::from_proto(&proto);
         assert_eq!(got, params);
+    }
+
+    fn hard_nat_start_batch_env(
+        session_id: u64,
+        seq: u64,
+        batch_id: u64,
+        nat3_addr_index: u32,
+        nat4_ip_index: u32,
+        ports: &[u32],
+    ) -> crate::proto::HardNatControlEnvelope {
+        crate::proto::HardNatControlEnvelope {
+            session_id,
+            seq,
+            role_from: HardNatRole::Nat4 as u32,
+            msg: Some(crate::proto::hard_nat_control_envelope::Msg::StartBatch(
+                crate::proto::HardNatStartBatch {
+                    batch_id,
+                    nat3_addr_index,
+                    nat4_ip_index,
+                    ports: ports.to_vec(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn hard_nat_keepalive_env(
+        session_id: u64,
+        seq: u64,
+        lease_timeout_ms: u32,
+    ) -> crate::proto::HardNatControlEnvelope {
+        crate::proto::HardNatControlEnvelope {
+            session_id,
+            seq,
+            role_from: HardNatRole::Nat4 as u32,
+            msg: Some(
+                crate::proto::hard_nat_control_envelope::Msg::LeaseKeepAlive(
+                    crate::proto::HardNatLeaseKeepAlive {
+                        lease_timeout_ms,
+                        ..Default::default()
+                    },
+                ),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn hard_nat_connected_env(session_id: u64, seq: u64) -> crate::proto::HardNatControlEnvelope {
+        crate::proto::HardNatControlEnvelope {
+            session_id,
+            seq,
+            role_from: HardNatRole::Nat4 as u32,
+            msg: Some(crate::proto::hard_nat_control_envelope::Msg::Connected(
+                crate::proto::HardNatConnected {
+                    selected_nat3_addr: "203.0.113.10:40001".into(),
+                    selected_nat4_ip: "198.51.100.20".into(),
+                    selected_port: 40001,
+                    restore_ttl: HARD_NAT_DEFAULT_CONNECTED_TTL,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn hard_nat_abort_env(session_id: u64, seq: u64) -> crate::proto::HardNatControlEnvelope {
+        crate::proto::HardNatControlEnvelope {
+            session_id,
+            seq,
+            role_from: HardNatRole::Nat4 as u32,
+            msg: Some(crate::proto::hard_nat_control_envelope::Msg::Abort(
+                crate::proto::HardNatAbort {
+                    reason: "timed out".into(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn hard_nat_ack_env(
+        session_id: u64,
+        seq: u64,
+        acked_seq: u64,
+    ) -> crate::proto::HardNatControlEnvelope {
+        crate::proto::HardNatControlEnvelope {
+            session_id,
+            seq,
+            role_from: HardNatRole::Nat3 as u32,
+            msg: Some(crate::proto::hard_nat_control_envelope::Msg::Ack(
+                crate::proto::HardNatAck {
+                    acked_seq,
+                    state: 1,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hard_nat_scheduler_rotates_nat4_ips_then_nat3_addrs_then_next_batch() {
+        let mut scheduler = HardNatScheduler::new(HardNatSchedulerConfig {
+            session_id: 7,
+            nat4_ip_count: 2,
+            nat3_addr_count: 2,
+            lease_timeout: Duration::from_secs(12),
+        });
+
+        let start = scheduler.start_batch(vec![40001, 40002]).unwrap();
+        match start.msg {
+            Some(crate::proto::hard_nat_control_envelope::Msg::StartBatch(msg)) => {
+                assert_eq!(msg.batch_id, 1);
+                assert_eq!(msg.nat3_addr_index, 0);
+                assert_eq!(msg.nat4_ip_index, 0);
+                assert_eq!(msg.ports, vec![40001, 40002]);
+            }
+            other => panic!("unexpected start batch msg: {other:?}"),
+        }
+        assert_eq!(scheduler.phase(), HardNatSchedulerPhase::ProbingBatch);
+
+        let step1 = scheduler.advance_after_timeout().unwrap();
+        match step1 {
+            HardNatSchedulerAdvance::Send(env) => match env.msg {
+                Some(crate::proto::hard_nat_control_envelope::Msg::AdvanceNat4Ip(msg)) => {
+                    assert_eq!(msg.batch_id, 1);
+                    assert_eq!(msg.next_nat4_ip_index, 1);
+                }
+                other => panic!("unexpected first advance msg: {other:?}"),
+            },
+            other => panic!("unexpected first advance step: {other:?}"),
+        }
+
+        let step2 = scheduler.advance_after_timeout().unwrap();
+        match step2 {
+            HardNatSchedulerAdvance::Send(env) => match env.msg {
+                Some(crate::proto::hard_nat_control_envelope::Msg::AdvanceNat3Addr(msg)) => {
+                    assert_eq!(msg.batch_id, 1);
+                    assert_eq!(msg.next_nat3_addr_index, 1);
+                }
+                other => panic!("unexpected second advance msg: {other:?}"),
+            },
+            other => panic!("unexpected second advance step: {other:?}"),
+        }
+
+        let step3 = scheduler.advance_after_timeout().unwrap();
+        match step3 {
+            HardNatSchedulerAdvance::Send(env) => match env.msg {
+                Some(crate::proto::hard_nat_control_envelope::Msg::AdvanceNat4Ip(msg)) => {
+                    assert_eq!(msg.batch_id, 1);
+                    assert_eq!(msg.next_nat4_ip_index, 1);
+                }
+                other => panic!("unexpected third advance msg: {other:?}"),
+            },
+            other => panic!("unexpected third advance step: {other:?}"),
+        }
+
+        assert_eq!(
+            scheduler.advance_after_timeout().unwrap(),
+            HardNatSchedulerAdvance::NeedNextBatch { next_batch_id: 2 }
+        );
+
+        let next = scheduler.start_next_batch(vec![41001, 41002]).unwrap();
+        match next.msg {
+            Some(crate::proto::hard_nat_control_envelope::Msg::NextBatch(msg)) => {
+                assert_eq!(msg.next_batch_id, 2);
+                assert_eq!(msg.nat3_addr_index, 0);
+                assert_eq!(msg.nat4_ip_index, 0);
+                assert_eq!(msg.ports, vec![41001, 41002]);
+            }
+            other => panic!("unexpected next batch msg: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_nat_executor_refreshes_lease_and_expires_without_keepalive() {
+        let mut executor = HardNatExecutor::new(7, Duration::from_secs(5));
+        let started_at = Instant::now();
+
+        assert_eq!(
+            executor.apply_control(
+                hard_nat_start_batch_env(7, 1, 1, 0, 0, &[40001, 40002]),
+                started_at,
+            ),
+            HardNatControlApply::Applied
+        );
+        assert_eq!(
+            executor.phase(),
+            HardNatExecutorPhase::ExecutingBatch(HardNatBatchCursor {
+                batch_id: 1,
+                nat3_addr_index: 0,
+                nat4_ip_index: 0,
+                ports: vec![40001, 40002],
+            })
+        );
+        assert_eq!(
+            executor.lease_deadline(),
+            Some(started_at + Duration::from_secs(5))
+        );
+
+        executor.mark_waiting_for_next_command();
+        assert_eq!(
+            executor.phase(),
+            HardNatExecutorPhase::WaitingNextCommand(HardNatBatchCursor {
+                batch_id: 1,
+                nat3_addr_index: 0,
+                nat4_ip_index: 0,
+                ports: vec![40001, 40002],
+            })
+        );
+
+        assert_eq!(
+            executor.apply_control(
+                hard_nat_keepalive_env(7, 2, 7_000),
+                started_at + Duration::from_secs(2),
+            ),
+            HardNatControlApply::Applied
+        );
+        assert_eq!(
+            executor.lease_deadline(),
+            Some(started_at + Duration::from_secs(9))
+        );
+        assert!(!executor.expire_if_needed(started_at + Duration::from_secs(8)));
+        assert!(executor.expire_if_needed(started_at + Duration::from_secs(10)));
+        assert_eq!(executor.phase(), HardNatExecutorPhase::Expired);
+    }
+
+    #[test]
+    fn hard_nat_executor_ignores_wrong_session_and_stale_seq_control_packets() {
+        let mut executor = HardNatExecutor::new(7, Duration::from_secs(5));
+        let now = Instant::now();
+
+        assert_eq!(
+            executor.apply_control(hard_nat_start_batch_env(7, 10, 1, 0, 0, &[40001]), now),
+            HardNatControlApply::Applied
+        );
+        assert_eq!(
+            executor.apply_control(
+                hard_nat_start_batch_env(8, 11, 2, 0, 0, &[41001]),
+                now + Duration::from_secs(1),
+            ),
+            HardNatControlApply::IgnoredSession
+        );
+        assert_eq!(
+            executor.apply_control(
+                hard_nat_keepalive_env(7, 10, 9_000),
+                now + Duration::from_secs(1),
+            ),
+            HardNatControlApply::IgnoredSeq
+        );
+        assert_eq!(
+            executor.phase(),
+            HardNatExecutorPhase::ExecutingBatch(HardNatBatchCursor {
+                batch_id: 1,
+                nat3_addr_index: 0,
+                nat4_ip_index: 0,
+                ports: vec![40001],
+            })
+        );
+    }
+
+    #[test]
+    fn hard_nat_scheduler_ack_and_terminal_states_ignore_stale_events() {
+        let mut scheduler = HardNatScheduler::new(HardNatSchedulerConfig {
+            session_id: 7,
+            nat4_ip_count: 2,
+            nat3_addr_count: 1,
+            lease_timeout: Duration::from_secs(12),
+        });
+
+        let start = scheduler.start_batch(vec![40001]).unwrap();
+        assert!(scheduler.apply_ack(hard_nat_ack_env(7, 100, start.seq)));
+        assert!(!scheduler.apply_ack(hard_nat_ack_env(7, 101, start.seq)));
+        assert!(!scheduler.apply_ack(hard_nat_ack_env(8, 102, start.seq)));
+
+        let step = scheduler.advance_after_timeout().unwrap();
+        let advance_seq = match step {
+            HardNatSchedulerAdvance::Send(ref env) => env.seq,
+            other => panic!("unexpected advance step: {other:?}"),
+        };
+        assert!(scheduler.apply_ack(hard_nat_ack_env(7, 103, advance_seq)));
+        assert!(!scheduler.apply_ack(hard_nat_ack_env(7, 104, start.seq)));
+
+        let connected = scheduler.connected(
+            "203.0.113.10:40001".into(),
+            "198.51.100.20".into(),
+            40001,
+            HARD_NAT_DEFAULT_CONNECTED_TTL,
+        );
+        assert!(connected.is_ok());
+        assert_eq!(scheduler.phase(), HardNatSchedulerPhase::Connected);
+        assert_eq!(scheduler.advance_after_timeout(), None);
+
+        let mut executor = HardNatExecutor::new(7, Duration::from_secs(5));
+        let now = Instant::now();
+        assert_eq!(
+            executor.apply_control(hard_nat_start_batch_env(7, 1, 1, 0, 0, &[40001]), now),
+            HardNatControlApply::Applied
+        );
+        assert_eq!(
+            executor.apply_control(hard_nat_connected_env(7, 2), now + Duration::from_secs(1)),
+            HardNatControlApply::Applied
+        );
+        assert_eq!(executor.phase(), HardNatExecutorPhase::Connected);
+        assert!(!executor.expire_if_needed(now + Duration::from_secs(30)));
+
+        let mut aborted = HardNatExecutor::new(7, Duration::from_secs(5));
+        assert_eq!(
+            aborted.apply_control(hard_nat_start_batch_env(7, 1, 1, 0, 0, &[40001]), now),
+            HardNatControlApply::Applied
+        );
+        assert_eq!(
+            aborted.apply_control(hard_nat_abort_env(7, 2), now + Duration::from_secs(1)),
+            HardNatControlApply::Applied
+        );
+        assert_eq!(aborted.phase(), HardNatExecutorPhase::Aborted);
+        assert!(!aborted.expire_if_needed(now + Duration::from_secs(30)));
     }
 
     #[test]
