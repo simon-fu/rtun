@@ -298,7 +298,13 @@ impl AsyncHandler<OpOpenP2P> for Entity {
                     .as_ref()
                     .and_then(|weak| weak.upgrade())
                     .with_context(|| "agent ctrl invoker unavailable for udp relay")?;
-                return handle_udp_relay(ctrl, self.udp_relay_flows.clone(), args).await;
+                return handle_udp_relay(
+                    ctrl,
+                    self.udp_relay_flows.clone(),
+                    self.hard_nat_tx.clone(),
+                    args,
+                )
+                .await;
             }
             P2p_args::QuicThrput(args) => return handle_quic_throughput(args).await,
             P2p_args::WebrtcThrput(args) => return handle_webrtc_throughput(args).await,
@@ -744,6 +750,7 @@ struct SharedRelayFlow {
 async fn handle_udp_relay(
     ctrl: AgentCtrlInvoker,
     shared_flows: SharedRelayFlows,
+    hard_nat_tx: broadcast::Sender<HardNatControlEnvelope>,
     mut remote_args: UdpRelayArgs,
 ) -> Result<OpenP2PResponse> {
     let hard_nat_cfg = UdpRelayHardNatConfig::from_proto(&remote_args.hard_nat);
@@ -828,11 +835,7 @@ async fn handle_udp_relay(
         .unwrap_or_default()
         .with_batch_port_count(hard_nat_cfg.scan_count);
     runtime_hard_nat_session.apply_defaults_if_missing();
-    let hard_nat_rx = if hard_nat_cfg.mode == HardNatMode::Off {
-        None
-    } else {
-        Some(ctrl.subscribe_hard_nat_control().await?)
-    };
+    let hard_nat_rx = build_udp_relay_hard_nat_control_rx(hard_nat_cfg.mode, &hard_nat_tx);
     let local_hard_nat_target_addr = local_prepared_nat3
         .as_ref()
         .map(|prepared| prepared.nat4_target.to_string())
@@ -928,6 +931,17 @@ async fn handle_udp_relay(
     };
 
     Ok(rsp)
+}
+
+fn build_udp_relay_hard_nat_control_rx(
+    mode: HardNatMode,
+    hard_nat_tx: &broadcast::Sender<HardNatControlEnvelope>,
+) -> Option<broadcast::Receiver<HardNatControlEnvelope>> {
+    if mode == HardNatMode::Off {
+        None
+    } else {
+        Some(hard_nat_tx.subscribe())
+    }
 }
 
 fn resolve_udp_relay_max_payload(input: u32, codec: UdpRelayCodec) -> Result<usize> {
@@ -2424,6 +2438,35 @@ mod tests {
 
         agent.shutdown().await;
         agent.wait_for_completed().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn udp_relay_hard_nat_control_rx_comes_directly_from_sender() -> Result<()> {
+        let (tx, _) = broadcast::channel(4);
+        assert!(build_udp_relay_hard_nat_control_rx(HardNatMode::Off, &tx).is_none());
+
+        let mut rx = build_udp_relay_hard_nat_control_rx(HardNatMode::Force, &tx)
+            .expect("force mode should subscribe");
+        let env = HardNatControlEnvelope {
+            session_id: 77,
+            seq: 5,
+            role_from: 2,
+            msg: Some(crate::proto::hard_nat_control_envelope::Msg::LeaseKeepAlive(
+                crate::proto::HardNatLeaseKeepAlive {
+                    lease_timeout_ms: 2500,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        tx.send(env.clone())?;
+        let got = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, env);
         Ok(())
     }
 }
