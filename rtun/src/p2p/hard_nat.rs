@@ -1410,9 +1410,8 @@ pub async fn run_nat3(args: Nat3RunConfig) -> Result<()> {
     }
 
     let interval = args.interval;
-    let text = resolve_probe_text(args.content.as_deref());
-    let conn = run_nat3_once(args).await?;
-    send_conn_loop(conn.socket, conn.remote_addr, &text, interval).await
+    let (conn, recv_tasks, text) = probe_nat3_until_connected(args, None).await?;
+    send_conn_loop_keep_recv(conn.socket, conn.remote_addr, &text, interval, recv_tasks).await
 }
 
 pub async fn run_nat3_once(args: Nat3RunConfig) -> Result<HardNatConnectedSocket> {
@@ -1430,6 +1429,15 @@ async fn run_nat3_once_with_socket(
     args: Nat3RunConfig,
     prebound_socket: Option<UdpSocket>,
 ) -> Result<HardNatConnectedSocket> {
+    let (first, recv_tasks, _text) = probe_nat3_until_connected(args, prebound_socket).await?;
+    recv_tasks.abort_and_wait().await;
+    Ok(first)
+}
+
+async fn probe_nat3_until_connected(
+    args: Nat3RunConfig,
+    prebound_socket: Option<UdpSocket>,
+) -> Result<(HardNatConnectedSocket, RecvTaskGuard, String)> {
     args.validate()?;
     if args.hold_batch_until_enter {
         bail!("hold_batch_until_enter is only supported by run_nat3");
@@ -1453,7 +1461,8 @@ async fn run_nat3_once_with_socket(
         .local_addr()
         .with_context(|| "get local address failed")?;
 
-    let text = Arc::new(resolve_probe_text(args.content.as_deref()));
+    let text = resolve_probe_text(args.content.as_deref());
+    let expected_text = Arc::new(text.clone());
 
     let shared = Arc::new(Shared {
         connecteds: Default::default(),
@@ -1464,7 +1473,7 @@ async fn run_nat3_once_with_socket(
         let shared = shared.clone();
         let opts = RecvLoopOptions {
             role: HardNatRole::Nat3,
-            expected_text: text.clone(),
+            expected_text: expected_text.clone(),
             promote_hit_ttl: None,
             debug_converge_lease: args.debug_converge_lease,
             manual_converge_socket: None,
@@ -1488,7 +1497,8 @@ async fn run_nat3_once_with_socket(
             build_nat3_target_batch(args.count, target_ip, &mut try_ports, max_ports, &mut num);
 
         while start_time.elapsed() < batch_interval {
-            has_recv = send_nat3_batch_once(&socket, &text, &targets, &shared, num, true).await?;
+            has_recv =
+                send_nat3_batch_once(&socket, &expected_text, &targets, &shared, num, true).await?;
 
             if has_recv {
                 break;
@@ -1502,8 +1512,7 @@ async fn run_nat3_once_with_socket(
     let first = shared
         .first_connected_conn(HardNatRole::Nat3, start_at)
         .with_context(|| "missing connected target")?;
-    recv_tasks.abort_and_wait().await;
-    Ok(first)
+    Ok((first, recv_tasks, text))
 }
 
 async fn run_nat3_hold_batch_until_enter(args: Nat3RunConfig) -> Result<()> {
@@ -2252,6 +2261,16 @@ async fn send_conn_loop(
 
         tokio::time::sleep(interval).await;
     }
+}
+
+async fn send_conn_loop_keep_recv(
+    socket: Arc<UdpSocket>,
+    target: SocketAddr,
+    text: &str,
+    interval: Duration,
+    _recv_tasks: RecvTaskGuard,
+) -> Result<()> {
+    send_conn_loop(socket, target, text, interval).await
 }
 
 #[cfg(test)]
@@ -3533,6 +3552,80 @@ mod tests {
 
         recv_task.abort();
         let _ = recv_task.await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_conn_loop_keep_recv_preserves_nat3_token_echo_path() -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let local_addr = socket.local_addr()?;
+        let peer = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer_addr = peer.local_addr()?;
+        let shared = Arc::new(Shared {
+            connecteds: Default::default(),
+        });
+
+        let recv_task = {
+            let socket = socket.clone();
+            let shared = shared.clone();
+            let opts = RecvLoopOptions {
+                role: HardNatRole::Nat3,
+                expected_text: Arc::new(DEFAULT_PROBE_TEXT.to_string()),
+                promote_hit_ttl: None,
+                debug_converge_lease: true,
+                manual_converge_socket: None,
+            };
+            tokio::spawn(async move {
+                let _ = recv_loop(socket, &shared, opts).await;
+            })
+        };
+
+        let send_task = {
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                send_conn_loop_keep_recv(
+                    socket,
+                    peer_addr,
+                    DEFAULT_PROBE_TEXT,
+                    Duration::from_millis(20),
+                    RecvTaskGuard::new(vec![recv_task]),
+                )
+                .await
+            })
+        };
+
+        let mut buf = [0_u8; 256];
+        let (len, from) =
+            tokio::time::timeout(Duration::from_millis(300), peer.recv_from(&mut buf))
+                .await
+                .with_context(|| "timed out waiting for initial connected send")??;
+        assert_eq!(from, local_addr);
+        assert_eq!(&buf[..len], DEFAULT_PROBE_TEXT.as_bytes());
+
+        let token = ProbeToken {
+            role: HardNatRole::Nat4,
+            socket_id: 0x11,
+            generation: 0x22,
+            seq: 0x33,
+        };
+        let payload = encode_probe_token(token);
+        peer.send_to(payload.as_bytes(), local_addr).await?;
+
+        let echoed = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                let (len, from) = peer.recv_from(&mut buf).await?;
+                if &buf[..len] == payload.as_bytes() {
+                    return Ok::<_, anyhow::Error>((len, from));
+                }
+            }
+        })
+        .await
+        .with_context(|| "timed out waiting for nat3 token echo during connected send loop")??;
+
+        assert_eq!(echoed.1, local_addr);
+
+        send_task.abort();
+        let _ = send_task.await;
         Ok(())
     }
 
