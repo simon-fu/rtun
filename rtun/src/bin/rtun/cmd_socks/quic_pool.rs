@@ -15,6 +15,7 @@ use rtun::{
         ice_peer::{default_ice_servers, IceArgs, IceConfig, IcePeer},
         ice_quic::{QuicConn, QuicIceCert, UpgradeToQuic},
     },
+    p2p::hard_nat::HardNatSessionParams,
     proto::{
         open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, P2PArgs, P2PHardNatArgs, P2PQuicArgs,
         QuicSocksArgs, QuicStats,
@@ -138,7 +139,7 @@ fn build_quic_socks_hard_nat_args(
         return ::protobuf::MessageField::none();
     }
 
-    ::protobuf::MessageField::some(P2PHardNatArgs {
+    let mut args = P2PHardNatArgs {
         mode: cfg.mode.to_proto_u32(),
         role: cfg.role.to_proto_u32(),
         socket_count: cfg.socket_count,
@@ -148,7 +149,39 @@ fn build_quic_socks_hard_nat_args(
         ttl: cfg.ttl.unwrap_or_default(),
         no_ttl: cfg.no_ttl,
         ..Default::default()
-    })
+    };
+    HardNatSessionParams::placeholder_defaults()
+        .with_batch_port_count(cfg.scan_count)
+        .write_to_proto(&mut args);
+    ::protobuf::MessageField::some(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quic_socks_hard_nat_proto_sets_static_session_defaults() {
+        let proto = build_quic_socks_hard_nat_args(QuicSocksHardNatConfig {
+            mode: SocksHardNatModeCli::Force,
+            role: SocksHardNatRoleCli::Nat4,
+            scan_count: 33,
+            ..Default::default()
+        });
+        let proto = proto.as_ref().unwrap();
+
+        assert_eq!(
+            proto.proto_version,
+            rtun::p2p::hard_nat::HARD_NAT_PROTO_VERSION
+        );
+        assert_eq!(proto.batch_port_count, 33);
+        assert_eq!(
+            proto.connected_ttl,
+            rtun::p2p::hard_nat::HARD_NAT_DEFAULT_CONNECTED_TTL
+        );
+        assert!(proto.nat4_candidate_ips.is_empty());
+        assert!(proto.nat3_public_addrs.is_empty());
+    }
 }
 
 // pub struct AgentPool<H: CtrlHandler> {

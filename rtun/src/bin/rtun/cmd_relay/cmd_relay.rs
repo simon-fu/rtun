@@ -27,8 +27,9 @@ use rtun::{
     p2p::hard_nat::{
         derive_target_plan_from_ice_with_explicit_nat4_target, prepare_nat3_public_target,
         race_assist, resolve_role_plan, run_nat3_once, run_nat3_once_with_prebound_socket,
-        run_nat4_once, HardNatConnectedSocket, HardNatRole, HardNatRoleHint, Nat3RunConfig,
-        Nat4RunConfig, PreparedNat3Socket, HARD_NAT_MAX_ASSIST_DELAY_MS,
+        run_nat4_once, HardNatConnectedSocket, HardNatRole, HardNatRoleHint,
+        HardNatSessionParams, Nat3RunConfig, Nat4RunConfig, PreparedNat3Socket,
+        HARD_NAT_MAX_ASSIST_DELAY_MS,
         HARD_NAT_MAX_BATCH_INTERVAL_MS, HARD_NAT_MAX_INTERVAL_MS, HARD_NAT_MAX_SCAN_COUNT,
         HARD_NAT_MAX_SOCKET_COUNT, HARD_NAT_MAX_TTL,
     },
@@ -2592,7 +2593,7 @@ fn build_udp_relay_hard_nat_args(
         return protobuf::MessageField::none();
     }
 
-    protobuf::MessageField::some(P2PHardNatArgs {
+    let mut args = P2PHardNatArgs {
         mode: cfg.mode.to_proto_u32(),
         role: cfg.role.to_proto_u32(),
         socket_count: cfg.socket_count,
@@ -2603,7 +2604,11 @@ fn build_udp_relay_hard_nat_args(
         ttl: cfg.ttl.unwrap_or_default(),
         no_ttl: cfg.no_ttl,
         ..Default::default()
-    })
+    };
+    HardNatSessionParams::placeholder_defaults()
+        .with_batch_port_count(cfg.scan_count)
+        .write_to_proto(&mut args);
+    protobuf::MessageField::some(args)
 }
 
 fn parse_udp_relay_hard_nat_target_addr(args: &UdpRelayArgs) -> Result<Option<SocketAddr>> {
@@ -5207,7 +5212,8 @@ mod tests {
     use clap::Parser;
     use regex::Regex;
     use rtun::p2p::hard_nat::{
-        HARD_NAT_MAX_SCAN_COUNT, HARD_NAT_MAX_SOCKET_COUNT, HARD_NAT_MAX_TTL,
+        HARD_NAT_DEFAULT_CONNECTED_TTL, HARD_NAT_MAX_SCAN_COUNT, HARD_NAT_MAX_SOCKET_COUNT,
+        HARD_NAT_MAX_TTL, HARD_NAT_PROTO_VERSION,
     };
     use rtun::proto::UdpRelayArgs;
     use std::time::{Duration, Instant};
@@ -5288,6 +5294,25 @@ mod tests {
         assert_eq!(proto.assist_delay_ms, 222);
         assert_eq!(proto.ttl, 7);
         assert!(proto.no_ttl);
+    }
+
+    #[test]
+    fn relay_hard_nat_proto_sets_static_session_defaults() {
+        let args = parse_cmd_args_for_test(&[
+            "--p2p-hardnat",
+            "force",
+            "--p2p-hardnat-scan-count",
+            "256",
+        ]);
+        let cfg = resolve_relay_udp_hard_nat_config(&args).unwrap();
+        let proto = build_udp_relay_hard_nat_args(cfg);
+        let proto = proto.as_ref().unwrap();
+
+        assert_eq!(proto.proto_version, HARD_NAT_PROTO_VERSION);
+        assert_eq!(proto.batch_port_count, 256);
+        assert_eq!(proto.connected_ttl, HARD_NAT_DEFAULT_CONNECTED_TTL);
+        assert!(proto.nat4_candidate_ips.is_empty());
+        assert!(proto.nat3_public_addrs.is_empty());
     }
 
     #[test]

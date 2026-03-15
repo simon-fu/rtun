@@ -39,6 +39,8 @@ pub const HARD_NAT_MAX_INTERVAL_MS: u32 = 60_000;
 pub const HARD_NAT_MAX_BATCH_INTERVAL_MS: u32 = 300_000;
 pub const HARD_NAT_MAX_ASSIST_DELAY_MS: u32 = 10_000;
 pub const HARD_NAT_MAX_TTL: u32 = 255;
+pub const HARD_NAT_PROTO_VERSION: u32 = 1;
+pub const HARD_NAT_DEFAULT_CONNECTED_TTL: u32 = 64;
 #[cfg(test)]
 const HARD_NAT_KEEP_RECV_PROMOTED_TTL: u32 = 64;
 pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_WARM_DRAIN_MS: u64 = 300;
@@ -920,6 +922,92 @@ pub struct HardNatTargetPlan {
     pub usable_udp_candidates: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HardNatSessionParams {
+    pub proto_version: u32,
+    pub session_id: u64,
+    pub lease_timeout_ms: u32,
+    pub keepalive_interval_ms: u32,
+    pub batch_port_count: u32,
+    pub ip_try_timeout_ms: u32,
+    pub batch_timeout_ms: u32,
+    pub connected_ttl: u32,
+    pub nat4_candidate_ips: Vec<String>,
+    pub nat3_public_addrs: Vec<String>,
+}
+
+impl HardNatSessionParams {
+    pub fn placeholder_defaults() -> Self {
+        Self {
+            proto_version: HARD_NAT_PROTO_VERSION,
+            connected_ttl: HARD_NAT_DEFAULT_CONNECTED_TTL,
+            ..Default::default()
+        }
+    }
+
+    pub fn from_proto(args: &P2PHardNatArgs) -> Self {
+        Self {
+            proto_version: args.proto_version,
+            session_id: args.session_id,
+            lease_timeout_ms: args.lease_timeout_ms,
+            keepalive_interval_ms: args.keepalive_interval_ms,
+            batch_port_count: args.batch_port_count,
+            ip_try_timeout_ms: args.ip_try_timeout_ms,
+            batch_timeout_ms: args.batch_timeout_ms,
+            connected_ttl: args.connected_ttl,
+            nat4_candidate_ips: args
+                .nat4_candidate_ips
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            nat3_public_addrs: args
+                .nat3_public_addrs
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        }
+    }
+
+    pub fn apply_defaults_if_missing(&mut self) {
+        if self.proto_version == 0 {
+            self.proto_version = HARD_NAT_PROTO_VERSION;
+        }
+        if self.connected_ttl == 0 {
+            self.connected_ttl = HARD_NAT_DEFAULT_CONNECTED_TTL;
+        }
+    }
+
+    pub fn with_batch_port_count(mut self, batch_port_count: u32) -> Self {
+        if self.batch_port_count == 0 {
+            self.batch_port_count = batch_port_count;
+        }
+        self
+    }
+
+    pub fn write_to_proto(&self, args: &mut P2PHardNatArgs) {
+        args.proto_version = self.proto_version;
+        args.session_id = self.session_id;
+        args.lease_timeout_ms = self.lease_timeout_ms;
+        args.keepalive_interval_ms = self.keepalive_interval_ms;
+        args.batch_port_count = self.batch_port_count;
+        args.ip_try_timeout_ms = self.ip_try_timeout_ms;
+        args.batch_timeout_ms = self.batch_timeout_ms;
+        args.connected_ttl = self.connected_ttl;
+        args.nat4_candidate_ips = self
+            .nat4_candidate_ips
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect();
+        args.nat3_public_addrs = self
+            .nat3_public_addrs
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect();
+    }
+}
+
 pub fn derive_target_plan_from_ice(remote: &IceArgs) -> HardNatTargetPlan {
     let mut parsed_candidates = 0usize;
     let mut usable = Vec::new();
@@ -956,6 +1044,32 @@ pub fn derive_target_plan_from_ice_with_explicit_nat4_target(
         plan.nat4_target = Some(target);
     }
     plan
+}
+
+pub fn collect_udp_candidate_ips_from_ice(remote: &IceArgs) -> Vec<String> {
+    let mut usable = Vec::new();
+
+    for candidate in &remote.candidates {
+        let Ok(candidate) = parse_candidate(candidate) else {
+            continue;
+        };
+        if !candidate.proto().eq_ignore_ascii_case("udp") {
+            continue;
+        }
+        usable.push(candidate);
+    }
+
+    usable.sort_by_key(|candidate| candidate_priority_key(candidate.kind(), candidate.addr()));
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for candidate in usable {
+        let ip = candidate.addr().ip().to_string();
+        if seen.insert(ip.clone()) {
+            out.push(ip);
+        }
+    }
+    out
 }
 
 fn candidate_priority_key(kind: CandidateKind, addr: SocketAddr) -> (u8, u8) {
@@ -3089,6 +3203,47 @@ mod tests {
         assert_eq!(plan.usable_udp_candidates, 1);
         assert_eq!(plan.nat3_target_ip, Some(explicit_target.ip()));
         assert_eq!(plan.nat4_target, Some(explicit_target));
+    }
+
+    #[test]
+    fn hard_nat_session_params_roundtrip_proto_fields() {
+        let params = HardNatSessionParams {
+            proto_version: HARD_NAT_PROTO_VERSION,
+            session_id: 0x1234_5678_9abc_def0,
+            lease_timeout_ms: 15_000,
+            keepalive_interval_ms: 3_000,
+            batch_port_count: 96,
+            ip_try_timeout_ms: 1_200,
+            batch_timeout_ms: 8_000,
+            connected_ttl: 64,
+            nat4_candidate_ips: vec!["198.51.100.10".into(), "2001:db8::10".into()],
+            nat3_public_addrs: vec!["203.0.113.10:40000".into(), "[2001:db8::20]:40001".into()],
+        };
+        let mut proto = P2PHardNatArgs::default();
+        params.write_to_proto(&mut proto);
+
+        let got = HardNatSessionParams::from_proto(&proto);
+        assert_eq!(got, params);
+    }
+
+    #[test]
+    fn collect_udp_candidate_ips_from_ice_dedup_and_prefers_public_srflx() {
+        let args = IceArgs {
+            ufrag: "u".into(),
+            pwd: "p".into(),
+            candidates: vec![
+                "candidate:1 1 udp 2130706175 192.168.1.10 50000 typ host".into(),
+                "candidate:2 1 udp 1694498559 198.51.100.10 50001 typ srflx raddr 0.0.0.0 rport 9"
+                    .into(),
+                "candidate:3 1 udp 1694498558 198.51.100.10 50002 typ srflx raddr 0.0.0.0 rport 9"
+                    .into(),
+                "candidate:4 1 tcp 1694498557 203.0.113.20 50003 typ host".into(),
+                "candidate:5 1 udp 2130706175 203.0.113.30 50004 typ host".into(),
+            ],
+        };
+
+        let got = collect_udp_candidate_ips_from_ice(&args);
+        assert_eq!(got, vec!["198.51.100.10", "203.0.113.30", "192.168.1.10"]);
     }
 
     #[test]

@@ -145,6 +145,16 @@ message P2PHardNatArgs {
     uint32 ttl                          = 7;
     bool no_ttl                         = 8;
     uint32 assist_delay_ms              = 9;
+    uint32 proto_version                = 10;
+    uint64 session_id                   = 11;
+    uint32 lease_timeout_ms             = 12;
+    uint32 keepalive_interval_ms        = 13;
+    uint32 batch_port_count             = 14;
+    uint32 ip_try_timeout_ms            = 15;
+    uint32 batch_timeout_ms             = 16;
+    uint32 connected_ttl                = 17;
+    repeated string nat4_candidate_ips  = 18;
+    repeated string nat3_public_addrs   = 19;
 }
 
 message QuicSocksArgs {

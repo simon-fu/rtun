@@ -30,12 +30,13 @@ use crate::{
         webrtc_ice_peer::{DtlsIceArgs, WebrtcIceConfig, WebrtcIcePeer},
     },
     p2p::hard_nat::{
+        collect_udp_candidate_ips_from_ice,
         derive_target_plan_from_ice_with_explicit_nat4_target, prepare_nat3_public_target,
         race_assist, resolve_role_plan, run_nat3_once, run_nat3_once_with_prebound_socket,
         run_nat4_once, HardNatConnectedSocket, HardNatMode, HardNatRole, HardNatRoleHint,
-        Nat3RunConfig, Nat4RunConfig, PreparedNat3Socket, HARD_NAT_MAX_ASSIST_DELAY_MS,
-        HARD_NAT_MAX_BATCH_INTERVAL_MS, HARD_NAT_MAX_INTERVAL_MS, HARD_NAT_MAX_SCAN_COUNT,
-        HARD_NAT_MAX_SOCKET_COUNT, HARD_NAT_MAX_TTL,
+        HardNatSessionParams, Nat3RunConfig, Nat4RunConfig, PreparedNat3Socket,
+        HARD_NAT_MAX_ASSIST_DELAY_MS, HARD_NAT_MAX_BATCH_INTERVAL_MS, HARD_NAT_MAX_INTERVAL_MS,
+        HARD_NAT_MAX_SCAN_COUNT, HARD_NAT_MAX_SOCKET_COUNT, HARD_NAT_MAX_TTL,
     },
     proto::{
         open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, ExecAgentScriptArgs,
@@ -325,6 +326,28 @@ impl AsyncHandler<DisableShell> for Entity {
     }
 }
 
+fn build_local_hard_nat_response_args(
+    remote_hard_nat: &MessageField<P2PHardNatArgs>,
+    local_ice: &IceArgs,
+    local_nat3_public_addr: Option<SocketAddr>,
+) -> MessageField<P2PHardNatArgs> {
+    let Some(remote_hard_nat) = remote_hard_nat.as_ref() else {
+        return MessageField::none();
+    };
+
+    let mut local_hard_nat = remote_hard_nat.clone();
+    let mut session = HardNatSessionParams::from_proto(remote_hard_nat);
+    session.apply_defaults_if_missing();
+    session = session.with_batch_port_count(remote_hard_nat.scan_count);
+    session.nat4_candidate_ips = collect_udp_candidate_ips_from_ice(local_ice);
+    session.nat3_public_addrs = local_nat3_public_addr
+        .into_iter()
+        .map(|addr| addr.to_string())
+        .collect();
+    session.write_to_proto(&mut local_hard_nat);
+    MessageField::some(local_hard_nat)
+}
+
 async fn handle_quic_socks(
     socks_server: super::ch_socks::Server,
     mut remote_args: P2PQuicArgs,
@@ -352,6 +375,7 @@ async fn handle_quic_socks(
     let uid = peer.uid();
     let local_ice = peer.server_gather(remote_ice.clone()).await?;
     tracing::debug!("starting quic tunnel {uid}, local {local_ice:?}, remote {remote_ice:?}");
+    let local_hard_nat = build_local_hard_nat_response_args(&remote_args.hard_nat, &local_ice, None);
 
     let local_cert = QuicIceCert::try_new()?;
     let local_cert_der = local_cert.to_bytes()?.into();
@@ -372,6 +396,7 @@ async fn handle_quic_socks(
                 base: MessageField::some(P2PQuicArgs {
                     ice: Some(local_ice.into()).into(),
                     cert_der: local_cert_der,
+                    hard_nat: local_hard_nat,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -742,6 +767,11 @@ async fn handle_udp_relay(
         .as_ref()
         .map(|prepared| prepared.nat4_target.to_string())
         .unwrap_or_default();
+    let local_hard_nat = build_local_hard_nat_response_args(
+        &remote_args.hard_nat,
+        &local_ice,
+        local_prepared_nat3.as_ref().map(|prepared| prepared.nat4_target),
+    );
     tracing::warn!(
         "[relay_agent_diag] starting udp relay tunnel {uid}, local {local_ice:?}, remote {remote_ice:?}, target [{target_addr}], idle {:?}, max_payload {}, codec {}",
         idle_timeout,
@@ -810,6 +840,7 @@ async fn handle_udp_relay(
                 idle_timeout_secs: idle_timeout.as_secs().min(u32::MAX as u64) as u32,
                 max_payload: max_payload as u32,
                 obfs_seed: codec.obfs_seed,
+                hard_nat: local_hard_nat,
                 hard_nat_target_addr: local_hard_nat_target_addr.into(),
                 ..Default::default()
             })),
@@ -2038,6 +2069,60 @@ mod tests {
         assert_eq!(cfg.batch_interval_ms, HARD_NAT_MAX_BATCH_INTERVAL_MS);
         assert_eq!(cfg.assist_delay_ms, HARD_NAT_MAX_ASSIST_DELAY_MS);
         assert_eq!(cfg.ttl, Some(HARD_NAT_MAX_TTL));
+    }
+
+    #[test]
+    fn build_local_hard_nat_response_args_adds_local_candidates_and_session_defaults() {
+        let remote_hard_nat = MessageField::some(P2PHardNatArgs {
+            mode: 3,
+            role: 1,
+            scan_count: 128,
+            session_id: 0x99,
+            ..Default::default()
+        });
+        let local_ice = IceArgs {
+            ufrag: "u".into(),
+            pwd: "p".into(),
+            candidates: vec![
+                "candidate:1 1 udp 1694498559 198.51.100.10 40001 typ srflx raddr 0.0.0.0 rport 9"
+                    .into(),
+                "candidate:2 1 udp 2130706175 192.168.1.10 40002 typ host".into(),
+            ],
+        };
+
+        let proto = build_local_hard_nat_response_args(
+            &remote_hard_nat,
+            &local_ice,
+            Some("203.0.113.10:54321".parse().unwrap()),
+        );
+        let proto = proto.as_ref().expect("response hard nat");
+
+        assert_eq!(
+            proto.proto_version,
+            crate::p2p::hard_nat::HARD_NAT_PROTO_VERSION
+        );
+        assert_eq!(proto.session_id, 0x99);
+        assert_eq!(proto.batch_port_count, 128);
+        assert_eq!(
+            proto.connected_ttl,
+            crate::p2p::hard_nat::HARD_NAT_DEFAULT_CONNECTED_TTL
+        );
+        assert_eq!(
+            proto
+                .nat4_candidate_ips
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+            vec!["198.51.100.10", "192.168.1.10"]
+        );
+        assert_eq!(
+            proto
+                .nat3_public_addrs
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+            vec!["203.0.113.10:54321"]
+        );
     }
 
     #[test]
