@@ -40,8 +40,9 @@ use crate::{
     },
     proto::{
         open_p2presponse::Open_p2p_rsp, p2pargs::P2p_args, ExecAgentScriptArgs,
-        ExecAgentScriptResult, OpenP2PResponse, P2PArgs, P2PDtlsArgs, P2PHardNatArgs, P2PQuicArgs,
-        QuicSocksArgs, QuicThroughputArgs, UdpRelayArgs, WebrtcThroughputArgs,
+        ExecAgentScriptResult, HardNatControlEnvelope, OpenP2PResponse, P2PArgs, P2PDtlsArgs,
+        P2PHardNatArgs, P2PQuicArgs, QuicSocksArgs, QuicThroughputArgs, UdpRelayArgs,
+        WebrtcThroughputArgs,
     },
     switch::{
         agent::ch_socks::ChSocks,
@@ -49,7 +50,9 @@ use crate::{
         invoker_ctrl::{
             CtrlWeak, OpExecAgentScript, OpExecAgentScriptResult, OpKickDown, OpKickDownResult,
             OpOpenP2P, OpOpenP2PResult, OpOpenShell, OpOpenShellResult, OpOpenSocks,
-            OpOpenSocksResult,
+            OpOpenSocksResult, OpRecvHardNatControl, OpRecvHardNatControlResult,
+            OpSendHardNatControl, OpSendHardNatControlResult, OpSubscribeHardNatControl,
+            OpSubscribeHardNatControlResult,
         },
         next_ch_id::NextChId,
         udp_relay_codec::{
@@ -62,7 +65,7 @@ use tokio::{
     io::AsyncReadExt,
     net::UdpSocket,
     process::Command,
-    sync::{mpsc, oneshot, Mutex as AsyncMutex},
+    sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex},
     time::timeout,
 };
 
@@ -97,6 +100,14 @@ impl AgentCtrl {
         let r = self.handle.invoker().invoke(DisableShell(v)).await??;
         Ok(r)
     }
+
+    pub async fn set_hard_nat_outbound(
+        &self,
+        tx: mpsc::Sender<HardNatControlEnvelope>,
+    ) -> Result<()> {
+        self.handle.invoker().invoke(SetHardNatOutbound(tx)).await?;
+        Ok(())
+    }
 }
 
 pub async fn make_agent_ctrl(uid: HUId) -> Result<AgentCtrl> {
@@ -108,6 +119,8 @@ pub async fn make_agent_ctrl(uid: HUId) -> Result<AgentCtrl> {
         udp_relay_flows: Arc::new(AsyncMutex::new(HashMap::new())),
         weak: None,
         guard: CtrlGuard::new(),
+        hard_nat_tx: broadcast::channel(16).0,
+        hard_nat_outbound_tx: None,
         disable_shell: false,
     };
 
@@ -322,6 +335,41 @@ impl AsyncHandler<DisableShell> for Entity {
 
     async fn handle(&mut self, req: DisableShell) -> Self::Response {
         self.disable_shell = req.0;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncHandler<OpSendHardNatControl> for Entity {
+    type Response = OpSendHardNatControlResult;
+
+    async fn handle(&mut self, req: OpSendHardNatControl) -> Self::Response {
+        let tx = self
+            .hard_nat_outbound_tx
+            .as_ref()
+            .with_context(|| "hardnat outbound not ready")?;
+        tx.send(req.0)
+            .await
+            .map_err(|_e| anyhow::anyhow!("hardnat outbound closed"))?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncHandler<OpSubscribeHardNatControl> for Entity {
+    type Response = OpSubscribeHardNatControlResult;
+
+    async fn handle(&mut self, _req: OpSubscribeHardNatControl) -> Self::Response {
+        Ok(self.hard_nat_tx.subscribe())
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncHandler<OpRecvHardNatControl> for Entity {
+    type Response = OpRecvHardNatControlResult;
+
+    async fn handle(&mut self, req: OpRecvHardNatControl) -> Self::Response {
+        let _r = self.hard_nat_tx.send(req.0);
         Ok(())
     }
 }
@@ -1916,6 +1964,17 @@ impl AsyncHandler<SetWeak> for Entity {
 
 struct SetWeak(CtrlWeak<Entity>);
 
+#[async_trait::async_trait]
+impl AsyncHandler<SetHardNatOutbound> for Entity {
+    type Response = ();
+
+    async fn handle(&mut self, req: SetHardNatOutbound) -> Self::Response {
+        self.hard_nat_outbound_tx = Some(req.0);
+    }
+}
+
+struct SetHardNatOutbound(mpsc::Sender<HardNatControlEnvelope>);
+
 pub struct Entity {
     uid: HUId,
     next_ch_id: NextChId,
@@ -1924,6 +1983,8 @@ pub struct Entity {
     udp_relay_flows: SharedRelayFlows,
     weak: Option<CtrlWeak<Self>>,
     guard: CtrlGuard,
+    hard_nat_tx: broadcast::Sender<HardNatControlEnvelope>,
+    hard_nat_outbound_tx: Option<mpsc::Sender<HardNatControlEnvelope>>,
     disable_shell: bool,
 }
 
@@ -2233,6 +2294,46 @@ mod tests {
         assert!(stdout.contains("arg1=foo"), "stdout={stdout}");
         assert!(stdout.contains("arg2=bar baz"), "stdout={stdout}");
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hard_nat_control_subscribe_and_send_use_agent_channels() -> Result<()> {
+        let mut agent = make_agent_ctrl(gen_huid()).await?;
+        let ctrl = agent.clone_ctrl();
+        let mut sub = ctrl.subscribe_hard_nat_control().await?;
+
+        let env = HardNatControlEnvelope {
+            session_id: 55,
+            seq: 9,
+            role_from: 2,
+            msg: Some(crate::proto::hard_nat_control_envelope::Msg::LeaseKeepAlive(
+                crate::proto::HardNatLeaseKeepAlive {
+                    lease_timeout_ms: 6000,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        ctrl.recv_hard_nat_control(env.clone()).await?;
+        let got = tokio::time::timeout(Duration::from_secs(1), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, env);
+
+        let (tx, mut rx) = mpsc::channel(1);
+        agent.set_hard_nat_outbound(tx).await?;
+        ctrl.send_hard_nat_control(env.clone()).await?;
+        let sent = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent, env);
+
+        agent.shutdown().await;
+        agent.wait_for_completed().await?;
         Ok(())
     }
 }

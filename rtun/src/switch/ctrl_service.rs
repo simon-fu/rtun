@@ -15,7 +15,7 @@ use crate::{
 };
 use bytes::Bytes;
 use protobuf::Message;
-use tokio::task::JoinHandle;
+use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::{
     invoker_ctrl::{CtrlHandler, CtrlInvoker},
@@ -28,9 +28,10 @@ pub fn spawn_ctrl_service<H1: CtrlHandler, H2: SwitchHanlder>(
     agent: CtrlInvoker<H1>,
     switch: SwitchInvoker<H2>,
     mut chpair: ChPair,
+    mut hard_nat_rx: mpsc::Receiver<HardNatControlEnvelope>,
 ) -> JoinHandle<Result<ExitReason>> {
     let task = spawn_with_name(format!("ctrl-service-{}", uid), async move {
-        let r = ctrl_loop_full(&agent, &switch, &mut chpair).await;
+        let r = ctrl_loop_full(&agent, &switch, &mut chpair, &mut hard_nat_rx).await;
         tracing::debug!("finished with [{:?}]", r);
         switch.shutdown().await;
         r
@@ -100,10 +101,24 @@ async fn send_ctrl_rpc_response(
     Ok(())
 }
 
+async fn send_hard_nat_control(ctrl_tx: &ChSender, env: HardNatControlEnvelope) -> Result<()> {
+    let data = CtrlChannelPacket {
+        body: Some(ctrl_channel_packet::Body::HardNatControl(env)),
+        ..Default::default()
+    }
+    .write_to_bytes()?;
+    ctrl_tx
+        .send_data(data.into())
+        .await
+        .map_err(|_x| anyhow!("send hardnat control fail"))?;
+    Ok(())
+}
+
 async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
     agent: &CtrlInvoker<H1>,
     switch: &SwitchInvoker<H2>,
     ctrl_pair: &mut ChPair,
+    hard_nat_rx: &mut mpsc::Receiver<HardNatControlEnvelope>,
 ) -> Result<ExitReason> {
     let ctrl_tx = &mut ctrl_pair.tx;
     let ctrl_rx = &mut ctrl_pair.rx;
@@ -119,6 +134,11 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
 
         let packet = tokio::select! {
             _r = agent_watch.watch() => bail!("agent has gone"),
+            outbound = hard_nat_rx.recv() => {
+                let env = outbound.with_context(|| "hardnat outbound closed")?;
+                send_hard_nat_control(ctrl_tx, env).await?;
+                continue;
+            }
             r = ctrl_rx.recv_packet() => r?,
             _r = tokio::time::sleep(alive_timeout) => {
                 bail!("wait for ping timeout")
@@ -129,8 +149,8 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
             DecodedCtrlServicePacket::LegacyRpc(req) => (req, false),
             DecodedCtrlServicePacket::WrappedRpc(req) => (req, true),
             DecodedCtrlServicePacket::HardNatControl(env) => {
-                tracing::debug!("recv hardnat control before runtime hooked: {:?}", env);
-                bail!("hardnat control not supported yet")
+                agent.recv_hard_nat_control(env).await?;
+                continue;
             }
         };
 
@@ -304,20 +324,24 @@ mod tests {
             invoker_ctrl::{
                 CloseChannelResult, OpCloseChannel, OpExecAgentScript, OpExecAgentScriptResult,
                 OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult, OpOpenShell,
-                OpOpenShellResult, OpOpenSocks, OpOpenSocksResult,
+                OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, OpRecvHardNatControl,
+                OpRecvHardNatControlResult, OpSendHardNatControl, OpSendHardNatControlResult,
+                OpSubscribeHardNatControl, OpSubscribeHardNatControlResult,
             },
             invoker_switch::{AddChannelResult, ReqAddChannel, ReqGetMuxTx, ReqGetMuxTxResult, ReqRemoveChannel, RemoveChannelResult},
         },
     };
     use crate::proto::{
-        c2arequest::C2a_req_args, ctrl_channel_packet, ctrl_rpc_response, CtrlChannelPacket,
-        CtrlRpcResponse, OpenP2PResponse, P2PArgs, ResponseStatus,
+        c2arequest::C2a_req_args, ctrl_channel_packet, ctrl_rpc_response,
+        hard_nat_control_envelope, CtrlChannelPacket, CtrlRpcResponse, OpenP2PResponse, P2PArgs,
+        ResponseStatus,
     };
     use protobuf::Message;
-    use tokio::{sync::mpsc, time::timeout};
+    use tokio::{sync::{broadcast, mpsc}, time::timeout};
 
     struct TestCtrlEntity {
         guard: CtrlGuard,
+        hard_nat_tx: broadcast::Sender<HardNatControlEnvelope>,
     }
 
     impl ActorEntity for TestCtrlEntity {
@@ -393,6 +417,34 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpSendHardNatControl> for TestCtrlEntity {
+        type Response = OpSendHardNatControlResult;
+
+        async fn handle(&mut self, _req: OpSendHardNatControl) -> Self::Response {
+            anyhow::bail!("unexpected send_hardnat_control")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpSubscribeHardNatControl> for TestCtrlEntity {
+        type Response = OpSubscribeHardNatControlResult;
+
+        async fn handle(&mut self, _req: OpSubscribeHardNatControl) -> Self::Response {
+            Ok(self.hard_nat_tx.subscribe())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpRecvHardNatControl> for TestCtrlEntity {
+        type Response = OpRecvHardNatControlResult;
+
+        async fn handle(&mut self, req: OpRecvHardNatControl) -> Self::Response {
+            let _r = self.hard_nat_tx.send(req.0);
+            Ok(())
+        }
+    }
+
     impl CtrlHandler for TestCtrlEntity {}
 
     struct TestSwitchEntity {
@@ -449,10 +501,12 @@ mod tests {
     impl SwitchHanlder for TestSwitchEntity {}
 
     fn spawn_test_ctrl() -> crate::actor_service::ActorHandle<TestCtrlEntity> {
+        let (hard_nat_tx, _) = broadcast::channel(4);
         start_actor(
             "test-ctrl-service-agent".into(),
             TestCtrlEntity {
                 guard: CtrlGuard::new(),
+                hard_nat_tx,
             },
             handle_first_none,
             wait_next_none,
@@ -554,8 +608,11 @@ mod tests {
         let ctrl = CtrlInvoker::new(ctrl_handle.invoker().clone());
         let switch = SwitchInvoker::new(switch_handle.invoker().clone());
         let (mut service_pair, mut client_pair) = make_duplex_ctrl_pair(ChId(1));
+        let (hard_nat_tx, mut hard_nat_rx) = mpsc::channel(1);
 
-        let service = tokio::spawn(async move { ctrl_loop_full(&ctrl, &switch, &mut service_pair).await });
+        let service = tokio::spawn(async move {
+            ctrl_loop_full(&ctrl, &switch, &mut service_pair, &mut hard_nat_rx).await
+        });
 
         let req = C2ARequest {
             c2a_req_args: Some(C2a_req_args::Ping(crate::proto::Ping {
@@ -578,6 +635,7 @@ mod tests {
         assert_eq!(pong.timestamp, 123);
 
         drop(client_pair.tx);
+        drop(hard_nat_tx);
         assert!(service.await.unwrap().is_err());
     }
 
@@ -588,8 +646,11 @@ mod tests {
         let ctrl = CtrlInvoker::new(ctrl_handle.invoker().clone());
         let switch = SwitchInvoker::new(switch_handle.invoker().clone());
         let (mut service_pair, mut client_pair) = make_duplex_ctrl_pair(ChId(1));
+        let (hard_nat_tx, mut hard_nat_rx) = mpsc::channel(1);
 
-        let service = tokio::spawn(async move { ctrl_loop_full(&ctrl, &switch, &mut service_pair).await });
+        let service = tokio::spawn(async move {
+            ctrl_loop_full(&ctrl, &switch, &mut service_pair, &mut hard_nat_rx).await
+        });
 
         let req = CtrlChannelPacket {
             body: Some(ctrl_channel_packet::Body::RpcRequest(C2ARequest {
@@ -622,6 +683,96 @@ mod tests {
         assert_eq!(pong.timestamp, 456);
 
         drop(client_pair.tx);
+        drop(hard_nat_tx);
+        assert!(service.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn ctrl_loop_full_forwards_hardnat_control_to_agent_subscriber() {
+        let ctrl_handle = spawn_test_ctrl();
+        let switch_handle = spawn_test_switch();
+        let ctrl = CtrlInvoker::new(ctrl_handle.invoker().clone());
+        let mut hard_nat_rx_sub = ctrl.subscribe_hard_nat_control().await.unwrap();
+        let switch = SwitchInvoker::new(switch_handle.invoker().clone());
+        let (mut service_pair, client_pair) = make_duplex_ctrl_pair(ChId(1));
+        let (hard_nat_tx, mut hard_nat_rx) = mpsc::channel(1);
+
+        let service = tokio::spawn(async move {
+            ctrl_loop_full(&ctrl, &switch, &mut service_pair, &mut hard_nat_rx).await
+        });
+
+        let control = CtrlChannelPacket {
+            body: Some(ctrl_channel_packet::Body::HardNatControl(HardNatControlEnvelope {
+                session_id: 42,
+                seq: 7,
+                role_from: 2,
+                msg: Some(hard_nat_control_envelope::Msg::LeaseKeepAlive(
+                    crate::proto::HardNatLeaseKeepAlive {
+                        lease_timeout_ms: 7000,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        client_pair
+            .tx
+            .send_data(control.write_to_bytes().unwrap().into())
+            .await
+            .unwrap();
+
+        let got = timeout(Duration::from_secs(1), hard_nat_rx_sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.session_id, 42);
+
+        drop(client_pair.tx);
+        drop(hard_nat_tx);
+        assert!(service.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn ctrl_loop_full_sends_outbound_hardnat_control_packets() {
+        let ctrl_handle = spawn_test_ctrl();
+        let switch_handle = spawn_test_switch();
+        let ctrl = CtrlInvoker::new(ctrl_handle.invoker().clone());
+        let switch = SwitchInvoker::new(switch_handle.invoker().clone());
+        let (mut service_pair, mut client_pair) = make_duplex_ctrl_pair(ChId(1));
+        let (hard_nat_tx, mut hard_nat_rx) = mpsc::channel(1);
+
+        let service = tokio::spawn(async move {
+            ctrl_loop_full(&ctrl, &switch, &mut service_pair, &mut hard_nat_rx).await
+        });
+
+        let env = HardNatControlEnvelope {
+            session_id: 77,
+            seq: 3,
+            role_from: 1,
+            msg: Some(hard_nat_control_envelope::Msg::LeaseKeepAlive(
+                crate::proto::HardNatLeaseKeepAlive {
+                    lease_timeout_ms: 9000,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        hard_nat_tx.send(env.clone()).await.unwrap();
+
+        let packet = timeout(Duration::from_secs(1), client_pair.rx.recv_packet())
+            .await
+            .unwrap()
+            .unwrap();
+        let packet = CtrlChannelPacket::parse_from_bytes(&packet.payload).unwrap();
+        let got = match packet.body {
+            Some(ctrl_channel_packet::Body::HardNatControl(env)) => env,
+            other => panic!("unexpected packet: {other:?}"),
+        };
+        assert_eq!(got, env);
+
+        drop(client_pair.tx);
+        drop(hard_nat_tx);
         assert!(service.await.unwrap().is_err());
     }
 }

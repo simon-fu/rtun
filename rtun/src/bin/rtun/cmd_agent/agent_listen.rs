@@ -27,7 +27,7 @@ use rtun::{
     ws::server::{WsSource, WsStreamAxum},
 };
 use sha2::{Digest, Sha256};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::mpsc};
 
 use axum::{
     extract::{
@@ -944,6 +944,7 @@ where
     let ctrl_ch_id = ChId(0);
     let (ctrl_tx, ctrl_rx) = ChPair::new(ctrl_ch_id).split();
     let ctrl_tx = switch.add_channel(ctrl_ch_id, ctrl_tx).await?;
+    let (_hard_nat_tx, hard_nat_rx) = mpsc::channel(16);
 
     spawn_ctrl_service(
         uid,
@@ -953,6 +954,7 @@ where
             tx: ctrl_tx,
             rx: ctrl_rx,
         },
+        hard_nat_rx,
     );
 
     let _r = session.wait_for_completed().await;

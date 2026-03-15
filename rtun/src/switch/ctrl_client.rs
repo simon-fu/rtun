@@ -4,7 +4,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use chrono::Local;
 use protobuf::Message;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{broadcast, mpsc},
+    task::JoinHandle,
+};
 
 use crate::{
     async_rt::spawn_with_name,
@@ -28,7 +31,9 @@ use super::{
     invoker_ctrl::{
         CloseChannelResult, CtrlHandler, CtrlInvoker, OpCloseChannel, OpExecAgentScript,
         OpExecAgentScriptResult, OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult,
-        OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult,
+        OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, OpRecvHardNatControl,
+        OpRecvHardNatControlResult, OpSendHardNatControl, OpSendHardNatControlResult,
+        OpSubscribeHardNatControl, OpSubscribeHardNatControlResult,
     },
     invoker_switch::{SwitchHanlder, SwitchInvoker},
     next_ch_id::NextChId,
@@ -73,9 +78,11 @@ pub async fn make_ctrl_client<H: SwitchHanlder>(
     let (ctrl_tx, ctrl_rx) = pair.split();
     let (rpc_tx, rpc_rx) = mpsc::channel(16);
     let (event_tx, event_rx) = mpsc::channel(16);
+    let (hard_nat_tx, _) = broadcast::channel(16);
+    let hard_nat_tx_reader = hard_nat_tx.clone();
 
     let reader_task = spawn_with_name(format!("ctrl-client-reader-{}", uid), async move {
-        ctrl_reader_loop(ctrl_rx, rpc_tx, event_tx).await
+        ctrl_reader_loop(ctrl_rx, rpc_tx, event_tx, hard_nat_tx_reader).await
     });
 
     let entity = Entity {
@@ -85,6 +92,7 @@ pub async fn make_ctrl_client<H: SwitchHanlder>(
         rpc_rx,
         event_rx,
         reader_task,
+        hard_nat_tx,
         switch,
         // mux_tx,
         next_ch_id: Default::default(),
@@ -111,7 +119,6 @@ enum CtrlRpcPacket {
 }
 
 enum CtrlEvent {
-    HardNatControl(HardNatControlEnvelope),
     CtrlChBroken,
 }
 
@@ -139,6 +146,7 @@ async fn ctrl_reader_loop(
     mut ctrl_rx: ChReceiver,
     rpc_tx: mpsc::Sender<CtrlRpcPacket>,
     event_tx: mpsc::Sender<CtrlEvent>,
+    hard_nat_tx: broadcast::Sender<HardNatControlEnvelope>,
 ) {
     loop {
         let packet = match ctrl_rx.recv_packet().await {
@@ -156,9 +164,7 @@ async fn ctrl_reader_loop(
                 }
             }
             Ok(DecodedCtrlClientPacket::HardNatControl(env)) => {
-                if event_tx.send(CtrlEvent::HardNatControl(env)).await.is_err() {
-                    return;
-                }
+                let _r = hard_nat_tx.send(env);
             }
             Err(e) => {
                 tracing::debug!("decode ctrl client packet failed: {e:#}");
@@ -558,6 +564,43 @@ impl<H: SwitchHanlder> AsyncHandler<OpExecAgentScript> for Entity<H> {
     }
 }
 
+#[async_trait::async_trait]
+impl<H: SwitchHanlder> AsyncHandler<OpSendHardNatControl> for Entity<H> {
+    type Response = OpSendHardNatControlResult;
+
+    async fn handle(&mut self, req: OpSendHardNatControl) -> Self::Response {
+        let data = CtrlChannelPacket {
+            body: Some(ctrl_channel_packet::Body::HardNatControl(req.0)),
+            ..Default::default()
+        }
+        .write_to_bytes()?;
+        self.ctrl_tx
+            .send_data(data.into())
+            .await
+            .map_err(|_e| anyhow!("send hardnat control failed"))?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl<H: SwitchHanlder> AsyncHandler<OpSubscribeHardNatControl> for Entity<H> {
+    type Response = OpSubscribeHardNatControlResult;
+
+    async fn handle(&mut self, _req: OpSubscribeHardNatControl) -> Self::Response {
+        Ok(self.hard_nat_tx.subscribe())
+    }
+}
+
+#[async_trait::async_trait]
+impl<H: SwitchHanlder> AsyncHandler<OpRecvHardNatControl> for Entity<H> {
+    type Response = OpRecvHardNatControlResult;
+
+    async fn handle(&mut self, req: OpRecvHardNatControl) -> Self::Response {
+        let _r = self.hard_nat_tx.send(req.0);
+        Ok(())
+    }
+}
+
 // struct SetNoSocks(bool);
 
 // #[async_trait::async_trait]
@@ -579,6 +622,7 @@ pub struct Entity<H: SwitchHanlder> {
     rpc_rx: mpsc::Receiver<CtrlRpcPacket>,
     event_rx: mpsc::Receiver<CtrlEvent>,
     reader_task: JoinHandle<()>,
+    hard_nat_tx: broadcast::Sender<HardNatControlEnvelope>,
     switch: SwitchInvoker<H>,
     // mux_tx: ChTx,
     next_ch_id: NextChId,
@@ -598,7 +642,6 @@ pub struct Entity<H: SwitchHanlder> {
 pub enum Next {
     SwitchGone,
     CtrlChBroken,
-    HardNatControl(HardNatControlEnvelope),
     Ping,
 }
 
@@ -608,7 +651,6 @@ async fn wait_next<H: SwitchHanlder>(entity: &mut Entity<H>) -> Next {
         _r = entity.switch_watch.watch() => Next::SwitchGone,
         event = entity.event_rx.recv() => match event {
             Some(CtrlEvent::CtrlChBroken) | None => Next::CtrlChBroken,
-            Some(CtrlEvent::HardNatControl(env)) => Next::HardNatControl(env),
         },
         _r = tokio::time::sleep(duration) => Next::Ping,
     }
@@ -621,10 +663,6 @@ async fn handle_next<H: SwitchHanlder>(entity: &mut Entity<H>, next: Next) -> Re
         }
         Next::CtrlChBroken => {
             tracing::debug!("ctrl channel broken");
-        }
-        Next::HardNatControl(env) => {
-            tracing::debug!("recv hardnat control before runtime hooked: {:?}", env);
-            return Ok(Action::None);
         }
         Next::Ping => {
             let timeout = Duration::from_millis(90 * 1000);
@@ -990,6 +1028,7 @@ mod tests {
             .await
             .unwrap();
         let invoker = ctrl.clone_invoker();
+        let mut hard_nat_rx = invoker.subscribe_hard_nat_control().await.unwrap();
 
         let remote = tokio::spawn(async move {
             let control = CtrlChannelPacket {
@@ -1035,6 +1074,12 @@ mod tests {
                 .unwrap();
         });
 
+        let hard_nat = timeout(Duration::from_secs(1), hard_nat_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hard_nat.session_id, 9);
+
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let rsp = timeout(Duration::from_secs(1), invoker.open_p2p(P2PArgs::default()))
@@ -1047,6 +1092,45 @@ mod tests {
         ));
 
         remote.await.unwrap();
+        ctrl.shutdown_and_waitfor().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ctrl_client_send_hardnat_control_emits_wrapped_packet() {
+        let switch_handle = spawn_test_switch();
+        let switch = SwitchInvoker::new(switch_handle.invoker().clone());
+        let (client_pair, mut remote_pair) = make_duplex_ctrl_pair(ChId(8));
+        let mut ctrl = make_ctrl_client(gen_huid(), client_pair, switch, false)
+            .await
+            .unwrap();
+        let invoker = ctrl.clone_invoker();
+
+        let control = HardNatControlEnvelope {
+            session_id: 88,
+            seq: 5,
+            role_from: 1,
+            msg: Some(hard_nat_control_envelope::Msg::LeaseKeepAlive(
+                HardNatLeaseKeepAlive {
+                    lease_timeout_ms: 9000,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        invoker.send_hard_nat_control(control.clone()).await.unwrap();
+
+        let packet = timeout(Duration::from_secs(1), remote_pair.rx.recv_packet())
+            .await
+            .unwrap()
+            .unwrap();
+        let packet = CtrlChannelPacket::parse_from_bytes(&packet.payload).unwrap();
+        let got = match packet.body {
+            Some(ctrl_channel_packet::Body::HardNatControl(env)) => env,
+            other => panic!("unexpected packet: {other:?}"),
+        };
+        assert_eq!(got, control);
+
         ctrl.shutdown_and_waitfor().await.unwrap();
     }
 }

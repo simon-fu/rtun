@@ -3,6 +3,7 @@ use crate::{
     huid::gen_huid::gen_huid,
 };
 use anyhow::Result;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::{
@@ -22,6 +23,8 @@ pub async fn make_agent_session<S1: PacketSink, S2: PacketSource>(
 
     let ctrl_session = make_agent_ctrl(uid).await?;
     let ctrl = ctrl_session.clone_ctrl();
+    let (hard_nat_tx, hard_nat_rx) = mpsc::channel(16);
+    ctrl_session.set_hard_nat_outbound(hard_nat_tx).await?;
 
     let ctrl_ch_id = ChId(0);
     let (ctrl_tx, ctrl_rx) = ChPair::new(ctrl_ch_id).split();
@@ -31,7 +34,7 @@ pub async fn make_agent_session<S1: PacketSink, S2: PacketSource>(
         rx: ctrl_rx,
     };
 
-    let task = spawn_ctrl_service(uid, ctrl, switch, pair);
+    let task = spawn_ctrl_service(uid, ctrl, switch, pair, hard_nat_rx);
 
     Ok(AgentSession {
         switch_session,

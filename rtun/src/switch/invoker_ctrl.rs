@@ -3,10 +3,11 @@ use crate::{
     channel::{ChId, ChSender},
     proto::{
         ExecAgentScriptArgs, ExecAgentScriptResult, KickDownArgs, OpenP2PResponse, OpenShellArgs,
-        OpenSocksArgs, P2PArgs,
+        OpenSocksArgs, P2PArgs, HardNatControlEnvelope,
     },
 };
 use anyhow::Result;
+use tokio::sync::broadcast;
 
 use super::entity_watch::{OpWatch, WatchResult};
 
@@ -20,6 +21,9 @@ pub trait CtrlHandler:
     + AsyncHandler<OpKickDown, Response = OpKickDownResult>
     + AsyncHandler<OpOpenP2P, Response = OpOpenP2PResult>
     + AsyncHandler<OpExecAgentScript, Response = OpExecAgentScriptResult>
+    + AsyncHandler<OpSendHardNatControl, Response = OpSendHardNatControlResult>
+    + AsyncHandler<OpSubscribeHardNatControl, Response = OpSubscribeHardNatControlResult>
+    + AsyncHandler<OpRecvHardNatControl, Response = OpRecvHardNatControlResult>
 {
 }
 
@@ -88,6 +92,24 @@ where
     pub async fn exec_agent_script(&self, args: ExecAgentScriptArgs) -> OpExecAgentScriptResult {
         self.invoker.invoke(OpExecAgentScript(args)).await?
     }
+
+    pub async fn send_hard_nat_control(
+        &self,
+        args: HardNatControlEnvelope,
+    ) -> OpSendHardNatControlResult {
+        self.invoker.invoke(OpSendHardNatControl(args)).await?
+    }
+
+    pub async fn subscribe_hard_nat_control(&self) -> OpSubscribeHardNatControlResult {
+        self.invoker.invoke(OpSubscribeHardNatControl).await?
+    }
+
+    pub async fn recv_hard_nat_control(
+        &self,
+        args: HardNatControlEnvelope,
+    ) -> OpRecvHardNatControlResult {
+        self.invoker.invoke(OpRecvHardNatControl(args)).await?
+    }
 }
 
 pub struct CtrlWeak<H: CtrlHandler> {
@@ -142,3 +164,18 @@ pub type OpOpenP2PResult = Result<OpenP2PResponse>;
 pub struct OpExecAgentScript(pub ExecAgentScriptArgs);
 
 pub type OpExecAgentScriptResult = Result<ExecAgentScriptResult>;
+
+#[derive(Debug)]
+pub struct OpSendHardNatControl(pub HardNatControlEnvelope);
+
+pub type OpSendHardNatControlResult = Result<()>;
+
+#[derive(Debug)]
+pub struct OpSubscribeHardNatControl;
+
+pub type OpSubscribeHardNatControlResult = Result<broadcast::Receiver<HardNatControlEnvelope>>;
+
+#[derive(Debug)]
+pub struct OpRecvHardNatControl(pub HardNatControlEnvelope);
+
+pub type OpRecvHardNatControlResult = Result<()>;
