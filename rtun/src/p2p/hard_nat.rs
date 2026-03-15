@@ -48,6 +48,7 @@ pub const HARD_NAT_PROTO_VERSION: u32 = 1;
 pub const HARD_NAT_DEFAULT_CONNECTED_TTL: u32 = 64;
 pub const HARD_NAT_DEFAULT_LEASE_TIMEOUT_MS: u32 = 10_000;
 pub const HARD_NAT_DEFAULT_KEEPALIVE_INTERVAL_MS: u32 = 1_000;
+pub const HARD_NAT_DEFAULT_IP_TRY_TIMEOUT_MS: u32 = 1_000;
 #[cfg(test)]
 const HARD_NAT_KEEP_RECV_PROMOTED_TTL: u32 = 64;
 pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_WARM_DRAIN_MS: u64 = 300;
@@ -1005,6 +1006,13 @@ impl HardNatSessionParams {
         )
     }
 
+    pub fn ip_try_timeout(&self) -> Duration {
+        duration_from_ms_or_default(
+            self.ip_try_timeout_ms,
+            Duration::from_millis(HARD_NAT_DEFAULT_IP_TRY_TIMEOUT_MS as u64),
+        )
+    }
+
     pub fn write_to_proto(&self, args: &mut P2PHardNatArgs) {
         args.proto_version = self.proto_version;
         args.session_id = self.session_id;
@@ -1259,6 +1267,10 @@ impl HardNatScheduler {
             msg: Some(msg),
             ..Default::default()
         }
+    }
+
+    fn current_cursor(&self) -> Option<HardNatBatchCursor> {
+        self.cursor.clone()
     }
 }
 
@@ -2143,11 +2155,7 @@ where
             _ = status_tick.tick() => {}
             _ = send_tick.tick(), if matches!(executor.phase(), HardNatExecutorPhase::ExecutingBatch(_) | HardNatExecutorPhase::WaitingNextCommand(_)) => {
                 if let Some(cursor) = executor.current_cursor() {
-                    let targets = cursor
-                        .ports
-                        .iter()
-                        .map(|port| SocketAddr::new(args.target_ip, *port as u16))
-                        .collect::<Vec<_>>();
+                    let targets = build_nat3_controlled_targets(&session, args.target_ip, &cursor)?;
                     let _ = send_nat3_batch_once(&socket, &text, &targets, &shared, 0, false).await?;
                 }
             }
@@ -2183,6 +2191,11 @@ where
         nat3_addr_count: session.nat3_public_addrs.len().max(1),
         lease_timeout: session.lease_timeout(),
     });
+    let batch_count = if session.batch_port_count == 0 {
+        start_batch_ports.len().max(1)
+    } else {
+        session.batch_port_count as usize
+    };
 
     let start_batch = scheduler.start_batch(start_batch_ports)?;
     send_control(start_batch).await?;
@@ -2199,6 +2212,8 @@ where
     let mut probe_tick = tokio::time::interval(runtime.interval);
     probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let ip_try_timeout = session.ip_try_timeout().max(args.interval);
+    let mut ip_try_sleep = Box::pin(tokio::time::sleep(ip_try_timeout));
     let mut keepalive_tick = tokio::time::interval(session.keepalive_interval());
     keepalive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let _ = keepalive_tick.tick().await;
@@ -2207,11 +2222,14 @@ where
     let result: Result<HardNatConnectedSocket> = async {
         loop {
             if probe_due {
+                let current_cursor = scheduler.current_cursor();
+                let current_target =
+                    resolve_nat4_controlled_target(&session, args.target, current_cursor.as_ref())?;
                 for sender in &runtime.senders {
                     if runtime.shared.has_connected() {
                         break;
                     }
-                    sender.send_one().await?;
+                    sender.send_one_to(current_target).await?;
                 }
                 probe_due = false;
             }
@@ -2227,6 +2245,24 @@ where
                 _ = keepalive_tick.tick() => {
                     send_control(scheduler.lease_keepalive()).await?;
                 }
+                _ = &mut ip_try_sleep => {
+                    match scheduler.advance_after_timeout() {
+                        Some(HardNatSchedulerAdvance::Send(env)) => {
+                            send_control(env).await?;
+                            probe_due = true;
+                        }
+                        Some(HardNatSchedulerAdvance::NeedNextBatch { .. }) => {
+                            let next_ports = build_random_port_batch(batch_count);
+                            let env = scheduler.start_next_batch(next_ports)?;
+                            send_control(env).await?;
+                            probe_due = true;
+                        }
+                        None => {}
+                    }
+                    ip_try_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + ip_try_timeout);
+                }
             }
         }
 
@@ -2235,12 +2271,11 @@ where
             .first_connected_conn(HardNatRole::Nat4, runtime.start_at)
             .with_context(|| "missing connected target after nat4 controlled connect")?;
 
-        let selected_nat4_ip = selected_nat4_ip
-            .clone()
-            .or_else(|| session.nat4_candidate_ips.first().cloned())
-            .unwrap_or_default();
+        let current_cursor = scheduler.current_cursor();
+        let selected_nat4_ip =
+            resolve_selected_nat4_ip(&session, selected_nat4_ip.as_deref(), current_cursor.as_ref())?;
         let connected = scheduler.connected(
-            args.target.to_string(),
+            first.remote_addr.to_string(),
             selected_nat4_ip,
             first.remote_addr.port() as u32,
             session.connected_ttl.max(HARD_NAT_DEFAULT_CONNECTED_TTL),
@@ -2614,6 +2649,77 @@ fn build_nat3_target_batch(
     }
 
     targets
+}
+
+fn build_nat3_controlled_targets(
+    session: &HardNatSessionParams,
+    fallback_target_ip: IpAddr,
+    cursor: &HardNatBatchCursor,
+) -> Result<Vec<SocketAddr>> {
+    let target_ip = resolve_nat4_candidate_ip(session, fallback_target_ip, cursor.nat4_ip_index)?;
+    cursor
+        .ports
+        .iter()
+        .map(|port| {
+            let port = u16::try_from(*port)
+                .with_context(|| format!("hard-nat nat3 batch port out of range [{port}]"))?;
+            Ok(SocketAddr::new(target_ip, port))
+        })
+        .collect()
+}
+
+fn resolve_nat4_candidate_ip(
+    session: &HardNatSessionParams,
+    fallback_target_ip: IpAddr,
+    nat4_ip_index: u32,
+) -> Result<IpAddr> {
+    if session.nat4_candidate_ips.is_empty() {
+        return Ok(fallback_target_ip);
+    }
+
+    let value = session
+        .nat4_candidate_ips
+        .get(nat4_ip_index as usize)
+        .with_context(|| format!("hard-nat nat4 candidate ip index out of range [{nat4_ip_index}]"))?;
+    value
+        .parse()
+        .with_context(|| format!("parse hard-nat nat4 candidate ip failed [{value}]"))
+}
+
+fn resolve_nat4_controlled_target(
+    session: &HardNatSessionParams,
+    fallback_target: SocketAddr,
+    cursor: Option<&HardNatBatchCursor>,
+) -> Result<SocketAddr> {
+    if session.nat3_public_addrs.is_empty() {
+        return Ok(fallback_target);
+    }
+
+    let nat3_addr_index = cursor.map(|cursor| cursor.nat3_addr_index).unwrap_or(0);
+    let value = session
+        .nat3_public_addrs
+        .get(nat3_addr_index as usize)
+        .with_context(|| format!("hard-nat nat3 public addr index out of range [{nat3_addr_index}]"))?;
+    value
+        .parse()
+        .with_context(|| format!("parse hard-nat nat3 public addr failed [{value}]"))
+}
+
+fn resolve_selected_nat4_ip(
+    session: &HardNatSessionParams,
+    fallback_target_ip: Option<&str>,
+    cursor: Option<&HardNatBatchCursor>,
+) -> Result<String> {
+    if session.nat4_candidate_ips.is_empty() {
+        return Ok(fallback_target_ip.unwrap_or_default().to_string());
+    }
+
+    let nat4_ip_index = cursor.map(|cursor| cursor.nat4_ip_index).unwrap_or(0);
+    session
+        .nat4_candidate_ips
+        .get(nat4_ip_index as usize)
+        .cloned()
+        .with_context(|| format!("hard-nat nat4 candidate ip index out of range [{nat4_ip_index}]"))
 }
 
 pub fn build_random_port_batch(count: usize) -> Vec<u32> {
@@ -3036,24 +3142,26 @@ impl ProbePayload {
 impl UdpSender {
     async fn send_one(&self) -> Result<()> {
         let payload = self.payload.next_text();
-        self.send_payload(&payload).await
+        self.send_payload_to(self.target, &payload).await
+    }
+
+    async fn send_one_to(&self, target: SocketAddr) -> Result<()> {
+        let payload = self.payload.next_text();
+        self.send_payload_to(target, &payload).await
     }
 
     async fn send_token(&self, token: ProbeToken) -> Result<()> {
         let payload = encode_probe_token(token);
-        self.send_payload(&payload).await
+        self.send_payload_to(self.target, &payload).await
     }
 
-    async fn send_payload(&self, payload: &str) -> Result<()> {
+    async fn send_payload_to(&self, target: SocketAddr, payload: &str) -> Result<()> {
         let len = self
             .socket
-            .send_to(payload.as_bytes(), self.target)
+            .send_to(payload.as_bytes(), target)
             .await
             .with_context(|| "send_to failed")?;
-        debug!(
-            "sent to [{}] => [{}]: bytes [{len}]",
-            self.local, self.target
-        );
+        debug!("sent to [{}] => [{}]: bytes [{len}]", self.local, target);
         Ok(())
     }
 
@@ -5121,6 +5229,34 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn build_nat3_controlled_targets_uses_cursor_nat4_ip_and_ports() -> Result<()> {
+        let session = HardNatSessionParams {
+            nat4_candidate_ips: vec!["198.51.100.10".into(), "198.51.100.20".into()],
+            ..Default::default()
+        };
+
+        let targets = build_nat3_controlled_targets(
+            &session,
+            "203.0.113.10".parse()?,
+            &HardNatBatchCursor {
+                batch_id: 1,
+                nat3_addr_index: 0,
+                nat4_ip_index: 1,
+                ports: vec![41001, 41002],
+            },
+        )?;
+
+        assert_eq!(
+            targets,
+            vec![
+                "198.51.100.20:41001".parse().unwrap(),
+                "198.51.100.20:41002".parse().unwrap()
+            ]
+        );
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn run_nat4_controlled_once_sends_start_keepalive_and_connected_control() -> Result<()> {
         let peer = UdpSocket::bind("127.0.0.1:0").await?;
@@ -5210,6 +5346,218 @@ mod tests {
                     break;
                 }
                 other => panic!("unexpected nat4 follow-up control msg: {other:?}"),
+            }
+        }
+
+        assert_eq!(conn.role, HardNatRole::Nat4);
+        assert_eq!(conn.remote_addr, peer_addr);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_nat4_controlled_once_advances_nat3_addr_before_connected() -> Result<()> {
+        let peer1 = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer1_addr = peer1.local_addr()?;
+        let peer2 = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer2_addr = peer2.local_addr()?;
+        let (control_tx, mut control_rx) = mpsc::channel(32);
+
+        let peer1_task = tokio::spawn(async move {
+            let mut buf = [0_u8; 256];
+            let _ = peer1.recv_from(&mut buf).await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let peer2_task = tokio::spawn(async move {
+            let mut buf = [0_u8; 256];
+            let (len, from) = peer2.recv_from(&mut buf).await?;
+            peer2.send_to(&buf[..len], from).await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let session = HardNatSessionParams {
+            proto_version: HARD_NAT_PROTO_VERSION,
+            session_id: 299,
+            lease_timeout_ms: 1_000,
+            keepalive_interval_ms: 500,
+            batch_port_count: 1,
+            ip_try_timeout_ms: 60,
+            connected_ttl: HARD_NAT_DEFAULT_CONNECTED_TTL,
+            nat4_candidate_ips: vec!["127.0.0.1".into(), "127.0.0.2".into()],
+            nat3_public_addrs: vec![peer1_addr.to_string(), peer2_addr.to_string()],
+            ..Default::default()
+        };
+
+        let conn = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_nat4_controlled_once(
+                Nat4RunConfig {
+                    content: None,
+                    target: peer1_addr,
+                    count: 1,
+                    ttl: Some(4),
+                    interval: Duration::from_millis(20),
+                    dump_public_addrs: false,
+                    debug_keep_recv: false,
+                    debug_promote_hit_ttl: None,
+                    debug_converge_lease: false,
+                },
+                session,
+                vec![42001],
+                Some("127.0.0.1".into()),
+                move |env| {
+                    let control_tx = control_tx.clone();
+                    async move {
+                        control_tx
+                            .send(env)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("send hardnat control failed: {e}"))?;
+                        Ok(())
+                    }
+                },
+            ),
+        )
+        .await
+        .with_context(|| "timed out waiting for nat4 controlled connect after addr advance")??;
+
+        peer1_task.await??;
+        peer2_task.await??;
+
+        let mut saw_start = false;
+        let mut saw_advance_nat4_ip = false;
+        let mut saw_advance_nat3_addr = false;
+        loop {
+            let env = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+                .await
+                .with_context(|| "timed out waiting for nat4 control messages")?
+                .with_context(|| "nat4 control channel closed unexpectedly")?;
+            match env.msg {
+                Some(crate::proto::hard_nat_control_envelope::Msg::StartBatch(msg)) => {
+                    saw_start = true;
+                    assert_eq!(msg.batch_id, 1);
+                }
+                Some(crate::proto::hard_nat_control_envelope::Msg::AdvanceNat4Ip(msg)) => {
+                    saw_advance_nat4_ip = true;
+                    assert_eq!(msg.batch_id, 1);
+                    assert_eq!(msg.next_nat4_ip_index, 1);
+                }
+                Some(crate::proto::hard_nat_control_envelope::Msg::AdvanceNat3Addr(msg)) => {
+                    saw_advance_nat3_addr = true;
+                    assert_eq!(msg.batch_id, 1);
+                    assert_eq!(msg.next_nat3_addr_index, 1);
+                }
+                Some(crate::proto::hard_nat_control_envelope::Msg::Connected(msg)) => {
+                    assert!(saw_start, "expected start-batch before connected");
+                    assert!(saw_advance_nat4_ip, "expected advance-nat4-ip before connected");
+                    assert!(saw_advance_nat3_addr, "expected advance-nat3-addr before connected");
+                    assert_eq!(msg.selected_nat3_addr.to_string(), peer2_addr.to_string());
+                    assert_eq!(msg.selected_nat4_ip.to_string(), "127.0.0.1");
+                    break;
+                }
+                Some(crate::proto::hard_nat_control_envelope::Msg::LeaseKeepAlive(_)) => {}
+                other => panic!("unexpected nat4 control msg during addr advance test: {other:?}"),
+            }
+        }
+
+        assert_eq!(conn.role, HardNatRole::Nat4);
+        assert_eq!(conn.remote_addr, peer2_addr);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_nat4_controlled_once_starts_next_batch_after_timeouts() -> Result<()> {
+        let peer = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer_addr = peer.local_addr()?;
+        let (control_tx, mut control_rx) = mpsc::channel(32);
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let peer_task = {
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 256];
+                loop {
+                    let (len, from) = peer.recv_from(&mut buf).await?;
+                    if gate.load(std::sync::atomic::Ordering::Relaxed) {
+                        peer.send_to(&buf[..len], from).await?;
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                }
+            })
+        };
+
+        let session = HardNatSessionParams {
+            proto_version: HARD_NAT_PROTO_VERSION,
+            session_id: 399,
+            lease_timeout_ms: 1_000,
+            keepalive_interval_ms: 500,
+            batch_port_count: 1,
+            ip_try_timeout_ms: 50,
+            connected_ttl: HARD_NAT_DEFAULT_CONNECTED_TTL,
+            nat4_candidate_ips: vec!["127.0.0.1".into()],
+            nat3_public_addrs: vec![peer_addr.to_string()],
+            ..Default::default()
+        };
+
+        let conn = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_nat4_controlled_once(
+                Nat4RunConfig {
+                    content: None,
+                    target: peer_addr,
+                    count: 1,
+                    ttl: Some(4),
+                    interval: Duration::from_millis(20),
+                    dump_public_addrs: false,
+                    debug_keep_recv: false,
+                    debug_promote_hit_ttl: None,
+                    debug_converge_lease: false,
+                },
+                session,
+                vec![43001],
+                Some("127.0.0.1".into()),
+                move |env| {
+                    let control_tx = control_tx.clone();
+                    let gate = gate.clone();
+                    async move {
+                        if matches!(
+                            env.msg,
+                            Some(crate::proto::hard_nat_control_envelope::Msg::NextBatch(_))
+                        ) {
+                            gate.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        control_tx
+                            .send(env)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("send hardnat control failed: {e}"))?;
+                        Ok(())
+                    }
+                },
+            ),
+        )
+        .await
+        .with_context(|| "timed out waiting for nat4 controlled connect after next-batch")??;
+
+        peer_task.await??;
+
+        let mut saw_next_batch = false;
+        loop {
+            let env = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+                .await
+                .with_context(|| "timed out waiting for nat4 next-batch control")?
+                .with_context(|| "nat4 control channel closed unexpectedly")?;
+            match env.msg {
+                Some(crate::proto::hard_nat_control_envelope::Msg::NextBatch(msg)) => {
+                    saw_next_batch = true;
+                    assert_eq!(msg.next_batch_id, 2);
+                    assert_eq!(msg.ports.len(), 1);
+                }
+                Some(crate::proto::hard_nat_control_envelope::Msg::Connected(msg)) => {
+                    assert!(saw_next_batch, "expected next-batch before connected");
+                    assert_eq!(msg.selected_nat3_addr.to_string(), peer_addr.to_string());
+                    break;
+                }
+                Some(crate::proto::hard_nat_control_envelope::Msg::StartBatch(_))
+                | Some(crate::proto::hard_nat_control_envelope::Msg::LeaseKeepAlive(_)) => {}
+                other => panic!("unexpected nat4 control msg during next-batch test: {other:?}"),
             }
         }
 
