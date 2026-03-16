@@ -26,8 +26,9 @@ use rtun::{
     ice::ice_peer::{default_ice_servers, IceArgs, IceConfig, IcePeer},
     p2p::hard_nat::{
         apply_local_hard_nat_session_inputs, build_random_port_batch,
-        collect_udp_candidate_ips_from_ice, derive_target_plan_from_ice_with_explicit_nat4_target,
-        prepare_nat3_public_target, race_assist, resolve_role_plan, run_nat3_controlled_once,
+        collect_public_udp_candidate_ips_from_ice, collect_udp_candidate_ips_from_ice,
+        derive_target_plan_from_ice_with_explicit_nat4_target, prepare_nat3_public_target,
+        race_assist, resolve_role_plan, run_nat3_controlled_once,
         run_nat3_controlled_once_with_prebound_socket, run_nat4_controlled_once,
         HardNatConnectedSocket, HardNatRole, HardNatRoleHint, HardNatSessionParams, Nat3RunConfig,
         Nat4RunConfig, PreparedNat3Socket, HARD_NAT_MAX_ASSIST_DELAY_MS,
@@ -2422,9 +2423,12 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
 
     let local_ice = peer.client_gather().await?;
     let local_codec = UdpRelayCodec::new(gen_udp_relay_obfs_seed());
-    let local_nat4_ip = collect_udp_candidate_ips_from_ice(&local_ice)
-        .into_iter()
-        .next();
+    let local_nat4_candidate_ips = collect_public_udp_candidate_ips_from_ice(&local_ice);
+    let local_nat4_ip = local_nat4_candidate_ips.first().cloned().or_else(|| {
+        collect_udp_candidate_ips_from_ice(&local_ice)
+            .into_iter()
+            .next()
+    });
     let local_role_plan = resolve_role_plan(udp_relay_hard_nat.role_hint(), true);
     let local_prepared_nat3 = if (udp_relay_hard_nat.is_force() || udp_relay_hard_nat.is_assist())
         && local_role_plan.local_role == HardNatRole::Nat3
@@ -2601,6 +2605,7 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
             ctrl,
             udp_relay_hard_nat,
             remote_hard_nat_session.clone(),
+            local_nat4_candidate_ips.clone(),
             local_nat4_ip.clone(),
             &remote_ice,
             remote_hard_nat_target,
@@ -2640,6 +2645,7 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
             target,
             udp_relay_hard_nat,
             remote_hard_nat_session,
+            local_nat4_candidate_ips,
             local_nat4_ip,
             local_prepared_nat3,
             hard_nat_rx,
@@ -2728,6 +2734,7 @@ async fn open_udp_relay_tunnel_assist_socket<H: CtrlHandler>(
     target: SocketAddr,
     cfg: RelayUdpHardNatConfig,
     hard_nat_session: HardNatSessionParams,
+    local_nat4_candidate_ips: Vec<String>,
     local_nat4_ip: Option<String>,
     local_prepared_nat3: Option<PreparedNat3Socket>,
     hard_nat_rx: Option<broadcast::Receiver<HardNatControlEnvelope>>,
@@ -2760,6 +2767,7 @@ async fn open_udp_relay_tunnel_assist_socket<H: CtrlHandler>(
             ctrl,
             cfg,
             hard_nat_session,
+            local_nat4_candidate_ips,
             local_nat4_ip,
             &remote_ice_for_hard_nat,
             remote_hard_nat_target,
@@ -2843,6 +2851,7 @@ async fn open_udp_relay_tunnel_hard_nat_socket<H: CtrlHandler>(
     ctrl: &CtrlInvoker<H>,
     cfg: RelayUdpHardNatConfig,
     hard_nat_session: HardNatSessionParams,
+    local_nat4_candidate_ips: Vec<String>,
     local_nat4_ip: Option<String>,
     remote_ice: &IceArgs,
     remote_hard_nat_target: Option<SocketAddr>,
@@ -2939,6 +2948,7 @@ async fn open_udp_relay_tunnel_hard_nat_socket<H: CtrlHandler>(
                     debug_converge_lease: false,
                 },
                 hard_nat_session,
+                local_nat4_candidate_ips,
                 build_random_port_batch(batch_count),
                 local_nat4_ip,
                 {
@@ -5466,7 +5476,7 @@ mod tests {
                 .iter()
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>(),
-            vec!["198.51.100.10", "192.168.1.10"]
+            vec!["198.51.100.10"]
         );
         assert_eq!(
             proto

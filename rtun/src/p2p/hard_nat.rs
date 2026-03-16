@@ -1046,7 +1046,7 @@ pub fn apply_local_hard_nat_session_inputs(
     let mut session = HardNatSessionParams::from_proto(args);
     session.apply_defaults_if_missing();
     session = session.with_batch_port_count(batch_port_count_hint);
-    session.nat4_candidate_ips = collect_udp_candidate_ips_from_ice(local_ice);
+    session.nat4_candidate_ips = collect_public_udp_candidate_ips_from_ice(local_ice);
     session.nat3_public_addrs = local_nat3_public_addrs
         .iter()
         .map(SocketAddr::to_string)
@@ -1521,7 +1521,11 @@ fn build_hard_nat_ack(
 fn hard_nat_control_debug_label(env: &HardNatControlEnvelope) -> String {
     let msg = match env.msg.as_ref() {
         Some(hard_nat_control_envelope::Msg::StartBatch(msg)) => {
-            format!("StartBatch(batch_id={}, ports={})", msg.batch_id, msg.ports.len())
+            format!(
+                "StartBatch(batch_id={}, ports={})",
+                msg.batch_id,
+                msg.ports.len()
+            )
         }
         Some(hard_nat_control_envelope::Msg::NextBatch(msg)) => {
             format!(
@@ -1649,6 +1653,13 @@ pub fn collect_udp_candidate_ips_from_ice(remote: &IceArgs) -> Vec<String> {
         }
     }
     out
+}
+
+pub fn collect_public_udp_candidate_ips_from_ice(remote: &IceArgs) -> Vec<String> {
+    collect_udp_candidate_ips_from_ice(remote)
+        .into_iter()
+        .filter(|value| value.parse::<IpAddr>().map(is_public_ip).unwrap_or(false))
+        .collect()
 }
 
 fn candidate_priority_key(kind: CandidateKind, addr: SocketAddr) -> (u8, u8) {
@@ -2250,6 +2261,7 @@ where
 pub async fn run_nat4_controlled_once<SendControl, SendControlFut>(
     args: Nat4RunConfig,
     session: HardNatSessionParams,
+    local_nat4_candidate_ips: Vec<String>,
     start_batch_ports: Vec<u32>,
     selected_nat4_ip: Option<String>,
     mut send_control: SendControl,
@@ -2265,7 +2277,7 @@ where
 
     let mut scheduler = HardNatScheduler::new(HardNatSchedulerConfig {
         session_id: session.session_id,
-        nat4_ip_count: session.nat4_candidate_ips.len().max(1),
+        nat4_ip_count: local_nat4_candidate_ips.len().max(1),
         nat3_addr_count: session.nat3_public_addrs.len().max(1),
         lease_timeout: session.lease_timeout(),
     });
@@ -2367,8 +2379,11 @@ where
             .with_context(|| "missing connected target after nat4 controlled connect")?;
 
         let current_cursor = scheduler.current_cursor();
-        let selected_nat4_ip =
-            resolve_selected_nat4_ip(&session, selected_nat4_ip.as_deref(), current_cursor.as_ref())?;
+        let selected_nat4_ip = resolve_selected_nat4_ip(
+            &local_nat4_candidate_ips,
+            selected_nat4_ip.as_deref(),
+            current_cursor.as_ref(),
+        )?;
         let connected = scheduler.connected(
             first.remote_addr.to_string(),
             selected_nat4_ip,
@@ -2783,7 +2798,9 @@ fn resolve_nat4_candidate_ip(
     let value = session
         .nat4_candidate_ips
         .get(nat4_ip_index as usize)
-        .with_context(|| format!("hard-nat nat4 candidate ip index out of range [{nat4_ip_index}]"))?;
+        .with_context(|| {
+            format!("hard-nat nat4 candidate ip index out of range [{nat4_ip_index}]")
+        })?;
     value
         .parse()
         .with_context(|| format!("parse hard-nat nat4 candidate ip failed [{value}]"))
@@ -2802,24 +2819,25 @@ fn resolve_nat4_controlled_target(
     let value = session
         .nat3_public_addrs
         .get(nat3_addr_index as usize)
-        .with_context(|| format!("hard-nat nat3 public addr index out of range [{nat3_addr_index}]"))?;
+        .with_context(|| {
+            format!("hard-nat nat3 public addr index out of range [{nat3_addr_index}]")
+        })?;
     value
         .parse()
         .with_context(|| format!("parse hard-nat nat3 public addr failed [{value}]"))
 }
 
 fn resolve_selected_nat4_ip(
-    session: &HardNatSessionParams,
+    local_nat4_candidate_ips: &[String],
     fallback_target_ip: Option<&str>,
     cursor: Option<&HardNatBatchCursor>,
 ) -> Result<String> {
-    if session.nat4_candidate_ips.is_empty() {
+    if local_nat4_candidate_ips.is_empty() {
         return Ok(fallback_target_ip.unwrap_or_default().to_string());
     }
 
     let nat4_ip_index = cursor.map(|cursor| cursor.nat4_ip_index).unwrap_or(0);
-    session
-        .nat4_candidate_ips
+    local_nat4_candidate_ips
         .get(nat4_ip_index as usize)
         .cloned()
         .with_context(|| format!("hard-nat nat4 candidate ip index out of range [{nat4_ip_index}]"))
@@ -4533,6 +4551,25 @@ mod tests {
     }
 
     #[test]
+    fn collect_public_udp_candidate_ips_from_ice_filters_non_public() {
+        let args = IceArgs {
+            ufrag: "u".into(),
+            pwd: "p".into(),
+            candidates: vec![
+                "candidate:1 1 udp 2130706175 192.168.1.10 50000 typ host".into(),
+                "candidate:2 1 udp 1694498559 198.51.100.10 50001 typ srflx raddr 0.0.0.0 rport 9"
+                    .into(),
+                "candidate:3 1 udp 1694498558 198.51.100.11 50002 typ srflx raddr 0.0.0.0 rport 9"
+                    .into(),
+                "candidate:4 1 udp 2130706175 203.0.113.30 50004 typ host".into(),
+            ],
+        };
+
+        let got = collect_public_udp_candidate_ips_from_ice(&args);
+        assert_eq!(got, vec!["198.51.100.10", "198.51.100.11", "203.0.113.30"]);
+    }
+
+    #[test]
     fn apply_local_hard_nat_session_inputs_adds_local_candidates_and_nat3_addrs() {
         let mut args = P2PHardNatArgs {
             session_id: 0x99,
@@ -4567,7 +4604,7 @@ mod tests {
                 .iter()
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>(),
-            vec!["198.51.100.10", "192.168.1.10"]
+            vec!["198.51.100.10"]
         );
         assert_eq!(
             args.nat3_public_addrs
@@ -5444,6 +5481,7 @@ mod tests {
                 debug_converge_lease: false,
             },
             session,
+            vec!["127.0.0.1".into()],
             vec![41001, 41002],
             Some("127.0.0.1".into()),
             move |env| {
@@ -5487,7 +5525,10 @@ mod tests {
                     saw_keepalive = true;
                 }
                 Some(crate::proto::hard_nat_control_envelope::Msg::Connected(msg)) => {
-                    assert!(saw_keepalive, "expected at least one keepalive before connected");
+                    assert!(
+                        saw_keepalive,
+                        "expected at least one keepalive before connected"
+                    );
                     assert_eq!(env.session_id, 99);
                     assert_eq!(msg.selected_nat3_addr.to_string(), peer_addr.to_string());
                     assert_eq!(msg.selected_nat4_ip.to_string(), "127.0.0.1");
@@ -5531,7 +5572,7 @@ mod tests {
             batch_port_count: 1,
             ip_try_timeout_ms: 60,
             connected_ttl: HARD_NAT_DEFAULT_CONNECTED_TTL,
-            nat4_candidate_ips: vec!["127.0.0.1".into(), "127.0.0.2".into()],
+            nat4_candidate_ips: vec!["203.0.113.200".into()],
             nat3_public_addrs: vec![peer1_addr.to_string(), peer2_addr.to_string()],
             ..Default::default()
         };
@@ -5551,6 +5592,7 @@ mod tests {
                     debug_converge_lease: false,
                 },
                 session,
+                vec!["127.0.0.1".into(), "127.0.0.2".into()],
                 vec![42001],
                 Some("127.0.0.1".into()),
                 move |env| {
@@ -5596,8 +5638,14 @@ mod tests {
                 }
                 Some(crate::proto::hard_nat_control_envelope::Msg::Connected(msg)) => {
                     assert!(saw_start, "expected start-batch before connected");
-                    assert!(saw_advance_nat4_ip, "expected advance-nat4-ip before connected");
-                    assert!(saw_advance_nat3_addr, "expected advance-nat3-addr before connected");
+                    assert!(
+                        saw_advance_nat4_ip,
+                        "expected advance-nat4-ip before connected"
+                    );
+                    assert!(
+                        saw_advance_nat3_addr,
+                        "expected advance-nat3-addr before connected"
+                    );
                     assert_eq!(msg.selected_nat3_addr.to_string(), peer2_addr.to_string());
                     assert_eq!(msg.selected_nat4_ip.to_string(), "127.0.0.1");
                     break;
@@ -5661,6 +5709,7 @@ mod tests {
                     debug_converge_lease: false,
                 },
                 session,
+                vec!["127.0.0.1".into()],
                 vec![43001],
                 Some("127.0.0.1".into()),
                 move |env| {
