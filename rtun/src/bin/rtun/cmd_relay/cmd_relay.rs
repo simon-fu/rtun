@@ -5376,7 +5376,7 @@ mod tests {
             ufrag: "u".into(),
             pwd: "p".into(),
             candidates: vec![
-                "candidate:1 1 udp 1694498559 198.51.100.10 40001 typ srflx raddr 0.0.0.0 rport 9"
+                "candidate:1 1 udp 1694498559 8.8.8.8 40001 typ srflx raddr 0.0.0.0 rport 9"
                     .into(),
                 "candidate:2 1 udp 2130706175 192.168.1.10 40002 typ host".into(),
             ],
@@ -5476,7 +5476,7 @@ mod tests {
                 .iter()
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>(),
-            vec!["198.51.100.10"]
+            vec!["8.8.8.8"]
         );
         assert_eq!(
             proto

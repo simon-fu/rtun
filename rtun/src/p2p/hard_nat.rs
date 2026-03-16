@@ -1674,22 +1674,65 @@ fn candidate_priority_key(kind: CandidateKind, addr: SocketAddr) -> (u8, u8) {
 
 fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            !(v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || v4.is_unspecified())
-        }
-        IpAddr::V6(v6) => {
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local())
-        }
+        IpAddr::V4(v4) => is_public_ipv4(v4),
+        IpAddr::V6(v6) => is_public_ipv6(v6),
     }
+}
+
+fn is_public_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    if v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || v4.is_unspecified()
+    {
+        return false;
+    }
+
+    let [a, b, c, _d] = v4.octets();
+
+    if a == 0 {
+        return false;
+    }
+    if a == 100 && (64..=127).contains(&b) {
+        return false;
+    }
+    if a == 192 && b == 0 && (c == 0 || c == 2) {
+        return false;
+    }
+    if a == 198 && (b == 18 || b == 19) {
+        return false;
+    }
+    if a == 198 && b == 51 && c == 100 {
+        return false;
+    }
+    if a == 203 && b == 0 && c == 113 {
+        return false;
+    }
+    if a >= 240 {
+        return false;
+    }
+
+    true
+}
+
+fn is_public_ipv6(v6: std::net::Ipv6Addr) -> bool {
+    if v6.is_loopback()
+        || v6.is_unspecified()
+        || v6.is_multicast()
+        || v6.is_unique_local()
+        || v6.is_unicast_link_local()
+    {
+        return false;
+    }
+
+    let segments = v6.segments();
+    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+        return false;
+    }
+
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -4557,16 +4600,16 @@ mod tests {
             pwd: "p".into(),
             candidates: vec![
                 "candidate:1 1 udp 2130706175 192.168.1.10 50000 typ host".into(),
-                "candidate:2 1 udp 1694498559 198.51.100.10 50001 typ srflx raddr 0.0.0.0 rport 9"
+                "candidate:2 1 udp 1694498559 8.8.8.8 50001 typ srflx raddr 0.0.0.0 rport 9"
                     .into(),
-                "candidate:3 1 udp 1694498558 198.51.100.11 50002 typ srflx raddr 0.0.0.0 rport 9"
+                "candidate:3 1 udp 1694498558 1.1.1.1 50002 typ srflx raddr 0.0.0.0 rport 9"
                     .into(),
-                "candidate:4 1 udp 2130706175 203.0.113.30 50004 typ host".into(),
+                "candidate:4 1 udp 2130706175 198.18.0.1 50004 typ host".into(),
             ],
         };
 
         let got = collect_public_udp_candidate_ips_from_ice(&args);
-        assert_eq!(got, vec!["198.51.100.10", "198.51.100.11", "203.0.113.30"]);
+        assert_eq!(got, vec!["8.8.8.8", "1.1.1.1"]);
     }
 
     #[test]
@@ -4580,7 +4623,7 @@ mod tests {
             ufrag: "u".into(),
             pwd: "p".into(),
             candidates: vec![
-                "candidate:1 1 udp 1694498559 198.51.100.10 40001 typ srflx raddr 0.0.0.0 rport 9"
+                "candidate:1 1 udp 1694498559 8.8.8.8 40001 typ srflx raddr 0.0.0.0 rport 9"
                     .into(),
                 "candidate:2 1 udp 2130706175 192.168.1.10 40002 typ host".into(),
             ],
@@ -4604,7 +4647,7 @@ mod tests {
                 .iter()
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>(),
-            vec!["198.51.100.10"]
+            vec!["8.8.8.8"]
         );
         assert_eq!(
             args.nat3_public_addrs
