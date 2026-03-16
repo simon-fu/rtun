@@ -30,7 +30,8 @@ use crate::{
         webrtc_ice_peer::{DtlsIceArgs, WebrtcIceConfig, WebrtcIcePeer},
     },
     p2p::hard_nat::{
-        build_random_port_batch, collect_udp_candidate_ips_from_ice,
+        apply_local_hard_nat_session_inputs, build_random_port_batch,
+        collect_udp_candidate_ips_from_ice,
         derive_target_plan_from_ice_with_explicit_nat4_target, prepare_nat3_public_target,
         race_assist, resolve_role_plan, run_nat3_controlled_once,
         run_nat3_controlled_once_with_prebound_socket, run_nat4_controlled_once,
@@ -396,15 +397,15 @@ fn build_local_hard_nat_response_args(
     };
 
     let mut local_hard_nat = remote_hard_nat.clone();
-    let mut session = HardNatSessionParams::from_proto(remote_hard_nat);
-    session.apply_defaults_if_missing();
-    session = session.with_batch_port_count(remote_hard_nat.scan_count);
-    session.nat4_candidate_ips = collect_udp_candidate_ips_from_ice(local_ice);
-    session.nat3_public_addrs = local_nat3_public_addr
+    let local_nat3_public_addrs = local_nat3_public_addr
         .into_iter()
-        .map(|addr| addr.to_string())
-        .collect();
-    session.write_to_proto(&mut local_hard_nat);
+        .collect::<Vec<_>>();
+    apply_local_hard_nat_session_inputs(
+        &mut local_hard_nat,
+        remote_hard_nat.scan_count,
+        local_ice,
+        &local_nat3_public_addrs,
+    );
     MessageField::some(local_hard_nat)
 }
 

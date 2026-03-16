@@ -1037,6 +1037,23 @@ impl HardNatSessionParams {
     }
 }
 
+pub fn apply_local_hard_nat_session_inputs(
+    args: &mut P2PHardNatArgs,
+    batch_port_count_hint: u32,
+    local_ice: &IceArgs,
+    local_nat3_public_addrs: &[SocketAddr],
+) {
+    let mut session = HardNatSessionParams::from_proto(args);
+    session.apply_defaults_if_missing();
+    session = session.with_batch_port_count(batch_port_count_hint);
+    session.nat4_candidate_ips = collect_udp_candidate_ips_from_ice(local_ice);
+    session.nat3_public_addrs = local_nat3_public_addrs
+        .iter()
+        .map(SocketAddr::to_string)
+        .collect();
+    session.write_to_proto(args);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardNatBatchCursor {
     pub batch_id: u64,
@@ -4513,6 +4530,52 @@ mod tests {
 
         let got = collect_udp_candidate_ips_from_ice(&args);
         assert_eq!(got, vec!["198.51.100.10", "203.0.113.30", "192.168.1.10"]);
+    }
+
+    #[test]
+    fn apply_local_hard_nat_session_inputs_adds_local_candidates_and_nat3_addrs() {
+        let mut args = P2PHardNatArgs {
+            session_id: 0x99,
+            scan_count: 128,
+            ..Default::default()
+        };
+        let local_ice = IceArgs {
+            ufrag: "u".into(),
+            pwd: "p".into(),
+            candidates: vec![
+                "candidate:1 1 udp 1694498559 198.51.100.10 40001 typ srflx raddr 0.0.0.0 rport 9"
+                    .into(),
+                "candidate:2 1 udp 2130706175 192.168.1.10 40002 typ host".into(),
+            ],
+        };
+        let nat3_public_addrs = vec!["203.0.113.10:54321".parse().unwrap()];
+        let batch_port_count_hint = args.scan_count;
+
+        apply_local_hard_nat_session_inputs(
+            &mut args,
+            batch_port_count_hint,
+            &local_ice,
+            &nat3_public_addrs,
+        );
+
+        assert_eq!(args.proto_version, HARD_NAT_PROTO_VERSION);
+        assert_eq!(args.session_id, 0x99);
+        assert_eq!(args.batch_port_count, 128);
+        assert_eq!(args.connected_ttl, HARD_NAT_DEFAULT_CONNECTED_TTL);
+        assert_eq!(
+            args.nat4_candidate_ips
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+            vec!["198.51.100.10", "192.168.1.10"]
+        );
+        assert_eq!(
+            args.nat3_public_addrs
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+            vec!["203.0.113.10:54321"]
+        );
     }
 
     #[test]
