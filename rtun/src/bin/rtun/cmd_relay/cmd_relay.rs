@@ -26,9 +26,8 @@ use rtun::{
     ice::ice_peer::{default_ice_servers, IceArgs, IceConfig, IcePeer},
     p2p::hard_nat::{
         apply_local_hard_nat_session_inputs, build_random_port_batch,
-        collect_udp_candidate_ips_from_ice,
-        derive_target_plan_from_ice_with_explicit_nat4_target, prepare_nat3_public_target,
-        race_assist, resolve_role_plan, run_nat3_controlled_once,
+        collect_udp_candidate_ips_from_ice, derive_target_plan_from_ice_with_explicit_nat4_target,
+        prepare_nat3_public_target, race_assist, resolve_role_plan, run_nat3_controlled_once,
         run_nat3_controlled_once_with_prebound_socket, run_nat4_controlled_once,
         HardNatConnectedSocket, HardNatRole, HardNatRoleHint, HardNatSessionParams, Nat3RunConfig,
         Nat4RunConfig, PreparedNat3Socket, HARD_NAT_MAX_ASSIST_DELAY_MS,
@@ -2572,12 +2571,22 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
                 .unwrap_or_default()
                 .with_batch_port_count(udp_relay_hard_nat.scan_count);
             remote_hard_nat_session.apply_defaults_if_missing();
+            tracing::debug!(
+                "[relay_hardnat_diag] received remote hard-nat session: nat4_candidate_ips={:?}, nat3_public_addrs={:?}",
+                remote_hard_nat_session.nat4_candidate_ips,
+                remote_hard_nat_session.nat3_public_addrs,
+            );
             let remote_ice: IceArgs = relay_args
                 .ice
                 .take()
                 .with_context(|| "no ice in udp relay args")?
                 .into();
-            (remote_ice, codec, remote_hard_nat_target, remote_hard_nat_session)
+            (
+                remote_ice,
+                codec,
+                remote_hard_nat_target,
+                remote_hard_nat_session,
+            )
         }
         Open_p2p_rsp::Status(s) => {
             bail!("open p2p but {s:?}");
@@ -2671,6 +2680,12 @@ fn build_udp_relay_hard_nat_args(
         cfg.scan_count,
         local_ice,
         local_nat3_public_addrs,
+    );
+    let session = HardNatSessionParams::from_proto(&args);
+    tracing::debug!(
+        "[relay_hardnat_diag] built local hard-nat session: nat4_candidate_ips={:?}, nat3_public_addrs={:?}",
+        session.nat4_candidate_ips,
+        session.nat3_public_addrs,
     );
     protobuf::MessageField::some(args)
 }
@@ -5431,12 +5446,8 @@ mod tests {
 
     #[test]
     fn relay_hard_nat_request_args_add_local_candidates_and_session_defaults() {
-        let args = parse_cmd_args_for_test(&[
-            "--p2p-hardnat",
-            "force",
-            "--p2p-hardnat-scan-count",
-            "256",
-        ]);
+        let args =
+            parse_cmd_args_for_test(&["--p2p-hardnat", "force", "--p2p-hardnat-scan-count", "256"]);
         let cfg = resolve_relay_udp_hard_nat_config(&args).unwrap();
         let nat3_public_addrs = vec!["203.0.113.10:54321".parse().unwrap()];
         let proto = build_udp_relay_hard_nat_args(

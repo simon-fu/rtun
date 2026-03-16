@@ -31,9 +31,8 @@ use crate::{
     },
     p2p::hard_nat::{
         apply_local_hard_nat_session_inputs, build_random_port_batch,
-        collect_udp_candidate_ips_from_ice,
-        derive_target_plan_from_ice_with_explicit_nat4_target, prepare_nat3_public_target,
-        race_assist, resolve_role_plan, run_nat3_controlled_once,
+        collect_udp_candidate_ips_from_ice, derive_target_plan_from_ice_with_explicit_nat4_target,
+        prepare_nat3_public_target, race_assist, resolve_role_plan, run_nat3_controlled_once,
         run_nat3_controlled_once_with_prebound_socket, run_nat4_controlled_once,
         HardNatConnectedSocket, HardNatMode, HardNatRole, HardNatRoleHint, HardNatSessionParams,
         Nat3RunConfig, Nat4RunConfig, PreparedNat3Socket, HARD_NAT_MAX_ASSIST_DELAY_MS,
@@ -397,9 +396,7 @@ fn build_local_hard_nat_response_args(
     };
 
     let mut local_hard_nat = remote_hard_nat.clone();
-    let local_nat3_public_addrs = local_nat3_public_addr
-        .into_iter()
-        .collect::<Vec<_>>();
+    let local_nat3_public_addrs = local_nat3_public_addr.into_iter().collect::<Vec<_>>();
     apply_local_hard_nat_session_inputs(
         &mut local_hard_nat,
         remote_hard_nat.scan_count,
@@ -436,7 +433,8 @@ async fn handle_quic_socks(
     let uid = peer.uid();
     let local_ice = peer.server_gather(remote_ice.clone()).await?;
     tracing::debug!("starting quic tunnel {uid}, local {local_ice:?}, remote {remote_ice:?}");
-    let local_hard_nat = build_local_hard_nat_response_args(&remote_args.hard_nat, &local_ice, None);
+    let local_hard_nat =
+        build_local_hard_nat_response_args(&remote_args.hard_nat, &local_ice, None);
 
     let local_cert = QuicIceCert::try_new()?;
     let local_cert_der = local_cert.to_bytes()?.into();
@@ -836,6 +834,11 @@ async fn handle_udp_relay(
         .unwrap_or_default()
         .with_batch_port_count(hard_nat_cfg.scan_count);
     runtime_hard_nat_session.apply_defaults_if_missing();
+    tracing::debug!(
+        "[agent_hardnat_diag] received remote hard-nat session: nat4_candidate_ips={:?}, nat3_public_addrs={:?}",
+        runtime_hard_nat_session.nat4_candidate_ips,
+        runtime_hard_nat_session.nat3_public_addrs,
+    );
     let hard_nat_rx = build_udp_relay_hard_nat_control_rx(hard_nat_cfg.mode, &hard_nat_tx);
     let local_hard_nat_target_addr = local_prepared_nat3
         .as_ref()
@@ -844,7 +847,9 @@ async fn handle_udp_relay(
     let local_hard_nat = build_local_hard_nat_response_args(
         &remote_args.hard_nat,
         &local_ice,
-        local_prepared_nat3.as_ref().map(|prepared| prepared.nat4_target),
+        local_prepared_nat3
+            .as_ref()
+            .map(|prepared| prepared.nat4_target),
     );
     tracing::warn!(
         "[relay_agent_diag] starting udp relay tunnel {uid}, local {local_ice:?}, remote {remote_ice:?}, target [{target_addr}], idle {:?}, max_payload {}, codec {}",
@@ -2412,12 +2417,14 @@ mod tests {
             session_id: 55,
             seq: 9,
             role_from: 2,
-            msg: Some(crate::proto::hard_nat_control_envelope::Msg::LeaseKeepAlive(
-                crate::proto::HardNatLeaseKeepAlive {
-                    lease_timeout_ms: 6000,
-                    ..Default::default()
-                },
-            )),
+            msg: Some(
+                crate::proto::hard_nat_control_envelope::Msg::LeaseKeepAlive(
+                    crate::proto::HardNatLeaseKeepAlive {
+                        lease_timeout_ms: 6000,
+                        ..Default::default()
+                    },
+                ),
+            ),
             ..Default::default()
         };
 
@@ -2453,12 +2460,14 @@ mod tests {
             session_id: 77,
             seq: 5,
             role_from: 2,
-            msg: Some(crate::proto::hard_nat_control_envelope::Msg::LeaseKeepAlive(
-                crate::proto::HardNatLeaseKeepAlive {
-                    lease_timeout_ms: 2500,
-                    ..Default::default()
-                },
-            )),
+            msg: Some(
+                crate::proto::hard_nat_control_envelope::Msg::LeaseKeepAlive(
+                    crate::proto::HardNatLeaseKeepAlive {
+                        lease_timeout_ms: 2500,
+                        ..Default::default()
+                    },
+                ),
+            ),
             ..Default::default()
         };
 
