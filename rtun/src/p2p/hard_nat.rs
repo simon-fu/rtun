@@ -1501,12 +1501,65 @@ fn build_hard_nat_ack(
     }
 }
 
+fn hard_nat_control_debug_label(env: &HardNatControlEnvelope) -> String {
+    let msg = match env.msg.as_ref() {
+        Some(hard_nat_control_envelope::Msg::StartBatch(msg)) => {
+            format!("StartBatch(batch_id={}, ports={})", msg.batch_id, msg.ports.len())
+        }
+        Some(hard_nat_control_envelope::Msg::NextBatch(msg)) => {
+            format!(
+                "NextBatch(next_batch_id={}, nat3_addr_index={}, nat4_ip_index={}, ports={})",
+                msg.next_batch_id,
+                msg.nat3_addr_index,
+                msg.nat4_ip_index,
+                msg.ports.len()
+            )
+        }
+        Some(hard_nat_control_envelope::Msg::LeaseKeepAlive(msg)) => {
+            format!("LeaseKeepAlive(timeout_ms={})", msg.lease_timeout_ms)
+        }
+        Some(hard_nat_control_envelope::Msg::AdvanceNat4Ip(msg)) => {
+            format!(
+                "AdvanceNat4Ip(batch_id={}, next_index={})",
+                msg.batch_id, msg.next_nat4_ip_index
+            )
+        }
+        Some(hard_nat_control_envelope::Msg::AdvanceNat3Addr(msg)) => {
+            format!(
+                "AdvanceNat3Addr(batch_id={}, next_index={})",
+                msg.batch_id, msg.next_nat3_addr_index
+            )
+        }
+        Some(hard_nat_control_envelope::Msg::Connected(msg)) => format!(
+            "Connected(nat3_addr={}, nat4_ip={}, port={}, restore_ttl={})",
+            msg.selected_nat3_addr, msg.selected_nat4_ip, msg.selected_port, msg.restore_ttl
+        ),
+        Some(hard_nat_control_envelope::Msg::Abort(msg)) => {
+            format!("Abort(reason={})", msg.reason)
+        }
+        Some(hard_nat_control_envelope::Msg::Ack(msg)) => {
+            format!("Ack(acked_seq={}, state={})", msg.acked_seq, msg.state)
+        }
+        None => "None".to_string(),
+    };
+    format!(
+        "session_id={}, seq={}, role_from={}, msg={}",
+        env.session_id, env.seq, env.role_from, msg
+    )
+}
+
 async fn recv_hard_nat_control(
     control_rx: &mut broadcast::Receiver<HardNatControlEnvelope>,
 ) -> Result<HardNatControlEnvelope> {
     loop {
         match control_rx.recv().await {
-            Ok(env) => return Ok(env),
+            Ok(env) => {
+                debug!(
+                    "hard_nat: received control {}",
+                    hard_nat_control_debug_label(&env)
+                );
+                return Ok(env);
+            }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 warn!("hard-nat control receiver lagged, skipped [{skipped}] messages");
             }
@@ -2137,6 +2190,10 @@ where
                 let env = env?;
                 let acked_seq = env.seq;
                 let apply = executor.apply_control(env, Instant::now());
+                debug!(
+                    "hard_nat nat3 controlled apply={apply:?}, phase={:?}",
+                    executor.phase()
+                );
                 if apply == HardNatControlApply::Applied {
                     let ack = build_hard_nat_ack(
                         session.session_id,
@@ -2145,6 +2202,10 @@ where
                         hard_nat_executor_state_value(executor.phase()),
                     );
                     ack_seq += 1;
+                    debug!(
+                        "hard_nat nat3 controlled sending ack {}",
+                        hard_nat_control_debug_label(&ack)
+                    );
                     send_control(ack).await?;
                     if let Some(reason) = abort_reason {
                         recv_tasks.abort_and_wait().await;
@@ -2198,6 +2259,10 @@ where
     };
 
     let start_batch = scheduler.start_batch(start_batch_ports)?;
+    debug!(
+        "hard_nat nat4 controlled sending start {}",
+        hard_nat_control_debug_label(&start_batch)
+    );
     send_control(start_batch).await?;
 
     let runtime = match prepare_nat4_probe_runtime(&args).await {
@@ -2243,17 +2308,30 @@ where
                     probe_due = true;
                 }
                 _ = keepalive_tick.tick() => {
-                    send_control(scheduler.lease_keepalive()).await?;
+                    let keepalive = scheduler.lease_keepalive();
+                    debug!(
+                        "hard_nat nat4 controlled sending keepalive {}",
+                        hard_nat_control_debug_label(&keepalive)
+                    );
+                    send_control(keepalive).await?;
                 }
                 _ = &mut ip_try_sleep => {
                     match scheduler.advance_after_timeout() {
                         Some(HardNatSchedulerAdvance::Send(env)) => {
+                            debug!(
+                                "hard_nat nat4 controlled sending advance {}",
+                                hard_nat_control_debug_label(&env)
+                            );
                             send_control(env).await?;
                             probe_due = true;
                         }
                         Some(HardNatSchedulerAdvance::NeedNextBatch { .. }) => {
                             let next_ports = build_random_port_batch(batch_count);
                             let env = scheduler.start_next_batch(next_ports)?;
+                            debug!(
+                                "hard_nat nat4 controlled sending next batch {}",
+                                hard_nat_control_debug_label(&env)
+                            );
                             send_control(env).await?;
                             probe_due = true;
                         }
@@ -2280,6 +2358,10 @@ where
             first.remote_addr.port() as u32,
             session.connected_ttl.max(HARD_NAT_DEFAULT_CONNECTED_TTL),
         )?;
+        debug!(
+            "hard_nat nat4 controlled sending connected {}",
+            hard_nat_control_debug_label(&connected)
+        );
         send_control(connected).await?;
         Ok(first)
     }
@@ -2290,6 +2372,10 @@ where
         Ok(first) => Ok(first),
         Err(err) => {
             if let Ok(abort) = scheduler.abort(format!("{err:#}")) {
+                debug!(
+                    "hard_nat nat4 controlled sending abort {}",
+                    hard_nat_control_debug_label(&abort)
+                );
                 let _ = send_control(abort).await;
             }
             Err(err)

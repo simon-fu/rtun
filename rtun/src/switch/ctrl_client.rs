@@ -131,6 +131,53 @@ enum DecodedCtrlClientPacket {
     HardNatControl(HardNatControlEnvelope),
 }
 
+fn hard_nat_control_debug_label(env: &HardNatControlEnvelope) -> String {
+    let msg = match env.msg.as_ref() {
+        Some(crate::proto::hard_nat_control_envelope::Msg::StartBatch(msg)) => {
+            format!("StartBatch(batch_id={}, ports={})", msg.batch_id, msg.ports.len())
+        }
+        Some(crate::proto::hard_nat_control_envelope::Msg::NextBatch(msg)) => {
+            format!(
+                "NextBatch(next_batch_id={}, nat3_addr_index={}, nat4_ip_index={}, ports={})",
+                msg.next_batch_id,
+                msg.nat3_addr_index,
+                msg.nat4_ip_index,
+                msg.ports.len()
+            )
+        }
+        Some(crate::proto::hard_nat_control_envelope::Msg::LeaseKeepAlive(msg)) => {
+            format!("LeaseKeepAlive(timeout_ms={})", msg.lease_timeout_ms)
+        }
+        Some(crate::proto::hard_nat_control_envelope::Msg::AdvanceNat4Ip(msg)) => {
+            format!(
+                "AdvanceNat4Ip(batch_id={}, next_index={})",
+                msg.batch_id, msg.next_nat4_ip_index
+            )
+        }
+        Some(crate::proto::hard_nat_control_envelope::Msg::AdvanceNat3Addr(msg)) => {
+            format!(
+                "AdvanceNat3Addr(batch_id={}, next_index={})",
+                msg.batch_id, msg.next_nat3_addr_index
+            )
+        }
+        Some(crate::proto::hard_nat_control_envelope::Msg::Connected(msg)) => format!(
+            "Connected(nat3_addr={}, nat4_ip={}, port={}, restore_ttl={})",
+            msg.selected_nat3_addr, msg.selected_nat4_ip, msg.selected_port, msg.restore_ttl
+        ),
+        Some(crate::proto::hard_nat_control_envelope::Msg::Abort(msg)) => {
+            format!("Abort(reason={})", msg.reason)
+        }
+        Some(crate::proto::hard_nat_control_envelope::Msg::Ack(msg)) => {
+            format!("Ack(acked_seq={}, state={})", msg.acked_seq, msg.state)
+        }
+        None => "None".to_string(),
+    };
+    format!(
+        "session_id={}, seq={}, role_from={}, msg={}",
+        env.session_id, env.seq, env.role_from, msg
+    )
+}
+
 fn decode_ctrl_client_packet(payload: Bytes) -> Result<DecodedCtrlClientPacket> {
     let legacy = payload.clone();
     match CtrlChannelPacket::parse_from_bytes(&payload) {
@@ -155,7 +202,8 @@ async fn ctrl_reader_loop(
     loop {
         let packet = match ctrl_rx.recv_packet().await {
             Ok(packet) => packet,
-            Err(_e) => {
+            Err(e) => {
+                tracing::debug!("ctrl_client: recv ctrl packet failed: {e:#}");
                 let _r = event_tx.send(CtrlEvent::CtrlChBroken).await;
                 return;
             }
@@ -168,6 +216,10 @@ async fn ctrl_reader_loop(
                 }
             }
             Ok(DecodedCtrlClientPacket::HardNatControl(env)) => {
+                tracing::debug!(
+                    "ctrl_client: received hard-nat control {}",
+                    hard_nat_control_debug_label(&env)
+                );
                 let _r = hard_nat_tx.send(env);
             }
             Err(e) => {
@@ -577,6 +629,10 @@ impl<H: SwitchHanlder> AsyncHandler<OpSendHardNatControl> for Entity<H> {
 
     async fn handle(&mut self, req: OpSendHardNatControl) -> Self::Response {
         send_due_ping(self).await?;
+        tracing::debug!(
+            "ctrl_client: sending hard-nat control {}",
+            hard_nat_control_debug_label(&req.0)
+        );
 
         let data = CtrlChannelPacket {
             body: Some(ctrl_channel_packet::Body::HardNatControl(req.0)),
@@ -587,6 +643,7 @@ impl<H: SwitchHanlder> AsyncHandler<OpSendHardNatControl> for Entity<H> {
             .send_data(data.into())
             .await
             .map_err(|_e| anyhow!("send hardnat control failed"))?;
+        tracing::debug!("ctrl_client: hard-nat control sent");
         Ok(())
     }
 }

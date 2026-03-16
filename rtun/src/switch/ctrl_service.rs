@@ -23,6 +23,53 @@ use super::{
     next_ch_id::NextChId,
 };
 
+fn hard_nat_control_debug_label(env: &HardNatControlEnvelope) -> String {
+    let msg = match env.msg.as_ref() {
+        Some(crate::proto::hard_nat_control_envelope::Msg::StartBatch(msg)) => {
+            format!("StartBatch(batch_id={}, ports={})", msg.batch_id, msg.ports.len())
+        }
+        Some(crate::proto::hard_nat_control_envelope::Msg::NextBatch(msg)) => {
+            format!(
+                "NextBatch(next_batch_id={}, nat3_addr_index={}, nat4_ip_index={}, ports={})",
+                msg.next_batch_id,
+                msg.nat3_addr_index,
+                msg.nat4_ip_index,
+                msg.ports.len()
+            )
+        }
+        Some(crate::proto::hard_nat_control_envelope::Msg::LeaseKeepAlive(msg)) => {
+            format!("LeaseKeepAlive(timeout_ms={})", msg.lease_timeout_ms)
+        }
+        Some(crate::proto::hard_nat_control_envelope::Msg::AdvanceNat4Ip(msg)) => {
+            format!(
+                "AdvanceNat4Ip(batch_id={}, next_index={})",
+                msg.batch_id, msg.next_nat4_ip_index
+            )
+        }
+        Some(crate::proto::hard_nat_control_envelope::Msg::AdvanceNat3Addr(msg)) => {
+            format!(
+                "AdvanceNat3Addr(batch_id={}, next_index={})",
+                msg.batch_id, msg.next_nat3_addr_index
+            )
+        }
+        Some(crate::proto::hard_nat_control_envelope::Msg::Connected(msg)) => format!(
+            "Connected(nat3_addr={}, nat4_ip={}, port={}, restore_ttl={})",
+            msg.selected_nat3_addr, msg.selected_nat4_ip, msg.selected_port, msg.restore_ttl
+        ),
+        Some(crate::proto::hard_nat_control_envelope::Msg::Abort(msg)) => {
+            format!("Abort(reason={})", msg.reason)
+        }
+        Some(crate::proto::hard_nat_control_envelope::Msg::Ack(msg)) => {
+            format!("Ack(acked_seq={}, state={})", msg.acked_seq, msg.state)
+        }
+        None => "None".to_string(),
+    };
+    format!(
+        "session_id={}, seq={}, role_from={}, msg={}",
+        env.session_id, env.seq, env.role_from, msg
+    )
+}
+
 pub fn spawn_ctrl_service<H1: CtrlHandler, H2: SwitchHanlder>(
     uid: HUId,
     agent: CtrlInvoker<H1>,
@@ -32,7 +79,7 @@ pub fn spawn_ctrl_service<H1: CtrlHandler, H2: SwitchHanlder>(
 ) -> JoinHandle<Result<ExitReason>> {
     let task = spawn_with_name(format!("ctrl-service-{}", uid), async move {
         let r = ctrl_loop_full(&agent, &switch, &mut chpair, &mut hard_nat_rx).await;
-        tracing::debug!("finished with [{:?}]", r);
+        tracing::debug!("ctrl_service loop finished with [{r:?}]");
         switch.shutdown().await;
         r
     });
@@ -135,11 +182,27 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
         let packet = tokio::select! {
             _r = agent_watch.watch() => bail!("agent has gone"),
             outbound = hard_nat_rx.recv() => {
-                let env = outbound.with_context(|| "hardnat outbound closed")?;
+                let env = match outbound {
+                    Some(env) => env,
+                    None => {
+                        tracing::debug!("ctrl_service: hard-nat outbound channel closed");
+                        bail!("hardnat outbound closed");
+                    }
+                };
+                tracing::debug!(
+                    "ctrl_service: sending outbound hard-nat control {}",
+                    hard_nat_control_debug_label(&env)
+                );
                 send_hard_nat_control(ctrl_tx, env).await?;
                 continue;
             }
-            r = ctrl_rx.recv_packet() => r?,
+            r = ctrl_rx.recv_packet() => match r {
+                Ok(packet) => packet,
+                Err(e) => {
+                    tracing::debug!("ctrl_service: recv ctrl packet failed: {e:#}");
+                    return Err(e.into());
+                }
+            },
             _r = tokio::time::sleep(alive_timeout) => {
                 bail!("wait for ping timeout")
             }
@@ -149,6 +212,10 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
             DecodedCtrlServicePacket::LegacyRpc(req) => (req, false),
             DecodedCtrlServicePacket::WrappedRpc(req) => (req, true),
             DecodedCtrlServicePacket::HardNatControl(env) => {
+                tracing::debug!(
+                    "ctrl_service: received inbound hard-nat control {}",
+                    hard_nat_control_debug_label(&env)
+                );
                 agent.recv_hard_nat_control(env).await?;
                 continue;
             }
