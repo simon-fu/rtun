@@ -98,21 +98,66 @@ enum DecodedCtrlServicePacket {
     HardNatControl(HardNatControlEnvelope),
 }
 
+fn is_plausible_c2a_request(req: &C2ARequest) -> bool {
+    match req.c2a_req_args.as_ref() {
+        Some(C2a_req_args::OpenSell(args)) => {
+            args.ch_id.is_some()
+                || args.cols != 0
+                || args.rows != 0
+                || args.program_args.is_some()
+        }
+        Some(C2a_req_args::OpenSocks(args)) => {
+            args.ch_id.is_some() || !args.peer_addr.is_empty()
+        }
+        Some(C2a_req_args::CloseChannel(args)) => args.ch_id != 0,
+        Some(C2a_req_args::Ping(_)) => true,
+        Some(C2a_req_args::KickDown(args)) => args.code != 0 || !args.reason.is_empty(),
+        Some(C2a_req_args::OpenP2p(args)) => args.p2p_args.is_some(),
+        Some(C2a_req_args::ExecAgentScript(args)) => {
+            !args.name.is_empty()
+                || !args.content.is_empty()
+                || args.timeout_secs != 0
+                || args.max_stdout_bytes != 0
+                || args.max_stderr_bytes != 0
+                || !args.argv.is_empty()
+        }
+        None => false,
+    }
+}
+
+fn is_plausible_hard_nat_control(env: &HardNatControlEnvelope) -> bool {
+    env.msg.is_some()
+}
+
 fn decode_ctrl_service_packet(payload: &[u8]) -> Result<DecodedCtrlServicePacket> {
-    let wrapped = CtrlChannelPacket::parse_from_bytes(payload)?;
-    match wrapped.body {
-        Some(ctrl_channel_packet::Body::RpcRequest(req)) => Ok(DecodedCtrlServicePacket::WrappedRpc(req)),
-        Some(ctrl_channel_packet::Body::HardNatControl(env)) => {
-            Ok(DecodedCtrlServicePacket::HardNatControl(env))
-        }
-        Some(ctrl_channel_packet::Body::RpcResponse(_)) => {
-            bail!("unexpected rpc response on ctrl service")
-        }
-        None => {
-            let legacy = C2ARequest::parse_from_bytes(payload)?;
-            Ok(DecodedCtrlServicePacket::LegacyRpc(legacy))
+    if let Ok(wrapped) = CtrlChannelPacket::parse_from_bytes(payload) {
+        match wrapped.body {
+            Some(ctrl_channel_packet::Body::HardNatControl(env))
+                if is_plausible_hard_nat_control(&env) =>
+            {
+                return Ok(DecodedCtrlServicePacket::HardNatControl(env));
+            }
+            Some(ctrl_channel_packet::Body::RpcRequest(req)) if is_plausible_c2a_request(&req) => {
+                let legacy = C2ARequest::parse_from_bytes(payload).ok();
+                if legacy
+                    .as_ref()
+                    .map(is_plausible_c2a_request)
+                    .unwrap_or(false)
+                {
+                    return Ok(DecodedCtrlServicePacket::LegacyRpc(legacy.unwrap()));
+                }
+                return Ok(DecodedCtrlServicePacket::WrappedRpc(req));
+            }
+            _ => {}
         }
     }
+
+    let legacy = C2ARequest::parse_from_bytes(payload)?;
+    if is_plausible_c2a_request(&legacy) {
+        return Ok(DecodedCtrlServicePacket::LegacyRpc(legacy));
+    }
+
+    bail!("unrecognized ctrl packet")
 }
 
 fn encode_ctrl_rpc_response_packet(rsp: CtrlRpcResponse, wrapped: bool) -> Result<Bytes> {
@@ -403,8 +448,8 @@ mod tests {
     };
     use crate::proto::{
         c2arequest::C2a_req_args, ctrl_channel_packet, ctrl_rpc_response,
-        hard_nat_control_envelope, CtrlChannelPacket, CtrlRpcResponse, OpenP2PResponse, P2PArgs,
-        ResponseStatus,
+        hard_nat_control_envelope, open_channel_response::Open_ch_rsp, CtrlChannelPacket,
+        CtrlRpcResponse, OpenChannelResponse, OpenP2PResponse, P2PArgs, ResponseStatus,
     };
     use protobuf::Message;
     use tokio::{sync::{broadcast, mpsc}, time::timeout};
@@ -412,6 +457,8 @@ mod tests {
     struct TestCtrlEntity {
         guard: CtrlGuard,
         hard_nat_tx: broadcast::Sender<HardNatControlEnvelope>,
+        open_shell_ch_id: Option<ChId>,
+        open_socks_ch_id: Option<ChId>,
     }
 
     impl ActorEntity for TestCtrlEntity {
@@ -447,7 +494,11 @@ mod tests {
         type Response = OpOpenShellResult;
 
         async fn handle(&mut self, _req: OpOpenShell) -> Self::Response {
-            anyhow::bail!("unexpected open_shell")
+            let ch_id = self
+                .open_shell_ch_id
+                .with_context(|| "unexpected open_shell")?;
+            let (tx, _rx) = mpsc::channel(CHANNEL_SIZE);
+            Ok(ChSender::new(ch_id, tx))
         }
     }
 
@@ -456,7 +507,11 @@ mod tests {
         type Response = OpOpenSocksResult;
 
         async fn handle(&mut self, _req: OpOpenSocks) -> Self::Response {
-            anyhow::bail!("unexpected open_socks")
+            let ch_id = self
+                .open_socks_ch_id
+                .with_context(|| "unexpected open_socks")?;
+            let (tx, _rx) = mpsc::channel(CHANNEL_SIZE);
+            Ok(ChSender::new(ch_id, tx))
         }
     }
 
@@ -571,12 +626,21 @@ mod tests {
     impl SwitchHanlder for TestSwitchEntity {}
 
     fn spawn_test_ctrl() -> crate::actor_service::ActorHandle<TestCtrlEntity> {
+        spawn_test_ctrl_with_channels(None, None)
+    }
+
+    fn spawn_test_ctrl_with_channels(
+        open_shell_ch_id: Option<ChId>,
+        open_socks_ch_id: Option<ChId>,
+    ) -> crate::actor_service::ActorHandle<TestCtrlEntity> {
         let (hard_nat_tx, _) = broadcast::channel(4);
         start_actor(
             "test-ctrl-service-agent".into(),
             TestCtrlEntity {
                 guard: CtrlGuard::new(),
                 hard_nat_tx,
+                open_shell_ch_id,
+                open_socks_ch_id,
             },
             handle_first_none,
             wait_next_none,
@@ -633,6 +697,48 @@ mod tests {
         };
         let decoded = decode_ctrl_service_packet(&wrapped_req.write_to_bytes().unwrap()).unwrap();
         assert!(matches!(decoded, DecodedCtrlServicePacket::WrappedRpc(_)));
+    }
+
+    #[test]
+    fn decode_ctrl_service_packet_accepts_legacy_open_shell_request() {
+        let legacy_req = C2ARequest {
+            c2a_req_args: Some(C2a_req_args::OpenSell(crate::proto::OpenShellArgs {
+                ch_id: Some(9),
+                cols: 80,
+                rows: 24,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let decoded = decode_ctrl_service_packet(&legacy_req.write_to_bytes().unwrap()).unwrap();
+        assert!(matches!(decoded, DecodedCtrlServicePacket::LegacyRpc(_)));
+    }
+
+    #[test]
+    fn decode_ctrl_service_packet_accepts_legacy_open_socks_request() {
+        let legacy_req = C2ARequest {
+            c2a_req_args: Some(C2a_req_args::OpenSocks(crate::proto::OpenSocksArgs {
+                ch_id: Some(9),
+                peer_addr: "127.0.0.1:1080".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let decoded = decode_ctrl_service_packet(&legacy_req.write_to_bytes().unwrap()).unwrap();
+        assert!(matches!(decoded, DecodedCtrlServicePacket::LegacyRpc(_)));
+    }
+
+    #[test]
+    fn decode_ctrl_service_packet_accepts_legacy_close_channel_request() {
+        let legacy_req = C2ARequest {
+            c2a_req_args: Some(C2a_req_args::CloseChannel(crate::proto::CloseChannelArgs {
+                ch_id: 9,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let decoded = decode_ctrl_service_packet(&legacy_req.write_to_bytes().unwrap()).unwrap();
+        assert!(matches!(decoded, DecodedCtrlServicePacket::LegacyRpc(_)));
     }
 
     #[test]
@@ -703,6 +809,129 @@ mod tests {
             .unwrap();
         let pong = Pong::parse_from_bytes(&rsp.payload).unwrap();
         assert_eq!(pong.timestamp, 123);
+
+        drop(client_pair.tx);
+        drop(hard_nat_tx);
+        assert!(service.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn ctrl_loop_full_replies_raw_open_channel_response_to_legacy_open_shell() {
+        let ctrl_handle = spawn_test_ctrl_with_channels(Some(ChId(90)), None);
+        let switch_handle = spawn_test_switch();
+        let ctrl = CtrlInvoker::new(ctrl_handle.invoker().clone());
+        let switch = SwitchInvoker::new(switch_handle.invoker().clone());
+        let (mut service_pair, mut client_pair) = make_duplex_ctrl_pair(ChId(1));
+        let (hard_nat_tx, mut hard_nat_rx) = mpsc::channel(1);
+
+        let service = tokio::spawn(async move {
+            ctrl_loop_full(&ctrl, &switch, &mut service_pair, &mut hard_nat_rx).await
+        });
+
+        let req = C2ARequest {
+            c2a_req_args: Some(C2a_req_args::OpenSell(crate::proto::OpenShellArgs {
+                ch_id: Some(9),
+                cols: 80,
+                rows: 24,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        client_pair
+            .tx
+            .send_data(req.write_to_bytes().unwrap().into())
+            .await
+            .unwrap();
+
+        let rsp = timeout(Duration::from_secs(1), client_pair.rx.recv_packet())
+            .await
+            .unwrap()
+            .unwrap();
+        let rsp = OpenChannelResponse::parse_from_bytes(&rsp.payload)
+            .unwrap()
+            .open_ch_rsp
+            .unwrap();
+        assert!(matches!(rsp, Open_ch_rsp::ChId(9)));
+
+        drop(client_pair.tx);
+        drop(hard_nat_tx);
+        assert!(service.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn ctrl_loop_full_replies_raw_open_channel_response_to_legacy_open_socks() {
+        let ctrl_handle = spawn_test_ctrl_with_channels(None, Some(ChId(100)));
+        let switch_handle = spawn_test_switch();
+        let ctrl = CtrlInvoker::new(ctrl_handle.invoker().clone());
+        let switch = SwitchInvoker::new(switch_handle.invoker().clone());
+        let (mut service_pair, mut client_pair) = make_duplex_ctrl_pair(ChId(1));
+        let (hard_nat_tx, mut hard_nat_rx) = mpsc::channel(1);
+
+        let service = tokio::spawn(async move {
+            ctrl_loop_full(&ctrl, &switch, &mut service_pair, &mut hard_nat_rx).await
+        });
+
+        let req = C2ARequest {
+            c2a_req_args: Some(C2a_req_args::OpenSocks(crate::proto::OpenSocksArgs {
+                ch_id: Some(10),
+                peer_addr: "127.0.0.1:1080".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        client_pair
+            .tx
+            .send_data(req.write_to_bytes().unwrap().into())
+            .await
+            .unwrap();
+
+        let rsp = timeout(Duration::from_secs(1), client_pair.rx.recv_packet())
+            .await
+            .unwrap()
+            .unwrap();
+        let rsp = OpenChannelResponse::parse_from_bytes(&rsp.payload)
+            .unwrap()
+            .open_ch_rsp
+            .unwrap();
+        assert!(matches!(rsp, Open_ch_rsp::ChId(10)));
+
+        drop(client_pair.tx);
+        drop(hard_nat_tx);
+        assert!(service.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn ctrl_loop_full_replies_raw_status_to_legacy_close_channel() {
+        let ctrl_handle = spawn_test_ctrl();
+        let switch_handle = spawn_test_switch();
+        let ctrl = CtrlInvoker::new(ctrl_handle.invoker().clone());
+        let switch = SwitchInvoker::new(switch_handle.invoker().clone());
+        let (mut service_pair, mut client_pair) = make_duplex_ctrl_pair(ChId(1));
+        let (hard_nat_tx, mut hard_nat_rx) = mpsc::channel(1);
+
+        let service = tokio::spawn(async move {
+            ctrl_loop_full(&ctrl, &switch, &mut service_pair, &mut hard_nat_rx).await
+        });
+
+        let req = C2ARequest {
+            c2a_req_args: Some(C2a_req_args::CloseChannel(crate::proto::CloseChannelArgs {
+                ch_id: 7,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        client_pair
+            .tx
+            .send_data(req.write_to_bytes().unwrap().into())
+            .await
+            .unwrap();
+
+        let rsp = timeout(Duration::from_secs(1), client_pair.rx.recv_packet())
+            .await
+            .unwrap()
+            .unwrap();
+        let status = ResponseStatus::parse_from_bytes(&rsp.payload).unwrap();
+        assert_eq!(status.code, 0);
 
         drop(client_pair.tx);
         drop(hard_nat_tx);

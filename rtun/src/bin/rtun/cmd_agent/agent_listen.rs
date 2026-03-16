@@ -1218,11 +1218,24 @@ pub struct CmdArgs {
 mod tests {
     use super::*;
     use rtun::{
+        actor_service::{
+            handle_first_none, handle_msg_none, handle_next_none, start_actor, wait_next_none,
+            ActorEntity, AsyncHandler,
+        },
         channel::ChPacket,
         huid::gen_huid::gen_huid,
-        proto::{hard_nat_control_envelope, HardNatControlEnvelope, HardNatLeaseKeepAlive},
+        proto::{hard_nat_control_envelope, HardNatControlEnvelope, HardNatLeaseKeepAlive, OpenShellArgs},
         switch::{
             agent::ctrl::make_agent_ctrl,
+            entity_watch::{CtrlGuard, OpWatch, WatchResult},
+            invoker_ctrl::{
+                CloseChannelResult, CtrlHandler, CtrlInvoker, OpCloseChannel, OpExecAgentScript,
+                OpExecAgentScriptResult, OpKickDown, OpKickDownResult, OpOpenP2P,
+                OpOpenP2PResult, OpOpenShell, OpOpenShellResult, OpOpenSocks,
+                OpOpenSocksResult, OpRecvHardNatControl, OpRecvHardNatControlResult,
+                OpSendHardNatControl, OpSendHardNatControlResult, OpSubscribeHardNatControl,
+                OpSubscribeHardNatControlResult,
+            },
             session_stream::make_stream_session,
             switch_sink::{PacketSink, SinkError},
             switch_source::{PacketSource, StreamError, StreamPacket},
@@ -1235,10 +1248,148 @@ mod tests {
         task::{Context, Poll},
     };
     use tokio::{
-        sync::mpsc::{self, error::TryRecvError, UnboundedReceiver, UnboundedSender},
+        sync::{
+            broadcast,
+            mpsc::{self, error::TryRecvError, UnboundedReceiver, UnboundedSender},
+        },
         time::{timeout, Duration},
     };
     use tokio_stream::wrappers::UnboundedReceiverStream;
+
+    struct RecordingCtrl {
+        guard: CtrlGuard,
+        hard_nat_tx: broadcast::Sender<HardNatControlEnvelope>,
+        open_shell_tx: UnboundedSender<OpenShellArgs>,
+    }
+
+    impl ActorEntity for RecordingCtrl {
+        type Next = ();
+        type Msg = ();
+        type Result = Result<()>;
+
+        fn into_result(self, result: Result<()>) -> Self::Result {
+            result
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpWatch> for RecordingCtrl {
+        type Response = WatchResult;
+
+        async fn handle(&mut self, _req: OpWatch) -> Self::Response {
+            Ok(self.guard.watch())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpCloseChannel> for RecordingCtrl {
+        type Response = CloseChannelResult;
+
+        async fn handle(&mut self, _req: OpCloseChannel) -> Self::Response {
+            Ok(true)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpOpenShell> for RecordingCtrl {
+        type Response = OpOpenShellResult;
+
+        async fn handle(&mut self, req: OpOpenShell) -> Self::Response {
+            self.open_shell_tx
+                .send(req.1)
+                .map_err(|_| anyhow::anyhow!("open_shell observer dropped"))?;
+            let (tx, _rx) = mpsc::channel(16);
+            Ok(rtun::channel::ChSender::new(ChId(99), tx))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpOpenSocks> for RecordingCtrl {
+        type Response = OpOpenSocksResult;
+
+        async fn handle(&mut self, _req: OpOpenSocks) -> Self::Response {
+            anyhow::bail!("unexpected open_socks")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpKickDown> for RecordingCtrl {
+        type Response = OpKickDownResult;
+
+        async fn handle(&mut self, _req: OpKickDown) -> Self::Response {
+            anyhow::bail!("unexpected kick_down")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpOpenP2P> for RecordingCtrl {
+        type Response = OpOpenP2PResult;
+
+        async fn handle(&mut self, _req: OpOpenP2P) -> Self::Response {
+            anyhow::bail!("unexpected open_p2p")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpExecAgentScript> for RecordingCtrl {
+        type Response = OpExecAgentScriptResult;
+
+        async fn handle(&mut self, _req: OpExecAgentScript) -> Self::Response {
+            anyhow::bail!("unexpected exec_agent_script")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpSendHardNatControl> for RecordingCtrl {
+        type Response = OpSendHardNatControlResult;
+
+        async fn handle(&mut self, _req: OpSendHardNatControl) -> Self::Response {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpSubscribeHardNatControl> for RecordingCtrl {
+        type Response = OpSubscribeHardNatControlResult;
+
+        async fn handle(&mut self, _req: OpSubscribeHardNatControl) -> Self::Response {
+            Ok(self.hard_nat_tx.subscribe())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncHandler<OpRecvHardNatControl> for RecordingCtrl {
+        type Response = OpRecvHardNatControlResult;
+
+        async fn handle(&mut self, req: OpRecvHardNatControl) -> Self::Response {
+            let _r = self.hard_nat_tx.send(req.0);
+            Ok(())
+        }
+    }
+
+    impl CtrlHandler for RecordingCtrl {}
+
+    fn spawn_recording_ctrl(
+    ) -> (
+        ActorHandle<RecordingCtrl>,
+        UnboundedReceiver<OpenShellArgs>,
+    ) {
+        let (hard_nat_tx, _) = broadcast::channel(4);
+        let (open_shell_tx, open_shell_rx) = mpsc::unbounded_channel();
+        let handle = start_actor(
+            "recording-upstream-ctrl".into(),
+            RecordingCtrl {
+                guard: CtrlGuard::new(),
+                hard_nat_tx,
+                open_shell_tx,
+            },
+            handle_first_none,
+            wait_next_none,
+            handle_next_none,
+            handle_msg_none,
+        );
+        (handle, open_shell_rx)
+    }
 
     struct TestPacketSink {
         tx: UnboundedSender<Vec<u8>>,
@@ -1425,5 +1576,44 @@ mod tests {
 
         upstream_agent.shutdown().await;
         upstream_agent.wait_for_completed().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_sub_agent_stream_forwards_legacy_open_shell_to_upstream() {
+        let (upstream_handle, mut open_shell_rx) = spawn_recording_ctrl();
+        let upstream_ctrl = CtrlInvoker::new(upstream_handle.invoker().clone());
+
+        let (server_stream, client_stream) = make_test_packet_stream_pair();
+        let sub_task = tokio::spawn(run_sub_agent_stream(upstream_ctrl, gen_huid(), server_stream));
+        let downstream = make_stream_session(client_stream, false).await.unwrap();
+        let downstream_ctrl = downstream.ctrl_client().clone_invoker();
+
+        let (shell_tx, _shell_rx) = ChPair::new(ChId(1)).split();
+        let opened_shell_tx = downstream_ctrl
+            .open_shell(
+                shell_tx,
+                OpenShellArgs {
+                    cols: 80,
+                    rows: 24,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(opened_shell_tx.ch_id(), ChId(1));
+
+        let got = timeout(Duration::from_secs(1), open_shell_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.cols, 80);
+        assert_eq!(got.rows, 24);
+        assert!(got.ch_id.is_some());
+
+        downstream.ctrl_client().shutdown().await;
+        drop(downstream);
+        sub_task.abort();
+        let _ = sub_task.await;
     }
 }
