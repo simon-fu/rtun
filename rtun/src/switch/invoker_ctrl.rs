@@ -2,8 +2,8 @@ use crate::{
     actor_service::{ActorEntity, AsyncHandler, Invoker, WeakInvoker},
     channel::{ChId, ChSender},
     proto::{
-        ExecAgentScriptArgs, ExecAgentScriptResult, KickDownArgs, OpenP2PResponse, OpenShellArgs,
-        OpenSocksArgs, P2PArgs, HardNatControlEnvelope,
+        ExecAgentScriptArgs, ExecAgentScriptResult, HardNatControlEnvelope, KickDownArgs,
+        OpenP2PResponse, OpenShellArgs, OpenSocksArgs, P2PArgs,
     },
 };
 use anyhow::Result;

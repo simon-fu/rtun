@@ -51,6 +51,7 @@ pub const HARD_NAT_DEFAULT_KEEPALIVE_INTERVAL_MS: u32 = 1_000;
 pub const HARD_NAT_DEFAULT_IP_TRY_TIMEOUT_MS: u32 = 1_000;
 #[cfg(test)]
 const HARD_NAT_KEEP_RECV_PROMOTED_TTL: u32 = 64;
+static NEXT_HARD_NAT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_WARM_DRAIN_MS: u64 = 300;
 pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_PROBING_WINDOW_MS: u64 = 1_500;
 pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_PROBE_HIT_N1: u32 = 2;
@@ -64,6 +65,15 @@ const NAT3_PAUSE_AFTER_DISCOVERY_PROMPT: &str =
     "nat3 discovery finished, press Enter to start probing";
 const NAT3_HOLD_BATCH_UNTIL_ENTER_PROMPT: &str =
     "nat3 batch probing active, press Enter to reroll target ports";
+
+fn allocate_hard_nat_session_id() -> u64 {
+    loop {
+        let session_id = NEXT_HARD_NAT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        if session_id != 0 {
+            return session_id;
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HardNatRole {
@@ -1045,6 +1055,9 @@ pub fn apply_local_hard_nat_session_inputs(
 ) {
     let mut session = HardNatSessionParams::from_proto(args);
     session.apply_defaults_if_missing();
+    if session.session_id == 0 {
+        session.session_id = allocate_hard_nat_session_id();
+    }
     session = session.with_batch_port_count(batch_port_count_hint);
     session.nat4_candidate_ips = collect_public_udp_candidate_ips_from_ice(local_ice);
     session.nat3_public_addrs = local_nat3_public_addrs
@@ -4656,6 +4669,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["203.0.113.10:54321"]
         );
+    }
+
+    #[test]
+    fn apply_local_hard_nat_session_inputs_generates_unique_session_id_when_missing() {
+        let local_ice = IceArgs {
+            ufrag: "u".into(),
+            pwd: "p".into(),
+            candidates: vec![
+                "candidate:1 1 udp 1694498559 8.8.8.8 40001 typ srflx raddr 0.0.0.0 rport 9"
+                    .into(),
+            ],
+        };
+        let nat3_public_addrs = vec!["203.0.113.10:54321".parse().unwrap()];
+        let mut first = P2PHardNatArgs::default();
+        let mut second = P2PHardNatArgs::default();
+
+        apply_local_hard_nat_session_inputs(&mut first, 64, &local_ice, &nat3_public_addrs);
+        apply_local_hard_nat_session_inputs(&mut second, 64, &local_ice, &nat3_public_addrs);
+
+        assert_ne!(first.session_id, 0);
+        assert_ne!(second.session_id, 0);
+        assert_ne!(first.session_id, second.session_id);
     }
 
     #[test]

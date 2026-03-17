@@ -26,10 +26,9 @@ use rtun::{
         invoker_ctrl::{
             CloseChannelResult, CtrlHandler, CtrlInvoker, OpCloseChannel, OpExecAgentScript,
             OpExecAgentScriptResult, OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult,
-            OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult,
-            OpRecvHardNatControl, OpRecvHardNatControlResult, OpSendHardNatControl,
-            OpSendHardNatControlResult, OpSubscribeHardNatControl,
-            OpSubscribeHardNatControlResult,
+            OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult, OpRecvHardNatControl,
+            OpRecvHardNatControlResult, OpSendHardNatControl, OpSendHardNatControlResult,
+            OpSubscribeHardNatControl, OpSubscribeHardNatControlResult,
         },
         session_stream::make_stream_session,
         switch_pair::{make_switch_pair, SwitchPairEntity},
@@ -1217,6 +1216,8 @@ pub struct CmdArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::{Sink, Stream};
+    use protobuf::Message;
     use rtun::{
         actor_service::{
             handle_first_none, handle_msg_none, handle_next_none, start_actor, wait_next_none,
@@ -1224,16 +1225,18 @@ mod tests {
         },
         channel::ChPacket,
         huid::gen_huid::gen_huid,
-        proto::{hard_nat_control_envelope, HardNatControlEnvelope, HardNatLeaseKeepAlive, OpenShellArgs},
+        proto::{
+            hard_nat_control_envelope, HardNatControlEnvelope, HardNatLeaseKeepAlive, OpenShellArgs,
+        },
         switch::{
             agent::ctrl::make_agent_ctrl,
             entity_watch::{CtrlGuard, OpWatch, WatchResult},
             invoker_ctrl::{
                 CloseChannelResult, CtrlHandler, CtrlInvoker, OpCloseChannel, OpExecAgentScript,
-                OpExecAgentScriptResult, OpKickDown, OpKickDownResult, OpOpenP2P,
-                OpOpenP2PResult, OpOpenShell, OpOpenShellResult, OpOpenSocks,
-                OpOpenSocksResult, OpRecvHardNatControl, OpRecvHardNatControlResult,
-                OpSendHardNatControl, OpSendHardNatControlResult, OpSubscribeHardNatControl,
+                OpExecAgentScriptResult, OpKickDown, OpKickDownResult, OpOpenP2P, OpOpenP2PResult,
+                OpOpenShell, OpOpenShellResult, OpOpenSocks, OpOpenSocksResult,
+                OpRecvHardNatControl, OpRecvHardNatControlResult, OpSendHardNatControl,
+                OpSendHardNatControlResult, OpSubscribeHardNatControl,
                 OpSubscribeHardNatControlResult,
             },
             session_stream::make_stream_session,
@@ -1241,8 +1244,6 @@ mod tests {
             switch_source::{PacketSource, StreamError, StreamPacket},
         },
     };
-    use futures::{Sink, Stream};
-    use protobuf::Message;
     use std::{
         pin::Pin,
         task::{Context, Poll},
@@ -1369,11 +1370,7 @@ mod tests {
 
     impl CtrlHandler for RecordingCtrl {}
 
-    fn spawn_recording_ctrl(
-    ) -> (
-        ActorHandle<RecordingCtrl>,
-        UnboundedReceiver<OpenShellArgs>,
-    ) {
+    fn spawn_recording_ctrl() -> (ActorHandle<RecordingCtrl>, UnboundedReceiver<OpenShellArgs>) {
         let (hard_nat_tx, _) = broadcast::channel(4);
         let (open_shell_tx, open_shell_rx) = mpsc::unbounded_channel();
         let handle = start_actor(
@@ -1453,8 +1450,7 @@ mod tests {
 
     impl PacketSource for TestPacketSource {}
 
-    fn make_test_packet_stream_pair(
-    ) -> (
+    fn make_test_packet_stream_pair() -> (
         (TestPacketSink, TestPacketSource),
         (TestPacketSink, TestPacketSource),
     ) {
@@ -1522,7 +1518,11 @@ mod tests {
             .unwrap();
 
         let (server_stream, client_stream) = make_test_packet_stream_pair();
-        let sub_task = tokio::spawn(run_sub_agent_stream(upstream_ctrl, gen_huid(), server_stream));
+        let sub_task = tokio::spawn(run_sub_agent_stream(
+            upstream_ctrl,
+            gen_huid(),
+            server_stream,
+        ));
         let downstream = make_stream_session(client_stream, false).await.unwrap();
         let downstream_ctrl = downstream.ctrl_client().clone_invoker();
 
@@ -1538,7 +1538,10 @@ mod tests {
             )),
             ..Default::default()
         };
-        downstream_ctrl.send_hard_nat_control(env.clone()).await.unwrap();
+        downstream_ctrl
+            .send_hard_nat_control(env.clone())
+            .await
+            .unwrap();
 
         let got = timeout(Duration::from_secs(1), upstream_out_rx.recv())
             .await
@@ -1584,7 +1587,11 @@ mod tests {
         let upstream_ctrl = CtrlInvoker::new(upstream_handle.invoker().clone());
 
         let (server_stream, client_stream) = make_test_packet_stream_pair();
-        let sub_task = tokio::spawn(run_sub_agent_stream(upstream_ctrl, gen_huid(), server_stream));
+        let sub_task = tokio::spawn(run_sub_agent_stream(
+            upstream_ctrl,
+            gen_huid(),
+            server_stream,
+        ));
         let downstream = make_stream_session(client_stream, false).await.unwrap();
         let downstream_ctrl = downstream.ctrl_client().clone_invoker();
 

@@ -155,13 +155,15 @@ mod tests {
                 session_id: 7,
                 seq: 14,
                 role_from: 2,
-                msg: Some(hard_nat_control_envelope::Msg::NextBatch(HardNatNextBatch {
-                    next_batch_id: 4,
-                    nat3_addr_index: 0,
-                    nat4_ip_index: 0,
-                    ports: vec![41001, 41002],
-                    ..Default::default()
-                })),
+                msg: Some(hard_nat_control_envelope::Msg::NextBatch(
+                    HardNatNextBatch {
+                        next_batch_id: 4,
+                        nat3_addr_index: 0,
+                        nat4_ip_index: 0,
+                        ports: vec![41001, 41002],
+                        ..Default::default()
+                    },
+                )),
                 ..Default::default()
             },
             HardNatControlEnvelope {
@@ -180,13 +182,15 @@ mod tests {
                 session_id: 7,
                 seq: 16,
                 role_from: 2,
-                msg: Some(hard_nat_control_envelope::Msg::Connected(HardNatConnected {
-                    selected_nat3_addr: "203.0.113.10:40001".into(),
-                    selected_nat4_ip: "198.51.100.20".into(),
-                    selected_port: 40001,
-                    restore_ttl: 64,
-                    ..Default::default()
-                })),
+                msg: Some(hard_nat_control_envelope::Msg::Connected(
+                    HardNatConnected {
+                        selected_nat3_addr: "203.0.113.10:40001".into(),
+                        selected_nat4_ip: "198.51.100.20".into(),
+                        selected_port: 40001,
+                        restore_ttl: 64,
+                        ..Default::default()
+                    },
+                )),
                 ..Default::default()
             },
             HardNatControlEnvelope {
@@ -223,13 +227,11 @@ mod tests {
         let rpc = CtrlChannelPacket {
             body: Some(ctrl_channel_packet::Body::RpcResponse(CtrlRpcResponse {
                 body: Some(ctrl_rpc_response::Body::OpenP2p(OpenP2PResponse {
-                    open_p2p_rsp: Some(open_p2presponse::Open_p2p_rsp::Status(
-                        ResponseStatus {
-                            code: 0,
-                            reason: "ok".into(),
-                            ..Default::default()
-                        },
-                    )),
+                    open_p2p_rsp: Some(open_p2presponse::Open_p2p_rsp::Status(ResponseStatus {
+                        code: 0,
+                        reason: "ok".into(),
+                        ..Default::default()
+                    })),
                     ..Default::default()
                 })),
                 ..Default::default()

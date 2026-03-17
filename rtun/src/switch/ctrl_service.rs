@@ -7,9 +7,9 @@ use crate::{
     channel::{ChId, ChPair, ChSender},
     huid::HUId,
     proto::{
-        c2arequest::C2a_req_args, make_open_p2p_response_error, make_open_shell_response_error,
-        make_open_shell_response_ok, make_response_status_ok, ctrl_channel_packet,
-        ctrl_rpc_response, C2ARequest, CtrlChannelPacket, CtrlRpcResponse,
+        c2arequest::C2a_req_args, ctrl_channel_packet, ctrl_rpc_response,
+        make_open_p2p_response_error, make_open_shell_response_error, make_open_shell_response_ok,
+        make_response_status_ok, C2ARequest, CtrlChannelPacket, CtrlRpcResponse,
         ExecAgentScriptResult, HardNatControlEnvelope, KickDownArgs, Pong,
     },
 };
@@ -26,7 +26,11 @@ use super::{
 fn hard_nat_control_debug_label(env: &HardNatControlEnvelope) -> String {
     let msg = match env.msg.as_ref() {
         Some(crate::proto::hard_nat_control_envelope::Msg::StartBatch(msg)) => {
-            format!("StartBatch(batch_id={}, ports={})", msg.batch_id, msg.ports.len())
+            format!(
+                "StartBatch(batch_id={}, ports={})",
+                msg.batch_id,
+                msg.ports.len()
+            )
         }
         Some(crate::proto::hard_nat_control_envelope::Msg::NextBatch(msg)) => {
             format!(
@@ -101,14 +105,9 @@ enum DecodedCtrlServicePacket {
 fn is_plausible_c2a_request(req: &C2ARequest) -> bool {
     match req.c2a_req_args.as_ref() {
         Some(C2a_req_args::OpenSell(args)) => {
-            args.ch_id.is_some()
-                || args.cols != 0
-                || args.rows != 0
-                || args.program_args.is_some()
+            args.ch_id.is_some() || args.cols != 0 || args.rows != 0 || args.program_args.is_some()
         }
-        Some(C2a_req_args::OpenSocks(args)) => {
-            args.ch_id.is_some() || !args.peer_addr.is_empty()
-        }
+        Some(C2a_req_args::OpenSocks(args)) => args.ch_id.is_some() || !args.peer_addr.is_empty(),
         Some(C2a_req_args::CloseChannel(args)) => args.ch_id != 0,
         Some(C2a_req_args::Ping(_)) => true,
         Some(C2a_req_args::KickDown(args)) => args.code != 0 || !args.reason.is_empty(),
@@ -428,12 +427,17 @@ async fn ctrl_loop_full<H1: CtrlHandler, H2: SwitchHanlder>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{
+        c2arequest::C2a_req_args, ctrl_channel_packet, ctrl_rpc_response,
+        hard_nat_control_envelope, open_channel_response::Open_ch_rsp, CtrlChannelPacket,
+        CtrlRpcResponse, OpenChannelResponse, OpenP2PResponse, P2PArgs, ResponseStatus,
+    };
     use crate::{
         actor_service::{
             handle_first_none, handle_msg_none, handle_next_none, start_actor, wait_next_none,
             ActorEntity, AsyncHandler,
         },
-        channel::{CHANNEL_SIZE, ChReceiver, ChSender, ChTx},
+        channel::{ChReceiver, ChSender, ChTx, CHANNEL_SIZE},
         switch::{
             entity_watch::{CtrlGuard, OpWatch, WatchResult},
             invoker_ctrl::{
@@ -443,16 +447,17 @@ mod tests {
                 OpRecvHardNatControlResult, OpSendHardNatControl, OpSendHardNatControlResult,
                 OpSubscribeHardNatControl, OpSubscribeHardNatControlResult,
             },
-            invoker_switch::{AddChannelResult, ReqAddChannel, ReqGetMuxTx, ReqGetMuxTxResult, ReqRemoveChannel, RemoveChannelResult},
+            invoker_switch::{
+                AddChannelResult, RemoveChannelResult, ReqAddChannel, ReqGetMuxTx,
+                ReqGetMuxTxResult, ReqRemoveChannel,
+            },
         },
     };
-    use crate::proto::{
-        c2arequest::C2a_req_args, ctrl_channel_packet, ctrl_rpc_response,
-        hard_nat_control_envelope, open_channel_response::Open_ch_rsp, CtrlChannelPacket,
-        CtrlRpcResponse, OpenChannelResponse, OpenP2PResponse, P2PArgs, ResponseStatus,
-    };
     use protobuf::Message;
-    use tokio::{sync::{broadcast, mpsc}, time::timeout};
+    use tokio::{
+        sync::{broadcast, mpsc},
+        time::timeout,
+    };
 
     struct TestCtrlEntity {
         guard: CtrlGuard,
@@ -1001,18 +1006,20 @@ mod tests {
         });
 
         let control = CtrlChannelPacket {
-            body: Some(ctrl_channel_packet::Body::HardNatControl(HardNatControlEnvelope {
-                session_id: 42,
-                seq: 7,
-                role_from: 2,
-                msg: Some(hard_nat_control_envelope::Msg::LeaseKeepAlive(
-                    crate::proto::HardNatLeaseKeepAlive {
-                        lease_timeout_ms: 7000,
-                        ..Default::default()
-                    },
-                )),
-                ..Default::default()
-            })),
+            body: Some(ctrl_channel_packet::Body::HardNatControl(
+                HardNatControlEnvelope {
+                    session_id: 42,
+                    seq: 7,
+                    role_from: 2,
+                    msg: Some(hard_nat_control_envelope::Msg::LeaseKeepAlive(
+                        crate::proto::HardNatLeaseKeepAlive {
+                            lease_timeout_ms: 7000,
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
             ..Default::default()
         };
         client_pair

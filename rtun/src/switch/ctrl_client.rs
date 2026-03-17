@@ -10,19 +10,19 @@ use tokio::{
 };
 
 use crate::{
-    async_rt::spawn_with_name,
     actor_service::{
         handle_first_none, handle_msg_none, start_actor, Action, ActorEntity, ActorHandle,
         AsyncHandler,
     },
+    async_rt::spawn_with_name,
     channel::{ChId, ChPair, ChReceiver, ChSender},
     huid::HUId,
     proto::{
         c2arequest::C2a_req_args, ctrl_channel_packet, ctrl_rpc_response,
         open_channel_response::Open_ch_rsp, C2ARequest, CloseChannelArgs, CtrlChannelPacket,
         CtrlRpcResponse, ExecAgentScriptArgs, ExecAgentScriptResult, HardNatControlEnvelope,
-        KickDownArgs, OpenChannelResponse, OpenP2PResponse, OpenShellArgs, OpenSocksArgs,
-        P2PArgs, Ping, Pong, ResponseStatus,
+        KickDownArgs, OpenChannelResponse, OpenP2PResponse, OpenShellArgs, OpenSocksArgs, P2PArgs,
+        Ping, Pong, ResponseStatus,
     },
 };
 
@@ -134,7 +134,11 @@ enum DecodedCtrlClientPacket {
 fn hard_nat_control_debug_label(env: &HardNatControlEnvelope) -> String {
     let msg = match env.msg.as_ref() {
         Some(crate::proto::hard_nat_control_envelope::Msg::StartBatch(msg)) => {
-            format!("StartBatch(batch_id={}, ports={})", msg.batch_id, msg.ports.len())
+            format!(
+                "StartBatch(batch_id={}, ports={})",
+                msg.batch_id,
+                msg.ports.len()
+            )
         }
         Some(crate::proto::hard_nat_control_envelope::Msg::NextBatch(msg)) => {
             format!(
@@ -247,7 +251,10 @@ async fn recv_ctrl_rpc_packet(
     rpc_rx.recv().await.with_context(|| context.to_string())
 }
 
-fn decode_open_channel_response(packet: CtrlRpcPacket, context: &str) -> Result<OpenChannelResponse> {
+fn decode_open_channel_response(
+    packet: CtrlRpcPacket,
+    context: &str,
+) -> Result<OpenChannelResponse> {
     match packet {
         CtrlRpcPacket::Raw(payload) => {
             OpenChannelResponse::parse_from_bytes(&payload).with_context(|| context.to_string())
@@ -273,7 +280,9 @@ fn decode_response_status(packet: CtrlRpcPacket, context: &str) -> Result<Respon
 
 fn decode_pong(packet: CtrlRpcPacket, context: &str) -> Result<Pong> {
     match packet {
-        CtrlRpcPacket::Raw(payload) => Pong::parse_from_bytes(&payload).with_context(|| context.to_string()),
+        CtrlRpcPacket::Raw(payload) => {
+            Pong::parse_from_bytes(&payload).with_context(|| context.to_string())
+        }
         CtrlRpcPacket::Wrapped(rsp) => match rsp.body.with_context(|| context.to_string())? {
             ctrl_rpc_response::Body::Pong(rsp) => Ok(rsp),
             _ => bail!("{context}: unexpected wrapped rpc body"),
@@ -992,7 +1001,7 @@ mod tests {
             handle_first_none, handle_msg_none, handle_next_none, start_actor, wait_next_none,
             ActorEntity, AsyncHandler,
         },
-        channel::{CHANNEL_SIZE, ChReceiver, ChSender, ChTx},
+        channel::{ChReceiver, ChSender, ChTx, CHANNEL_SIZE},
         huid::gen_huid::gen_huid,
         proto::{
             ctrl_channel_packet, hard_nat_control_envelope, open_p2presponse, CtrlChannelPacket,
@@ -1001,8 +1010,8 @@ mod tests {
         switch::{
             entity_watch::{CtrlGuard, OpWatch, WatchResult},
             invoker_switch::{
-                AddChannelResult, ReqAddChannel, ReqGetMuxTx, ReqGetMuxTxResult, ReqRemoveChannel,
-                RemoveChannelResult,
+                AddChannelResult, RemoveChannelResult, ReqAddChannel, ReqGetMuxTx,
+                ReqGetMuxTxResult, ReqRemoveChannel,
             },
         },
     };
@@ -1190,7 +1199,10 @@ mod tests {
             ..Default::default()
         };
 
-        invoker.send_hard_nat_control(control.clone()).await.unwrap();
+        invoker
+            .send_hard_nat_control(control.clone())
+            .await
+            .unwrap();
 
         let packet = timeout(Duration::from_secs(1), remote_pair.rx.recv_packet())
             .await
@@ -1260,7 +1272,10 @@ mod tests {
 
         let mut saw_ping = false;
         for _ in 0..12 {
-            invoker.send_hard_nat_control(control.clone()).await.unwrap();
+            invoker
+                .send_hard_nat_control(control.clone())
+                .await
+                .unwrap();
             tokio::task::yield_now().await;
             tokio::time::sleep(Duration::from_secs(1)).await;
             tokio::task::yield_now().await;
@@ -1270,7 +1285,10 @@ mod tests {
             }
         }
 
-        assert!(saw_ping, "ctrl client should keep sending ping under hard-nat traffic");
+        assert!(
+            saw_ping,
+            "ctrl client should keep sending ping under hard-nat traffic"
+        );
 
         remote.await.unwrap();
         ctrl.shutdown_and_waitfor().await.unwrap();
