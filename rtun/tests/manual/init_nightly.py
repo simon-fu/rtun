@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import pty
 import select
 import shlex
+import shutil
+import struct
 import sys
+import termios
 import time
 import uuid
 from pathlib import Path
@@ -34,6 +38,8 @@ class PtyShellRunner:
 
     def start(self) -> None:
         master_fd, slave_fd = pty.openpty()
+        cols, rows = get_local_terminal_size()
+        set_pty_window_size(slave_fd, cols, rows)
         self.proc = subprocess.Popen(
             self.argv,
             stdin=slave_fd,
@@ -91,6 +97,16 @@ class PtyShellRunner:
                 if rc is not None:
                     return rc
         raise TimeoutError(f"wait remote marker timeout: {marker}")
+
+
+def get_local_terminal_size() -> tuple[int, int]:
+    size = shutil.get_terminal_size(fallback=(80, 24))
+    return size.columns, size.lines
+
+
+def set_pty_window_size(fd: int, cols: int, rows: int) -> None:
+    winsz = struct.pack("HHHH", rows, cols, 0, 0)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, winsz)
 
 
 def build_parser() -> argparse.ArgumentParser:

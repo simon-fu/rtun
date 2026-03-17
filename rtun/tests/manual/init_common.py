@@ -43,7 +43,7 @@ EXCLUDED_FILE_SUFFIXES = {
     ".tmp",
 }
 
-MARKER_RE = re.compile(rf"^{MARKER_PREFIX}([A-Za-z0-9_-]+):(-?\d+)$")
+MARKER_RE = re.compile(rf"{MARKER_PREFIX}([A-Za-z0-9_-]+):(-?\d+)")
 
 
 def should_exclude_relative_path(rel_path: Path) -> bool:
@@ -136,7 +136,7 @@ def wrap_remote_command_for_marker(command: str, marker: str) -> str:
 
 
 def parse_remote_command_result(line: str, marker: str) -> Optional[int]:
-    m = MARKER_RE.match(line.strip())
+    m = MARKER_RE.search(line)
     if not m:
         return None
     got_marker, rc_text = m.groups()

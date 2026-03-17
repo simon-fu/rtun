@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
+import fcntl
+import os
+import pty
+import struct
 import sys
 import tempfile
+import termios
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,7 +26,11 @@ from init_common import (
     parse_remote_command_result,
     wrap_remote_command_for_marker,
 )
-from init_nightly import build_rtun_shell_cmd, parse_args as parse_nightly_args
+from init_nightly import (
+    build_rtun_shell_cmd,
+    parse_args as parse_nightly_args,
+    set_pty_window_size,
+)
 from init_rtun_local import parse_args as parse_local_args
 
 
@@ -85,6 +94,10 @@ class MarkerProtocolTests(unittest.TestCase):
         self.assertIsNone(parse_remote_command_result("normal output", "k1"))
         self.assertIsNone(parse_remote_command_result("__RTUN_INIT_DONE__k2:0", "k1"))
 
+    def test_parse_remote_command_result_accepts_ansi_prefixed_marker(self) -> None:
+        line = "\x1b[?2004l\r__RTUN_INIT_DONE__k1:0"
+        self.assertEqual(parse_remote_command_result(line, "k1"), 0)
+
 
 class ParserTests(unittest.TestCase):
     def test_init_nightly_default_shell_agent(self) -> None:
@@ -109,6 +122,26 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(cmd[1], "--config")
         self.assertEqual(cmd[2], "/tmp/fake-home/simon/bin/config/rtun-full.toml")
         self.assertNotIn("~/simon/bin/config/rtun-full.toml", cmd)
+
+
+class PtySizingTests(unittest.TestCase):
+    def test_set_pty_window_size_sets_non_zero_terminal_size(self) -> None:
+        master_fd, slave_fd = pty.openpty()
+        try:
+            before = struct.unpack(
+                "HHHH", fcntl.ioctl(slave_fd, termios.TIOCGWINSZ, b"\0" * 8)
+            )
+            self.assertEqual(before[:2], (0, 0))
+
+            set_pty_window_size(slave_fd, cols=80, rows=24)
+
+            after = struct.unpack(
+                "HHHH", fcntl.ioctl(slave_fd, termios.TIOCGWINSZ, b"\0" * 8)
+            )
+            self.assertEqual(after[:2], (24, 80))
+        finally:
+            os.close(master_fd)
+            os.close(slave_fd)
 
 
 if __name__ == "__main__":
