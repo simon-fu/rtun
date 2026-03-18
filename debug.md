@@ -101,10 +101,11 @@ relay 子命令的 agent 名字是正则匹配，比如 '^nightly-rtun1-manual$'
 
 1. 先重新采样 `rtun-local` 的当前 `nat4_candidate_ips`
     ```shell
-    ssh rtun-local 'cd /tmp/rtun-local-work && timeout 18s env RUST_LOG=debug stdbuf -oL -eL target/debug/rtun nat4 nat4 -t 1.1.1.1:9 -c 128 --dump-public-addrs 2>&1 | grep -oE "mapped \\[[0-9.]+:[0-9]+\\]" | sed "s/mapped \\[//; s/\\]//" | awk -F: "{print \\$1}" | sort | uniq -c'
+    ssh rtun-local 'cd /tmp/rtun-local-work && timeout 18s env RUST_LOG=debug stdbuf -oL -eL target/debug/rtun nat4 nat4 -t 1.1.1.1:9 -c 128 --dump-public-addrs 2>&1 | python3 -c '\''import re,sys; text=sys.stdin.read(); m=re.search(r"candidate_ips \\[(.*?)\\]", text, re.S); print(m.group(1) if m else "")'\'''
     ```
-    - 当前多次观测里，主 IP 常见是 `101.39.212.231`
-    - 次要 IP 常见是 `101.40.161.229`
+    - 现在 `--dump-public-addrs` 走的是 dedicated sampler，主日志要看 `candidate_ips [...]`，不是旧的每 socket `mapped [...]`
+    - 输出顺序就是当前 sampler 给出的优先级顺序
+    - 当前 fresh session 可能同时出现 `60.194.*` 和 `101.*` 多个 IP，不要预设固定主次顺序
     - 不要直接复用上一次 session 的 IP 结论，每一轮都先重新采样
 
 2. 清理两边旧 session 和旧日志
@@ -243,9 +244,8 @@ relay 子命令的 agent 名字是正则匹配，比如 '^nightly-rtun1-manual$'
     - 当前本地手工测试必须同时加 `--debug-keep-recv`
 
 3. 每轮 fresh session 都要重新采样 `nat4_candidate_ips`
-    - 当前常见主 IP 是 `101.39.212.231`
-    - 当前常见次要 IP 是 `101.40.161.229`
-    - 但不要把这两个值当成永久固定值
+    - 当前可能采到 `60.194.*`、`101.*` 多个 IP
+    - 不要把某个 IP 当成永久固定主 IP
 
 4. 如果 primary IP 连续多批完全没有 `manual converge recv`
     - 不要在同一个 IP 上无限重试
@@ -272,11 +272,20 @@ relay 子命令的 agent 名字是正则匹配，比如 '^nightly-rtun1-manual$'
       - nightly：`cd /tmp/rtun-nightly-work && git rev-parse HEAD`
     - 如果 commit 不一致，不要继续拿本地实现推理 nightly；先按 nightly 实际 commit 复现和定位
 
-7. rtun-local 的 tcpdump 如果是 0 包，不是“没抓到日志”这么简单
+8. `init_nightly.py` 当前偶发会出现“脚本返回 build 失败，但远端 cargo 最后继续收尾并产出二进制”
+    - 如果脚本报 `cargo build -p rtun --bin rtun` 失败，不要立刻判定 nightly 初始化失败
+    - 先确认两件事：
+      ```shell
+      cd /tmp/rtun-nightly-work && ls -l target/debug/rtun
+      ps -ef | grep "cargo build -p rtun --bin rtun" | grep -v grep
+      ```
+    - 如果二进制已经生成，或者 cargo 还在跑，先以远端实际状态为准，再决定要不要重置环境
+
+9. rtun-local 的 tcpdump 如果是 0 包，不是“没抓到日志”这么简单
     - 这通常表示：nightly 的探测包没有真正到达 rtun-local 主机
     - 这条证据要和 nat3 的持续 `nat hello`、nat4 的持续 `send token` 放在一起看
 
-8. 如果某一轮出现了阶段性进展
+10. 如果某一轮出现了阶段性进展
     - 不要把“某个 IP 在某轮命中过”这种结果沉淀到 `debug.md`
     - 结果写 issue 折叠块
     - `debug.md` 只沉淀：
@@ -284,7 +293,7 @@ relay 子命令的 agent 名字是正则匹配，比如 '^nightly-rtun1-manual$'
       - 下次仍然要注意的坑
       - 下次仍然要采集的观测项
 
-9. 解析 nat3 discovery 输出时，不要直接用普通 `tmux capture-pane`
+11. 解析 nat3 discovery 输出时，不要直接用普通 `tmux capture-pane`
     - 如果 pane 宽度不够，`recommended peer command` 这一行会被折行，端口号可能被截断
     - 固定使用 `tmux capture-pane -pJ -t rtun-debug-agent ...`
     - `-pJ` 会把折行重新拼回一行，便于准确抠出 `<nat3_public_addr>`

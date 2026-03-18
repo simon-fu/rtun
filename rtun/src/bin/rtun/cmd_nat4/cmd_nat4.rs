@@ -187,7 +187,7 @@ pub struct Nat4SendCmdArgs {
 
     #[clap(
         long = "dump-public-addrs",
-        long_help = "discover and print each nat4 socket public mapped address before probing"
+        long_help = "run dedicated nat4 pre-sampler and print sampled public mapped addresses before probing"
     )]
     dump_public_addrs: bool,
 

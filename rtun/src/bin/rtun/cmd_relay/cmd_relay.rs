@@ -25,8 +25,9 @@ use rtun::{
     hex::BinStrLine,
     ice::ice_peer::{default_ice_servers, IceArgs, IceConfig, IcePeer},
     p2p::hard_nat::{
-        apply_local_hard_nat_session_inputs, build_random_port_batch,
-        collect_public_udp_candidate_ips_from_ice, collect_udp_candidate_ips_from_ice,
+        apply_local_hard_nat_session_candidates, build_random_port_batch,
+        collect_local_nat4_candidate_ips, collect_public_udp_candidate_ips_from_ice,
+        collect_udp_candidate_ips_from_ice,
         derive_target_plan_from_ice_with_explicit_nat4_target, prepare_nat3_public_target,
         race_assist, resolve_role_plan, run_nat3_controlled_once,
         run_nat3_controlled_once_with_prebound_socket, run_nat4_controlled_once,
@@ -2423,7 +2424,11 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
 
     let local_ice = peer.client_gather().await?;
     let local_codec = UdpRelayCodec::new(gen_udp_relay_obfs_seed());
-    let local_nat4_candidate_ips = collect_public_udp_candidate_ips_from_ice(&local_ice);
+    let local_nat4_candidate_ips = if udp_relay_hard_nat.is_off() {
+        collect_public_udp_candidate_ips_from_ice(&local_ice)
+    } else {
+        collect_local_nat4_candidate_ips(&local_ice).await
+    };
     let local_nat4_ip = local_nat4_candidate_ips.first().cloned().or_else(|| {
         collect_udp_candidate_ips_from_ice(&local_ice)
             .into_iter()
@@ -2504,8 +2509,11 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
         .as_ref()
         .map(|prepared| vec![prepared.nat4_target])
         .unwrap_or_default();
-    let local_hard_nat =
-        build_udp_relay_hard_nat_args(udp_relay_hard_nat, &local_ice, &local_nat3_public_addrs);
+    let local_hard_nat = build_udp_relay_hard_nat_args(
+        udp_relay_hard_nat,
+        &local_nat4_candidate_ips,
+        &local_nat3_public_addrs,
+    );
     let hard_nat_rx = if udp_relay_hard_nat.is_off() {
         None
     } else {
@@ -2662,7 +2670,7 @@ async fn open_udp_relay_tunnel<H: CtrlHandler>(
 
 fn build_udp_relay_hard_nat_args(
     cfg: RelayUdpHardNatConfig,
-    local_ice: &IceArgs,
+    local_nat4_candidate_ips: &[String],
     local_nat3_public_addrs: &[SocketAddr],
 ) -> protobuf::MessageField<P2PHardNatArgs> {
     if cfg.is_off() {
@@ -2681,10 +2689,10 @@ fn build_udp_relay_hard_nat_args(
         no_ttl: cfg.no_ttl,
         ..Default::default()
     };
-    apply_local_hard_nat_session_inputs(
+    apply_local_hard_nat_session_candidates(
         &mut args,
         cfg.scan_count,
-        local_ice,
+        local_nat4_candidate_ips,
         local_nat3_public_addrs,
     );
     let session = HardNatSessionParams::from_proto(&args);
@@ -5352,7 +5360,6 @@ mod tests {
     use crate::rest_proto::AgentInfo;
     use clap::Parser;
     use regex::Regex;
-    use rtun::ice::ice_peer::IceArgs;
     use rtun::p2p::hard_nat::{
         HARD_NAT_DEFAULT_CONNECTED_TTL, HARD_NAT_MAX_SCAN_COUNT, HARD_NAT_MAX_SOCKET_COUNT,
         HARD_NAT_MAX_TTL, HARD_NAT_PROTO_VERSION,
@@ -5369,18 +5376,6 @@ mod tests {
         ];
         argv.extend_from_slice(extra);
         CmdArgs::try_parse_from(argv).unwrap()
-    }
-
-    fn sample_local_ice_for_hard_nat_test() -> IceArgs {
-        IceArgs {
-            ufrag: "u".into(),
-            pwd: "p".into(),
-            candidates: vec![
-                "candidate:1 1 udp 1694498559 8.8.8.8 40001 typ srflx raddr 0.0.0.0 rport 9"
-                    .into(),
-                "candidate:2 1 udp 2130706175 192.168.1.10 40002 typ host".into(),
-            ],
-        }
     }
 
     #[test]
@@ -5403,7 +5398,7 @@ mod tests {
         assert_eq!(cfg.ttl, None);
         assert!(!cfg.no_ttl);
         assert!(
-            build_udp_relay_hard_nat_args(cfg, &sample_local_ice_for_hard_nat_test(), &[])
+            build_udp_relay_hard_nat_args(cfg, &["8.8.8.8".to_string()], &[])
                 .as_ref()
                 .is_none()
         );
@@ -5441,7 +5436,7 @@ mod tests {
         assert_eq!(cfg.ttl, Some(7));
         assert!(cfg.no_ttl);
 
-        let proto = build_udp_relay_hard_nat_args(cfg, &sample_local_ice_for_hard_nat_test(), &[]);
+        let proto = build_udp_relay_hard_nat_args(cfg, &["8.8.8.8".to_string()], &[]);
         let proto = proto.as_ref().unwrap();
         assert_eq!(proto.mode, 1);
         assert_eq!(proto.role, 2);
@@ -5462,7 +5457,7 @@ mod tests {
         let nat3_public_addrs = vec!["203.0.113.10:54321".parse().unwrap()];
         let proto = build_udp_relay_hard_nat_args(
             cfg,
-            &sample_local_ice_for_hard_nat_test(),
+            &["8.8.8.8".to_string()],
             &nat3_public_addrs,
         );
         let proto = proto.as_ref().unwrap();

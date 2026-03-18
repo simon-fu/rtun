@@ -43,6 +43,13 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn with_detect_all_server(self, detect_all_server: bool) -> Self {
+        Self {
+            detect_all_server,
+            ..self
+        }
+    }
+
     pub fn with_min_success_response(self, min_success_response: usize) -> Self {
         Self {
             min_success_response: Some(min_success_response),

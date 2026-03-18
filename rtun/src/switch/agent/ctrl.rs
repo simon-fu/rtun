@@ -30,8 +30,9 @@ use crate::{
         webrtc_ice_peer::{DtlsIceArgs, WebrtcIceConfig, WebrtcIcePeer},
     },
     p2p::hard_nat::{
-        apply_local_hard_nat_session_inputs, build_random_port_batch,
-        collect_public_udp_candidate_ips_from_ice, collect_udp_candidate_ips_from_ice,
+        apply_local_hard_nat_session_candidates, build_random_port_batch,
+        collect_local_nat4_candidate_ips, collect_public_udp_candidate_ips_from_ice,
+        collect_udp_candidate_ips_from_ice,
         derive_target_plan_from_ice_with_explicit_nat4_target, prepare_nat3_public_target,
         race_assist, resolve_role_plan, run_nat3_controlled_once,
         run_nat3_controlled_once_with_prebound_socket, run_nat4_controlled_once,
@@ -389,7 +390,7 @@ impl AsyncHandler<OpRecvHardNatControl> for Entity {
 
 fn build_local_hard_nat_response_args(
     remote_hard_nat: &MessageField<P2PHardNatArgs>,
-    local_ice: &IceArgs,
+    local_nat4_candidate_ips: &[String],
     local_nat3_public_addr: Option<SocketAddr>,
 ) -> MessageField<P2PHardNatArgs> {
     let Some(remote_hard_nat) = remote_hard_nat.as_ref() else {
@@ -398,10 +399,10 @@ fn build_local_hard_nat_response_args(
 
     let mut local_hard_nat = remote_hard_nat.clone();
     let local_nat3_public_addrs = local_nat3_public_addr.into_iter().collect::<Vec<_>>();
-    apply_local_hard_nat_session_inputs(
+    apply_local_hard_nat_session_candidates(
         &mut local_hard_nat,
         remote_hard_nat.scan_count,
-        local_ice,
+        local_nat4_candidate_ips,
         &local_nat3_public_addrs,
     );
     MessageField::some(local_hard_nat)
@@ -434,8 +435,13 @@ async fn handle_quic_socks(
     let uid = peer.uid();
     let local_ice = peer.server_gather(remote_ice.clone()).await?;
     tracing::debug!("starting quic tunnel {uid}, local {local_ice:?}, remote {remote_ice:?}");
+    let local_nat4_candidate_ips = if hard_nat_mode != HardNatMode::Off {
+        collect_local_nat4_candidate_ips(&local_ice).await
+    } else {
+        Vec::new()
+    };
     let local_hard_nat =
-        build_local_hard_nat_response_args(&remote_args.hard_nat, &local_ice, None);
+        build_local_hard_nat_response_args(&remote_args.hard_nat, &local_nat4_candidate_ips, None);
 
     let local_cert = QuicIceCert::try_new()?;
     let local_cert_der = local_cert.to_bytes()?.into();
@@ -797,7 +803,11 @@ async fn handle_udp_relay(
 
     let uid = peer.uid();
     let local_ice = peer.server_gather(remote_ice.clone()).await?;
-    let local_nat4_candidate_ips = collect_public_udp_candidate_ips_from_ice(&local_ice);
+    let local_nat4_candidate_ips = if hard_nat_cfg.mode == HardNatMode::Off {
+        collect_public_udp_candidate_ips_from_ice(&local_ice)
+    } else {
+        collect_local_nat4_candidate_ips(&local_ice).await
+    };
     let local_nat4_ip = local_nat4_candidate_ips.first().cloned().or_else(|| {
         collect_udp_candidate_ips_from_ice(&local_ice)
             .into_iter()
@@ -850,7 +860,7 @@ async fn handle_udp_relay(
         .unwrap_or_default();
     let local_hard_nat = build_local_hard_nat_response_args(
         &remote_args.hard_nat,
-        &local_ice,
+        &local_nat4_candidate_ips,
         local_prepared_nat3
             .as_ref()
             .map(|prepared| prepared.nat4_target),
@@ -2263,7 +2273,7 @@ mod tests {
             session_id: 0x99,
             ..Default::default()
         });
-        let local_ice = IceArgs {
+        let _local_ice = IceArgs {
             ufrag: "u".into(),
             pwd: "p".into(),
             candidates: vec![
@@ -2272,9 +2282,10 @@ mod tests {
             ],
         };
 
+        let local_nat4_candidate_ips = vec!["8.8.8.8".to_string()];
         let proto = build_local_hard_nat_response_args(
             &remote_hard_nat,
-            &local_ice,
+            &local_nat4_candidate_ips,
             Some("203.0.113.10:54321".parse().unwrap()),
         );
         let proto = proto.as_ref().expect("response hard nat");

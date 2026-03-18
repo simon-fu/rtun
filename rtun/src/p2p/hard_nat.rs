@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{bail, Context as _, Result};
-use futures::StreamExt;
+use futures::{stream::FuturesUnordered, StreamExt};
 use nix::poll::{poll, PollFd, PollFlags};
 use parking_lot::Mutex;
 use rand::Rng as _;
@@ -63,6 +63,8 @@ pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_QUIET_DRAIN_MS: u64 = 300;
 pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_VALIDATION_HIT_N2: u32 = 2;
 pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_VALIDATION_WINDOW_MS: u64 = 2_500;
 pub const HARD_NAT_MANUAL_CONVERGE_DEFAULT_COOLDOWN_MS: u64 = 1_000;
+pub const HARD_NAT_NAT4_CANDIDATE_SAMPLE_SOCKET_COUNT: usize = 8;
+pub const HARD_NAT_NAT4_CANDIDATE_SAMPLE_TIMEOUT_SECS: u64 = 5;
 const NAT3_STUN_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(800);
 const NAT3_PAUSE_AFTER_DISCOVERY_PROMPT: &str =
     "nat3 discovery finished, press Enter to start probing";
@@ -1156,13 +1158,28 @@ pub fn apply_local_hard_nat_session_inputs(
     local_ice: &IceArgs,
     local_nat3_public_addrs: &[SocketAddr],
 ) {
+    let local_nat4_candidate_ips = collect_public_udp_candidate_ips_from_ice(local_ice);
+    apply_local_hard_nat_session_candidates(
+        args,
+        batch_port_count_hint,
+        &local_nat4_candidate_ips,
+        local_nat3_public_addrs,
+    );
+}
+
+pub fn apply_local_hard_nat_session_candidates(
+    args: &mut P2PHardNatArgs,
+    batch_port_count_hint: u32,
+    local_nat4_candidate_ips: &[String],
+    local_nat3_public_addrs: &[SocketAddr],
+) {
     let mut session = HardNatSessionParams::from_proto(args);
     session.apply_defaults_if_missing();
     if session.session_id == 0 {
         session.session_id = allocate_hard_nat_session_id();
     }
     session = session.with_batch_port_count(batch_port_count_hint);
-    session.nat4_candidate_ips = collect_public_udp_candidate_ips_from_ice(local_ice);
+    session.nat4_candidate_ips = local_nat4_candidate_ips.to_vec();
     session.nat3_public_addrs = local_nat3_public_addrs
         .iter()
         .map(SocketAddr::to_string)
@@ -1778,6 +1795,77 @@ pub fn collect_public_udp_candidate_ips_from_ice(remote: &IceArgs) -> Vec<String
         .collect()
 }
 
+pub fn merge_nat4_candidate_ips_from_sources(
+    ice_candidates: &[String],
+    sampled_addrs: &[SocketAddr],
+) -> Vec<String> {
+    let mut sampled_hit_counts = HashMap::<String, usize>::new();
+    for addr in sampled_addrs {
+        if !is_public_ip(addr.ip()) {
+            continue;
+        }
+        *sampled_hit_counts
+            .entry(addr.ip().to_string())
+            .or_insert(0_usize) += 1;
+    }
+
+    let mut sampled_ranked = sampled_hit_counts.into_iter().collect::<Vec<_>>();
+    sampled_ranked.sort_by(|(left_ip, left_hits), (right_ip, right_hits)| {
+        right_hits
+            .cmp(left_hits)
+            .then_with(|| left_ip.cmp(right_ip))
+    });
+
+    let mut out = sampled_ranked
+        .into_iter()
+        .map(|(ip, _)| ip)
+        .collect::<Vec<_>>();
+    let mut seen = out.iter().cloned().collect::<HashSet<_>>();
+    for value in ice_candidates {
+        let Ok(ip) = value.parse::<IpAddr>() else {
+            continue;
+        };
+        if !is_public_ip(ip) {
+            continue;
+        }
+        if seen.insert(value.clone()) {
+            out.push(value.clone());
+        }
+    }
+    out
+}
+
+pub async fn collect_local_nat4_candidate_ips(local_ice: &IceArgs) -> Vec<String> {
+    let ice_candidates = collect_public_udp_candidate_ips_from_ice(local_ice);
+    let stun_servers = match resolve_nat3_stun_servers(true, &[]) {
+        Ok(servers) => servers,
+        Err(err) => {
+            warn!("resolve nat4 candidate ip stun servers failed, fallback to ICE only: {err:#}");
+            return ice_candidates;
+        }
+    };
+
+    let sampled_addrs = match sample_nat4_candidate_public_addrs(
+        HARD_NAT_NAT4_CANDIDATE_SAMPLE_SOCKET_COUNT,
+        &stun_servers,
+        Duration::from_secs(HARD_NAT_NAT4_CANDIDATE_SAMPLE_TIMEOUT_SECS),
+    )
+    .await
+    {
+        Ok(addrs) => addrs,
+        Err(err) => {
+            warn!("sample nat4 candidate ips failed, fallback to ICE only: {err:#}");
+            return ice_candidates;
+        }
+    };
+
+    let merged = merge_nat4_candidate_ips_from_sources(&ice_candidates, &sampled_addrs);
+    debug!(
+        "nat4 candidate ip sampling merged: ice_candidates={ice_candidates:?}, sampled_addrs={sampled_addrs:?}, merged={merged:?}"
+    );
+    merged
+}
+
 fn candidate_priority_key(kind: CandidateKind, addr: SocketAddr) -> (u8, u8) {
     let public_rank = if is_public_ip(addr.ip()) { 0 } else { 1 };
     let kind_rank = match kind {
@@ -2081,6 +2169,7 @@ async fn discover_nat3_public_addr(
     .with_context(|| "detect nat3 public address failed")
 }
 
+#[cfg(test)]
 async fn discover_nat4_public_addr(
     socket: TokioUdpSocket,
     stun_servers: &[String],
@@ -2101,6 +2190,75 @@ async fn discover_nat4_public_addr(
     Ok((socket, mapped_addr))
 }
 
+async fn discover_nat4_public_addrs_from_all_servers(
+    socket: TokioUdpSocket,
+    stun_servers: &[String],
+) -> Result<Vec<SocketAddr>> {
+    let (_socket, output) = detect_nat_type3_with_recovery(
+        socket,
+        stun_servers.iter().map(String::as_str),
+        StunConfig::default()
+            .with_detect_all_server(true)
+            .with_min_success_response(1)
+            .with_transaction_timeout(NAT3_STUN_TRANSACTION_TIMEOUT),
+    )
+    .await;
+
+    let mapped_addrs = match output {
+        Ok(output) => output.mapped_iter().collect::<Vec<_>>(),
+        Err(err) => {
+            warn!("discover nat4 candidate socket public addrs failed: {err:#}");
+            Vec::new()
+        }
+    };
+    Ok(mapped_addrs)
+}
+
+async fn sample_nat4_candidate_public_addrs(
+    sample_socket_count: usize,
+    stun_servers: &[String],
+    total_timeout: Duration,
+) -> Result<Vec<SocketAddr>> {
+    if sample_socket_count == 0 || stun_servers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut pending = FuturesUnordered::new();
+    for _ in 0..sample_socket_count {
+        let socket = tokio_socket_bind("0.0.0.0:0")
+            .await
+            .with_context(|| "bind nat4 candidate sample socket failed")?;
+        let servers = stun_servers.to_vec();
+        pending.push(async move { discover_nat4_public_addrs_from_all_servers(socket, &servers).await });
+    }
+
+    let deadline = tokio::time::Instant::now() + total_timeout;
+    let sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(sleep);
+
+    let mut sampled_addrs = Vec::new();
+    while !pending.is_empty() {
+        tokio::select! {
+            result = pending.next() => {
+                if let Some(result) = result {
+                    sampled_addrs.extend(result?);
+                }
+            }
+            _ = &mut sleep => {
+                warn!(
+                    "nat4 candidate ip sampling hit deadline: sockets [{}], timeout [{:?}], collected [{}]",
+                    sample_socket_count,
+                    total_timeout,
+                    sampled_addrs.len()
+                );
+                break;
+            }
+        }
+    }
+    Ok(sampled_addrs)
+}
+
+#[cfg(test)]
 async fn discover_nat4_public_addrs(
     sockets: Vec<TokioUdpSocket>,
     stun_servers: &[String],
@@ -2110,21 +2268,6 @@ async fn discover_nat4_public_addrs(
         discovered.push(discover_nat4_public_addr(socket, stun_servers).await?);
     }
     Ok(discovered)
-}
-
-fn log_nat4_public_addr_discovery(
-    index: usize,
-    local_addr: SocketAddr,
-    mapped_addr: Option<SocketAddr>,
-) {
-    match mapped_addr {
-        Some(mapped_addr) => debug!(
-            "nat4 public address discovery socket [{index}] local [{local_addr}] => mapped [{mapped_addr}]"
-        ),
-        None => debug!(
-            "nat4 public address discovery socket [{index}] local [{local_addr}] => mapped [none]"
-        ),
-    }
 }
 
 pub struct PreparedNat3Socket {
@@ -3351,11 +3494,6 @@ async fn prepare_nat4_probe_runtime(args: &Nat4RunConfig) -> Result<Nat4ProbeRun
             .with_context(|| "ping_and_get_hops failed")?,
     };
 
-    let nat4_discovery_stun_servers = if args.dump_public_addrs {
-        Some(resolve_nat3_stun_servers(true, &[])?)
-    } else {
-        None
-    };
     let debug_promote_hit_ttl = args.debug_promote_hit_ttl;
 
     let mut sender_parts = Vec::with_capacity(args.count);
@@ -3377,23 +3515,23 @@ async fn prepare_nat4_probe_runtime(args: &Nat4RunConfig) -> Result<Nat4ProbeRun
         sender_parts.push((socket, local));
     }
 
-    let sender_parts = if let Some(stun_servers) = nat4_discovery_stun_servers.as_ref() {
-        discover_nat4_public_addrs(
-            sender_parts.into_iter().map(|(socket, _)| socket).collect(),
-            stun_servers,
+    if args.dump_public_addrs {
+        let stun_servers = resolve_nat3_stun_servers(true, &[])?;
+        let sampled_addrs = sample_nat4_candidate_public_addrs(
+            HARD_NAT_NAT4_CANDIDATE_SAMPLE_SOCKET_COUNT,
+            &stun_servers,
+            Duration::from_secs(HARD_NAT_NAT4_CANDIDATE_SAMPLE_TIMEOUT_SECS),
         )
-        .await?
-        .into_iter()
-        .enumerate()
-        .map(|(index, (socket, mapped_addr))| {
-            let local = socket.local_addr()?;
-            log_nat4_public_addr_discovery(index, local, mapped_addr);
-            Ok((socket, local))
-        })
-        .collect::<Result<Vec<_>>>()?
-    } else {
-        sender_parts
-    };
+        .await?;
+        let candidate_ips = merge_nat4_candidate_ips_from_sources(&[], &sampled_addrs);
+        debug!(
+            "nat4 dump-public-addrs dedicated sampler: sample_sockets [{}], stun_servers {:?}, sampled_addrs {:?}, candidate_ips {:?}",
+            HARD_NAT_NAT4_CANDIDATE_SAMPLE_SOCKET_COUNT,
+            stun_servers,
+            sampled_addrs,
+            candidate_ips
+        );
+    }
 
     let mut senders = Vec::with_capacity(args.count);
     for (socket_id, (socket, local)) in sender_parts.into_iter().enumerate() {
@@ -5484,6 +5622,64 @@ mod tests {
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>(),
             vec!["8.8.8.8"]
+        );
+        assert_eq!(
+            args.nat3_public_addrs
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+            vec!["203.0.113.10:54321"]
+        );
+    }
+
+    #[test]
+    fn merge_nat4_candidate_ips_from_sources_prefers_sample_frequency_and_public_ice_fallbacks() {
+        let ice_candidates = vec![
+            "8.8.8.8".to_string(),
+            "1.1.1.1".to_string(),
+            "192.168.1.10".to_string(),
+        ];
+        let sampled_addrs = vec![
+            "9.9.9.9:30001".parse().unwrap(),
+            "1.1.1.1:30002".parse().unwrap(),
+            "9.9.9.9:30003".parse().unwrap(),
+            "4.4.4.4:30004".parse().unwrap(),
+            "10.0.0.1:30005".parse().unwrap(),
+        ];
+
+        let got = merge_nat4_candidate_ips_from_sources(&ice_candidates, &sampled_addrs);
+
+        assert_eq!(got, vec!["9.9.9.9", "1.1.1.1", "4.4.4.4", "8.8.8.8"]);
+    }
+
+    #[test]
+    fn apply_local_hard_nat_session_candidates_uses_explicit_nat4_ip_list() {
+        let mut args = P2PHardNatArgs {
+            session_id: 0x99,
+            scan_count: 128,
+            ..Default::default()
+        };
+        let batch_port_count_hint = args.scan_count;
+        let local_nat4_candidate_ips = vec!["9.9.9.9".to_string(), "8.8.8.8".to_string()];
+        let nat3_public_addrs = vec!["203.0.113.10:54321".parse().unwrap()];
+
+        apply_local_hard_nat_session_candidates(
+            &mut args,
+            batch_port_count_hint,
+            &local_nat4_candidate_ips,
+            &nat3_public_addrs,
+        );
+
+        assert_eq!(args.proto_version, HARD_NAT_PROTO_VERSION);
+        assert_eq!(args.session_id, 0x99);
+        assert_eq!(args.batch_port_count, 128);
+        assert_eq!(args.connected_ttl, HARD_NAT_DEFAULT_CONNECTED_TTL);
+        assert_eq!(
+            args.nat4_candidate_ips
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+            vec!["9.9.9.9", "8.8.8.8"]
         );
         assert_eq!(
             args.nat3_public_addrs
