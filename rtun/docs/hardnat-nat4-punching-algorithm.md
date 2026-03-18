@@ -42,3 +42,93 @@
 - nat3 使用单个 UDP socket 执行探测，并通过 `nat3_public_addrs[]` 向 nat4 暴露可尝试的公网地址。
 - nat4 使用一批 UDP socket 执行 TTL warm up 和接收，只有命中的 socket 才进入握手和候选者竞争。
 - probing 阶段使用较小 TTL，只有在步骤 8 命中后才恢复为正常 TTL，避免把低 TTL 带入后续数据面。
+
+## nat3 状态机
+
+nat3 侧需要与上面的 nat4 主流程配合，最小状态机定义如下：
+
+- `Idle`
+  尚未开始打洞，没有选定当前 `nat4_ip` 和端口批次。
+- `Probing`
+  正在对当前 `nat4_ip` 的一批随机端口发送 `probe` 包。
+- `Handshake`
+  已经收到 nat4 对某个 5-tuple 的 `ack`，停止对当前批次的随机扫端口，只保留该 5-tuple 的往返握手。
+- `Connected`
+  已经与 nat4 候选者 socket 建立稳定连通，进入成功状态。
+- `Failed`
+  外层尝试达到 `N4` 上限，打洞失败结束。
+
+状态切换规则：
+
+1. nat3 初始进入 `Idle`，选定当前 `nat4_ip` 和端口批次后进入 `Probing`。
+2. nat3 在 `Probing` 状态下，如果收到 nat4 对某个 5-tuple 的 `ack`，则记住该远端地址与本地 socket 组合，停止当前批次的随机端口探测，进入 `Handshake`。
+3. nat3 在 `Handshake` 状态下，只对触发 `ack` 的那个 5-tuple 继续收发握手包，不再并行向其它随机端口继续探测。
+4. nat3 在 `Handshake` 状态下，如果持续收到来自 nat4 候选者 socket 的握手响应并满足成功条件，则进入 `Connected`。
+5. nat3 在 `Handshake` 状态下，如果超时没有继续收到有效响应，则回退到外层重试流程，由 nat4/nat3 继续执行步骤 13 到步骤 17。
+6. nat3 在外层尝试达到 `N4` 上限后进入 `Failed`。
+
+## 计数器语义
+
+为避免实现时对 `N1`、`N2`、`N3`、`N4` 理解不一致，约定如下：
+
+- `N1`
+  单个 nat4 socket 进入握手阶段后，要求该 socket 连续发送并收到响应的最小轮次数。`N1` 只用于“该 socket 是否有资格抢候选者”的判定。
+- `N2`
+  nat4 候选者 socket 抢占成功后，要求该 socket 连续发送并收到响应的最小轮次数。`N2` 只用于“候选者是否最终确认连接成功”的判定。
+- `N3`
+  针对单个 `nat3_addr + nat4_ip` 组合，nat3 重新随机端口批次并重试步骤 7 的最大次数。每次“重复步骤 7”都表示重新生成一批新的随机目标端口。
+- `N4`
+  nat4 外层地址轮转总次数上限。这里的“一次”指完成对 `nat3_public_addrs[]` 的一整轮遍历；每轮中，每个 `nat3_addr` 都会按步骤 6 到步骤 15 依次尝试所有 `nat4_candidate_ips[]`。
+
+计数器重置规则：
+
+1. `N1` 在某个 socket 首次进入握手阶段时清零；该 socket 退出握手阶段后失效。
+2. `N2` 在某个 socket 成为候选者时清零；候选者被释放后失效。
+3. `N3` 在切换到新的 `nat4_ip` 时清零；在同一个 `nat4_ip` 下每重复一次步骤 7 递增一次。
+4. `N3` 在切换到新的 `nat3_addr` 时也清零，因为此时已经进入新的 `nat3_addr + nat4_ip` 组合。
+5. `N4` 只在完成一次 `nat3_public_addrs[]` 全量遍历后递增一次；开始下一轮遍历前不清零。
+
+## 资源生命周期
+
+### nat3 资源
+
+- nat3 在整个会话中复用同一个 UDP socket。
+- `nat3_public_addrs[]` 由这个 socket 的 STUN 结果导出，后续 `probe`、`ack` 响应和握手都使用同一个 socket。
+- nat3 在步骤 7 重试、步骤 6 切换 `nat4_ip`、步骤 4 切换 `nat3_addr` 时，都不重建本地 socket。
+- nat3 只有在进入 `Connected` 或 `Failed` 后才释放该 socket。
+
+### nat4 资源
+
+- nat4 在步骤 3 创建一批 UDP socket，并在整个会话中尽量复用这批 socket。
+- nat4 在步骤 5 对整批 socket 执行一次针对当前 `nat3_addr` 的 TTL warm up，然后进入接收状态。
+- 在步骤 13 内部重复步骤 7 时，nat4 继续复用当前这批 socket 和当前 `nat3_addr` 的接收状态，不重新建 socket，也不重新做 warm up。
+- 在步骤 15 切换到新的 `nat3_addr` 时，nat4 继续复用同一批 socket，但需要重新以新的 `nat3_addr` 为目标执行 TTL warm up，再进入接收状态。
+- 进入步骤 8 的命中 socket 会先恢复为正常 TTL，再进入握手阶段。
+- 未命中的 socket 保持 probing TTL。
+- 某个候选者 socket 在步骤 12 超时失效后，该 socket 退出候选者状态；其余握手等待状态 socket 继续参与候选者竞争。
+- nat4 在进入 `Connected` 后，只保留最终成功的那个 socket，其余 socket 释放。
+- nat4 在进入 `Failed` 后，释放整批 socket。
+
+## 报文定义
+
+本文档只定义最小语义，不限定最终编码格式。至少需要三类报文：
+
+- `probe`
+  由 nat3 在步骤 7 发出，用于对当前 `nat4_ip` 的随机端口做探测。
+- `ack`
+  由 nat4 在步骤 8 命中后回复，用于把 nat3 从 `Probing` 推进到 `Handshake`。
+- `handshake`
+  由 nat3 和 nat4 在步骤 9 到步骤 12 之间双向收发，用于确认候选者和最终连通。
+
+最小字段要求：
+
+1. 所有报文都应至少带 `session_id`，防止并发会话互相串包。
+2. `ack` 和 `handshake` 应能让接收方识别当前命中的 nat4 socket，至少要能区分当前 5-tuple 或等价的 socket 标识。
+3. `handshake` 应包含足够的阶段信息，使 nat3 能识别“普通握手响应”和“候选者确认响应”。
+
+最小判定规则：
+
+1. nat3 只有在 `Probing` 状态收到与当前会话匹配的 `ack` 时，才切换到 `Handshake`。
+2. nat4 只有在收到与当前会话匹配的 `probe` 后，才允许进入步骤 8。
+3. nat3 和 nat4 在 `Handshake` 阶段只接受当前已锁定 5-tuple 上的 `handshake` 报文，其它来源一律忽略。
+4. 一旦某个 nat4 socket 成为候选者，后续只有该候选者 socket 的 `handshake` 响应可以推进到成功状态，其它 socket 只能维持等待或被淘汰。
