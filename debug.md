@@ -41,6 +41,41 @@ relay 子命令的 agent 名字是正则匹配，比如 '^nightly-rtun1-manual$'
 
 3. 这两个脚本只负责“环境初始化”，不自动启动新的调试 agent，也不自动启动 relay。
 
+### manual NAT4 一键脚本
+
+如果目标是“先把 manual NAT4 基线自动跑通”，优先使用下面这个总控脚本，而不是每次手工敲完整流程：
+
+```shell
+python3 rtun/tests/manual/run_manual_nat4_auto.py \
+  --init-rtun-local \
+  --init-nightly \
+  --nightly-source worktree \
+  --summary-json /tmp/manual-nat4-auto-summary.json
+```
+
+- 默认 `rtun-local host` 是 `rtun-local`
+- 默认远端 shell agent 是 `nightly-rtun1-manual`
+- 如需切换环境名字，统一通过参数传：
+  ```shell
+  python3 rtun/tests/manual/run_manual_nat4_auto.py \
+    --rtun-local-host rtun-local \
+    --shell-agent nightly-rtun1-manual
+  ```
+- 这个脚本会自动：
+  - 可选初始化 `rtun-local` 和 nightly
+  - 采样本轮 `nat4_candidate_ips`
+  - 如果本轮包含 `101.40.161.229`，优先先打它；否则按采样顺序遍历
+  - 自动解析 `nat3_public_addr`
+  - 自动推进固定批次数 probing
+  - 任一 IP 满足成功条件后自动停止
+- 当前成功条件固定为：
+  - nat3 日志出现 `connected from target [...]`
+  - nat4 日志出现 `manual converge final connected selected: owner [...]`
+- 如果不加 `--init-rtun-local` 或 `--init-nightly`
+  - 脚本会复用现有环境
+  - 但这不保证当前二进制和代码版本是最新；脚本会打印 warning，调用方仍要对环境状态负责
+- `--summary-json` 只负责输出本轮每个 IP 的摘要，不替代 issue 记录
+
 
 ### 远端环境
 
