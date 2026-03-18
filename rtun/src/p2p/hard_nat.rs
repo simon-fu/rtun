@@ -1,9 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Write as FmtWrite,
     future::Future,
     net::{IpAddr, SocketAddr},
+    os::fd::AsRawFd,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -11,10 +13,11 @@ use std::{
 
 use anyhow::{bail, Context as _, Result};
 use futures::StreamExt;
+use nix::poll::{poll, PollFd, PollFlags};
 use parking_lot::Mutex;
 use rand::Rng as _;
 use tokio::net::UdpSocket;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -65,6 +68,9 @@ const NAT3_PAUSE_AFTER_DISCOVERY_PROMPT: &str =
     "nat3 discovery finished, press Enter to start probing";
 const NAT3_HOLD_BATCH_UNTIL_ENTER_PROMPT: &str =
     "nat3 batch probing active, press Enter to reroll target ports";
+const NAT3_HOLD_BATCH_STDIN_POLL_TIMEOUT_MS: i32 = 50;
+const NAT3_HOLD_BATCH_STDIN_EOF_RETRY: Duration = Duration::from_millis(10);
+const NAT3_HOLD_BATCH_STDIN_ERROR_RETRY: Duration = Duration::from_millis(50);
 
 fn allocate_hard_nat_session_id() -> u64 {
     loop {
@@ -157,6 +163,85 @@ enum RecvProbeAction {
     EchoNat4Token(ProbeToken),
 }
 
+fn format_packet_preview(packet: &[u8]) -> String {
+    const MAX_PREVIEW_BYTES: usize = 8;
+    let mut preview = String::new();
+    for (idx, byte) in packet.iter().take(MAX_PREVIEW_BYTES).enumerate() {
+        if idx > 0 {
+            preview.push(' ');
+        }
+        write!(&mut preview, "{:02X}", byte).expect("write preview failed");
+    }
+    preview
+}
+
+fn packet_kind_label(kind: ProbePacketKind) -> &'static str {
+    match kind {
+        ProbePacketKind::Content => "Content",
+        ProbePacketKind::Token(_) => "Token",
+        ProbePacketKind::Unknown => "Unknown",
+    }
+}
+
+fn log_debug_converge_recv(
+    role: HardNatRole,
+    classification: ProbePacketKind,
+    local: SocketAddr,
+    from: SocketAddr,
+    len: usize,
+    action: RecvProbeAction,
+    packet: &[u8],
+    expected_text: &str,
+) {
+    let classification_label = packet_kind_label(classification);
+    let classification_msg = format!("classification [{classification_label}]");
+    let decision_msg = format!("decision [{action:?}]");
+    match classification {
+        ProbePacketKind::Content => {
+            info!(
+                "manual converge recv content {classification_msg} {decision_msg} role [{role:?}] local [{local}] from [{from}] len [{len}] expected [{expected_text}]"
+            );
+        }
+        ProbePacketKind::Token(token) => {
+            info!(
+                "manual converge recv token {classification_msg} {decision_msg} role [{role:?}] local [{local}] from [{from}] len [{len}] token [{token:?}]"
+            );
+        }
+        ProbePacketKind::Unknown => {
+            let preview = format_packet_preview(packet);
+            info!(
+                "manual converge recv unknown {classification_msg} {decision_msg} role [{role:?}] local [{local}] from [{from}] len [{len}] preview [{preview}]"
+            );
+        }
+    }
+}
+
+fn log_manual_converge_token_send(local: SocketAddr, target: SocketAddr, token: ProbeToken) {
+    info!(
+        "manual converge send token local [{local}] target [{target}] socket [{socket_id}] generation [{generation}] seq [{seq}]",
+        socket_id = token.socket_id,
+        generation = token.generation,
+        seq = token.seq
+    );
+}
+
+fn log_manual_converge_validation_failure(
+    owner: u64,
+    generation: u64,
+    socket: &Nat4ProbeSocketState,
+    cfg: &ManualConvergeConfig,
+) {
+    info!(
+        "manual converge validation failed owner [{owner}] generation [{generation}] echo [{}/{}] last_sent [{:?}] last_matched [{:?}] validation_window [{:?}] cooldown [{:?}]",
+        socket.validation_echo_count,
+        cfg.validation_hit_n2,
+        socket.last_validation_sent_seq,
+        socket.last_validation_matched_seq,
+        cfg.validation_window,
+        cfg.cooldown,
+    );
+}
+
 impl RecvProbeAction {
     fn is_valid_probe(self) -> bool {
         !matches!(self, Self::Ignore)
@@ -184,10 +269,9 @@ fn classify_probe_packet(packet: &[u8], text: &str) -> ProbePacketKind {
 fn decide_recv_probe_action(
     role: HardNatRole,
     debug_converge_lease: bool,
-    packet: &[u8],
-    text: &str,
+    kind: ProbePacketKind,
 ) -> RecvProbeAction {
-    match classify_probe_packet(packet, text) {
+    match kind {
         ProbePacketKind::Content => RecvProbeAction::AcceptContent,
         ProbePacketKind::Token(token) if !debug_converge_lease => RecvProbeAction::Ignore,
         ProbePacketKind::Token(token) => match (role, token.role) {
@@ -425,13 +509,22 @@ impl ManualConvergeCoordinator {
         let global_phase = self.phase;
         let cfg = self.cfg.clone();
         let socket = self.ensure_socket(socket_id);
+        let phase_before = socket.phase;
         if global_phase != ManualConvergePhase::Probing {
+            info!(
+                "manual converge probe hit ignored: socket [{socket_id}], global_phase [{global_phase:?}], socket_phase [{phase_before:?}], probe_hit_count [{}]",
+                socket.probe_hit_count
+            );
             return false;
         }
         if !matches!(
             socket.phase,
             Nat4SocketPhase::Probing | Nat4SocketPhase::Candidate
         ) {
+            info!(
+                "manual converge probe hit ignored: socket [{socket_id}], global_phase [{global_phase:?}], socket_phase [{phase_before:?}], probe_hit_count [{}]",
+                socket.probe_hit_count
+            );
             return false;
         }
 
@@ -444,8 +537,14 @@ impl ManualConvergeCoordinator {
             socket.probe_window_started_at = Some(now);
         }
 
+        let count_before = socket.probe_hit_count;
         socket.last_probe_hit_at = Some(now);
         socket.probe_hit_count += 1;
+        let phase_after_hit = socket.phase;
+        info!(
+            "manual converge probe hit: socket [{socket_id}], global_phase [{global_phase:?}], socket_phase [{phase_before:?}] -> [{phase_after_hit:?}], probe_hit_count [{count_before} -> {}], window_reset [{should_reset_window}]",
+            socket.probe_hit_count
+        );
         if socket.phase == Nat4SocketPhase::Probing && socket.probe_hit_count >= cfg.probe_hit_n1 {
             socket.phase = Nat4SocketPhase::Candidate;
             debug!(
@@ -696,6 +795,10 @@ impl ManualConvergeCoordinator {
         self.quiet_ready.clear();
         self.quiet_started_at = None;
         self.quiet_completed_at = None;
+
+        if let Some(owner_socket) = self.sockets.get(&owner) {
+            log_manual_converge_validation_failure(owner, generation, owner_socket, &self.cfg);
+        }
 
         for (socket_id, socket) in self.sockets.iter_mut() {
             socket.reset_validation_state();
@@ -2096,23 +2199,29 @@ fn log_nat3_public_addr_discovery(local_addr: SocketAddr, output: &BindingOutput
     }
 }
 
+#[cfg(test)]
 fn wait_for_enter_prompt<R, W>(reader: &mut R, writer: &mut W, prompt: &str) -> Result<()>
 where
     R: std::io::BufRead,
     W: std::io::Write,
 {
-    writeln!(writer, "{prompt}").with_context(|| "write pause prompt failed")?;
-    writer
-        .flush()
-        .with_context(|| "flush pause prompt failed")?;
-
+    write_wait_prompt(writer, prompt)?;
     let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .with_context(|| "read pause confirmation failed")?;
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .with_context(|| "read pause confirmation failed")?;
+        if bytes == 0 {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        break;
+    }
     Ok(())
 }
 
+#[cfg(test)]
 fn wait_for_enter_after_discovery<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
 where
     R: std::io::BufRead,
@@ -2121,12 +2230,285 @@ where
     wait_for_enter_prompt(reader, writer, NAT3_PAUSE_AFTER_DISCOVERY_PROMPT)
 }
 
+#[cfg(test)]
 fn wait_for_enter_before_nat3_batch_reroll<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
 where
     R: std::io::BufRead,
     W: std::io::Write,
 {
-    wait_for_enter_prompt(reader, writer, NAT3_HOLD_BATCH_UNTIL_ENTER_PROMPT)
+    write_wait_prompt(writer, NAT3_HOLD_BATCH_UNTIL_ENTER_PROMPT)?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .with_context(|| "read pause confirmation failed")?;
+        if bytes == 0 {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        break;
+    }
+    Ok(())
+}
+
+async fn hold_batch_send_loop<SendFn, SendFut, WaitSignalFut>(
+    mut send_once: SendFn,
+    wait_signal: WaitSignalFut,
+    interval: Duration,
+) -> Result<()>
+where
+    SendFn: FnMut() -> SendFut,
+    SendFut: Future<Output = Result<()>>,
+    WaitSignalFut: Future<Output = Result<()>>,
+{
+    tokio::pin!(wait_signal);
+    loop {
+        send_once().await?;
+        tokio::select! {
+            signal = &mut wait_signal => {
+                signal?;
+                break;
+            }
+            _ = tokio::time::sleep(interval) => {}
+        }
+    }
+    Ok(())
+}
+
+fn write_wait_prompt<W: std::io::Write>(writer: &mut W, prompt: &str) -> Result<()> {
+    writeln!(writer, "{prompt}").with_context(|| "write pause prompt failed")?;
+    writer
+        .flush()
+        .with_context(|| "flush pause prompt failed")?;
+    Ok(())
+}
+
+async fn write_wait_prompt_async(prompt: &'static str) -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let stdout = std::io::stdout();
+        let mut writer = stdout.lock();
+        write_wait_prompt(&mut writer, prompt)
+    })
+    .await
+    .with_context(|| "wait prompt task join failed")??;
+    Ok(())
+}
+
+struct Nat3RerollEnterListener {
+    stop: Arc<AtomicBool>,
+    cmd_tx: std::sync::mpsc::Sender<Nat3RerollListenerCommand>,
+    rx: mpsc::UnboundedReceiver<u64>,
+    join_handle: Option<std::thread::JoinHandle<()>>,
+    next_epoch: u64,
+}
+
+impl Nat3RerollEnterListener {
+    fn spawn() -> Self {
+        Self::spawn_with_reader(std::io::stdin())
+    }
+
+    fn spawn_with_reader<R>(reader: R) -> Self
+    where
+        R: std::io::Read + AsRawFd + Send + 'static,
+    {
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let join_handle = std::thread::spawn(move || {
+            nat3_reroll_enter_listener_loop(reader, thread_stop, cmd_rx, tx)
+        });
+        Self {
+            stop,
+            cmd_tx,
+            rx,
+            join_handle: Some(join_handle),
+            next_epoch: 0,
+        }
+    }
+
+    async fn begin_epoch(&mut self) -> Result<(u64, usize)> {
+        self.next_epoch += 1;
+        let epoch = self.next_epoch;
+        let (ready_tx, ready_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Nat3RerollListenerCommand::StartEpoch { epoch, ready_tx })
+            .map_err(|_| anyhow::anyhow!("nat3 hold-batch enter listener stopped"))?;
+        let discarded_enters = ready_rx
+            .await
+            .with_context(|| "nat3 hold-batch enter listener start-epoch ack dropped")??;
+        Ok((epoch, discarded_enters))
+    }
+
+    async fn recv_epoch(&mut self, epoch: u64) -> Result<()> {
+        wait_for_nat3_reroll_signal(&mut self.rx, epoch).await
+    }
+}
+
+impl Drop for Nat3RerollEnterListener {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join_handle) = self.join_handle.take() {
+            if join_handle.join().is_err() {
+                warn!("nat3 hold-batch enter listener panicked");
+            }
+        }
+    }
+}
+
+enum Nat3RerollListenerCommand {
+    StartEpoch {
+        epoch: u64,
+        ready_tx: oneshot::Sender<Result<usize>>,
+    },
+}
+
+fn nat3_reroll_enter_listener_loop<R>(
+    mut reader: R,
+    stop: Arc<AtomicBool>,
+    cmd_rx: std::sync::mpsc::Receiver<Nat3RerollListenerCommand>,
+    tx: mpsc::UnboundedSender<u64>,
+) where
+    R: std::io::Read + AsRawFd,
+{
+    let stdin_fd = reader.as_raw_fd();
+    let mut input = [0_u8; 256];
+    let mut active_epoch = 0_u64;
+    while !stop.load(Ordering::Relaxed) {
+        while let Ok(command) = cmd_rx.try_recv() {
+            if let Err(err) = handle_nat3_reroll_listener_command(
+                &mut reader,
+                stdin_fd,
+                &mut active_epoch,
+                command,
+            ) {
+                warn!("nat3 hold-batch start epoch failed: {err:#}");
+            }
+        }
+
+        let mut poll_fds = [PollFd::new(
+            stdin_fd,
+            PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP,
+        )];
+        match poll(&mut poll_fds, NAT3_HOLD_BATCH_STDIN_POLL_TIMEOUT_MS) {
+            Ok(0) => continue,
+            Ok(_) => {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                match reader.read(&mut input) {
+                    Ok(0) => std::thread::sleep(NAT3_HOLD_BATCH_STDIN_EOF_RETRY),
+                    Ok(n) => {
+                        let observed = input[..n].iter().filter(|byte| **byte == b'\n').count();
+                        if active_epoch != 0 {
+                            for _ in 0..observed {
+                                if tx.send(active_epoch).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        if observed > 0 {
+                            debug!(
+                                "nat3 hold-batch enter observed: epoch [{active_epoch}] chunk_enters [{observed}]"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!("nat3 hold-batch read stdin failed: {err:#}");
+                        std::thread::sleep(NAT3_HOLD_BATCH_STDIN_ERROR_RETRY);
+                    }
+                }
+            }
+            Err(err) => {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                warn!("nat3 hold-batch poll stdin failed: {err:#}");
+                std::thread::sleep(NAT3_HOLD_BATCH_STDIN_ERROR_RETRY);
+            }
+        }
+    }
+}
+
+fn handle_nat3_reroll_listener_command<R>(
+    reader: &mut R,
+    stdin_fd: i32,
+    active_epoch: &mut u64,
+    command: Nat3RerollListenerCommand,
+) -> Result<()>
+where
+    R: std::io::Read,
+{
+    match command {
+        Nat3RerollListenerCommand::StartEpoch { epoch, ready_tx } => {
+            let discarded_enters = drain_nat3_reroll_stale_input(reader, stdin_fd)?;
+            *active_epoch = epoch;
+            let _ = ready_tx.send(Ok(discarded_enters));
+            Ok(())
+        }
+    }
+}
+
+fn drain_nat3_reroll_stale_input<R>(reader: &mut R, stdin_fd: i32) -> Result<usize>
+where
+    R: std::io::Read,
+{
+    let mut discarded_enters = 0_usize;
+    let mut input = [0_u8; 256];
+    loop {
+        let mut poll_fds = [PollFd::new(
+            stdin_fd,
+            PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP,
+        )];
+        match poll(&mut poll_fds, 0) {
+            Ok(0) => return Ok(discarded_enters),
+            Ok(_) => match reader.read(&mut input) {
+                Ok(0) => return Ok(discarded_enters),
+                Ok(n) => {
+                    discarded_enters += input[..n].iter().filter(|byte| **byte == b'\n').count();
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        "nat3 hold-batch read stdin while draining stale input failed"
+                    });
+                }
+            },
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    "nat3 hold-batch poll stdin while draining stale input failed"
+                });
+            }
+        }
+    }
+}
+
+async fn wait_for_nat3_reroll_signal(
+    rx: &mut mpsc::UnboundedReceiver<u64>,
+    epoch: u64,
+) -> Result<()> {
+    loop {
+        let observed_epoch = rx
+            .recv()
+            .await
+            .with_context(|| "nat3 hold-batch enter listener stopped")?;
+        if observed_epoch == epoch {
+            return Ok(());
+        }
+        debug!(
+            "nat3 hold-batch ignore stale enter signal: expected_epoch [{epoch}] observed_epoch [{observed_epoch}]"
+        );
+    }
+}
+
+async fn wait_for_nat3_enter_with_listener(prompt: &'static str) -> Result<()> {
+    let mut listener = Nat3RerollEnterListener::spawn();
+    let (epoch, discarded_enters) = listener.begin_epoch().await?;
+    write_wait_prompt_async(prompt).await?;
+    debug!(
+        "nat3 enter wait start: prompt [{prompt}], epoch [{epoch}], discarded_enters [{discarded_enters}]"
+    );
+    listener.recv_epoch(epoch).await
 }
 
 async fn maybe_pause_after_discovery(pause_after_discovery: bool) -> Result<()> {
@@ -2134,17 +2516,7 @@ async fn maybe_pause_after_discovery(pause_after_discovery: bool) -> Result<()> 
         return Ok(());
     }
 
-    tokio::task::spawn_blocking(|| -> Result<()> {
-        let stdin = std::io::stdin();
-        let stdout = std::io::stdout();
-        let mut reader = std::io::BufReader::new(stdin.lock());
-        let mut writer = stdout.lock();
-        wait_for_enter_after_discovery(&mut reader, &mut writer)
-    })
-    .await
-    .with_context(|| "pause-after-discovery task join failed")??;
-
-    Ok(())
+    wait_for_nat3_enter_with_listener(NAT3_PAUSE_AFTER_DISCOVERY_PROMPT).await
 }
 
 pub fn half_hops_from_ping_ttl(ttl: u32) -> Option<u32> {
@@ -2620,30 +2992,30 @@ async fn run_nat3_hold_batch_until_enter(args: Nat3RunConfig) -> Result<()> {
     let mut num = 0_usize;
     let max_ports = 50000;
     let mut try_ports = HashSet::with_capacity(max_ports);
+    let mut reroll_listener = Nat3RerollEnterListener::spawn();
+    let mut batch_id = 0_u64;
 
     loop {
+        batch_id += 1;
         let targets =
             build_nat3_target_batch(args.count, target_ip, &mut try_ports, max_ports, &mut num);
-        let reroll_task = tokio::task::spawn_blocking(|| -> Result<()> {
-            let stdin = std::io::stdin();
-            let stdout = std::io::stdout();
-            let mut reader = std::io::BufReader::new(stdin.lock());
-            let mut writer = stdout.lock();
-            wait_for_enter_before_nat3_batch_reroll(&mut reader, &mut writer)
-        });
+        let (batch_epoch, discarded_enters) = reroll_listener.begin_epoch().await?;
+        write_wait_prompt_async(NAT3_HOLD_BATCH_UNTIL_ENTER_PROMPT).await?;
+        debug!(
+            "nat3 hold-batch start: batch [{batch_id}], epoch [{batch_epoch}], discarded_enters [{discarded_enters}], targets [{}]",
+            targets.len()
+        );
 
-        loop {
-            let _ = send_nat3_batch_once(&socket, &text, &targets, &shared, num, false).await?;
-
-            if reroll_task.is_finished() {
-                reroll_task
-                    .await
-                    .with_context(|| "hold-batch-until-enter task join failed")??;
-                break;
-            }
-
-            tokio::time::sleep(interval).await;
-        }
+        hold_batch_send_loop(
+            || async {
+                let _ = send_nat3_batch_once(&socket, &text, &targets, &shared, num, false).await?;
+                Ok::<(), anyhow::Error>(())
+            },
+            reroll_listener.recv_epoch(batch_epoch),
+            interval,
+        )
+        .await?;
+        debug!("nat3 hold-batch reroll: batch [{batch_id}]");
     }
 }
 
@@ -3189,12 +3561,20 @@ async fn recv_loop(
             .await
             .with_context(|| "recv_from failed")?;
         let packet = &buf[..len];
-        let action = decide_recv_probe_action(
-            opts.role,
-            opts.debug_converge_lease,
-            packet,
-            opts.expected_text.as_str(),
-        );
+        let packet_kind = classify_probe_packet(packet, opts.expected_text.as_str());
+        let action = decide_recv_probe_action(opts.role, opts.debug_converge_lease, packet_kind);
+        if opts.debug_converge_lease {
+            log_debug_converge_recv(
+                opts.role,
+                packet_kind,
+                local,
+                from,
+                len,
+                action,
+                packet,
+                opts.expected_text.as_str(),
+            );
+        }
         if action.is_valid_probe() {
             if !ttl_promoted {
                 if let Some(ttl) = opts.promote_hit_ttl {
@@ -3223,24 +3603,28 @@ async fn recv_loop(
                 let _ = coordinator.record_probe_hit(manual.socket_id, now);
             }
             let old = shared.connecteds.lock().insert(from, socket.clone());
-            match action {
-                RecvProbeAction::AcceptContent => {
-                    info!(
-                        "recv text [{local}] <= [{from}], text [{}]",
-                        opts.expected_text.as_str()
-                    );
+            if !opts.debug_converge_lease {
+                match action {
+                    RecvProbeAction::AcceptContent => {
+                        info!(
+                            "recv text [{local}] <= [{from}], text [{}]",
+                            opts.expected_text.as_str()
+                        );
+                    }
+                    RecvProbeAction::AcceptNat4TokenEcho(token)
+                    | RecvProbeAction::EchoNat4Token(token) => {
+                        debug!("recv probe token [{local}] <= [{from}], token [{token:?}]");
+                    }
+                    RecvProbeAction::Ignore => {}
                 }
-                RecvProbeAction::AcceptNat4TokenEcho(token)
-                | RecvProbeAction::EchoNat4Token(token) => {
-                    debug!("recv probe token [{local}] <= [{from}], token [{token:?}]");
-                }
-                RecvProbeAction::Ignore => {}
             }
             if old.is_none() {
                 info!("connected from target [{from:?}]");
             }
         } else {
-            info!("recv unknown [{local}] <= [{from}], bytes [{len}]");
+            if !opts.debug_converge_lease {
+                info!("recv unknown [{local}] <= [{from}], bytes [{len}]");
+            }
         }
     }
 }
@@ -3319,26 +3703,36 @@ impl ProbePayload {
 impl UdpSender {
     async fn send_one(&self) -> Result<()> {
         let payload = self.payload.next_text();
-        self.send_payload_to(self.target, &payload).await
+        self.send_payload_to(self.target, &payload, None).await
     }
 
     async fn send_one_to(&self, target: SocketAddr) -> Result<()> {
         let payload = self.payload.next_text();
-        self.send_payload_to(target, &payload).await
+        self.send_payload_to(target, &payload, None).await
     }
 
     async fn send_token(&self, token: ProbeToken) -> Result<()> {
         let payload = encode_probe_token(token);
-        self.send_payload_to(self.target, &payload).await
+        self.send_payload_to(self.target, &payload, Some(token))
+            .await?;
+        Ok(())
     }
 
-    async fn send_payload_to(&self, target: SocketAddr, payload: &str) -> Result<()> {
+    async fn send_payload_to(
+        &self,
+        target: SocketAddr,
+        payload: &str,
+        token: Option<ProbeToken>,
+    ) -> Result<()> {
         let len = self
             .socket
             .send_to(payload.as_bytes(), target)
             .await
             .with_context(|| "send_to failed")?;
         debug!("sent to [{}] => [{}]: bytes [{len}]", self.local, target);
+        if let Some(token) = token {
+            log_manual_converge_token_send(self.local, target, token);
+        }
         Ok(())
     }
 
@@ -3435,9 +3829,12 @@ mod tests {
         async_udp::{tokio_socket_bind, AsyncUdpSocket},
         stun::{decode_message, try_binding_response_bytes},
     };
-    use std::io::{self, Cursor};
+    use std::collections::VecDeque;
+    use std::fs::File;
+    use std::io::{self, BufRead, Cursor, Read, Write};
     use std::net::{Ipv4Addr, SocketAddrV4};
-    use std::sync::{Arc, Mutex};
+    use std::os::fd::FromRawFd;
+    use std::sync::{mpsc as std_mpsc, Arc, Mutex};
     use tokio::sync::{broadcast, mpsc};
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -3479,6 +3876,74 @@ mod tests {
         tracing::subscriber::with_default(subscriber, f);
         let bytes = logs.0.lock().expect("lock shared log buffer").clone();
         String::from_utf8(bytes).expect("utf8 logs")
+    }
+
+    /// 模拟 stdin 在异步场景下先遇到 EOF（`read_line` 返回 0），再提供用户换行。
+    struct SequencedBufRead {
+        responses: VecDeque<ReaderResponse>,
+        buffer: Vec<u8>,
+        saw_empty: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReaderResponse {
+        Empty,
+        Data(&'static [u8]),
+    }
+
+    impl SequencedBufRead {
+        fn new(responses: Vec<ReaderResponse>) -> Self {
+            Self {
+                responses: VecDeque::from(responses),
+                buffer: Vec::new(),
+                saw_empty: false,
+            }
+        }
+
+        fn saw_empty(&self) -> bool {
+            self.saw_empty
+        }
+
+        fn responses_remaining(&self) -> usize {
+            self.responses.len()
+        }
+    }
+
+    impl Read for SequencedBufRead {
+        fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+            let buf = self.fill_buf()?;
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let amt = buf.len().min(dst.len());
+            dst[..amt].copy_from_slice(&buf[..amt]);
+            self.consume(amt);
+            Ok(amt)
+        }
+    }
+
+    impl BufRead for SequencedBufRead {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if self.buffer.is_empty() {
+                while let Some(response) = self.responses.pop_front() {
+                    match response {
+                        ReaderResponse::Empty => {
+                            self.saw_empty = true;
+                            return Ok(&[]);
+                        }
+                        ReaderResponse::Data(bytes) => {
+                            self.buffer.extend_from_slice(bytes);
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(&self.buffer)
+        }
+
+        fn consume(&mut self, amt: usize) {
+            self.buffer.drain(..amt);
+        }
     }
 
     #[test]
@@ -3606,6 +4071,25 @@ mod tests {
     }
 
     #[test]
+    fn pause_after_discovery_requires_enter_even_after_eof() {
+        let mut reader =
+            SequencedBufRead::new(vec![ReaderResponse::Empty, ReaderResponse::Data(b"\n")]);
+        let mut output = Vec::new();
+        wait_for_enter_after_discovery(&mut reader, &mut output).unwrap();
+
+        assert!(reader.saw_empty(), "EOF should be observed before newline");
+        assert!(
+            !output.is_empty(),
+            "prompt should still be written when loop retries"
+        );
+        assert_eq!(
+            reader.responses_remaining(),
+            0,
+            "newline must be consumed before returning"
+        );
+    }
+
+    #[test]
     fn hold_batch_until_enter_prompt_message() {
         let mut input = Cursor::new(b"\n".to_vec());
         let mut output = Vec::new();
@@ -3616,6 +4100,354 @@ mod tests {
             prompt,
             "nat3 batch probing active, press Enter to reroll target ports\n"
         );
+    }
+
+    #[test]
+    fn hold_batch_until_enter_requires_enter_even_after_eof() {
+        let mut reader =
+            SequencedBufRead::new(vec![ReaderResponse::Empty, ReaderResponse::Data(b"\n")]);
+        let mut output = Vec::new();
+        wait_for_enter_before_nat3_batch_reroll(&mut reader, &mut output).unwrap();
+
+        assert!(reader.saw_empty(), "EOF should be observed before newline");
+        assert!(
+            !output.is_empty(),
+            "prompt should still be written when loop retries"
+        );
+        assert_eq!(
+            reader.responses_remaining(),
+            0,
+            "newline must be consumed before returning"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hold_batch_loop_repeats_same_batch_until_reroll() {
+        let batch_calls = Arc::new(Mutex::new(Vec::new()));
+        let (reroll_tx, mut reroll_rx) = mpsc::unbounded_channel();
+        let batch_epoch = 1_u64;
+        hold_batch_send_loop(
+            {
+                let calls = batch_calls.clone();
+                let reroll_tx = reroll_tx.clone();
+                move || {
+                    let calls = calls.clone();
+                    let reroll_tx = reroll_tx.clone();
+                    async move {
+                        let mut guard = calls.lock().unwrap();
+                        guard.push(1);
+                        if guard.len() == 3 {
+                            reroll_tx
+                                .send(batch_epoch)
+                                .expect("send reroll signal after third batch send");
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    }
+                }
+            },
+            wait_for_nat3_reroll_signal(&mut reroll_rx, batch_epoch),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        let guard = batch_calls.lock().unwrap();
+        assert_eq!(guard.len(), 3);
+        assert!(guard.iter().all(|&batch_id| batch_id == 1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hold_batch_loop_ignores_stale_signal_before_batch_start() {
+        let batch_calls = Arc::new(Mutex::new(Vec::new()));
+        let (reroll_tx, mut reroll_rx) = mpsc::unbounded_channel();
+        let stale_epoch = 1_u64;
+        let batch_epoch = 2_u64;
+        reroll_tx
+            .send(stale_epoch)
+            .expect("queue stale signal before batch starts");
+        hold_batch_send_loop(
+            {
+                let calls = batch_calls.clone();
+                let reroll_tx = reroll_tx.clone();
+                move || {
+                    let calls = calls.clone();
+                    let reroll_tx = reroll_tx.clone();
+                    async move {
+                        let mut guard = calls.lock().unwrap();
+                        guard.push(1);
+                        if guard.len() == 3 {
+                            reroll_tx
+                                .send(batch_epoch)
+                                .expect("send fresh signal for current batch");
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    }
+                }
+            },
+            wait_for_nat3_reroll_signal(&mut reroll_rx, batch_epoch),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+
+        let guard = batch_calls.lock().unwrap();
+        assert_eq!(
+            guard.len(),
+            3,
+            "batch should keep sending until a newer signal arrives"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hold_batch_loop_ignores_stale_signal_that_arrives_after_discard() {
+        let batch_calls = Arc::new(Mutex::new(Vec::new()));
+        let (reroll_tx, mut reroll_rx) = mpsc::unbounded_channel();
+        let stale_epoch = 1_u64;
+        let batch_epoch = 2_u64;
+        reroll_tx
+            .send(stale_epoch)
+            .expect("queue stale signal after previous batch boundary");
+        hold_batch_send_loop(
+            {
+                let calls = batch_calls.clone();
+                let reroll_tx = reroll_tx.clone();
+                move || {
+                    let calls = calls.clone();
+                    let reroll_tx = reroll_tx.clone();
+                    async move {
+                        let mut guard = calls.lock().unwrap();
+                        guard.push(1);
+                        if guard.len() == 3 {
+                            reroll_tx
+                                .send(batch_epoch)
+                                .expect("send fresh signal for current batch");
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    }
+                }
+            },
+            wait_for_nat3_reroll_signal(&mut reroll_rx, batch_epoch),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+
+        let guard = batch_calls.lock().unwrap();
+        assert_eq!(
+            guard.len(),
+            3,
+            "stale signal that arrives after discard should not reroll the current batch"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hold_batch_loop_rerolls_when_signal_is_already_pending_for_current_batch() {
+        let batch_calls = Arc::new(Mutex::new(Vec::new()));
+        let (reroll_tx, mut reroll_rx) = mpsc::unbounded_channel();
+        let batch_epoch = 1_u64;
+        reroll_tx
+            .send(batch_epoch)
+            .expect("queue signal that belongs to current batch");
+        hold_batch_send_loop(
+            {
+                let calls = batch_calls.clone();
+                move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.lock().unwrap().push(1);
+                        Ok::<(), anyhow::Error>(())
+                    }
+                }
+            },
+            wait_for_nat3_reroll_signal(&mut reroll_rx, batch_epoch),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+
+        let guard = batch_calls.lock().unwrap();
+        assert_eq!(
+            guard.len(),
+            1,
+            "signal queued for the current batch should reroll after the first send"
+        );
+    }
+
+    #[test]
+    fn hold_batch_enter_listener_drop_stops_polling_thread() {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("create pipe for listener test");
+        let read_file = unsafe { File::from_raw_fd(read_fd) };
+        let _write_file = unsafe { File::from_raw_fd(write_fd) };
+        let (done_tx, done_rx) = std_mpsc::channel();
+
+        std::thread::spawn(move || {
+            let listener = Nat3RerollEnterListener::spawn_with_reader(read_file);
+            drop(listener);
+            done_tx.send(()).expect("report listener drop completion");
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(500)).is_ok(),
+            "dropping the listener should not hang waiting for stdin"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hold_batch_enter_listener_begin_epoch_ignores_preexisting_stale_enters() {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("create pipe for listener test");
+        let read_file = unsafe { File::from_raw_fd(read_fd) };
+        let mut write_file = unsafe { File::from_raw_fd(write_fd) };
+        let mut listener = Nat3RerollEnterListener::spawn_with_reader(read_file);
+
+        write_file
+            .write_all(b"\n\n")
+            .expect("write stale enters before starting batch");
+
+        let (batch_epoch, _discarded_enters) = listener.begin_epoch().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.recv_epoch(batch_epoch))
+                .await
+                .is_err(),
+            "stale enters buffered before batch start must be discarded"
+        );
+
+        write_file
+            .write_all(b"\n")
+            .expect("write fresh enter for current batch");
+        tokio::time::timeout(Duration::from_millis(200), listener.recv_epoch(batch_epoch))
+            .await
+            .expect("fresh current-batch enter should arrive in time")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hold_batch_enter_listener_discovery_enter_does_not_reroll_next_epoch() {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("create pipe for listener test");
+        let read_file = unsafe { File::from_raw_fd(read_fd) };
+        let mut write_file = unsafe { File::from_raw_fd(write_fd) };
+        let mut listener = Nat3RerollEnterListener::spawn_with_reader(read_file);
+
+        let (discovery_epoch, _discarded_enters) = listener.begin_epoch().await.unwrap();
+        write_file
+            .write_all(b"\n")
+            .expect("write discovery enter for current epoch");
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            listener.recv_epoch(discovery_epoch),
+        )
+        .await
+        .expect("discovery enter should arrive in time")
+        .unwrap();
+
+        let (batch_epoch, discarded_enters) = listener.begin_epoch().await.unwrap();
+        assert_eq!(
+            discarded_enters, 0,
+            "consumed discovery enter should not remain queued for the next epoch"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.recv_epoch(batch_epoch))
+                .await
+                .is_err(),
+            "discovery enter must not automatically reroll the next epoch"
+        );
+
+        write_file
+            .write_all(b"\n")
+            .expect("write fresh enter for batch epoch");
+        tokio::time::timeout(Duration::from_millis(200), listener.recv_epoch(batch_epoch))
+            .await
+            .expect("fresh batch enter should arrive in time")
+            .unwrap();
+    }
+
+    #[test]
+    fn debug_converge_logs_unknown_preview() {
+        let logs = capture_logs(|| {
+            log_debug_converge_recv(
+                HardNatRole::Nat3,
+                ProbePacketKind::Unknown,
+                "127.0.0.1:12345".parse().unwrap(),
+                "203.0.113.1:54321".parse().unwrap(),
+                4,
+                RecvProbeAction::Ignore,
+                b"\x01\x02\x03\x04",
+                "nat hello",
+            );
+        });
+        assert!(logs.contains("manual converge recv unknown"));
+        assert!(logs.contains("preview [01 02 03 04]"));
+        assert!(logs.contains("classification [Unknown]"));
+        assert!(logs.contains("decision [Ignore]"));
+    }
+
+    #[test]
+    fn debug_converge_logs_nat4_token() {
+        let token = ProbeToken {
+            role: HardNatRole::Nat4,
+            socket_id: 7,
+            generation: 1,
+            seq: 2,
+        };
+        let logs = capture_logs(|| {
+            log_debug_converge_recv(
+                HardNatRole::Nat3,
+                ProbePacketKind::Token(token),
+                "127.0.0.1:12345".parse().unwrap(),
+                "203.0.113.1:54321".parse().unwrap(),
+                17,
+                RecvProbeAction::AcceptNat4TokenEcho(token),
+                b"token bytes",
+                "nat hello",
+            );
+        });
+        assert!(logs.contains("manual converge recv token"));
+        assert!(logs.contains("token [ProbeToken"));
+        assert!(logs.contains("classification [Token]"));
+        assert!(logs.contains("decision [AcceptNat4TokenEcho"));
+    }
+
+    #[test]
+    fn manual_converge_send_token_logs_metadata() {
+        let local: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let target: SocketAddr = "203.0.113.2:2".parse().unwrap();
+        let token = ProbeToken {
+            role: HardNatRole::Nat4,
+            socket_id: 5,
+            generation: 3,
+            seq: 9,
+        };
+        let logs = capture_logs(|| log_manual_converge_token_send(local, target, token));
+        assert!(logs.contains("manual converge send token"));
+        assert!(logs.contains("local [127.0.0.1:1]"));
+        assert!(logs.contains("target [203.0.113.2:2]"));
+        assert!(logs.contains("socket [5]"));
+        assert!(logs.contains("generation [3]"));
+        assert!(logs.contains("seq [9]"));
+    }
+
+    #[test]
+    fn manual_converge_validation_failure_logs_context() {
+        let mut state =
+            ManualConvergeCoordinator::new(1, Duration::from_millis(1), Duration::from_millis(0));
+        let owner = 0;
+        let generation = 17;
+        let now = Instant::now();
+        state.lease_owner = Some(owner);
+        state.current_generation = generation;
+        let mut socket = Nat4ProbeSocketState::new(owner);
+        socket.phase = Nat4SocketPhase::LeaseOwnerValidating { generation };
+        socket.validation_echo_count = 1;
+        socket.last_validation_sent_seq = Some(42);
+        socket.last_validation_matched_seq = Some(40);
+        state.sockets.insert(owner, socket);
+
+        let logs = capture_logs(|| state.release_failed_lease(owner, generation, now));
+        assert!(logs.contains("manual converge validation failed"));
+        assert!(logs.contains("generation [17]"));
+        assert!(logs.contains("validation_window"));
+        assert!(logs.contains("cooldown"));
+        assert!(logs.contains("echo [1/"));
+        assert!(logs.contains("last_sent [Some(42)]"));
+        assert!(logs.contains("last_matched [Some(40)]"));
     }
 
     #[test]
@@ -4101,13 +4933,9 @@ mod tests {
         };
         let payload = encode_probe_token(token);
 
+        let kind = classify_probe_packet(payload.as_bytes(), DEFAULT_PROBE_TEXT);
         assert_eq!(
-            decide_recv_probe_action(
-                HardNatRole::Nat3,
-                true,
-                payload.as_bytes(),
-                DEFAULT_PROBE_TEXT
-            ),
+            decide_recv_probe_action(HardNatRole::Nat3, true, kind),
             RecvProbeAction::EchoNat4Token(token)
         );
     }
@@ -4126,8 +4954,7 @@ mod tests {
             decide_recv_probe_action(
                 HardNatRole::Nat4,
                 true,
-                payload.as_bytes(),
-                DEFAULT_PROBE_TEXT
+                classify_probe_packet(payload.as_bytes(), DEFAULT_PROBE_TEXT),
             ),
             RecvProbeAction::AcceptNat4TokenEcho(token)
         );
@@ -4139,8 +4966,7 @@ mod tests {
             decide_recv_probe_action(
                 HardNatRole::Nat4,
                 true,
-                DEFAULT_PROBE_TEXT.as_bytes(),
-                DEFAULT_PROBE_TEXT
+                classify_probe_packet(DEFAULT_PROBE_TEXT.as_bytes(), DEFAULT_PROBE_TEXT),
             ),
             RecvProbeAction::AcceptContent
         );
@@ -4613,10 +5439,8 @@ mod tests {
             pwd: "p".into(),
             candidates: vec![
                 "candidate:1 1 udp 2130706175 192.168.1.10 50000 typ host".into(),
-                "candidate:2 1 udp 1694498559 8.8.8.8 50001 typ srflx raddr 0.0.0.0 rport 9"
-                    .into(),
-                "candidate:3 1 udp 1694498558 1.1.1.1 50002 typ srflx raddr 0.0.0.0 rport 9"
-                    .into(),
+                "candidate:2 1 udp 1694498559 8.8.8.8 50001 typ srflx raddr 0.0.0.0 rport 9".into(),
+                "candidate:3 1 udp 1694498558 1.1.1.1 50002 typ srflx raddr 0.0.0.0 rport 9".into(),
                 "candidate:4 1 udp 2130706175 198.18.0.1 50004 typ host".into(),
             ],
         };
@@ -4636,8 +5460,7 @@ mod tests {
             ufrag: "u".into(),
             pwd: "p".into(),
             candidates: vec![
-                "candidate:1 1 udp 1694498559 8.8.8.8 40001 typ srflx raddr 0.0.0.0 rport 9"
-                    .into(),
+                "candidate:1 1 udp 1694498559 8.8.8.8 40001 typ srflx raddr 0.0.0.0 rport 9".into(),
                 "candidate:2 1 udp 2130706175 192.168.1.10 40002 typ host".into(),
             ],
         };
@@ -4677,8 +5500,7 @@ mod tests {
             ufrag: "u".into(),
             pwd: "p".into(),
             candidates: vec![
-                "candidate:1 1 udp 1694498559 8.8.8.8 40001 typ srflx raddr 0.0.0.0 rport 9"
-                    .into(),
+                "candidate:1 1 udp 1694498559 8.8.8.8 40001 typ srflx raddr 0.0.0.0 rport 9".into(),
             ],
         };
         let nat3_public_addrs = vec!["203.0.113.10:54321".parse().unwrap()];

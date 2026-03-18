@@ -2,6 +2,7 @@
 import fcntl
 import os
 import pty
+import subprocess
 import struct
 import sys
 import tempfile
@@ -27,6 +28,11 @@ from init_common import (
     wrap_remote_command_for_marker,
 )
 from init_nightly import (
+    build_remote_append_file_command,
+    build_remote_write_file_command,
+    chunk_text,
+    build_worktree_extract_commands,
+    build_worktree_metadata,
     build_rtun_shell_cmd,
     parse_args as parse_nightly_args,
     set_pty_window_size,
@@ -104,6 +110,13 @@ class ParserTests(unittest.TestCase):
         args = parse_nightly_args(["--branch", "issue/9-hardnat-protocol"])
         self.assertEqual(args.shell_agent, NIGHTLY_SHELL_AGENT_DEFAULT)
         self.assertEqual(args.branch, "issue/9-hardnat-protocol")
+        self.assertEqual(args.source, "git")
+
+    def test_init_nightly_accepts_worktree_source(self) -> None:
+        args = parse_nightly_args(
+            ["--branch", "issue/9-hardnat-protocol", "--source", "worktree"]
+        )
+        self.assertEqual(args.source, "worktree")
 
     def test_init_nightly_branch_is_required(self) -> None:
         with self.assertRaises(SystemExit):
@@ -142,6 +155,167 @@ class PtySizingTests(unittest.TestCase):
         finally:
             os.close(master_fd)
             os.close(slave_fd)
+
+
+class WorktreeUploadCommandTests(unittest.TestCase):
+    def test_chunk_text_splits_without_dropping_bytes(self) -> None:
+        chunks = chunk_text("abcdefghij", 4)
+        self.assertEqual(chunks, ["abcd", "efgh", "ij"])
+
+    def test_build_remote_append_file_command_uses_single_line_printf(self) -> None:
+        command = build_remote_append_file_command(
+            "/tmp/rtun-nightly-work.tar.gz.b64",
+            "YWJjMTIz",
+        )
+        self.assertIn("printf '%s'", command)
+        self.assertIn("YWJjMTIz", command)
+        self.assertIn(">> /tmp/rtun-nightly-work.tar.gz.b64", command)
+        self.assertNotIn("<<", command)
+
+    def test_build_remote_write_file_command_uses_single_line_printf_b(self) -> None:
+        command = build_remote_write_file_command(
+            "/tmp/rtun-nightly-work/.init-source.txt",
+            "source=worktree\nbranch=issue/9",
+            "__unused__",
+        )
+        self.assertIn("printf '%b'", command)
+        self.assertIn("> /tmp/rtun-nightly-work/.init-source.txt", command)
+        self.assertIn("\\n", command)
+        self.assertNotIn("<<", command)
+
+    def test_build_worktree_extract_commands_decode_and_cleanup_archive_files(self) -> None:
+        cmds = build_worktree_extract_commands(
+            "/tmp/rtun-nightly-work",
+            "/tmp/rtun-nightly-work.tar.gz",
+            "/tmp/rtun-nightly-work.tar.gz.b64",
+        )
+        merged = "\n".join(cmds)
+        self.assertIn("base64 -d /tmp/rtun-nightly-work.tar.gz.b64 > /tmp/rtun-nightly-work.tar.gz", merged)
+        self.assertIn("tar -xzf /tmp/rtun-nightly-work.tar.gz -C /tmp/rtun-nightly-work", merged)
+        self.assertIn("rm -f /tmp/rtun-nightly-work.tar.gz.b64", merged)
+        self.assertIn("rm -f /tmp/rtun-nightly-work.tar.gz", merged)
+
+    def test_build_worktree_metadata_records_branch_head_dirty_and_sha(self) -> None:
+        metadata = build_worktree_metadata(
+            branch="issue/9-hardnat-protocol",
+            local_head="abc123",
+            dirty=True,
+            archive_sha256="deadbeef",
+        )
+        self.assertIn("source=worktree", metadata)
+        self.assertIn("branch=issue/9-hardnat-protocol", metadata)
+        self.assertIn("local_head=abc123", metadata)
+        self.assertIn("local_dirty=true", metadata)
+        self.assertIn("archive_sha256=deadbeef", metadata)
+
+
+class RemoteStartIssue9AgentScriptTests(unittest.TestCase):
+    def _write_executable(self, path: Path, content: str) -> None:
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o755)
+
+    def _run_remote_start_script(self, url: str, secret: str) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+        script = HERE / "remote_start_issue9_agent.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fakebin = root / "bin"
+            fakebin.mkdir()
+            tmux_log = root / "tmux.log"
+
+            self._write_executable(
+                fakebin / "git",
+                """#!/bin/sh
+set -eu
+target_dir=
+for arg in "$@"; do
+  target_dir="$arg"
+done
+mkdir -p "$target_dir"
+""",
+            )
+            self._write_executable(
+                fakebin / "cargo",
+                """#!/bin/sh
+set -eu
+mkdir -p target/debug
+: > target/debug/rtun
+chmod +x target/debug/rtun
+""",
+            )
+            self._write_executable(
+                fakebin / "sleep",
+                """#!/bin/sh
+exit 0
+""",
+            )
+            self._write_executable(
+                fakebin / "tmux",
+                """#!/bin/sh
+set -eu
+log_path="$TMUX_LOG"
+case "${1:-}" in
+  ls)
+    printf 'rtun-issue9-agent: 1 windows (created now)\\n'
+    exit 0
+    ;;
+esac
+{
+  printf 'CALL\\n'
+  for arg in "$@"; do
+    printf '%s\\n' "$arg"
+  done
+  printf 'END\\n'
+} >> "$log_path"
+exit 0
+""",
+            )
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fakebin}:{env.get('PATH', '')}"
+            env["TMUX_LOG"] = str(tmux_log)
+            env["MY_RTUN1_URL"] = url
+            env["MY_RTUN1_SECRET"] = secret
+
+            proc = subprocess.run(
+                ["sh", str(script)],
+                cwd=str(HERE),
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            calls: list[list[str]] = []
+            current: list[str] | None = None
+            for line in tmux_log.read_text(encoding="utf-8").splitlines():
+                if line == "CALL":
+                    current = []
+                elif line == "END":
+                    if current is not None:
+                        calls.append(current)
+                    current = None
+                elif current is not None:
+                    current.append(line)
+            return proc, calls
+
+    def test_remote_start_issue9_agent_does_not_inline_url_or_secret_into_tmux_command(self) -> None:
+        url = "wss://example.test/$HOME/$(printf-pwn)/`tick`"
+        secret = "secret-$HOME-$(printf-pwn)-`tick`"
+
+        proc, calls = self._run_remote_start_script(url, secret)
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        agent_cmd_args = [
+            arg
+            for call in calls
+            for arg in call
+            if "./target/debug/rtun agent pub" in arg
+        ]
+        self.assertTrue(agent_cmd_args, calls)
+        for arg in agent_cmd_args:
+            self.assertIn("$MY_RTUN1_URL", arg)
+            self.assertIn("$MY_RTUN1_SECRET", arg)
+            self.assertNotIn(url, arg)
+            self.assertNotIn(secret, arg)
 
 
 if __name__ == "__main__":
