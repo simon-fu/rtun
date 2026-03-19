@@ -1,5 +1,5 @@
 use std::{
-    cmp::{max, min},
+    cmp::min,
     io::{self, Write as _},
     net::SocketAddr,
     num::NonZeroU64,
@@ -15,12 +15,13 @@ use tracing::info;
 use super::udp_perf::{
     UdpPerfControlPacket, UdpPerfDataHeader, UdpPerfDataPacket, UdpPerfDirection, UdpPerfHello,
     UdpPerfMode, UdpPerfReport, UdpPerfStart, UdpPerfStop, UdpPerfSummary, UdpPerfWirePacket,
+    UDP_PERF_DATA_META_LEN,
 };
 
 const DEFAULT_PPS: u64 = 1_000;
 const FINAL_REPORT_TIMEOUT: Duration = Duration::from_secs(2);
-const IO_WAIT_MAX: Duration = Duration::from_millis(50);
-const IO_WAIT_MIN: Duration = Duration::from_millis(1);
+const MAX_UDP_DATAGRAM_PAYLOAD_LEN: usize = 65_507;
+const MAX_UDP_SAFE_PAYLOAD_LEN: usize = MAX_UDP_DATAGRAM_PAYLOAD_LEN - UDP_PERF_DATA_META_LEN;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -40,6 +41,10 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
         "--bitrate and --pps are mutually exclusive"
     );
     ensure!(args.len > 0, "--len must be greater than 0");
+    ensure!(
+        args.len <= MAX_UDP_SAFE_PAYLOAD_LEN,
+        "--len must be <= {MAX_UDP_SAFE_PAYLOAD_LEN} so encoded udp perf datagram stays within {MAX_UDP_DATAGRAM_PAYLOAD_LEN} bytes"
+    );
     let payload_len = u16::try_from(args.len).context("--len must be <= 65535")?;
     let target: SocketAddr = args
         .target
@@ -115,13 +120,12 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
         let now = Instant::now();
 
         if !stop_sent {
-            while let Some(due) = next_send_at {
-                if due > now {
-                    break;
+            if let Some(due) = next_send_at {
+                if due <= now {
+                    send_seq = send_seq.saturating_add(1);
+                    send_forward_data(&socket, session_id, send_seq, payload_len).await?;
+                    next_send_at = next_send_deadline(now, pps);
                 }
-                send_seq = send_seq.saturating_add(1);
-                send_forward_data(&socket, session_id, send_seq, payload_len).await?;
-                next_send_at = next_send_deadline(due, pps);
             }
         }
 
@@ -139,13 +143,9 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
             );
         }
 
-        if let Some(deadline) = final_deadline {
-            if now >= deadline {
-                bail!("timeout waiting final report");
-            }
-        }
-
-        if let Some(report) = final_report.take() {
+        if let Some(report) =
+            consume_final_report_or_timeout(&mut final_report, now, final_deadline)?
+        {
             let final_summary = build_client_view_summary(&report.summary, &client_rx, None);
             output.push_str(&render_final_summary(&final_summary, args.json)?);
             return Ok(ClientRunOutput {
@@ -155,32 +155,77 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
             });
         }
 
-        let wait = compute_wait_timeout(
-            now,
-            next_send_at,
-            (!stop_sent).then_some(stop_at),
-            final_deadline,
-        );
-        match tokio::time::timeout(wait, socket.recv(&mut recv_buf)).await {
-            Ok(Ok(n)) => {
-                if let Some(report) = handle_incoming_packet(
-                    &recv_buf[..n],
-                    &mut output,
-                    !args.json,
-                    output_policy,
-                    &mut client_rx,
-                )? {
-                    if report.is_final {
-                        final_report = Some(report);
+        if let Some(deadline) =
+            next_loop_deadline(next_send_at, (!stop_sent).then_some(stop_at), final_deadline)
+        {
+            let sleep = tokio::time::sleep_until(deadline);
+            tokio::pin!(sleep);
+            tokio::select! {
+                recv = socket.recv(&mut recv_buf) => {
+                    let n = recv.with_context(|| "udp-client recv failed")?;
+                    if let Some(report) = handle_incoming_packet(
+                        &recv_buf[..n],
+                        &mut output,
+                        !args.json,
+                        output_policy,
+                        &mut client_rx,
+                    )? {
+                        if report.is_final {
+                            final_report = Some(report);
+                        }
                     }
                 }
+                _ = &mut sleep => {}
             }
-            Ok(Err(err)) => {
-                return Err(err).with_context(|| "udp-client recv failed");
+        } else {
+            let n = socket
+                .recv(&mut recv_buf)
+                .await
+                .with_context(|| "udp-client recv failed")?;
+            if let Some(report) = handle_incoming_packet(
+                &recv_buf[..n],
+                &mut output,
+                !args.json,
+                output_policy,
+                &mut client_rx,
+            )? {
+                if report.is_final {
+                    final_report = Some(report);
+                }
             }
-            Err(_) => {}
         }
     }
+}
+
+fn consume_final_report_or_timeout(
+    final_report: &mut Option<UdpPerfReport>,
+    now: Instant,
+    final_deadline: Option<Instant>,
+) -> Result<Option<UdpPerfReport>> {
+    if let Some(report) = final_report.take() {
+        return Ok(Some(report));
+    }
+    if let Some(deadline) = final_deadline {
+        if now >= deadline {
+            bail!("timeout waiting final report");
+        }
+    }
+    Ok(None)
+}
+
+fn next_loop_deadline(
+    next_send_at: Option<Instant>,
+    stop_at: Option<Instant>,
+    final_deadline: Option<Instant>,
+) -> Option<Instant> {
+    let mut next = next_send_at;
+    if let Some(t) = stop_at {
+        next = Some(next.map_or(t, |cur| min(cur, t)));
+    }
+    if let Some(t) = final_deadline {
+        next = Some(next.map_or(t, |cur| min(cur, t)));
+    }
+    next
 }
 
 #[cfg(test)]
@@ -251,7 +296,7 @@ fn resolve_pps(args: &CmdArgs) -> Result<u64> {
         let bits_per_packet = (args.len as u64).saturating_mul(8);
         ensure!(bits_per_packet > 0, "invalid --len for bitrate calculation");
         let pps = bitrate / bits_per_packet;
-        return Ok(pps.max(1));
+        return Ok(pps);
     }
     Ok(DEFAULT_PPS)
 }
@@ -321,17 +366,19 @@ fn handle_incoming_packet(
     let wire = UdpPerfWirePacket::decode(bytes)?;
     match wire {
         UdpPerfWirePacket::Control(UdpPerfControlPacket::Report(report)) => {
-            if emit_interval && !report.is_final {
+            if !report.is_final {
                 let reverse_interval = client_rx.take_interval_snapshot();
-                let merged =
-                    build_client_view_summary(&report.summary, client_rx, Some(reverse_interval));
-                let line = render_interval_summary(&merged);
-                if output_policy.collect_interval {
-                    output.push_str(&line);
-                }
-                if output_policy.stream_interval {
-                    print!("{line}");
-                    io::stdout().flush().context("flush stdout failed")?;
+                if emit_interval {
+                    let merged =
+                        build_client_view_summary(&report.summary, client_rx, Some(reverse_interval));
+                    let line = render_interval_summary(&merged);
+                    if output_policy.collect_interval {
+                        output.push_str(&line);
+                    }
+                    if output_policy.stream_interval {
+                        print!("{line}");
+                        io::stdout().flush().context("flush stdout failed")?;
+                    }
                 }
             }
             Ok(Some(report))
@@ -450,25 +497,6 @@ fn packets_to_pps_local(packets: u64, elapsed_micros: u64) -> f64 {
     (packets as f64 * 1_000_000.0) / elapsed_micros as f64
 }
 
-fn compute_wait_timeout(
-    now: Instant,
-    next_send_at: Option<Instant>,
-    stop_at: Option<Instant>,
-    final_deadline: Option<Instant>,
-) -> Duration {
-    let mut next = next_send_at;
-    if let Some(t) = stop_at {
-        next = Some(next.map_or(t, |cur| min(cur, t)));
-    }
-    if let Some(t) = final_deadline {
-        next = Some(next.map_or(t, |cur| min(cur, t)));
-    }
-    let wait = next
-        .map(|t| t.saturating_duration_since(now))
-        .unwrap_or(IO_WAIT_MAX);
-    min(max(wait, IO_WAIT_MIN), IO_WAIT_MAX)
-}
-
 fn now_unix_micros() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d
@@ -520,8 +548,12 @@ mod tests {
 
     use anyhow::{Context, Result};
     use serde_json::Value;
+    use tokio::time::Instant;
 
     use super::super::udp_server;
+    use super::super::udp_perf::{
+        UdpPerfCountersSummary, UdpPerfDirectionSummary, UdpPerfReport, UdpPerfSummary,
+    };
     use super::{CmdArgs, UdpPerfMode};
 
     #[tokio::test]
@@ -655,6 +687,76 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn udp_client_prefers_received_final_report_over_timeout_deadline() -> Result<()> {
+        let now = Instant::now();
+        let mut final_report = Some(UdpPerfReport {
+            report_seq: 9,
+            is_final: true,
+            summary: empty_summary(UdpPerfMode::Forward),
+        });
+        let report =
+            super::consume_final_report_or_timeout(&mut final_report, now, Some(now))?
+                .context("expected final report to be consumed before timeout")?;
+        assert!(report.is_final);
+        assert_eq!(report.report_seq, 9);
+        assert!(final_report.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_client_json_reverse_interval_tracks_protocol_window() -> Result<()> {
+        let (target, _server_addr, server_task) = spawn_server(100).await?;
+        let mut args = test_args(target, UdpPerfMode::Reverse);
+        args.time = 2;
+        args.pps = Some(300);
+        args.json = true;
+
+        let out = super::run_for_test(args).await?;
+        let json: Value = serde_json::from_str(out.output.trim())
+            .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
+        let reverse_total = json
+            .pointer("/reverse/total/packets")
+            .and_then(Value::as_u64)
+            .context("missing reverse.total.packets")?;
+        let reverse_interval = json
+            .pointer("/reverse/interval/packets")
+            .and_then(Value::as_u64)
+            .context("missing reverse.interval.packets")?;
+
+        assert!(reverse_total > 0, "reverse total should be > 0");
+        assert!(reverse_interval > 0, "reverse interval should be > 0");
+        assert!(
+            reverse_interval < reverse_total,
+            "reverse interval should be smaller than total in json mode when interval < time, interval={reverse_interval}, total={reverse_total}"
+        );
+
+        server_task.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn udp_client_bitrate_below_one_packet_resolves_to_zero_pps() -> Result<()> {
+        let mut args = test_args("127.0.0.1:9".to_string(), UdpPerfMode::Forward);
+        args.len = 1200;
+        args.bitrate = Some(100);
+        args.pps = None;
+        assert_eq!(super::resolve_pps(&args)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_client_rejects_unsafe_udp_payload_length() {
+        let mut args = test_args("127.0.0.1:9".to_string(), UdpPerfMode::Forward);
+        args.len = super::MAX_UDP_SAFE_PAYLOAD_LEN + 1;
+        let err = super::run_for_test(args).await.expect_err("should reject --len");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--len must be <="),
+            "unexpected error message: {msg}"
+        );
+    }
+
     async fn spawn_server(
         interval_ms: u64,
     ) -> Result<(String, SocketAddr, tokio::task::JoinHandle<Result<()>>)> {
@@ -691,6 +793,19 @@ mod tests {
             interval: NonZeroU64::new(100).expect("nonzero"),
             warmup: 0,
             json: false,
+        }
+    }
+
+    fn empty_summary(mode: UdpPerfMode) -> UdpPerfSummary {
+        UdpPerfSummary {
+            session_id: 1,
+            mode,
+            total_elapsed_micros: 1,
+            interval_elapsed_micros: 1,
+            total: UdpPerfCountersSummary::default(),
+            interval: UdpPerfCountersSummary::default(),
+            forward: UdpPerfDirectionSummary::default(),
+            reverse: UdpPerfDirectionSummary::default(),
         }
     }
 }
