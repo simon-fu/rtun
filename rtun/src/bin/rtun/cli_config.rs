@@ -141,7 +141,10 @@ fn rewrite_legacy_bench_argv(mut argv: Vec<String>) -> Vec<String> {
         return argv;
     }
 
-    if tail.iter().any(|arg| is_legacy_bench_socks_flag(arg.as_str())) {
+    if tail
+        .iter()
+        .any(|arg| is_legacy_bench_socks_flag(arg.as_str()))
+    {
         argv.insert(idx + 1, "socks".to_string());
     }
     argv
@@ -152,7 +155,9 @@ fn is_explicit_bench_subcommand(arg: &str) -> bool {
 }
 
 fn is_legacy_bench_socks_flag(arg: &str) -> bool {
-    matches!(arg, "-s" | "--socks") || arg.starts_with("--socks=")
+    matches!(arg, "-s" | "--socks")
+        || arg.starts_with("--socks=")
+        || (arg.len() > 2 && arg.starts_with("-s") && !arg.starts_with("--"))
 }
 
 #[cfg(test)]

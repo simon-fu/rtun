@@ -1,13 +1,14 @@
 use std::{collections::HashMap, net::SocketAddr, num::NonZeroU64, time::Duration};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::Parser;
 use tokio::net::UdpSocket;
 use tracing::info;
 
 use super::udp_perf::{
     UdpPerfControlPacket, UdpPerfDataHeader, UdpPerfDataPacket, UdpPerfDirection, UdpPerfMode,
-    UdpPerfReport, UdpPerfStart, UdpPerfStats, UdpPerfWirePacket,
+    UdpPerfReport, UdpPerfStart, UdpPerfStats, UdpPerfWirePacket, MAX_UDP_DATAGRAM_PAYLOAD_LEN,
+    MAX_UDP_SAFE_PAYLOAD_LEN,
 };
 
 type SessionKey = (SocketAddr, u64);
@@ -237,13 +238,11 @@ async fn on_packet(
         UdpPerfWirePacket::Control(ctrl) => match ctrl {
             UdpPerfControlPacket::Hello(hello) => {
                 let key = session_key(from, hello.session_id);
-                let sess = sessions
-                    .entry(key)
-                    .or_insert(Session::new_hello(
-                        from,
-                        hello.mode,
-                        default_report_interval,
-                    )?);
+                let sess = sessions.entry(key).or_insert(Session::new_hello(
+                    from,
+                    hello.mode,
+                    default_report_interval,
+                )?);
                 // Only allow HELLO to update mode before START.
                 if !sess.started {
                     sess.mode = hello.mode;
@@ -251,6 +250,7 @@ async fn on_packet(
             }
             UdpPerfControlPacket::Start(start) => {
                 // START begins a new measurement round: replace session (reset total+interval).
+                validate_start(&start)?;
                 let key = session_key(from, start.session_id);
                 let new_sess = Session::new_start(from, &start, default_report_interval)?;
                 sessions.insert(key, new_sess);
@@ -449,6 +449,16 @@ fn ensure_nonzero_interval(d: Duration) -> Result<()> {
 
 fn checked_add(base: tokio::time::Instant, delta: Duration) -> Option<tokio::time::Instant> {
     base.checked_add(delta)
+}
+
+fn validate_start(start: &UdpPerfStart) -> Result<()> {
+    if matches!(start.mode, UdpPerfMode::Reverse | UdpPerfMode::Bidir) {
+        ensure!(
+            start.payload_len as usize <= MAX_UDP_SAFE_PAYLOAD_LEN,
+            "START.payload_len must be <= {MAX_UDP_SAFE_PAYLOAD_LEN} so encoded udp perf datagram stays within {MAX_UDP_DATAGRAM_PAYLOAD_LEN} bytes"
+        );
+    }
+    Ok(())
 }
 
 fn session_key(peer: SocketAddr, session_id: u64) -> SessionKey {
@@ -817,6 +827,58 @@ mod tests {
         assert!(r.is_err(), "unexpected packet from invalid START");
 
         // Then a valid START should work.
+        client
+            .send(&wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Forward,
+                payload_len: 16,
+                packets_per_second: 1_000,
+                duration_micros: 200_000,
+                report_interval_micros: 10_000,
+            }))?)
+            .await?;
+        client
+            .send(&wire_data(session_id, UdpPerfDirection::Forward, 1, 16)?)
+            .await?;
+        let report = recv_report(&client, Duration::from_millis(200)).await?;
+        assert_eq!(report.summary.session_id, session_id);
+
+        shutdown_tx.send(()).ok();
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_rejects_oversized_reverse_start_and_keeps_running() -> Result<()> {
+        let (server_addr, shutdown_tx, mut server_task) = spawn_server_for_test(10).await?;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        client.connect(server_addr).await?;
+
+        let session_id = 809;
+        let oversized_payload_len =
+            (65_507usize - super::super::udp_perf::UDP_PERF_DATA_META_LEN + 1) as u16;
+        client
+            .send(&wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Reverse,
+                payload_len: oversized_payload_len,
+                packets_per_second: 1_000,
+                duration_micros: 200_000,
+                report_interval_micros: 10_000,
+            }))?)
+            .await?;
+
+        let mut buf = vec![0u8; 2048];
+        let r = tokio::time::timeout(Duration::from_millis(40), client.recv(&mut buf)).await;
+        assert!(r.is_err(), "unexpected packet from oversized START");
+
+        let server_exit = tokio::time::timeout(Duration::from_millis(40), &mut server_task).await;
+        assert!(
+            server_exit.is_err(),
+            "server exited after oversized reverse START"
+        );
+
         client
             .send(&wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
                 session_id,

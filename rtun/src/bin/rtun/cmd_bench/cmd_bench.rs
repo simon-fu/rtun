@@ -196,4 +196,31 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn bench_cli_rewrites_legacy_bench_args_to_socks_with_short_attached_value() {
+        let rewritten = rewrite_legacy_bench_argv_for_test(vec![
+            "rtun".to_string(),
+            "bench".to_string(),
+            "-s127.0.0.1:51080".to_string(),
+            "-a".to_string(),
+            "127.0.0.1".to_string(),
+            "-p".to_string(),
+            "12345".to_string(),
+        ]);
+
+        assert_eq!(
+            rewritten,
+            vec![
+                "rtun",
+                "bench",
+                "socks",
+                "-s127.0.0.1:51080",
+                "-a",
+                "127.0.0.1",
+                "-p",
+                "12345"
+            ]
+        );
+    }
 }
