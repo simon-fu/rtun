@@ -257,7 +257,13 @@ async fn on_packet(
                 // START begins a new measurement round: replace session (reset total+interval).
                 validate_start(&start)?;
                 let key = session_key(from, start.session_id);
-                let new_sess = Session::new_start(from, &start, default_report_interval)?;
+                let buffered_stats = sessions
+                    .remove(&key)
+                    .filter(|sess| !sess.started)
+                    .map(|sess| sess.stats)
+                    .unwrap_or_default();
+                let mut new_sess = Session::new_start(from, &start, default_report_interval)?;
+                new_sess.stats = buffered_stats;
                 sessions.insert(key, new_sess);
 
                 // For reverse/bidir with valid send cfg, send one packet immediately so client sees DATA.
@@ -291,6 +297,11 @@ async fn on_packet(
         UdpPerfWirePacket::Data(data) => {
             if let Some(sess) = sessions.get_mut(&session_key(from, data.header.session_id)) {
                 if !sess.started {
+                    if matches!(data.header.direction, UdpPerfDirection::Forward)
+                        && matches!(sess.mode, UdpPerfMode::Forward | UdpPerfMode::Bidir)
+                    {
+                        sess.stats.record_data_packet(&data);
+                    }
                     return Ok(());
                 }
                 sess.stats.record_data_packet(&data);
@@ -713,6 +724,50 @@ mod tests {
         let mut buf = vec![0u8; 2048];
         let r = tokio::time::timeout(Duration::from_millis(40), client.recv(&mut buf)).await;
         assert!(r.is_err(), "unexpected packet before START");
+
+        shutdown_tx.send(()).ok();
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_counts_forward_data_that_arrives_before_start() -> Result<()> {
+        let (server_addr, shutdown_tx, server_task) = spawn_server_for_test(1_000).await?;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        client.connect(server_addr).await?;
+
+        let session_id = 540;
+        client
+            .send(&wire_control(UdpPerfControlPacket::Hello(
+                super::super::udp_perf::UdpPerfHello {
+                    session_id,
+                    mode: UdpPerfMode::Forward,
+                },
+            ))?)
+            .await?;
+        client
+            .send(&wire_data(session_id, UdpPerfDirection::Forward, 1, 16)?)
+            .await?;
+        client
+            .send(&wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Forward,
+                payload_len: 16,
+                packets_per_second: 1_000,
+                duration_micros: 200_000,
+                report_interval_micros: 0,
+            }))?)
+            .await?;
+        client
+            .send(&wire_control(UdpPerfControlPacket::Stop(UdpPerfStop {
+                session_id,
+            }))?)
+            .await?;
+
+        let report = recv_report(&client, Duration::from_millis(200)).await?;
+        assert!(report.is_final);
+        assert_eq!(report.summary.forward.total.packets, 1);
 
         shutdown_tx.send(()).ok();
         server_task.abort();

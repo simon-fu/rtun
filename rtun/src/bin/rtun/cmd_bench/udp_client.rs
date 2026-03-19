@@ -61,9 +61,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
         .context("--interval is too large")?;
     let duration = Duration::from_micros(duration_micros);
 
-    let socket = UdpSocket::bind("0.0.0.0:0")
-        .await
-        .with_context(|| "udp-client bind failed")?;
+    let socket = bind_socket_for_target(target).await?;
     socket
         .connect(target)
         .await
@@ -338,7 +336,7 @@ fn first_send_deadline(started_at: Instant, mode: UdpPerfMode, pps: u64) -> Opti
         return None;
     }
     if matches!(mode, UdpPerfMode::Forward | UdpPerfMode::Bidir) {
-        return next_send_deadline(started_at, pps);
+        return Some(started_at);
     } else {
         None
     }
@@ -350,6 +348,16 @@ fn next_send_deadline(now: Instant, pps: u64) -> Option<Instant> {
     }
     let interval_micros = (1_000_000 / pps).max(1);
     now.checked_add(Duration::from_micros(interval_micros))
+}
+
+async fn bind_socket_for_target(target: SocketAddr) -> Result<UdpSocket> {
+    let bind_addr = match target {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    UdpSocket::bind(bind_addr)
+        .await
+        .with_context(|| format!("udp-client bind failed for target family [{target}]"))
 }
 
 async fn send_control(socket: &UdpSocket, pkt: UdpPerfControlPacket) -> Result<()> {
@@ -784,20 +792,60 @@ mod tests {
     }
 
     #[test]
-    fn udp_client_forward_and_bidir_first_send_deadline_wait_one_interval() -> Result<()> {
+    fn udp_client_forward_and_bidir_first_send_deadline_is_immediate() -> Result<()> {
         let started_at = Instant::now();
         let pps = 100;
-        let expected = super::next_send_deadline(started_at, pps).context("expected deadline")?;
-
         let forward =
             super::first_send_deadline(started_at, UdpPerfMode::Forward, pps).context("forward")?;
         let bidir =
             super::first_send_deadline(started_at, UdpPerfMode::Bidir, pps).context("bidir")?;
 
-        assert_eq!(forward, expected);
-        assert_eq!(bidir, expected);
-        assert!(forward > started_at);
-        assert!(bidir > started_at);
+        assert_eq!(forward, started_at);
+        assert_eq!(bidir, started_at);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_client_forward_mode_low_pps_still_sends_first_packet() -> Result<()> {
+        let (target, _server_addr, server_task) = spawn_server(2_000).await?;
+        let mut args = test_args(target, UdpPerfMode::Forward);
+        args.json = true;
+        args.pps = Some(1);
+
+        let out = super::run_for_test(args).await?;
+        let json: Value = serde_json::from_str(out.output.trim())
+            .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
+        let forward_packets = json
+            .pointer("/forward/total/packets")
+            .and_then(Value::as_u64)
+            .context("missing forward.total.packets")?;
+
+        assert_eq!(forward_packets, 1, "forward low-pps run should send one packet");
+
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_client_can_connect_to_ipv6_target() -> Result<()> {
+        let Some((target, _server_addr, server_task)) = spawn_ipv6_server(2_000).await? else {
+            return Ok(());
+        };
+        let mut args = test_args(target, UdpPerfMode::Forward);
+        args.json = true;
+        args.pps = Some(1);
+
+        let out = super::run_for_test(args).await?;
+        let json: Value = serde_json::from_str(out.output.trim())
+            .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
+        let total_packets = json
+            .pointer("/total/packets")
+            .and_then(Value::as_u64)
+            .context("missing total.packets")?;
+
+        assert!(total_packets > 0, "ipv6 target run should complete with traffic");
+
+        server_task.abort();
         Ok(())
     }
 
@@ -969,6 +1017,24 @@ mod tests {
         interval_ms: u64,
     ) -> Result<(String, SocketAddr, tokio::task::JoinHandle<Result<()>>)> {
         let listen_addr = reserve_udp_addr()?;
+        let (target, server_addr, task) = spawn_server_at(listen_addr, interval_ms).await?;
+        Ok((target, server_addr, task))
+    }
+
+    async fn spawn_ipv6_server(
+        interval_ms: u64,
+    ) -> Result<Option<(String, SocketAddr, tokio::task::JoinHandle<Result<()>>)>> {
+        let Ok(listen_addr) = reserve_udp_addr_v6() else {
+            return Ok(None);
+        };
+        let spawned = spawn_server_at(listen_addr, interval_ms).await?;
+        Ok(Some(spawned))
+    }
+
+    async fn spawn_server_at(
+        listen_addr: SocketAddr,
+        interval_ms: u64,
+    ) -> Result<(String, SocketAddr, tokio::task::JoinHandle<Result<()>>)> {
         let server_addr = listen_addr;
         let target = server_addr.to_string();
         let interval = NonZeroU64::new(interval_ms).context("interval must be non-zero")?;
@@ -986,6 +1052,13 @@ mod tests {
     fn reserve_udp_addr() -> Result<SocketAddr> {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0")
             .with_context(|| "bind test udp addr failed")?;
+        let addr = sock.local_addr().with_context(|| "local_addr failed")?;
+        Ok(addr)
+    }
+
+    fn reserve_udp_addr_v6() -> Result<SocketAddr> {
+        let sock = std::net::UdpSocket::bind("[::1]:0")
+            .with_context(|| "bind test ipv6 udp addr failed")?;
         let addr = sock.local_addr().with_context(|| "local_addr failed")?;
         Ok(addr)
     }

@@ -508,11 +508,11 @@ impl UdpPerfDirectionState {
         self.total.record_packet(bytes);
         self.interval.record_packet(bytes);
 
+        if self.expected_seq.is_none() {
+            self.expected_seq = Some(1);
+        }
+
         match self.expected_seq {
-            None => {
-                self.expected_seq = Some(seq.saturating_add(1));
-                self.last_seq = Some(seq);
-            }
             Some(expected_seq) if seq == expected_seq => {
                 self.expected_seq = Some(seq.saturating_add(1));
                 self.last_seq = Some(seq);
@@ -543,6 +543,7 @@ impl UdpPerfDirectionState {
                 }
                 self.last_seq = Some(seq);
             }
+            None => unreachable!("expected_seq initialized above"),
         }
     }
 
@@ -962,6 +963,40 @@ mod tests {
         assert_eq!(summary.total.duplicate, 0);
         assert_eq!(summary.forward.total.loss, 1);
         assert_eq!(summary.forward.interval.loss, 1);
+    }
+
+    #[test]
+    fn udp_perf_stats_track_leading_loss_before_first_observed_seq() {
+        let mut stats = UdpPerfStats::default();
+
+        for seq in [2_u64, 3] {
+            stats.record_data_packet(&data_packet(UdpPerfDirection::Forward, seq, 128));
+        }
+
+        let summary = stats.build_summary(15, UdpPerfMode::Forward, 2_000_000, 1_000_000);
+
+        assert_eq!(summary.total.loss, 1);
+        assert_eq!(summary.total.reorder, 0);
+        assert_eq!(summary.total.duplicate, 0);
+        assert_eq!(summary.forward.total.loss, 1);
+    }
+
+    #[test]
+    fn udp_perf_stats_treat_late_first_packet_as_reorder_not_duplicate() {
+        let mut stats = UdpPerfStats::default();
+
+        for seq in [2_u64, 1, 3] {
+            stats.record_data_packet(&data_packet(UdpPerfDirection::Forward, seq, 128));
+        }
+
+        let summary = stats.build_summary(16, UdpPerfMode::Forward, 3_000_000, 1_000_000);
+
+        assert_eq!(summary.total.loss, 0);
+        assert_eq!(summary.total.reorder, 1);
+        assert_eq!(summary.total.duplicate, 0);
+        assert_eq!(summary.forward.total.loss, 0);
+        assert_eq!(summary.forward.total.reorder, 1);
+        assert_eq!(summary.forward.total.duplicate, 0);
     }
 
     #[test]
