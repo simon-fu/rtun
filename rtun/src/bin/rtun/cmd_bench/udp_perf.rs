@@ -424,6 +424,7 @@ struct UdpPerfDirectionState {
     expected_seq: Option<u64>,
     last_seq: Option<u64>,
     missing_seq: HashSet<u64>,
+    interval_missing_seq: HashSet<u64>,
 }
 
 impl UdpPerfDirectionState {
@@ -441,11 +442,9 @@ impl UdpPerfDirectionState {
                 self.last_seq = Some(seq);
             }
             Some(expected_seq) if seq > expected_seq => {
-                let gap = seq - expected_seq;
-                self.total.loss_events += gap;
-                self.interval.loss_events += gap;
                 for missing_seq in expected_seq..seq {
                     self.missing_seq.insert(missing_seq);
+                    self.interval_missing_seq.insert(missing_seq);
                 }
                 self.expected_seq = Some(seq.saturating_add(1));
                 self.last_seq = Some(seq);
@@ -455,6 +454,7 @@ impl UdpPerfDirectionState {
                     self.total.duplicate += 1;
                     self.interval.duplicate += 1;
                 } else if self.missing_seq.remove(&seq) {
+                    self.interval_missing_seq.remove(&seq);
                     self.total.reorder += 1;
                     self.interval.reorder += 1;
                 } else {
@@ -480,7 +480,7 @@ impl UdpPerfDirectionState {
         UdpPerfRawCounters {
             bytes: self.interval.bytes,
             packets: self.interval.packets,
-            loss: self.interval.loss_events,
+            loss: self.interval_missing_seq.len() as u64,
             reorder: self.interval.reorder,
             duplicate: self.interval.duplicate,
         }
@@ -488,6 +488,7 @@ impl UdpPerfDirectionState {
 
     fn reset_interval(&mut self) {
         self.interval = UdpPerfTrafficCounters::default();
+        self.interval_missing_seq.clear();
     }
 }
 
@@ -495,7 +496,6 @@ impl UdpPerfDirectionState {
 struct UdpPerfTrafficCounters {
     bytes: u64,
     packets: u64,
-    loss_events: u64,
     reorder: u64,
     duplicate: u64,
 }
@@ -742,6 +742,41 @@ mod tests {
         assert_eq!(summary.forward.total.reorder, 1);
         assert_eq!(summary.forward.total.duplicate, 1);
         assert_eq!(summary.reverse.total.loss, 0);
+    }
+
+    #[test]
+    fn udp_perf_stats_track_remaining_loss_when_gap_is_not_filled() {
+        let mut stats = UdpPerfStats::default();
+
+        for seq in [1_u64, 3, 4] {
+            stats.record_data_packet(&data_packet(UdpPerfDirection::Forward, seq, 128));
+        }
+
+        let summary = stats.build_summary(11, UdpPerfMode::Forward, 3_000_000, 1_000_000);
+
+        assert_eq!(summary.total.loss, 1);
+        assert_eq!(summary.total.reorder, 0);
+        assert_eq!(summary.total.duplicate, 0);
+        assert_eq!(summary.forward.total.loss, 1);
+        assert_eq!(summary.forward.interval.loss, 1);
+    }
+
+    #[test]
+    fn udp_perf_interval_loss_is_rolled_back_when_gap_is_filled_same_interval() {
+        let mut stats = UdpPerfStats::default();
+
+        for seq in [1_u64, 3, 2] {
+            stats.record_data_packet(&data_packet(UdpPerfDirection::Forward, seq, 128));
+        }
+
+        let summary = stats.build_summary(12, UdpPerfMode::Forward, 3_000_000, 1_000_000);
+
+        assert_eq!(summary.total.loss, 0);
+        assert_eq!(summary.total.reorder, 1);
+        assert_eq!(summary.forward.interval.loss, 0);
+        assert_eq!(summary.forward.interval.reorder, 1);
+        assert_eq!(summary.interval.loss, 0);
+        assert_eq!(summary.interval.reorder, 1);
     }
 
     #[test]
