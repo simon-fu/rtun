@@ -136,11 +136,23 @@ fn rewrite_legacy_bench_argv(mut argv: Vec<String>) -> Vec<String> {
         return argv;
     }
 
-    let first = argv[idx + 1].as_str();
-    if matches!(first, "-s" | "--socks") {
+    let tail = &argv[idx + 1..];
+    if is_explicit_bench_subcommand(tail[0].as_str()) {
+        return argv;
+    }
+
+    if tail.iter().any(|arg| is_legacy_bench_socks_flag(arg.as_str())) {
         argv.insert(idx + 1, "socks".to_string());
     }
     argv
+}
+
+fn is_explicit_bench_subcommand(arg: &str) -> bool {
+    matches!(arg, "socks" | "udp-server" | "udp-client")
+}
+
+fn is_legacy_bench_socks_flag(arg: &str) -> bool {
+    matches!(arg, "-s" | "--socks") || arg.starts_with("--socks=")
 }
 
 #[cfg(test)]
