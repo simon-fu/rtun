@@ -338,7 +338,7 @@ fn first_send_deadline(started_at: Instant, mode: UdpPerfMode, pps: u64) -> Opti
         return None;
     }
     if matches!(mode, UdpPerfMode::Forward | UdpPerfMode::Bidir) {
-        Some(started_at)
+        return next_send_deadline(started_at, pps);
     } else {
         None
     }
@@ -780,6 +780,24 @@ mod tests {
         args.bitrate = Some(100);
         args.pps = None;
         assert_eq!(super::resolve_pps(&args)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn udp_client_forward_and_bidir_first_send_deadline_wait_one_interval() -> Result<()> {
+        let started_at = Instant::now();
+        let pps = 100;
+        let expected = super::next_send_deadline(started_at, pps).context("expected deadline")?;
+
+        let forward =
+            super::first_send_deadline(started_at, UdpPerfMode::Forward, pps).context("forward")?;
+        let bidir =
+            super::first_send_deadline(started_at, UdpPerfMode::Bidir, pps).context("bidir")?;
+
+        assert_eq!(forward, expected);
+        assert_eq!(bidir, expected);
+        assert!(forward > started_at);
+        assert!(bidir > started_at);
         Ok(())
     }
 
