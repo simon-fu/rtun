@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fmt::{Display, Formatter},
     str::FromStr,
 };
@@ -10,9 +9,10 @@ use serde::{Deserialize, Serialize};
 
 pub const UDP_PERF_PROTOCOL_VERSION: u8 = 1;
 
-pub const UDP_PERF_CONTROL_META_LEN: usize = 2;
+pub const UDP_PERF_WIRE_META_LEN: usize = 2;
+pub const UDP_PERF_CONTROL_META_LEN: usize = UDP_PERF_WIRE_META_LEN + 1;
 pub const UDP_PERF_CONTROL_HELLO_LEN: usize = UDP_PERF_CONTROL_META_LEN + 8 + 1;
-pub const UDP_PERF_CONTROL_START_LEN: usize = UDP_PERF_CONTROL_META_LEN + 8 + 1;
+pub const UDP_PERF_CONTROL_START_LEN: usize = UDP_PERF_CONTROL_META_LEN + 8 + 1 + 2 + 8 + 8 + 8;
 pub const UDP_PERF_CONTROL_STOP_LEN: usize = UDP_PERF_CONTROL_META_LEN + 8;
 
 pub const UDP_PERF_COUNTERS_SUMMARY_LEN: usize = 8 + 8 + 8 + 8 + 8 + 8 + 8;
@@ -26,10 +26,13 @@ pub const UDP_PERF_SUMMARY_LEN: usize = 8
     + UDP_PERF_COUNTERS_SUMMARY_LEN
     + UDP_PERF_DIRECTION_SUMMARY_LEN
     + UDP_PERF_DIRECTION_SUMMARY_LEN;
-pub const UDP_PERF_CONTROL_REPORT_LEN: usize = UDP_PERF_CONTROL_META_LEN + UDP_PERF_SUMMARY_LEN;
+pub const UDP_PERF_CONTROL_REPORT_LEN: usize =
+    UDP_PERF_CONTROL_META_LEN + 8 + 1 + UDP_PERF_SUMMARY_LEN;
 
-pub const UDP_PERF_DATA_META_LEN: usize = 1 + 8 + 1 + 1 + 8 + 8 + 2;
+pub const UDP_PERF_DATA_META_LEN: usize = UDP_PERF_WIRE_META_LEN + 8 + 1 + 1 + 8 + 8 + 2;
 
+const UDP_PERF_PACKET_TYPE_CONTROL: u8 = 1;
+const UDP_PERF_PACKET_TYPE_DATA: u8 = 2;
 const UDP_PERF_CONTROL_KIND_HELLO: u8 = 1;
 const UDP_PERF_CONTROL_KIND_START: u8 = 2;
 const UDP_PERF_CONTROL_KIND_STOP: u8 = 3;
@@ -136,6 +139,10 @@ pub struct UdpPerfHello {
 pub struct UdpPerfStart {
     pub session_id: u64,
     pub mode: UdpPerfMode,
+    pub payload_len: u16,
+    pub packets_per_second: u64,
+    pub duration_micros: u64,
+    pub report_interval_micros: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +152,8 @@ pub struct UdpPerfStop {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UdpPerfReport {
+    pub report_seq: u64,
+    pub is_final: bool,
     pub summary: UdpPerfSummary,
 }
 
@@ -163,6 +172,22 @@ impl UdpPerfControlPacket {
 
     pub fn decode(packet: &[u8]) -> Result<Self> {
         decode_udp_perf_control_packet(packet)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UdpPerfWirePacket {
+    Control(UdpPerfControlPacket),
+    Data(UdpPerfDataPacket),
+}
+
+impl UdpPerfWirePacket {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        encode_udp_perf_wire_packet(self)
+    }
+
+    pub fn decode(packet: &[u8]) -> Result<Self> {
+        decode_udp_perf_wire_packet(packet)
     }
 }
 
@@ -229,7 +254,7 @@ pub fn encode_udp_perf_control_packet(packet: &UdpPerfControlPacket) -> Result<V
         UdpPerfControlPacket::Report(_) => Vec::with_capacity(UDP_PERF_CONTROL_REPORT_LEN),
     };
 
-    write_u8(&mut buf, UDP_PERF_PROTOCOL_VERSION);
+    write_wire_prefix(&mut buf, UDP_PERF_PACKET_TYPE_CONTROL);
 
     match packet {
         UdpPerfControlPacket::Hello(hello) => {
@@ -241,6 +266,10 @@ pub fn encode_udp_perf_control_packet(packet: &UdpPerfControlPacket) -> Result<V
             write_u8(&mut buf, UDP_PERF_CONTROL_KIND_START);
             write_u64(&mut buf, start.session_id);
             write_u8(&mut buf, start.mode.into());
+            write_u16(&mut buf, start.payload_len);
+            write_u64(&mut buf, start.packets_per_second);
+            write_u64(&mut buf, start.duration_micros);
+            write_u64(&mut buf, start.report_interval_micros);
         }
         UdpPerfControlPacket::Stop(stop) => {
             write_u8(&mut buf, UDP_PERF_CONTROL_KIND_STOP);
@@ -248,6 +277,8 @@ pub fn encode_udp_perf_control_packet(packet: &UdpPerfControlPacket) -> Result<V
         }
         UdpPerfControlPacket::Report(report) => {
             write_u8(&mut buf, UDP_PERF_CONTROL_KIND_REPORT);
+            write_u64(&mut buf, report.report_seq);
+            write_bool(&mut buf, report.is_final);
             encode_udp_perf_summary(&mut buf, &report.summary);
         }
     }
@@ -264,6 +295,11 @@ pub fn decode_udp_perf_control_packet(packet: &[u8]) -> Result<UdpPerfControlPac
     );
 
     let mut packet = packet;
+    let packet_type = read_u8(&mut packet)?;
+    ensure!(
+        packet_type == UDP_PERF_PACKET_TYPE_CONTROL,
+        "unexpected udp perf packet type [{packet_type}] for control"
+    );
     let version = read_u8(&mut packet)?;
     ensure!(
         version == UDP_PERF_PROTOCOL_VERSION,
@@ -279,11 +315,17 @@ pub fn decode_udp_perf_control_packet(packet: &[u8]) -> Result<UdpPerfControlPac
         UDP_PERF_CONTROL_KIND_START => UdpPerfControlPacket::Start(UdpPerfStart {
             session_id: read_u64(&mut packet)?,
             mode: UdpPerfMode::try_from(read_u8(&mut packet)?)?,
+            payload_len: read_u16(&mut packet)?,
+            packets_per_second: read_u64(&mut packet)?,
+            duration_micros: read_u64(&mut packet)?,
+            report_interval_micros: read_u64(&mut packet)?,
         }),
         UDP_PERF_CONTROL_KIND_STOP => UdpPerfControlPacket::Stop(UdpPerfStop {
             session_id: read_u64(&mut packet)?,
         }),
         UDP_PERF_CONTROL_KIND_REPORT => UdpPerfControlPacket::Report(UdpPerfReport {
+            report_seq: read_u64(&mut packet)?,
+            is_final: read_bool(&mut packet)?,
             summary: decode_udp_perf_summary(&mut packet)?,
         }),
         _ => bail!("unsupported udp perf control kind [{kind}]"),
@@ -307,7 +349,7 @@ pub fn encode_udp_perf_data_packet(packet: &UdpPerfDataPacket) -> Result<Vec<u8>
     );
 
     let mut buf = Vec::with_capacity(UDP_PERF_DATA_META_LEN + packet.payload.len());
-    write_u8(&mut buf, UDP_PERF_PROTOCOL_VERSION);
+    write_wire_prefix(&mut buf, UDP_PERF_PACKET_TYPE_DATA);
     write_u64(&mut buf, packet.header.session_id);
     write_u8(&mut buf, packet.header.stream_id);
     write_u8(&mut buf, packet.header.direction.into());
@@ -327,6 +369,11 @@ pub fn decode_udp_perf_data_packet(packet: &[u8]) -> Result<UdpPerfDataPacket> {
     );
 
     let mut packet = packet;
+    let packet_type = read_u8(&mut packet)?;
+    ensure!(
+        packet_type == UDP_PERF_PACKET_TYPE_DATA,
+        "unexpected udp perf packet type [{packet_type}] for data"
+    );
     let version = read_u8(&mut packet)?;
     ensure!(
         version == UDP_PERF_PROTOCOL_VERSION,
@@ -357,6 +404,31 @@ pub fn decode_udp_perf_data_packet(packet: &[u8]) -> Result<UdpPerfDataPacket> {
         },
         payload: packet.to_vec(),
     })
+}
+
+pub fn encode_udp_perf_wire_packet(packet: &UdpPerfWirePacket) -> Result<Vec<u8>> {
+    match packet {
+        UdpPerfWirePacket::Control(packet) => packet.encode(),
+        UdpPerfWirePacket::Data(packet) => packet.encode(),
+    }
+}
+
+pub fn decode_udp_perf_wire_packet(packet: &[u8]) -> Result<UdpPerfWirePacket> {
+    ensure!(
+        packet.len() >= 1,
+        "udp perf wire packet too short [{}] < [1]",
+        packet.len()
+    );
+
+    match packet[0] {
+        UDP_PERF_PACKET_TYPE_CONTROL => Ok(UdpPerfWirePacket::Control(
+            UdpPerfControlPacket::decode(packet)?,
+        )),
+        UDP_PERF_PACKET_TYPE_DATA => {
+            Ok(UdpPerfWirePacket::Data(UdpPerfDataPacket::decode(packet)?))
+        }
+        packet_type => bail!("unsupported udp perf packet type [{packet_type}]"),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -423,8 +495,10 @@ struct UdpPerfDirectionState {
     interval: UdpPerfTrafficCounters,
     expected_seq: Option<u64>,
     last_seq: Option<u64>,
-    missing_seq: HashSet<u64>,
-    interval_missing_seq: HashSet<u64>,
+    total_gap_ranges: Vec<UdpPerfGapRange>,
+    interval_gap_ranges: Vec<UdpPerfGapRange>,
+    total_missing_packets: u64,
+    interval_missing_packets: u64,
 }
 
 impl UdpPerfDirectionState {
@@ -442,10 +516,11 @@ impl UdpPerfDirectionState {
                 self.last_seq = Some(seq);
             }
             Some(expected_seq) if seq > expected_seq => {
-                for missing_seq in expected_seq..seq {
-                    self.missing_seq.insert(missing_seq);
-                    self.interval_missing_seq.insert(missing_seq);
-                }
+                let gap = seq - expected_seq;
+                append_gap_range(&mut self.total_gap_ranges, expected_seq, seq);
+                append_gap_range(&mut self.interval_gap_ranges, expected_seq, seq);
+                self.total_missing_packets += gap;
+                self.interval_missing_packets += gap;
                 self.expected_seq = Some(seq.saturating_add(1));
                 self.last_seq = Some(seq);
             }
@@ -453,8 +528,11 @@ impl UdpPerfDirectionState {
                 if self.last_seq == Some(seq) {
                     self.total.duplicate += 1;
                     self.interval.duplicate += 1;
-                } else if self.missing_seq.remove(&seq) {
-                    self.interval_missing_seq.remove(&seq);
+                } else if remove_seq_from_gap_ranges(&mut self.total_gap_ranges, seq) {
+                    self.total_missing_packets -= 1;
+                    if remove_seq_from_gap_ranges(&mut self.interval_gap_ranges, seq) {
+                        self.interval_missing_packets -= 1;
+                    }
                     self.total.reorder += 1;
                     self.interval.reorder += 1;
                 } else {
@@ -470,7 +548,7 @@ impl UdpPerfDirectionState {
         UdpPerfRawCounters {
             bytes: self.total.bytes,
             packets: self.total.packets,
-            loss: self.missing_seq.len() as u64,
+            loss: self.total_missing_packets,
             reorder: self.total.reorder,
             duplicate: self.total.duplicate,
         }
@@ -480,7 +558,7 @@ impl UdpPerfDirectionState {
         UdpPerfRawCounters {
             bytes: self.interval.bytes,
             packets: self.interval.packets,
-            loss: self.interval_missing_seq.len() as u64,
+            loss: self.interval_missing_packets,
             reorder: self.interval.reorder,
             duplicate: self.interval.duplicate,
         }
@@ -488,8 +566,15 @@ impl UdpPerfDirectionState {
 
     fn reset_interval(&mut self) {
         self.interval = UdpPerfTrafficCounters::default();
-        self.interval_missing_seq.clear();
+        self.interval_gap_ranges.clear();
+        self.interval_missing_packets = 0;
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UdpPerfGapRange {
+    start: u64,
+    end_exclusive: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -569,6 +654,51 @@ fn encode_udp_perf_summary(buf: &mut Vec<u8>, summary: &UdpPerfSummary) {
     encode_direction_summary(buf, &summary.reverse);
 }
 
+fn write_wire_prefix(buf: &mut Vec<u8>, packet_type: u8) {
+    write_u8(buf, packet_type);
+    write_u8(buf, UDP_PERF_PROTOCOL_VERSION);
+}
+
+fn append_gap_range(ranges: &mut Vec<UdpPerfGapRange>, start: u64, end_exclusive: u64) {
+    if start < end_exclusive {
+        ranges.push(UdpPerfGapRange {
+            start,
+            end_exclusive,
+        });
+    }
+}
+
+fn remove_seq_from_gap_ranges(ranges: &mut Vec<UdpPerfGapRange>, seq: u64) -> bool {
+    for idx in 0..ranges.len() {
+        let range = ranges[idx];
+        if seq < range.start {
+            return false;
+        }
+
+        if seq >= range.end_exclusive {
+            continue;
+        }
+
+        if range.start == seq && range.end_exclusive == seq + 1 {
+            ranges.remove(idx);
+        } else if range.start == seq {
+            ranges[idx].start += 1;
+        } else if range.end_exclusive == seq + 1 {
+            ranges[idx].end_exclusive -= 1;
+        } else {
+            let tail = UdpPerfGapRange {
+                start: seq + 1,
+                end_exclusive: range.end_exclusive,
+            };
+            ranges[idx].end_exclusive = seq;
+            ranges.insert(idx + 1, tail);
+        }
+        return true;
+    }
+
+    false
+}
+
 fn decode_udp_perf_summary(buf: &mut &[u8]) -> Result<UdpPerfSummary> {
     Ok(UdpPerfSummary {
         session_id: read_u64(buf)?,
@@ -628,6 +758,10 @@ fn write_u64(buf: &mut Vec<u8>, value: u64) {
     buf.extend_from_slice(&value.to_be_bytes());
 }
 
+fn write_bool(buf: &mut Vec<u8>, value: bool) {
+    write_u8(buf, if value { 1 } else { 0 });
+}
+
 fn write_f64(buf: &mut Vec<u8>, value: f64) {
     buf.extend_from_slice(&value.to_bits().to_be_bytes());
 }
@@ -647,6 +781,14 @@ fn read_u64(buf: &mut &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes([
         data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
     ]))
+}
+
+fn read_bool(buf: &mut &[u8]) -> Result<bool> {
+    match read_u8(buf)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => bail!("invalid udp perf bool value [{value}]"),
+    }
 }
 
 fn read_f64(buf: &mut &[u8]) -> Result<f64> {
@@ -692,9 +834,15 @@ mod tests {
             UdpPerfControlPacket::Start(UdpPerfStart {
                 session_id: 7,
                 mode: UdpPerfMode::Bidir,
+                payload_len: 1200,
+                packets_per_second: 2_500,
+                duration_micros: 10_000_000,
+                report_interval_micros: 1_000_000,
             }),
             UdpPerfControlPacket::Stop(UdpPerfStop { session_id: 7 }),
             UdpPerfControlPacket::Report(UdpPerfReport {
+                report_seq: 3,
+                is_final: true,
                 summary: sample_summary(),
             }),
         ];
@@ -704,6 +852,59 @@ mod tests {
             let decoded = UdpPerfControlPacket::decode(&encoded).unwrap();
             assert_eq!(decoded, packet);
         }
+    }
+
+    #[test]
+    fn udp_perf_start_roundtrip_includes_reverse_stream_config() {
+        let packet = UdpPerfControlPacket::Start(UdpPerfStart {
+            session_id: 21,
+            mode: UdpPerfMode::Reverse,
+            payload_len: 1400,
+            packets_per_second: 8_000,
+            duration_micros: 30_000_000,
+            report_interval_micros: 500_000,
+        });
+
+        let encoded = packet.encode().unwrap();
+        let decoded = UdpPerfControlPacket::decode(&encoded).unwrap();
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn udp_perf_report_roundtrip_includes_phase_and_sequence() {
+        let packet = UdpPerfControlPacket::Report(UdpPerfReport {
+            report_seq: 9,
+            is_final: false,
+            summary: sample_summary(),
+        });
+
+        let encoded = packet.encode().unwrap();
+        let decoded = UdpPerfControlPacket::decode(&encoded).unwrap();
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn udp_perf_wire_packet_type_distinguishes_control_and_data() {
+        let control = UdpPerfWirePacket::Control(UdpPerfControlPacket::Hello(UdpPerfHello {
+            session_id: 7,
+            mode: UdpPerfMode::Forward,
+        }));
+        let data = UdpPerfWirePacket::Data(data_packet(UdpPerfDirection::Forward, 1, 8));
+
+        let control_encoded = control.encode().unwrap();
+        let data_encoded = data.encode().unwrap();
+
+        assert_ne!(control_encoded[0], data_encoded[0]);
+        assert!(matches!(
+            UdpPerfWirePacket::decode(&control_encoded).unwrap(),
+            UdpPerfWirePacket::Control(UdpPerfControlPacket::Hello(_))
+        ));
+        assert!(matches!(
+            UdpPerfWirePacket::decode(&data_encoded).unwrap(),
+            UdpPerfWirePacket::Data(_)
+        ));
+        assert!(UdpPerfControlPacket::decode(&data_encoded).is_err());
+        assert!(UdpPerfDataPacket::decode(&control_encoded).is_err());
     }
 
     #[test]
@@ -762,6 +963,33 @@ mod tests {
     }
 
     #[test]
+    fn udp_perf_reset_interval_clears_interval_state_and_keeps_total_state() {
+        let mut stats = UdpPerfStats::default();
+
+        for seq in [1_u64, 3] {
+            stats.record_data_packet(&data_packet(UdpPerfDirection::Forward, seq, 128));
+        }
+
+        stats.reset_interval();
+
+        let after_reset = stats.build_summary(13, UdpPerfMode::Forward, 3_000_000, 1_000_000);
+        assert_eq!(after_reset.total.loss, 1);
+        assert_eq!(after_reset.interval.bytes, 0);
+        assert_eq!(after_reset.interval.packets, 0);
+        assert_eq!(after_reset.interval.loss, 0);
+        assert_eq!(after_reset.interval.reorder, 0);
+
+        stats.record_data_packet(&data_packet(UdpPerfDirection::Forward, 2, 128));
+
+        let after_fill = stats.build_summary(13, UdpPerfMode::Forward, 4_000_000, 1_000_000);
+        assert_eq!(after_fill.total.loss, 0);
+        assert_eq!(after_fill.total.reorder, 1);
+        assert_eq!(after_fill.interval.loss, 0);
+        assert_eq!(after_fill.interval.reorder, 1);
+        assert_eq!(after_fill.interval.packets, 1);
+    }
+
+    #[test]
     fn udp_perf_interval_loss_is_rolled_back_when_gap_is_filled_same_interval() {
         let mut stats = UdpPerfStats::default();
 
@@ -777,6 +1005,23 @@ mod tests {
         assert_eq!(summary.forward.interval.reorder, 1);
         assert_eq!(summary.interval.loss, 0);
         assert_eq!(summary.interval.reorder, 1);
+    }
+
+    #[test]
+    fn udp_perf_large_gap_uses_single_gap_range_representation() {
+        let mut stats = UdpPerfStats::default();
+
+        stats.record_data_packet(&data_packet(UdpPerfDirection::Forward, 1, 128));
+        stats.record_data_packet(&data_packet(UdpPerfDirection::Forward, 1_000_000, 128));
+
+        assert_eq!(stats.forward.total_gap_ranges.len(), 1);
+        assert_eq!(stats.forward.interval_gap_ranges.len(), 1);
+        assert_eq!(stats.forward.total_missing_packets, 999_998);
+        assert_eq!(stats.forward.interval_missing_packets, 999_998);
+
+        let summary = stats.build_summary(14, UdpPerfMode::Forward, 2_000_000, 1_000_000);
+        assert_eq!(summary.total.loss, 999_998);
+        assert_eq!(summary.interval.loss, 999_998);
     }
 
     #[test]
