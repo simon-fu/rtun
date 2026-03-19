@@ -10,6 +10,8 @@ use super::udp_perf::{
     UdpPerfReport, UdpPerfStart, UdpPerfStats, UdpPerfWirePacket,
 };
 
+type SessionKey = (SocketAddr, u64);
+
 pub async fn run(args: CmdArgs) -> Result<()> {
     let listen: SocketAddr = args
         .listen
@@ -177,7 +179,7 @@ async fn udp_server_loop(
     mut shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<()> {
     ensure_nonzero_interval(default_report_interval)?;
-    let mut sessions: HashMap<u64, Session> = HashMap::new();
+    let mut sessions: HashMap<SessionKey, Session> = HashMap::new();
     let mut buf = vec![0u8; 64 * 1024];
 
     loop {
@@ -225,7 +227,7 @@ async fn udp_server_loop(
 
 async fn on_packet(
     socket: &UdpSocket,
-    sessions: &mut HashMap<u64, Session>,
+    sessions: &mut HashMap<SessionKey, Session>,
     default_report_interval: Duration,
     packet: &[u8],
     from: SocketAddr,
@@ -234,26 +236,27 @@ async fn on_packet(
     match wire {
         UdpPerfWirePacket::Control(ctrl) => match ctrl {
             UdpPerfControlPacket::Hello(hello) => {
+                let key = session_key(from, hello.session_id);
                 let sess = sessions
-                    .entry(hello.session_id)
+                    .entry(key)
                     .or_insert(Session::new_hello(
                         from,
                         hello.mode,
                         default_report_interval,
                     )?);
-                // Only allow HELLO to (re)bind peer before START.
+                // Only allow HELLO to update mode before START.
                 if !sess.started {
-                    sess.peer = from;
                     sess.mode = hello.mode;
                 }
             }
             UdpPerfControlPacket::Start(start) => {
                 // START begins a new measurement round: replace session (reset total+interval).
+                let key = session_key(from, start.session_id);
                 let new_sess = Session::new_start(from, &start, default_report_interval)?;
-                sessions.insert(start.session_id, new_sess);
+                sessions.insert(key, new_sess);
 
                 // For reverse/bidir with valid send cfg, send one packet immediately so client sees DATA.
-                if let Some(sess) = sessions.get_mut(&start.session_id) {
+                if let Some(sess) = sessions.get_mut(&key) {
                     if matches!(start.mode, UdpPerfMode::Reverse | UdpPerfMode::Bidir)
                         && sess.next_send_at.is_some()
                     {
@@ -263,7 +266,7 @@ async fn on_packet(
                 }
             }
             UdpPerfControlPacket::Stop(stop) => {
-                if let Some(mut sess) = sessions.remove(&stop.session_id) {
+                if let Some(mut sess) = sessions.remove(&session_key(from, stop.session_id)) {
                     send_final_report(
                         socket,
                         stop.session_id,
@@ -278,9 +281,8 @@ async fn on_packet(
             }
         },
         UdpPerfWirePacket::Data(data) => {
-            if let Some(sess) = sessions.get_mut(&data.header.session_id) {
-                // Do not allow other peers to hijack session_id by sending DATA.
-                if !sess.started || from != sess.peer {
+            if let Some(sess) = sessions.get_mut(&session_key(from, data.header.session_id)) {
+                if !sess.started {
                     return Ok(());
                 }
                 sess.stats.record_data_packet(&data);
@@ -293,7 +295,7 @@ async fn on_packet(
 
 async fn advance_sessions(
     socket: &UdpSocket,
-    sessions: &mut HashMap<u64, Session>,
+    sessions: &mut HashMap<SessionKey, Session>,
     now: tokio::time::Instant,
 ) -> Result<()> {
     // Avoid long per-tick work; especially if pps is huge.
@@ -301,12 +303,13 @@ async fn advance_sessions(
     let mut actions = 0usize;
 
     // To avoid borrow issues, operate on a snapshot of ids.
-    let session_ids: Vec<u64> = sessions.keys().copied().collect();
-    for session_id in session_ids {
+    let session_keys: Vec<SessionKey> = sessions.keys().copied().collect();
+    for (peer, session_id) in session_keys {
         if actions >= MAX_ACTIONS_PER_TICK {
             break;
         }
-        let Some(sess) = sessions.get_mut(&session_id) else {
+        let key = session_key(peer, session_id);
+        let Some(sess) = sessions.get_mut(&key) else {
             continue;
         };
 
@@ -446,6 +449,10 @@ fn ensure_nonzero_interval(d: Duration) -> Result<()> {
 
 fn checked_add(base: tokio::time::Instant, delta: Duration) -> Option<tokio::time::Instant> {
     base.checked_add(delta)
+}
+
+fn session_key(peer: SocketAddr, session_id: u64) -> SessionKey {
+    (peer, session_id)
 }
 
 #[cfg(test)]
@@ -877,6 +884,121 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn udp_server_same_session_id_keeps_reverse_data_isolated_per_peer() -> Result<()> {
+        let (server_addr, shutdown_tx, server_task) = spawn_server_for_test(1_000).await?;
+
+        let client1 = UdpSocket::bind("127.0.0.1:0").await?;
+        client1.connect(server_addr).await?;
+
+        let client2 = UdpSocket::bind("127.0.0.1:0").await?;
+        client2.connect(server_addr).await?;
+
+        let session_id = 1_001;
+        let start = UdpPerfStart {
+            session_id,
+            mode: UdpPerfMode::Reverse,
+            payload_len: 32,
+            packets_per_second: 5_000,
+            duration_micros: 300_000,
+            report_interval_micros: 200_000,
+        };
+
+        client1
+            .send(&wire_control(UdpPerfControlPacket::Start(start.clone()))?)
+            .await?;
+        let first1 = recv_data(&client1, Duration::from_millis(200)).await?;
+        assert_eq!(first1.header.session_id, session_id);
+        assert_eq!(first1.header.direction, UdpPerfDirection::Reverse);
+
+        client2
+            .send(&wire_control(UdpPerfControlPacket::Start(start))?)
+            .await?;
+        let first2 = recv_data(&client2, Duration::from_millis(200)).await?;
+        assert_eq!(first2.header.session_id, session_id);
+        assert_eq!(first2.header.direction, UdpPerfDirection::Reverse);
+
+        let next1 = recv_data(&client1, Duration::from_millis(200)).await?;
+        let next2 = recv_data(&client2, Duration::from_millis(200)).await?;
+        assert!(next1.header.seq > first1.header.seq);
+        assert!(next2.header.seq > first2.header.seq);
+
+        shutdown_tx.send(()).ok();
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_same_session_id_keeps_stop_and_final_report_isolated_per_peer() -> Result<()>
+    {
+        let (server_addr, shutdown_tx, server_task) = spawn_server_for_test(1_000).await?;
+
+        let client1 = UdpSocket::bind("127.0.0.1:0").await?;
+        client1.connect(server_addr).await?;
+
+        let client2 = UdpSocket::bind("127.0.0.1:0").await?;
+        client2.connect(server_addr).await?;
+
+        let session_id = 1_002;
+        let start = UdpPerfStart {
+            session_id,
+            mode: UdpPerfMode::Forward,
+            payload_len: 16,
+            packets_per_second: 1_000,
+            duration_micros: 300_000,
+            report_interval_micros: 200_000,
+        };
+
+        client1
+            .send(&wire_control(UdpPerfControlPacket::Start(start.clone()))?)
+            .await?;
+        client2
+            .send(&wire_control(UdpPerfControlPacket::Start(start))?)
+            .await?;
+
+        client1
+            .send(&wire_data(session_id, UdpPerfDirection::Forward, 1, 16)?)
+            .await?;
+        client2
+            .send(&wire_data(session_id, UdpPerfDirection::Forward, 1, 16)?)
+            .await?;
+
+        client1
+            .send(&wire_control(UdpPerfControlPacket::Stop(UdpPerfStop {
+                session_id,
+            }))?)
+            .await?;
+        let report1 = recv_report(&client1, Duration::from_millis(200)).await?;
+        assert!(report1.is_final);
+        assert_eq!(report1.summary.session_id, session_id);
+        assert_eq!(report1.summary.forward.total.packets, 1);
+
+        let mut buf = vec![0u8; 2048];
+        let no_cross_report =
+            tokio::time::timeout(Duration::from_millis(40), client2.recv(&mut buf)).await;
+        assert!(
+            no_cross_report.is_err(),
+            "unexpected packet delivered to peer2 after peer1 STOP"
+        );
+
+        client2
+            .send(&wire_data(session_id, UdpPerfDirection::Forward, 2, 16)?)
+            .await?;
+        client2
+            .send(&wire_control(UdpPerfControlPacket::Stop(UdpPerfStop {
+                session_id,
+            }))?)
+            .await?;
+        let report2 = recv_report(&client2, Duration::from_millis(200)).await?;
+        assert!(report2.is_final);
+        assert_eq!(report2.summary.session_id, session_id);
+        assert_eq!(report2.summary.forward.total.packets, 2);
+
+        shutdown_tx.send(()).ok();
+        server_task.abort();
+        Ok(())
+    }
+
     async fn spawn_server_for_test(
         default_interval_ms: u64,
     ) -> Result<(
@@ -932,6 +1054,18 @@ mod tests {
             let pkt = recv_wire(client, timeout).await?;
             if let UdpPerfWirePacket::Control(UdpPerfControlPacket::Report(r)) = pkt {
                 return Ok(r);
+            }
+        }
+    }
+
+    async fn recv_data(
+        client: &UdpSocket,
+        timeout: Duration,
+    ) -> Result<super::super::udp_perf::UdpPerfDataPacket> {
+        loop {
+            let pkt = recv_wire(client, timeout).await?;
+            if let UdpPerfWirePacket::Data(data) = pkt {
+                return Ok(data);
             }
         }
     }
