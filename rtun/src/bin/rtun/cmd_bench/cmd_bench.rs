@@ -35,16 +35,11 @@ enum SubCmd {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use clap::Parser;
-    use once_cell::sync::Lazy;
 
-    use crate::cli_config::{prepare_argv, CONFIG_ENV_VAR};
+    use crate::cli_config::rewrite_legacy_bench_argv_for_test;
 
     use super::{CmdArgs, SubCmd};
-
-    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     #[test]
     fn bench_cli_parses_udp_server_subcommand() {
@@ -84,12 +79,7 @@ mod tests {
 
     #[test]
     fn bench_cli_rewrites_legacy_bench_args_to_socks() {
-        let _guard = ENV_LOCK.lock().expect("lock env");
-        unsafe {
-            std::env::remove_var(CONFIG_ENV_VAR);
-        }
-
-        let prepared = prepare_argv(vec![
+        let rewritten = rewrite_legacy_bench_argv_for_test(vec![
             "rtun".to_string(),
             "bench".to_string(),
             "-s".to_string(),
@@ -98,11 +88,10 @@ mod tests {
             "127.0.0.1".to_string(),
             "-p".to_string(),
             "12345".to_string(),
-        ])
-        .expect("prepare argv");
+        ]);
 
         assert_eq!(
-            prepared.argv,
+            rewritten,
             vec![
                 "rtun",
                 "bench",
