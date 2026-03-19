@@ -18,6 +18,7 @@ pub fn prepare_argv(raw_argv: Vec<String>) -> Result<PreparedArgv> {
     }
 
     let (base_argv, cli_config_path) = strip_config_flag(raw_argv)?;
+    let base_argv = rewrite_legacy_bench_argv(base_argv);
     let config_path = match cli_config_path {
         Some(path) => Some(path),
         None => env_config_path()?,
@@ -125,6 +126,41 @@ fn load_config_file(path: &PathBuf) -> Result<ConfigFile> {
     let cfg = toml::from_str::<ConfigFile>(&content)
         .with_context(|| format!("parse toml config failed [{}]", path.display()))?;
     Ok(cfg)
+}
+
+fn rewrite_legacy_bench_argv(mut argv: Vec<String>) -> Vec<String> {
+    let Some((idx, cmd)) = find_subcommand_index(&argv) else {
+        return argv;
+    };
+    if cmd != "bench" || idx + 1 >= argv.len() {
+        return argv;
+    }
+
+    let after = &argv[idx + 1..];
+    let first = after[0].as_str();
+    if !first.starts_with('-') || matches!(first, "-h" | "--help") {
+        return argv;
+    }
+
+    let has_legacy_flag = after.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-s" | "--socks"
+                | "-a"
+                | "--addr"
+                | "-p"
+                | "--port"
+                | "-b"
+                | "--buffer"
+                | "--seconds"
+                | "-l"
+                | "--listen"
+        )
+    });
+    if has_legacy_flag {
+        argv.insert(idx + 1, "socks".to_string());
+    }
+    argv
 }
 
 fn find_subcommand_index(argv: &[String]) -> Option<(usize, &str)> {
@@ -425,6 +461,42 @@ args = ["--config", "/tmp/other.toml"]
         assert!(
             err.to_string().contains("must not include --config"),
             "{err:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_argv_rewrites_legacy_bench_to_socks_subcommand() -> Result<()> {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _restore = EnvRestore::new(CONFIG_ENV_VAR);
+        unsafe {
+            std::env::remove_var(CONFIG_ENV_VAR);
+        }
+
+        let raw = vec![
+            "rtun".to_string(),
+            "bench".to_string(),
+            "-s".to_string(),
+            "127.0.0.1:51080".to_string(),
+            "-a".to_string(),
+            "127.0.0.1".to_string(),
+            "-p".to_string(),
+            "12345".to_string(),
+        ];
+        let prepared = prepare_argv(raw)?;
+        assert_eq!(
+            prepared.argv,
+            vec![
+                "rtun",
+                "bench",
+                "socks",
+                "-s",
+                "127.0.0.1:51080",
+                "-a",
+                "127.0.0.1",
+                "-p",
+                "12345",
+            ]
         );
         Ok(())
     }

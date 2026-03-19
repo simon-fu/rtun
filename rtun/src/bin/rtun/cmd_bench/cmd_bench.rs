@@ -1,133 +1,119 @@
-/*
-    cargo run --bin rtun --release -- bench -s 127.0.0.1:51080 -a 127.0.0.1 -p 12345
-*/
-
-use std::time::{Duration, Instant};
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
-use fast_socks5::client::{Config, Socks5Stream};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
-use tracing::{info, span, warn, Instrument, Level};
 
 use crate::init_log_and_run;
+
+use super::{bench_socks, udp_client, udp_server};
 
 pub fn run(args: CmdArgs) -> Result<()> {
     init_log_and_run(do_run(args))?
 }
 
 async fn do_run(args: CmdArgs) -> Result<()> {
-    let buf_size = args.buffer.unwrap_or(32 * 1024);
-    let duration = Duration::from_secs(args.seconds.unwrap_or(30));
-
-    info!("buf_size [{buf_size}]");
-    info!("duration [{duration:?}]");
-
-    let mut config = Config::default();
-    config.set_skip_auth(false);
-
-    // Creating a SOCKS stream to the target address through the socks server
-    let stream = Socks5Stream::connect(
-        &args.socks,
-        args.target_addr.clone(),
-        args.target_port,
-        config,
-    )
-    .await
-    .with_context(|| format!("failed to connect to socks server [{}]", args.socks))?;
-
-    info!("connected to socks server [{}]", args.socks);
-
-    let (reader, mut writer) = tokio::io::split(stream);
-
-    let read_task = {
-        let span = span!(parent: None, Level::DEBUG, "read-half");
-        tokio::spawn(
-            async move {
-                let r = reading_loop(reader, buf_size).await;
-                if let Err(e) = r {
-                    warn!("finished error [{e:?}]");
-                }
-            }
-            .instrument(span),
-        )
-    };
-
-    let buf = vec![0_u8; buf_size];
-    let start_time = Instant::now();
-
-    while start_time.elapsed() < duration {
-        writer
-            .write_all(&buf[..])
-            .await
-            .with_context(|| "write failed")?;
+    match args.cmd {
+        SubCmd::Socks(args) => bench_socks::run(args).await,
+        SubCmd::UdpServer(args) => udp_server::run(args).await,
+        SubCmd::UdpClient(args) => udp_client::run(args).await,
     }
-
-    read_task.await?;
-
-    Ok(())
 }
 
-async fn reading_loop<T: AsyncRead + Unpin>(mut stream: T, buf_size: usize) -> Result<()> {
-    let mut buf = vec![0_u8; buf_size];
-    let mut total_bytes = 0_u64;
-    let mut last_bytes = 0_u64;
-    let mut last_time = Instant::now();
-
-    loop {
-        let len = stream
-            .read(&mut buf[..])
-            .await
-            .with_context(|| "read failed")?;
-        if len == 0 {
-            info!("read zero");
-            break;
-        }
-        total_bytes += len as u64;
-
-        let now = Instant::now();
-        let elapsed = (now - last_time).as_millis() as u64;
-        if elapsed >= 1500 {
-            let bytes = total_bytes - last_bytes;
-            let rate = 1000 * bytes / elapsed;
-            info!("recv rate {}/s", indicatif::HumanBytes(rate));
-
-            last_time = now;
-            last_bytes = total_bytes;
-        }
-    }
-
-    Ok(())
-}
-
-// refer https://github.com/clap-rs/clap/tree/master/clap_derive/examples
 #[derive(Parser, Debug)]
-#[clap(name = "echo", author, about, version)]
+#[clap(name = "bench", author, about, version)]
 pub struct CmdArgs {
-    #[clap(
-        short = 'l',
-        long = "listen",
-        long_help = "listen address",
-        default_value = "0.0.0.0:12345"
-    )]
-    listen: String,
+    #[clap(subcommand)]
+    cmd: SubCmd,
+}
 
-    #[clap(short = 's', long = "socks", long_help = "socks proxy address")]
-    socks: String,
+#[derive(Parser, Debug)]
+enum SubCmd {
+    Socks(bench_socks::CmdArgs),
+    #[clap(name = "udp-server")]
+    UdpServer(udp_server::CmdArgs),
+    #[clap(name = "udp-client")]
+    UdpClient(udp_client::CmdArgs),
+}
 
-    #[clap(short = 'a', long = "addr", long_help = "target domain/ip")]
-    target_addr: String,
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
 
-    #[clap(short = 'p', long = "port", long_help = "target port")]
-    target_port: u16,
+    use clap::Parser;
+    use once_cell::sync::Lazy;
 
-    #[clap(
-        short = 'b',
-        long = "buffer",
-        long_help = "buffer size in unit of bytes"
-    )]
-    buffer: Option<usize>,
+    use crate::cli_config::{prepare_argv, CONFIG_ENV_VAR};
 
-    #[clap(long = "seconds", long_help = "bench duration in seconds")]
-    seconds: Option<u64>,
+    use super::{CmdArgs, SubCmd};
+
+    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    #[test]
+    fn bench_cli_parses_udp_server_subcommand() {
+        let args = CmdArgs::try_parse_from(["bench", "udp-server", "--listen", "0.0.0.0:9001"])
+            .expect("parse bench udp-server");
+        match args.cmd {
+            SubCmd::UdpServer(cmd) => assert_eq!(cmd.listen, "0.0.0.0:9001"),
+            _ => panic!("expected udp-server"),
+        }
+    }
+
+    #[test]
+    fn bench_cli_parses_udp_client_subcommand() {
+        let args = CmdArgs::try_parse_from([
+            "bench",
+            "udp-client",
+            "--target",
+            "127.0.0.1:19001",
+            "--mode",
+            "reverse",
+            "--time",
+            "10",
+            "--len",
+            "1200",
+        ])
+        .expect("parse bench udp-client");
+        match args.cmd {
+            SubCmd::UdpClient(cmd) => {
+                assert_eq!(cmd.target, "127.0.0.1:19001");
+                assert_eq!(cmd.time, 10);
+                assert_eq!(cmd.len, 1200);
+                assert_eq!(cmd.mode.to_string(), "reverse");
+            }
+            _ => panic!("expected udp-client"),
+        }
+    }
+
+    #[test]
+    fn bench_cli_rewrites_legacy_bench_args_to_socks() {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        unsafe {
+            std::env::remove_var(CONFIG_ENV_VAR);
+        }
+
+        let prepared = prepare_argv(vec![
+            "rtun".to_string(),
+            "bench".to_string(),
+            "-s".to_string(),
+            "127.0.0.1:51080".to_string(),
+            "-a".to_string(),
+            "127.0.0.1".to_string(),
+            "-p".to_string(),
+            "12345".to_string(),
+        ])
+        .expect("prepare argv");
+
+        assert_eq!(
+            prepared.argv,
+            vec![
+                "rtun",
+                "bench",
+                "socks",
+                "-s",
+                "127.0.0.1:51080",
+                "-a",
+                "127.0.0.1",
+                "-p",
+                "12345"
+            ]
+        );
+    }
 }
