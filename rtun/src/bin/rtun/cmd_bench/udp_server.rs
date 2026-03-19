@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    num::NonZeroU64,
-    time::Duration,
-};
+use std::{collections::HashMap, net::SocketAddr, num::NonZeroU64, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
@@ -16,13 +11,16 @@ use super::udp_perf::{
 };
 
 pub async fn run(args: CmdArgs) -> Result<()> {
-    let listen: SocketAddr = args.listen.parse().with_context(|| {
-        format!("invalid --listen value [{}], expected ip:port", args.listen)
-    })?;
+    let listen: SocketAddr = args
+        .listen
+        .parse()
+        .with_context(|| format!("invalid --listen value [{}], expected ip:port", args.listen))?;
     let socket = UdpSocket::bind(listen)
         .await
         .with_context(|| format!("udp-server bind failed at [{listen}]"))?;
-    let local_addr = socket.local_addr().with_context(|| "get local_addr failed")?;
+    let local_addr = socket
+        .local_addr()
+        .with_context(|| "get local_addr failed")?;
     info!(
         "udp bench server listen [{}], report interval [{}ms]",
         local_addr,
@@ -64,7 +62,11 @@ struct Session {
 }
 
 impl Session {
-    fn new_hello(peer: SocketAddr, mode: UdpPerfMode, default_report_interval: Duration) -> Result<Self> {
+    fn new_hello(
+        peer: SocketAddr,
+        mode: UdpPerfMode,
+        default_report_interval: Duration,
+    ) -> Result<Self> {
         ensure_nonzero_interval(default_report_interval)?;
         let now = tokio::time::Instant::now();
         Ok(Self {
@@ -85,21 +87,24 @@ impl Session {
         })
     }
 
-    fn new_start(peer: SocketAddr, start: &UdpPerfStart, default_interval: Duration) -> Result<Self> {
+    fn new_start(
+        peer: SocketAddr,
+        start: &UdpPerfStart,
+        default_interval: Duration,
+    ) -> Result<Self> {
         ensure_nonzero_interval(default_interval)?;
         let now = tokio::time::Instant::now();
 
         let report_interval = if start.report_interval_micros != 0 {
             let d = Duration::from_micros(start.report_interval_micros);
-            ensure_nonzero_interval(d)
-                .with_context(|| "invalid START.report_interval_micros")?;
+            ensure_nonzero_interval(d).with_context(|| "invalid START.report_interval_micros")?;
             d
         } else {
             default_interval
         };
 
-        let next_report_at = checked_add(now, report_interval)
-            .with_context(|| "report deadline overflow")?;
+        let next_report_at =
+            checked_add(now, report_interval).with_context(|| "report deadline overflow")?;
 
         let mut sess = Self {
             peer,
@@ -176,10 +181,7 @@ async fn udp_server_loop(
     let mut buf = vec![0u8; 64 * 1024];
 
     loop {
-        let next_deadline = sessions
-            .values()
-            .filter_map(|s| s.next_deadline())
-            .min();
+        let next_deadline = sessions.values().filter_map(|s| s.next_deadline()).min();
 
         let shutdown_fut = async {
             if let Some(rx) = shutdown.as_mut() {
@@ -234,7 +236,11 @@ async fn on_packet(
             UdpPerfControlPacket::Hello(hello) => {
                 let sess = sessions
                     .entry(hello.session_id)
-                    .or_insert(Session::new_hello(from, hello.mode, default_report_interval)?);
+                    .or_insert(Session::new_hello(
+                        from,
+                        hello.mode,
+                        default_report_interval,
+                    )?);
                 // Only allow HELLO to (re)bind peer before START.
                 if !sess.started {
                     sess.peer = from;
@@ -258,7 +264,13 @@ async fn on_packet(
             }
             UdpPerfControlPacket::Stop(stop) => {
                 if let Some(mut sess) = sessions.remove(&stop.session_id) {
-                    send_final_report(socket, stop.session_id, &mut sess, tokio::time::Instant::now()).await?;
+                    send_final_report(
+                        socket,
+                        stop.session_id,
+                        &mut sess,
+                        tokio::time::Instant::now(),
+                    )
+                    .await?;
                 }
             }
             UdpPerfControlPacket::Report(_) => {
@@ -294,7 +306,9 @@ async fn advance_sessions(
         if actions >= MAX_ACTIONS_PER_TICK {
             break;
         }
-        let Some(sess) = sessions.get_mut(&session_id) else { continue };
+        let Some(sess) = sessions.get_mut(&session_id) else {
+            continue;
+        };
 
         // Stop sending when duration ends.
         if let Some(end_at) = sess.send_end_at {
@@ -324,7 +338,9 @@ async fn send_one(
     sess: &mut Session,
     now: tokio::time::Instant,
 ) -> Result<()> {
-    let Some(next_send_at) = sess.next_send_at else { return Ok(()) };
+    let Some(next_send_at) = sess.next_send_at else {
+        return Ok(());
+    };
     if next_send_at > now {
         return Ok(());
     }
@@ -428,10 +444,7 @@ fn ensure_nonzero_interval(d: Duration) -> Result<()> {
     Ok(())
 }
 
-fn checked_add(
-    base: tokio::time::Instant,
-    delta: Duration,
-) -> Option<tokio::time::Instant> {
+fn checked_add(base: tokio::time::Instant, delta: Duration) -> Option<tokio::time::Instant> {
     base.checked_add(delta)
 }
 
@@ -444,8 +457,8 @@ mod tests {
     use tokio::{net::UdpSocket, sync::oneshot};
 
     use super::super::udp_perf::{
-        UdpPerfControlPacket, UdpPerfDataHeader, UdpPerfDataPacket, UdpPerfDirection,
-        UdpPerfMode, UdpPerfStart, UdpPerfStop, UdpPerfWirePacket,
+        UdpPerfControlPacket, UdpPerfDataHeader, UdpPerfDataPacket, UdpPerfDirection, UdpPerfMode,
+        UdpPerfStart, UdpPerfStop, UdpPerfWirePacket,
     };
 
     #[test]
@@ -573,7 +586,9 @@ mod tests {
 
         // stop and validate final report sees both directions
         client
-            .send(&wire_control(UdpPerfControlPacket::Stop(UdpPerfStop { session_id }))?)
+            .send(&wire_control(UdpPerfControlPacket::Stop(UdpPerfStop {
+                session_id,
+            }))?)
             .await?;
         let report = recv_report(&client, Duration::from_millis(200)).await?;
         assert!(report.is_final);
@@ -609,7 +624,9 @@ mod tests {
             .await?;
 
         client
-            .send(&wire_control(UdpPerfControlPacket::Stop(UdpPerfStop { session_id }))?)
+            .send(&wire_control(UdpPerfControlPacket::Stop(UdpPerfStop {
+                session_id,
+            }))?)
             .await?;
 
         let report = recv_report(&client, Duration::from_millis(200)).await?;
@@ -841,7 +858,10 @@ mod tests {
 
         // Spoof data from client2 using same session_id.
         client2
-            .send_to(&wire_data(session_id, UdpPerfDirection::Forward, 2, 16)?, server_addr)
+            .send_to(
+                &wire_data(session_id, UdpPerfDirection::Forward, 2, 16)?,
+                server_addr,
+            )
             .await?;
 
         // Report should still go to client1, not client2.
@@ -859,7 +879,11 @@ mod tests {
 
     async fn spawn_server_for_test(
         default_interval_ms: u64,
-    ) -> Result<(SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<Result<()>>)> {
+    ) -> Result<(
+        SocketAddr,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
         let addr = socket.local_addr()?;
         let (tx, rx) = oneshot::channel();
@@ -874,7 +898,12 @@ mod tests {
         UdpPerfWirePacket::Control(pkt).encode()
     }
 
-    fn wire_data(session_id: u64, direction: UdpPerfDirection, seq: u64, payload_len: usize) -> Result<Vec<u8>> {
+    fn wire_data(
+        session_id: u64,
+        direction: UdpPerfDirection,
+        seq: u64,
+        payload_len: usize,
+    ) -> Result<Vec<u8>> {
         UdpPerfWirePacket::Data(UdpPerfDataPacket {
             header: UdpPerfDataHeader {
                 session_id,
@@ -895,7 +924,10 @@ mod tests {
         Ok(UdpPerfWirePacket::decode(&buf[..n])?)
     }
 
-    async fn recv_report(client: &UdpSocket, timeout: Duration) -> Result<super::super::udp_perf::UdpPerfReport> {
+    async fn recv_report(
+        client: &UdpSocket,
+        timeout: Duration,
+    ) -> Result<super::super::udp_perf::UdpPerfReport> {
         loop {
             let pkt = recv_wire(client, timeout).await?;
             if let UdpPerfWirePacket::Control(UdpPerfControlPacket::Report(r)) = pkt {

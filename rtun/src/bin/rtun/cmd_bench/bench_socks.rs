@@ -16,9 +16,14 @@ pub async fn run(args: CmdArgs) -> Result<()> {
     let mut config = Config::default();
     config.set_skip_auth(false);
 
-    let stream = Socks5Stream::connect(&args.socks, args.target_addr.clone(), args.target_port, config)
-        .await
-        .with_context(|| format!("failed to connect to socks server [{}]", args.socks))?;
+    let stream = Socks5Stream::connect(
+        &args.socks,
+        args.target_addr.clone(),
+        args.target_port,
+        config,
+    )
+    .await
+    .with_context(|| format!("failed to connect to socks server [{}]", args.socks))?;
 
     info!("connected to socks server [{}]", args.socks);
 
