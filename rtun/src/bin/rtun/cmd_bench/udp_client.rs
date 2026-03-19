@@ -119,16 +119,6 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
     loop {
         let now = Instant::now();
 
-        if !stop_sent {
-            if let Some(due) = next_send_at {
-                if due <= now {
-                    send_seq = send_seq.saturating_add(1);
-                    send_forward_data(&socket, session_id, send_seq, payload_len).await?;
-                    next_send_at = next_send_deadline(now, pps);
-                }
-            }
-        }
-
         if !stop_sent && now >= stop_at {
             send_control(
                 &socket,
@@ -141,6 +131,16 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                 now.checked_add(FINAL_REPORT_TIMEOUT)
                     .context("final report deadline overflow")?,
             );
+        }
+
+        if !stop_sent {
+            if let Some(due) = next_send_at {
+                if due <= now {
+                    send_seq = send_seq.saturating_add(1);
+                    send_forward_data(&socket, session_id, send_seq, payload_len).await?;
+                    next_send_at = next_send_deadline(now, pps);
+                }
+            }
         }
 
         if let Some(report) =
@@ -742,6 +742,26 @@ mod tests {
         args.bitrate = Some(100);
         args.pps = None;
         assert_eq!(super::resolve_pps(&args)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_client_forward_mode_duration_zero_sends_no_data() -> Result<()> {
+        let (target, _server_addr, server_task) = spawn_server(2_000).await?;
+        let mut args = test_args(target, UdpPerfMode::Forward);
+        args.time = 0;
+        args.pps = Some(300);
+
+        let out = super::run_for_test(args).await?;
+
+        assert!(out.final_report.is_final);
+        assert_eq!(out.final_report.summary.mode, UdpPerfMode::Forward);
+        assert_eq!(
+            out.final_report.summary.forward.total.packets, 0,
+            "time=0 should not send any forward packets"
+        );
+
+        server_task.abort();
         Ok(())
     }
 
