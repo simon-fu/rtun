@@ -264,11 +264,10 @@ async fn on_packet(
             }
             UdpPerfControlPacket::Start(start) => {
                 validate_start(&start)?;
-                let now = tokio::time::Instant::now();
                 let key = session_key(from, start.session_id);
                 if sessions
                     .get(&key)
-                    .is_some_and(|sess| is_duplicate_start(sess, &start, now))
+                    .is_some_and(|sess| is_duplicate_start(sess, &start))
                 {
                     return Ok(());
                 }
@@ -519,12 +518,8 @@ fn session_report_at(sess: &Session, now: tokio::time::Instant) -> tokio::time::
 fn is_duplicate_start(
     sess: &Session,
     start: &UdpPerfStart,
-    now: tokio::time::Instant,
 ) -> bool {
-    sess.started
-        && !sess.stop_requested
-        && sess.end_at.is_none_or(|end_at| now < end_at)
-        && sess.start_cfg.as_ref().is_some_and(|cfg| cfg == start)
+    sess.started && sess.start_cfg.as_ref().is_some_and(|cfg| cfg == start)
 }
 
 fn validate_start(start: &UdpPerfStart) -> Result<()> {
@@ -1080,6 +1075,52 @@ mod tests {
         let report = recv_final_report(&client, Duration::from_millis(400)).await?;
         assert!(report.is_final);
         assert_eq!(report.summary.total.packets, 1);
+
+        shutdown_tx.send(()).ok();
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_duplicate_start_after_stop_keeps_existing_stats() -> Result<()> {
+        let (server_addr, shutdown_tx, server_task) = spawn_server_for_test(1_000).await?;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        client.connect(server_addr).await?;
+
+        let session_id = 709;
+        let start = UdpPerfStart {
+            session_id,
+            mode: UdpPerfMode::Forward,
+            payload_len: 16,
+            packets_per_second: 1_000,
+            duration_micros: 80_000,
+            report_interval_micros: 0,
+        };
+
+        client
+            .send(&wire_control(UdpPerfControlPacket::Start(start.clone()))?)
+            .await?;
+        client
+            .send(&wire_data(session_id, UdpPerfDirection::Forward, 1, 16)?)
+            .await?;
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        client
+            .send(&wire_control(UdpPerfControlPacket::Stop(UdpPerfStop {
+                session_id,
+            }))?)
+            .await?;
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        client
+            .send(&wire_control(UdpPerfControlPacket::Start(start))?)
+            .await?;
+
+        let report = recv_final_report(&client, Duration::from_millis(250)).await?;
+        assert!(report.is_final);
+        assert_eq!(report.summary.total.packets, 1);
+        assert_eq!(report.summary.forward.total.packets, 1);
 
         shutdown_tx.send(()).ok();
         server_task.abort();

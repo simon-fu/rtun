@@ -14,14 +14,13 @@ use tracing::info;
 
 use super::udp_perf::{
     UdpPerfControlPacket, UdpPerfDataHeader, UdpPerfDataPacket, UdpPerfDirection, UdpPerfHello,
-    UdpPerfMode, UdpPerfReport, UdpPerfStart, UdpPerfStop, UdpPerfSummary, UdpPerfWirePacket,
-    MAX_UDP_DATAGRAM_PAYLOAD_LEN, MAX_UDP_SAFE_PAYLOAD_LEN,
+    UdpPerfMode, UdpPerfReport, UdpPerfStart, UdpPerfStats, UdpPerfStop, UdpPerfSummary,
+    UdpPerfWirePacket, MAX_UDP_DATAGRAM_PAYLOAD_LEN, MAX_UDP_SAFE_PAYLOAD_LEN,
 };
 
 const DEFAULT_PPS: u64 = 1_000;
 const FINAL_REPORT_TIMEOUT: Duration = Duration::from_secs(2);
 const START_RETRY_INTERVAL: Duration = Duration::from_millis(100);
-const MIN_FINAL_REVERSE_TAIL_IDLE_TIMEOUT_MS: u64 = 300;
 const MAX_INITIAL_FORWARD_SEND_DELAY: Duration = Duration::from_millis(10);
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -187,7 +186,11 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                         &mut client_rx,
                     )? {
                         if report.is_final {
-                            final_report_drain_deadline = schedule_final_report_drain_deadline(&report, Instant::now())?;
+                            final_report_drain_deadline = schedule_final_report_drain_deadline(
+                                &report,
+                                &client_rx,
+                                Instant::now(),
+                            )?;
                             final_report = Some(report);
                         }
                     }
@@ -195,6 +198,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                     if had_final_report {
                         refresh_final_report_drain_deadline(
                             final_report.as_ref(),
+                            &client_rx,
                             &mut final_report_drain_deadline,
                             Instant::now(),
                         )?;
@@ -217,7 +221,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
             )? {
                 if report.is_final {
                     final_report_drain_deadline =
-                        schedule_final_report_drain_deadline(&report, Instant::now())?;
+                        schedule_final_report_drain_deadline(&report, &client_rx, Instant::now())?;
                     final_report = Some(report);
                 }
             }
@@ -225,6 +229,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
             if had_final_report {
                 refresh_final_report_drain_deadline(
                     final_report.as_ref(),
+                    &client_rx,
                     &mut final_report_drain_deadline,
                     Instant::now(),
                 )?;
@@ -255,12 +260,14 @@ fn consume_final_report_or_timeout(
 
 fn schedule_final_report_drain_deadline(
     report: &UdpPerfReport,
+    client_rx: &ClientRxStats,
     now: Instant,
 ) -> Result<Option<Instant>> {
     if matches!(
         report.summary.mode,
         UdpPerfMode::Reverse | UdpPerfMode::Bidir
-    ) {
+    ) && client_rx.has_pending_reverse_packets(report)
+    {
         return Ok(Some(
             now.checked_add(reverse_tail_idle_timeout())
                 .context("final reverse drain deadline overflow")?,
@@ -297,18 +304,18 @@ fn next_start_retry_deadline(now: Instant) -> Result<Option<Instant>> {
 
 fn refresh_final_report_drain_deadline(
     final_report: Option<&UdpPerfReport>,
+    client_rx: &ClientRxStats,
     final_report_drain_deadline: &mut Option<Instant>,
     now: Instant,
 ) -> Result<()> {
     if let Some(report) = final_report {
-        *final_report_drain_deadline = schedule_final_report_drain_deadline(report, now)?;
+        *final_report_drain_deadline = schedule_final_report_drain_deadline(report, client_rx, now)?;
     }
     Ok(())
 }
 
 fn reverse_tail_idle_timeout() -> Duration {
-    let derived_ms = (FINAL_REPORT_TIMEOUT.as_millis() as u64) / 6;
-    Duration::from_millis(derived_ms.max(MIN_FINAL_REVERSE_TAIL_IDLE_TIMEOUT_MS))
+    FINAL_REPORT_TIMEOUT
 }
 
 fn send_interval(pps: u64) -> Option<Duration> {
@@ -344,12 +351,11 @@ struct OutputPolicy {
     collect_interval: bool,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default)]
 struct ClientRxStats {
     reverse_packets: u64,
     reverse_bytes: u64,
-    reverse_interval_packets: u64,
-    reverse_interval_bytes: u64,
+    reverse_stats: UdpPerfStats,
 }
 
 impl ClientRxStats {
@@ -357,22 +363,46 @@ impl ClientRxStats {
         if matches!(data.header.direction, UdpPerfDirection::Reverse) {
             self.reverse_packets = self.reverse_packets.saturating_add(1);
             self.reverse_bytes = self.reverse_bytes.saturating_add(data.payload.len() as u64);
-            self.reverse_interval_packets = self.reverse_interval_packets.saturating_add(1);
-            self.reverse_interval_bytes = self
-                .reverse_interval_bytes
-                .saturating_add(data.payload.len() as u64);
+            self.reverse_stats.record_data_packet(data);
         }
     }
 
-    fn interval_snapshot(&self) -> (u64, u64) {
-        (self.reverse_interval_bytes, self.reverse_interval_packets)
+    fn reverse_summary(
+        &self,
+        total_elapsed_micros: u64,
+        interval_elapsed_micros: u64,
+    ) -> super::udp_perf::UdpPerfDirectionSummary {
+        self.reverse_stats
+            .build_summary(0, UdpPerfMode::Reverse, total_elapsed_micros, interval_elapsed_micros)
+            .reverse
     }
 
-    fn take_interval_snapshot(&mut self) -> (u64, u64) {
-        let snap = self.interval_snapshot();
-        self.reverse_interval_packets = 0;
-        self.reverse_interval_bytes = 0;
-        snap
+    fn take_interval_summary(
+        &mut self,
+        total_elapsed_micros: u64,
+        interval_elapsed_micros: u64,
+    ) -> super::udp_perf::UdpPerfCountersSummary {
+        let interval = self
+            .reverse_summary(total_elapsed_micros, interval_elapsed_micros)
+            .interval;
+        self.reverse_stats.reset_interval();
+        interval
+    }
+
+    fn has_pending_reverse_packets(&self, report: &UdpPerfReport) -> bool {
+        if !matches!(
+            report.summary.mode,
+            UdpPerfMode::Reverse | UdpPerfMode::Bidir
+        ) {
+            return false;
+        }
+
+        let reverse = self.reverse_summary(
+            report.summary.total_elapsed_micros,
+            report.summary.interval_elapsed_micros,
+        );
+        let unique_packets = reverse.total.packets.saturating_sub(reverse.total.duplicate);
+        unique_packets < report.summary.reverse.total.packets
     }
 }
 
@@ -462,7 +492,10 @@ fn handle_incoming_packet(
     match wire {
         UdpPerfWirePacket::Control(UdpPerfControlPacket::Report(report)) => {
             if !report.is_final {
-                let reverse_interval = client_rx.take_interval_snapshot();
+                let reverse_interval = client_rx.take_interval_summary(
+                    report.summary.total_elapsed_micros,
+                    report.summary.interval_elapsed_micros,
+                );
                 if emit_interval {
                     let merged = build_client_view_summary(
                         &report.summary,
@@ -515,24 +548,14 @@ fn render_final_summary(summary: &UdpPerfSummary, as_json: bool) -> Result<Strin
 fn build_client_view_summary(
     server: &UdpPerfSummary,
     client_rx: &ClientRxStats,
-    reverse_interval_override: Option<(u64, u64)>,
+    reverse_interval_override: Option<super::udp_perf::UdpPerfCountersSummary>,
 ) -> UdpPerfSummary {
     let mut merged = server.clone();
     if matches!(server.mode, UdpPerfMode::Reverse | UdpPerfMode::Bidir) {
-        let reverse_total = counters_from_local(
-            client_rx.reverse_bytes,
-            client_rx.reverse_packets,
-            server.total_elapsed_micros,
-        );
-        let (reverse_interval_bytes, reverse_interval_packets) =
-            reverse_interval_override.unwrap_or_else(|| client_rx.interval_snapshot());
-        let reverse_interval = counters_from_local(
-            reverse_interval_bytes,
-            reverse_interval_packets,
-            server.interval_elapsed_micros,
-        );
-        merged.reverse.total = reverse_total.clone();
-        merged.reverse.interval = reverse_interval;
+        let reverse_summary =
+            client_rx.reverse_summary(server.total_elapsed_micros, server.interval_elapsed_micros);
+        merged.reverse.total = reverse_summary.total.clone();
+        merged.reverse.interval = reverse_interval_override.unwrap_or(reverse_summary.interval);
         merged.total = merge_counters(
             &merged.forward.total,
             &merged.reverse.total,
@@ -560,22 +583,6 @@ fn merge_counters(
         loss: a.loss.saturating_add(b.loss),
         reorder: a.reorder.saturating_add(b.reorder),
         duplicate: a.duplicate.saturating_add(b.duplicate),
-        mbps: bytes_to_mbps_local(bytes, elapsed_micros),
-        pps: packets_to_pps_local(packets, elapsed_micros),
-    }
-}
-
-fn counters_from_local(
-    bytes: u64,
-    packets: u64,
-    elapsed_micros: u64,
-) -> super::udp_perf::UdpPerfCountersSummary {
-    super::udp_perf::UdpPerfCountersSummary {
-        bytes,
-        packets,
-        loss: 0,
-        reorder: 0,
-        duplicate: 0,
         mbps: bytes_to_mbps_local(bytes, elapsed_micros),
         pps: packets_to_pps_local(packets, elapsed_micros),
     }
@@ -863,6 +870,33 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn udp_client_build_client_view_summary_preserves_reverse_loss_reorder_and_duplicate(
+    ) -> Result<()> {
+        let mut client_rx = super::ClientRxStats::default();
+        for seq in [1, 3, 2, 2] {
+            client_rx.on_data_packet(&UdpPerfDataPacket {
+                header: UdpPerfDataHeader {
+                    session_id: 1,
+                    stream_id: 1,
+                    direction: UdpPerfDirection::Reverse,
+                    seq,
+                    send_ts_micros: seq * 1_000,
+                    payload_len: 32,
+                },
+                payload: vec![0x5a; 32],
+            });
+        }
+
+        let merged =
+            super::build_client_view_summary(&empty_summary(UdpPerfMode::Reverse), &client_rx, None);
+        assert_eq!(merged.reverse.total.packets, 4);
+        assert_eq!(merged.reverse.total.loss, 0);
+        assert_eq!(merged.reverse.total.reorder, 1);
+        assert_eq!(merged.reverse.total.duplicate, 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn udp_client_forward_mode_low_pps_still_sends_first_packet() -> Result<()> {
         let (target, _server_addr, server_task) = spawn_server(2_000).await?;
@@ -1004,7 +1038,7 @@ mod tests {
     #[tokio::test]
     async fn udp_client_reverse_tail_drain_handles_high_latency_tail() -> Result<()> {
         let (target, server_task) =
-            spawn_reverse_tail_after_final_report_server_with_delay(Duration::from_millis(250))
+            spawn_reverse_tail_after_final_report_server_with_delay(Duration::from_millis(400))
                 .await?;
         let mut args = test_args(target, UdpPerfMode::Reverse);
         args.time = 0;
@@ -1278,10 +1312,29 @@ mod tests {
                                         mode: UdpPerfMode::Reverse,
                                         total_elapsed_micros: 20_000,
                                         interval_elapsed_micros: 20_000,
-                                        total: UdpPerfCountersSummary::default(),
-                                        interval: UdpPerfCountersSummary::default(),
+                                        total: UdpPerfCountersSummary {
+                                            packets: 1,
+                                            bytes: 32,
+                                            ..UdpPerfCountersSummary::default()
+                                        },
+                                        interval: UdpPerfCountersSummary {
+                                            packets: 1,
+                                            bytes: 32,
+                                            ..UdpPerfCountersSummary::default()
+                                        },
                                         forward: UdpPerfDirectionSummary::default(),
-                                        reverse: UdpPerfDirectionSummary::default(),
+                                        reverse: UdpPerfDirectionSummary {
+                                            total: UdpPerfCountersSummary {
+                                                packets: 1,
+                                                bytes: 32,
+                                                ..UdpPerfCountersSummary::default()
+                                            },
+                                            interval: UdpPerfCountersSummary {
+                                                packets: 1,
+                                                bytes: 32,
+                                                ..UdpPerfCountersSummary::default()
+                                            },
+                                        },
                                     },
                                 })?,
                                 peer,
@@ -1343,10 +1396,29 @@ mod tests {
                                         mode: UdpPerfMode::Reverse,
                                         total_elapsed_micros: 1_000_000,
                                         interval_elapsed_micros: 1_000_000,
-                                        total: UdpPerfCountersSummary::default(),
-                                        interval: UdpPerfCountersSummary::default(),
+                                        total: UdpPerfCountersSummary {
+                                            packets: 1,
+                                            bytes: 32,
+                                            ..UdpPerfCountersSummary::default()
+                                        },
+                                        interval: UdpPerfCountersSummary {
+                                            packets: 1,
+                                            bytes: 32,
+                                            ..UdpPerfCountersSummary::default()
+                                        },
                                         forward: UdpPerfDirectionSummary::default(),
-                                        reverse: UdpPerfDirectionSummary::default(),
+                                        reverse: UdpPerfDirectionSummary {
+                                            total: UdpPerfCountersSummary {
+                                                packets: 1,
+                                                bytes: 32,
+                                                ..UdpPerfCountersSummary::default()
+                                            },
+                                            interval: UdpPerfCountersSummary {
+                                                packets: 1,
+                                                bytes: 32,
+                                                ..UdpPerfCountersSummary::default()
+                                            },
+                                        },
                                     },
                                 })?,
                                 peer,
