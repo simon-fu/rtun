@@ -222,7 +222,6 @@ async fn udp_server_loop(
             _ = shutdown_fut => {
                 break;
             }
-            _ = timer_fut => {}
             recv_res = socket.recv_from(&mut buf) => {
                 let (n, from) = recv_res.with_context(|| "udp recv_from failed")?;
                 if let Err(e) = on_packet(&socket, &mut sessions, default_report_interval, &buf[..n], from).await {
@@ -230,6 +229,7 @@ async fn udp_server_loop(
                     tracing::debug!("udp-server ignore packet error: {e:?}");
                 }
             }
+            _ = timer_fut => {}
         }
 
         // Timer tick: advance due sessions (send first, then report).
@@ -300,6 +300,7 @@ async fn on_packet(
                     if sess.started {
                         sess.stop_requested = true;
                         sess.next_report_at = None;
+                        sess.next_send_at = None;
                         sess.end_at.map_or(true, |end_at| now >= end_at)
                     } else {
                         false
@@ -728,6 +729,49 @@ mod tests {
         let mut buf = vec![0u8; 2048];
         let r = tokio::time::timeout(Duration::from_millis(60), client.recv(&mut buf)).await;
         assert!(r.is_err(), "unexpected extra packet after STOP");
+
+        shutdown_tx.send(()).ok();
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_reverse_stop_halts_send_loop() -> Result<()> {
+        let (server_addr, shutdown_tx, server_task) = spawn_server_for_test(1_000).await?;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        client.connect(server_addr).await?;
+
+        let session_id = 405;
+        client
+            .send(&wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Reverse,
+                payload_len: 16,
+                packets_per_second: 5_000,
+                duration_micros: 200_000,
+                report_interval_micros: 0,
+            }))?)
+            .await?;
+
+        let first = recv_wire(&client, Duration::from_millis(200)).await?;
+        match first {
+            UdpPerfWirePacket::Data(data) => {
+                assert_eq!(data.header.session_id, session_id);
+                assert_eq!(data.header.direction, UdpPerfDirection::Reverse);
+            }
+            other => panic!("expected reverse data before STOP, got {other:?}"),
+        }
+
+        client
+            .send(&wire_control(UdpPerfControlPacket::Stop(UdpPerfStop {
+                session_id,
+            }))?)
+            .await?;
+
+        let mut buf = vec![0u8; 2048];
+        let r = tokio::time::timeout(Duration::from_millis(40), client.recv(&mut buf)).await;
+        assert!(r.is_err(), "unexpected reverse packet after STOP");
 
         shutdown_tx.send(()).ok();
         server_task.abort();
