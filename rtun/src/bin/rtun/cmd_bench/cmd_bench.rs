@@ -78,6 +78,29 @@ mod tests {
     }
 
     #[test]
+    fn bench_cli_parses_socks_subcommand() {
+        let args = CmdArgs::try_parse_from([
+            "bench",
+            "socks",
+            "-s",
+            "127.0.0.1:51080",
+            "-a",
+            "127.0.0.1",
+            "-p",
+            "12345",
+        ])
+        .expect("parse bench socks");
+        match args.cmd {
+            SubCmd::Socks(cmd) => {
+                assert_eq!(cmd.socks, "127.0.0.1:51080");
+                assert_eq!(cmd.target_addr, "127.0.0.1");
+                assert_eq!(cmd.target_port, 12345);
+            }
+            _ => panic!("expected socks"),
+        }
+    }
+
+    #[test]
     fn bench_cli_rewrites_legacy_bench_args_to_socks() {
         let rewritten = rewrite_legacy_bench_argv_for_test(vec![
             "rtun".to_string(),
