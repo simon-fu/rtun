@@ -20,7 +20,9 @@ use super::udp_perf::{
 
 const DEFAULT_PPS: u64 = 1_000;
 const FINAL_REPORT_TIMEOUT: Duration = Duration::from_secs(2);
-const FINAL_REVERSE_TAIL_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+const START_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const MIN_FINAL_REVERSE_TAIL_IDLE_TIMEOUT_MS: u64 = 300;
+const MAX_INITIAL_FORWARD_SEND_DELAY: Duration = Duration::from_millis(10);
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -87,18 +89,15 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
         tokio::time::sleep(Duration::from_secs(args.warmup)).await;
     }
 
-    send_control(
-        &socket,
-        UdpPerfControlPacket::Start(UdpPerfStart {
-            session_id,
-            mode: args.mode,
-            payload_len,
-            packets_per_second: pps,
-            duration_micros,
-            report_interval_micros,
-        }),
-    )
-    .await?;
+    let start = UdpPerfStart {
+        session_id,
+        mode: args.mode,
+        payload_len,
+        packets_per_second: pps,
+        duration_micros,
+        report_interval_micros,
+    };
+    send_control(&socket, UdpPerfControlPacket::Start(start.clone())).await?;
 
     let started_at = Instant::now();
     let stop_at = started_at
@@ -106,6 +105,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
         .context("local stop deadline overflow")?;
     let mut stop_sent = false;
     let mut final_deadline: Option<Instant> = None;
+    let mut next_start_retry_at = next_start_retry_deadline(started_at)?;
     let mut next_send_at = first_send_deadline(started_at, args.mode, pps);
     let mut send_seq: u64 = 0;
     let mut client_rx = ClientRxStats::default();
@@ -124,6 +124,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
             )
             .await?;
             stop_sent = true;
+            next_start_retry_at = None;
             next_send_at = None;
             final_deadline = Some(
                 now.checked_add(FINAL_REPORT_TIMEOUT)
@@ -132,6 +133,12 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
         }
 
         if !stop_sent {
+            if let Some(due) = next_start_retry_at {
+                if due <= now {
+                    send_control(&socket, UdpPerfControlPacket::Start(start.clone())).await?;
+                    next_start_retry_at = next_start_retry_deadline(now)?;
+                }
+            }
             if let Some(due) = next_send_at {
                 if due <= now {
                     send_seq = send_seq.saturating_add(1);
@@ -158,6 +165,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
 
         if let Some(deadline) = next_loop_deadline(
             next_send_at,
+            next_start_retry_at,
             (!stop_sent).then_some(stop_at),
             if final_report.is_some() {
                 final_report_drain_deadline
@@ -170,6 +178,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
             tokio::select! {
                 recv = socket.recv(&mut recv_buf) => {
                     let n = recv.with_context(|| "udp-client recv failed")?;
+                    let had_final_report = final_report.is_some();
                     if let Some(report) = handle_incoming_packet(
                         &recv_buf[..n],
                         &mut output,
@@ -182,6 +191,14 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                             final_report = Some(report);
                         }
                     }
+                    next_start_retry_at = None;
+                    if had_final_report {
+                        refresh_final_report_drain_deadline(
+                            final_report.as_ref(),
+                            &mut final_report_drain_deadline,
+                            Instant::now(),
+                        )?;
+                    }
                 }
                 _ = &mut sleep => {}
             }
@@ -190,6 +207,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                 .recv(&mut recv_buf)
                 .await
                 .with_context(|| "udp-client recv failed")?;
+            let had_final_report = final_report.is_some();
             if let Some(report) = handle_incoming_packet(
                 &recv_buf[..n],
                 &mut output,
@@ -202,6 +220,14 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                         schedule_final_report_drain_deadline(&report, Instant::now())?;
                     final_report = Some(report);
                 }
+            }
+            next_start_retry_at = None;
+            if had_final_report {
+                refresh_final_report_drain_deadline(
+                    final_report.as_ref(),
+                    &mut final_report_drain_deadline,
+                    Instant::now(),
+                )?;
             }
         }
     }
@@ -236,7 +262,7 @@ fn schedule_final_report_drain_deadline(
         UdpPerfMode::Reverse | UdpPerfMode::Bidir
     ) {
         return Ok(Some(
-            now.checked_add(FINAL_REVERSE_TAIL_DRAIN_TIMEOUT)
+            now.checked_add(reverse_tail_idle_timeout())
                 .context("final reverse drain deadline overflow")?,
         ));
     }
@@ -245,10 +271,14 @@ fn schedule_final_report_drain_deadline(
 
 fn next_loop_deadline(
     next_send_at: Option<Instant>,
+    next_start_retry_at: Option<Instant>,
     stop_at: Option<Instant>,
     final_deadline: Option<Instant>,
 ) -> Option<Instant> {
     let mut next = next_send_at;
+    if let Some(t) = next_start_retry_at {
+        next = Some(next.map_or(t, |cur| min(cur, t)));
+    }
     if let Some(t) = stop_at {
         next = Some(next.map_or(t, |cur| min(cur, t)));
     }
@@ -256,6 +286,37 @@ fn next_loop_deadline(
         next = Some(next.map_or(t, |cur| min(cur, t)));
     }
     next
+}
+
+fn next_start_retry_deadline(now: Instant) -> Result<Option<Instant>> {
+    Ok(Some(
+        now.checked_add(START_RETRY_INTERVAL)
+            .context("start retry deadline overflow")?,
+    ))
+}
+
+fn refresh_final_report_drain_deadline(
+    final_report: Option<&UdpPerfReport>,
+    final_report_drain_deadline: &mut Option<Instant>,
+    now: Instant,
+) -> Result<()> {
+    if let Some(report) = final_report {
+        *final_report_drain_deadline = schedule_final_report_drain_deadline(report, now)?;
+    }
+    Ok(())
+}
+
+fn reverse_tail_idle_timeout() -> Duration {
+    let derived_ms = (FINAL_REPORT_TIMEOUT.as_millis() as u64) / 6;
+    Duration::from_millis(derived_ms.max(MIN_FINAL_REVERSE_TAIL_IDLE_TIMEOUT_MS))
+}
+
+fn send_interval(pps: u64) -> Option<Duration> {
+    if pps == 0 {
+        return None;
+    }
+    let interval_micros = (1_000_000 / pps).max(1);
+    Some(Duration::from_micros(interval_micros))
 }
 
 #[cfg(test)]
@@ -332,22 +393,16 @@ fn resolve_pps(args: &CmdArgs) -> Result<u64> {
 }
 
 fn first_send_deadline(started_at: Instant, mode: UdpPerfMode, pps: u64) -> Option<Instant> {
-    if pps == 0 {
-        return None;
-    }
     if matches!(mode, UdpPerfMode::Forward | UdpPerfMode::Bidir) {
-        return Some(started_at);
+        let delay = std::cmp::min(send_interval(pps)?, MAX_INITIAL_FORWARD_SEND_DELAY);
+        return started_at.checked_add(delay);
     } else {
         None
     }
 }
 
 fn next_send_deadline(now: Instant, pps: u64) -> Option<Instant> {
-    if pps == 0 {
-        return None;
-    }
-    let interval_micros = (1_000_000 / pps).max(1);
-    now.checked_add(Duration::from_micros(interval_micros))
+    now.checked_add(send_interval(pps)?)
 }
 
 async fn bind_socket_for_target(target: SocketAddr) -> Result<UdpSocket> {
@@ -589,7 +644,7 @@ pub struct CmdArgs {
 mod tests {
     use std::{net::SocketAddr, num::NonZeroU64, time::Duration};
 
-    use anyhow::{Context, Result};
+    use anyhow::{Context, Result, bail, ensure};
     use serde_json::Value;
     use tokio::net::UdpSocket;
     use tokio::time::Instant;
@@ -792,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_client_forward_and_bidir_first_send_deadline_is_immediate() -> Result<()> {
+    fn udp_client_forward_and_bidir_first_send_deadline_adds_short_start_guard() -> Result<()> {
         let started_at = Instant::now();
         let pps = 100;
         let forward =
@@ -800,8 +855,11 @@ mod tests {
         let bidir =
             super::first_send_deadline(started_at, UdpPerfMode::Bidir, pps).context("bidir")?;
 
-        assert_eq!(forward, started_at);
-        assert_eq!(bidir, started_at);
+        let expected = started_at
+            .checked_add(Duration::from_millis(10))
+            .context("expected deadline overflow")?;
+        assert_eq!(forward, expected);
+        assert_eq!(bidir, expected);
         Ok(())
     }
 
@@ -820,9 +878,26 @@ mod tests {
             .and_then(Value::as_u64)
             .context("missing forward.total.packets")?;
 
-        assert_eq!(forward_packets, 1, "forward low-pps run should send one packet");
+        assert_eq!(
+            forward_packets, 1,
+            "forward low-pps run should send one packet, output={}",
+            out.output.trim()
+        );
 
         server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_client_forward_mode_low_pps_sends_one_data_packet() -> Result<()> {
+        let (target, server_task) = spawn_forward_packet_counting_server().await?;
+        let mut args = test_args(target, UdpPerfMode::Forward);
+        args.pps = Some(1);
+        args.json = true;
+
+        let _out = super::run_for_test(args).await?;
+
+        server_task.await??;
         Ok(())
     }
 
@@ -843,7 +918,11 @@ mod tests {
             .and_then(Value::as_u64)
             .context("missing total.packets")?;
 
-        assert!(total_packets > 0, "ipv6 target run should complete with traffic");
+        assert!(
+            total_packets > 0,
+            "ipv6 target run should complete with traffic, output={}",
+            out.output.trim()
+        );
 
         server_task.abort();
         Ok(())
@@ -877,7 +956,7 @@ mod tests {
         args.len = 32;
         args.json = true;
 
-        let out = tokio::time::timeout(Duration::from_millis(500), super::run_for_test(args))
+        let out = tokio::time::timeout(Duration::from_secs(1), super::run_for_test(args))
             .await
             .context("udp-client should finish in time")??;
 
@@ -892,6 +971,56 @@ mod tests {
                 .and_then(Value::as_u64),
             Some(1),
             "final reverse total should include tail packet received after final report"
+        );
+
+        server_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_client_retries_start_when_first_start_is_lost() -> Result<()> {
+        let (target, server_task) = spawn_drop_first_start_reverse_server().await?;
+        let mut args = test_args(target, UdpPerfMode::Reverse);
+        args.time = 1;
+        args.pps = Some(100);
+        args.json = true;
+
+        let out = tokio::time::timeout(Duration::from_secs(3), super::run_for_test(args))
+            .await
+            .context("udp-client should recover from one lost START")??;
+        let json: Value = serde_json::from_str(out.output.trim())
+            .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
+        let reverse_packets = json
+            .pointer("/reverse/total/packets")
+            .and_then(Value::as_u64)
+            .context("missing reverse.total.packets")?;
+
+        assert!(reverse_packets > 0, "reverse run should complete after START retry");
+
+        server_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_client_reverse_tail_drain_handles_high_latency_tail() -> Result<()> {
+        let (target, server_task) =
+            spawn_reverse_tail_after_final_report_server_with_delay(Duration::from_millis(250))
+                .await?;
+        let mut args = test_args(target, UdpPerfMode::Reverse);
+        args.time = 0;
+        args.len = 32;
+        args.json = true;
+
+        let out = tokio::time::timeout(Duration::from_secs(3), super::run_for_test(args))
+            .await
+            .context("udp-client should finish in time")??;
+        let json: Value = serde_json::from_str(out.output.trim())
+            .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
+        assert_eq!(
+            json.pointer("/reverse/total/packets")
+                .and_then(Value::as_u64),
+            Some(1),
+            "final reverse total should include delayed tail packet after final report"
         );
 
         server_task.await??;
@@ -1045,8 +1174,28 @@ mod tests {
             })
             .await
         });
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        wait_for_udp_server_ready(server_addr).await?;
         Ok((target, server_addr, task))
+    }
+
+    async fn wait_for_udp_server_ready(listen_addr: SocketAddr) -> Result<()> {
+        for _ in 0..50 {
+            match std::net::UdpSocket::bind(listen_addr) {
+                Ok(sock) => {
+                    drop(sock);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+                    return Ok(());
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("probe udp bench server readiness at [{listen_addr}] failed")
+                    });
+                }
+            }
+        }
+        bail!("udp bench server did not bind to [{listen_addr}] in time")
     }
 
     fn reserve_udp_addr() -> Result<SocketAddr> {
@@ -1092,6 +1241,12 @@ mod tests {
 
     async fn spawn_reverse_tail_after_final_report_server(
     ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
+        spawn_reverse_tail_after_final_report_server_with_delay(Duration::from_millis(20)).await
+    }
+
+    async fn spawn_reverse_tail_after_final_report_server_with_delay(
+        tail_delay: Duration,
+    ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
         let addr = socket.local_addr()?;
         let task = tokio::spawn(async move {
@@ -1132,9 +1287,150 @@ mod tests {
                                 peer,
                             )
                             .await?;
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        tokio::time::sleep(tail_delay).await;
                         socket
                             .send_to(&wire_reverse_data(sid, 1, 32)?, peer)
+                            .await?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        Ok((addr.to_string(), task))
+    }
+
+    async fn spawn_drop_first_start_reverse_server(
+    ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = socket.local_addr()?;
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut client = None;
+            let mut session_id = None;
+            let mut start_seen = 0u64;
+
+            loop {
+                let (n, from) = socket.recv_from(&mut buf).await?;
+                match UdpPerfWirePacket::decode(&buf[..n])? {
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Hello(hello)) => {
+                        client = Some(from);
+                        session_id = Some(hello.session_id);
+                    }
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Start(start)) => {
+                        client = Some(from);
+                        session_id = Some(start.session_id);
+                        start_seen += 1;
+                        if start_seen == 1 {
+                            continue;
+                        }
+
+                        socket
+                            .send_to(&wire_reverse_data(start.session_id, 1, 32)?, from)
+                            .await?;
+                    }
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Stop(stop)) => {
+                        ensure!(start_seen >= 2, "client did not retry START before STOP");
+                        let sid = session_id.unwrap_or(stop.session_id);
+                        let peer = client.unwrap_or(from);
+                        socket
+                            .send_to(
+                                &wire_report(UdpPerfReport {
+                                    report_seq: 1,
+                                    is_final: true,
+                                    summary: UdpPerfSummary {
+                                        session_id: sid,
+                                        mode: UdpPerfMode::Reverse,
+                                        total_elapsed_micros: 1_000_000,
+                                        interval_elapsed_micros: 1_000_000,
+                                        total: UdpPerfCountersSummary::default(),
+                                        interval: UdpPerfCountersSummary::default(),
+                                        forward: UdpPerfDirectionSummary::default(),
+                                        reverse: UdpPerfDirectionSummary::default(),
+                                    },
+                                })?,
+                                peer,
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        Ok((addr.to_string(), task))
+    }
+
+    async fn spawn_forward_packet_counting_server(
+    ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = socket.local_addr()?;
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut client = None;
+            let mut session_id = None;
+            let mut forward_packets = 0u64;
+
+            loop {
+                let (n, from) = socket.recv_from(&mut buf).await?;
+                match UdpPerfWirePacket::decode(&buf[..n])? {
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Hello(hello)) => {
+                        client = Some(from);
+                        session_id = Some(hello.session_id);
+                    }
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Start(start)) => {
+                        client = Some(from);
+                        session_id = Some(start.session_id);
+                    }
+                    UdpPerfWirePacket::Data(data) => {
+                        if matches!(data.header.direction, UdpPerfDirection::Forward) {
+                            forward_packets += 1;
+                        }
+                    }
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Stop(stop)) => {
+                        ensure!(
+                            forward_packets == 1,
+                            "expected exactly one forward packet, got {forward_packets}"
+                        );
+                        let sid = session_id.unwrap_or(stop.session_id);
+                        let peer = client.unwrap_or(from);
+                        socket
+                            .send_to(
+                                &wire_report(UdpPerfReport {
+                                    report_seq: 1,
+                                    is_final: true,
+                                    summary: UdpPerfSummary {
+                                        session_id: sid,
+                                        mode: UdpPerfMode::Forward,
+                                        total_elapsed_micros: 1_000_000,
+                                        interval_elapsed_micros: 1_000_000,
+                                        total: UdpPerfCountersSummary {
+                                            packets: forward_packets,
+                                            bytes: forward_packets.saturating_mul(96),
+                                            ..UdpPerfCountersSummary::default()
+                                        },
+                                        interval: UdpPerfCountersSummary {
+                                            packets: forward_packets,
+                                            bytes: forward_packets.saturating_mul(96),
+                                            ..UdpPerfCountersSummary::default()
+                                        },
+                                        forward: UdpPerfDirectionSummary {
+                                            total: UdpPerfCountersSummary {
+                                                packets: forward_packets,
+                                                bytes: forward_packets.saturating_mul(96),
+                                                ..UdpPerfCountersSummary::default()
+                                            },
+                                            interval: UdpPerfCountersSummary {
+                                                packets: forward_packets,
+                                                bytes: forward_packets.saturating_mul(96),
+                                                ..UdpPerfCountersSummary::default()
+                                            },
+                                        },
+                                        reverse: UdpPerfDirectionSummary::default(),
+                                    },
+                                })?,
+                                peer,
+                            )
                             .await?;
                         return Ok(());
                     }
