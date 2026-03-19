@@ -136,28 +136,8 @@ fn rewrite_legacy_bench_argv(mut argv: Vec<String>) -> Vec<String> {
         return argv;
     }
 
-    let after = &argv[idx + 1..];
-    let first = after[0].as_str();
-    if !first.starts_with('-') || matches!(first, "-h" | "--help") {
-        return argv;
-    }
-
-    let has_legacy_flag = after.iter().any(|arg| {
-        matches!(
-            arg.as_str(),
-            "-s" | "--socks"
-                | "-a"
-                | "--addr"
-                | "-p"
-                | "--port"
-                | "-b"
-                | "--buffer"
-                | "--seconds"
-                | "-l"
-                | "--listen"
-        )
-    });
-    if has_legacy_flag {
+    let first = argv[idx + 1].as_str();
+    if matches!(first, "-s" | "--socks") {
         argv.insert(idx + 1, "socks".to_string());
     }
     argv
@@ -497,6 +477,28 @@ args = ["--config", "/tmp/other.toml"]
                 "-p",
                 "12345",
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_argv_does_not_rewrite_bench_listen_flag_to_socks() -> Result<()> {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _restore = EnvRestore::new(CONFIG_ENV_VAR);
+        unsafe {
+            std::env::remove_var(CONFIG_ENV_VAR);
+        }
+
+        let raw = vec![
+            "rtun".to_string(),
+            "bench".to_string(),
+            "--listen".to_string(),
+            "0.0.0.0:9001".to_string(),
+        ];
+        let prepared = prepare_argv(raw)?;
+        assert_eq!(
+            prepared.argv,
+            vec!["rtun", "bench", "--listen", "0.0.0.0:9001",]
         );
         Ok(())
     }
