@@ -766,6 +766,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_perf_loopback_forward_end_to_end() -> Result<()> {
+        let (target, _server_addr, server_task) = spawn_server(100).await?;
+        let mut args = test_args(target, UdpPerfMode::Forward);
+        args.json = true;
+
+        let out = super::run_for_test(args).await?;
+        let json: Value = serde_json::from_str(out.output.trim())
+            .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
+        let total_packets = json
+            .pointer("/total/packets")
+            .and_then(Value::as_u64)
+            .context("missing total.packets")?;
+        let forward_packets = json
+            .pointer("/forward/total/packets")
+            .and_then(Value::as_u64)
+            .context("missing forward.total.packets")?;
+
+        assert!(total_packets > 0, "forward loopback total packets should be > 0");
+        assert!(
+            forward_packets > 0,
+            "forward loopback forward packets should be > 0"
+        );
+
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_perf_loopback_reverse_end_to_end() -> Result<()> {
+        let (target, _server_addr, server_task) = spawn_server(100).await?;
+        let mut args = test_args(target, UdpPerfMode::Reverse);
+        args.json = true;
+
+        let out = super::run_for_test(args).await?;
+        let json: Value = serde_json::from_str(out.output.trim())
+            .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
+        let total_packets = json
+            .pointer("/total/packets")
+            .and_then(Value::as_u64)
+            .context("missing total.packets")?;
+        let reverse_packets = json
+            .pointer("/reverse/total/packets")
+            .and_then(Value::as_u64)
+            .context("missing reverse.total.packets")?;
+
+        assert!(total_packets > 0, "reverse loopback total packets should be > 0");
+        assert!(
+            reverse_packets > 0,
+            "reverse loopback reverse packets should be > 0"
+        );
+
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_perf_loopback_bidir_end_to_end() -> Result<()> {
+        let (target, _server_addr, server_task) = spawn_server(100).await?;
+        let mut args = test_args(target, UdpPerfMode::Bidir);
+        args.json = true;
+
+        let out = super::run_for_test(args).await?;
+        let json: Value = serde_json::from_str(out.output.trim())
+            .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
+        let total_packets = json
+            .pointer("/total/packets")
+            .and_then(Value::as_u64)
+            .context("missing total.packets")?;
+        let forward_packets = json
+            .pointer("/forward/total/packets")
+            .and_then(Value::as_u64)
+            .context("missing forward.total.packets")?;
+        let reverse_packets = json
+            .pointer("/reverse/total/packets")
+            .and_then(Value::as_u64)
+            .context("missing reverse.total.packets")?;
+
+        assert!(total_packets > 0, "bidir loopback total packets should be > 0");
+        assert!(
+            forward_packets > 0,
+            "bidir loopback forward packets should be > 0"
+        );
+        assert!(
+            reverse_packets > 0,
+            "bidir loopback reverse packets should be > 0"
+        );
+
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn udp_client_rejects_unsafe_udp_payload_length() {
         let mut args = test_args("127.0.0.1:9".to_string(), UdpPerfMode::Forward);
         args.len = super::MAX_UDP_SAFE_PAYLOAD_LEN + 1;
