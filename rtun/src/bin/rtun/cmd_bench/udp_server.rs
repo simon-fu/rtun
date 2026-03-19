@@ -1,10 +1,11 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
+    num::NonZeroU64,
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use tokio::net::UdpSocket;
 use tracing::info;
@@ -24,11 +25,12 @@ pub async fn run(args: CmdArgs) -> Result<()> {
     let local_addr = socket.local_addr().with_context(|| "get local_addr failed")?;
     info!(
         "udp bench server listen [{}], report interval [{}ms]",
-        local_addr, args.interval
+        local_addr,
+        args.interval.get()
     );
 
     // For CLI, run forever. Tests provide shutdown channel.
-    udp_server_loop(socket, Duration::from_millis(args.interval), None).await
+    udp_server_loop(socket, Duration::from_millis(args.interval.get()), None).await
 }
 
 #[derive(Parser, Debug)]
@@ -37,18 +39,19 @@ pub struct CmdArgs {
     #[clap(long = "listen", default_value = "0.0.0.0:9001")]
     pub listen: String,
 
-    #[clap(long = "interval", default_value_t = 1000)]
-    pub interval: u64,
+    #[clap(long = "interval", default_value = "1000")]
+    pub interval: NonZeroU64,
 }
 
 #[derive(Debug)]
 struct Session {
     peer: SocketAddr,
     mode: UdpPerfMode,
+    started: bool,
     started_at: tokio::time::Instant,
     last_report_at: tokio::time::Instant,
     report_interval: Duration,
-    next_report_at: tokio::time::Instant,
+    next_report_at: Option<tokio::time::Instant>,
     report_seq: u64,
     stats: UdpPerfStats,
 
@@ -61,15 +64,17 @@ struct Session {
 }
 
 impl Session {
-    fn new(peer: SocketAddr, mode: UdpPerfMode, default_report_interval: Duration) -> Self {
+    fn new_hello(peer: SocketAddr, mode: UdpPerfMode, default_report_interval: Duration) -> Result<Self> {
+        ensure_nonzero_interval(default_report_interval)?;
         let now = tokio::time::Instant::now();
-        Self {
+        Ok(Self {
             peer,
             mode,
+            started: false,
             started_at: now,
             last_report_at: now,
             report_interval: default_report_interval,
-            next_report_at: now + default_report_interval,
+            next_report_at: None,
             report_seq: 0,
             stats: UdpPerfStats::default(),
             send_payload_len: 0,
@@ -77,44 +82,72 @@ impl Session {
             send_seq: 0,
             send_end_at: None,
             next_send_at: None,
-        }
+        })
     }
 
-    fn apply_start(&mut self, peer: SocketAddr, start: &UdpPerfStart, default_interval: Duration) {
-        self.peer = peer;
-        self.mode = start.mode;
-        if start.report_interval_micros != 0 {
-            self.report_interval = Duration::from_micros(start.report_interval_micros);
+    fn new_start(peer: SocketAddr, start: &UdpPerfStart, default_interval: Duration) -> Result<Self> {
+        ensure_nonzero_interval(default_interval)?;
+        let now = tokio::time::Instant::now();
+
+        let report_interval = if start.report_interval_micros != 0 {
+            let d = Duration::from_micros(start.report_interval_micros);
+            ensure_nonzero_interval(d)
+                .with_context(|| "invalid START.report_interval_micros")?;
+            d
         } else {
-            self.report_interval = default_interval;
+            default_interval
+        };
+
+        let next_report_at = checked_add(now, report_interval)
+            .with_context(|| "report deadline overflow")?;
+
+        let mut sess = Self {
+            peer,
+            mode: start.mode,
+            started: true,
+            started_at: now,
+            last_report_at: now,
+            report_interval,
+            next_report_at: Some(next_report_at),
+            report_seq: 0,
+            stats: UdpPerfStats::default(),
+            send_payload_len: start.payload_len as usize,
+            send_pps: start.packets_per_second,
+            send_seq: 0,
+            send_end_at: None,
+            next_send_at: None,
+        };
+
+        sess.apply_send_cfg(now, start)?;
+        Ok(sess)
+    }
+
+    fn apply_send_cfg(&mut self, now: tokio::time::Instant, start: &UdpPerfStart) -> Result<()> {
+        // If pps/duration are zero, do not send reverse data (and do not "send one immediately").
+        if start.packets_per_second == 0 || start.duration_micros == 0 {
+            self.send_end_at = None;
+            self.next_send_at = None;
+            return Ok(());
         }
 
-        let now = tokio::time::Instant::now();
-        // Keep accumulated stats; only (re)start time on START.
-        self.started_at = now;
-        self.last_report_at = now;
-        self.next_report_at = now + self.report_interval;
-        self.report_seq = 0;
-        self.stats.reset_interval();
-
-        self.send_payload_len = start.payload_len as usize;
-        self.send_pps = start.packets_per_second;
-        self.send_seq = 0;
-        self.send_end_at = Some(now + Duration::from_micros(start.duration_micros));
-
+        let end = checked_add(now, Duration::from_micros(start.duration_micros))
+            .with_context(|| "duration deadline overflow")?;
+        self.send_end_at = Some(end);
         match start.mode {
             UdpPerfMode::Forward => self.next_send_at = None,
-            UdpPerfMode::Reverse | UdpPerfMode::Bidir => {
-                // Send immediately.
-                self.next_send_at = Some(now);
-            }
+            UdpPerfMode::Reverse | UdpPerfMode::Bidir => self.next_send_at = Some(now),
         }
+        Ok(())
     }
 
     fn next_deadline(&self) -> Option<tokio::time::Instant> {
-        match self.next_send_at {
-            None => Some(self.next_report_at),
-            Some(s) => Some(std::cmp::min(self.next_report_at, s)),
+        let r = self.next_report_at;
+        let s = self.next_send_at;
+        match (r, s) {
+            (None, None) => None,
+            (Some(r), None) => Some(r),
+            (None, Some(s)) => Some(s),
+            (Some(r), Some(s)) => Some(std::cmp::min(r, s)),
         }
     }
 
@@ -126,7 +159,10 @@ impl Session {
     }
 
     fn should_report_now(&self, now: tokio::time::Instant) -> bool {
-        self.next_report_at <= now
+        match self.next_report_at {
+            Some(t) => t <= now,
+            None => false,
+        }
     }
 }
 
@@ -135,6 +171,7 @@ async fn udp_server_loop(
     default_report_interval: Duration,
     mut shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<()> {
+    ensure_nonzero_interval(default_report_interval)?;
     let mut sessions: HashMap<u64, Session> = HashMap::new();
     let mut buf = vec![0u8; 64 * 1024];
 
@@ -197,18 +234,26 @@ async fn on_packet(
             UdpPerfControlPacket::Hello(hello) => {
                 let sess = sessions
                     .entry(hello.session_id)
-                    .or_insert_with(|| Session::new(from, hello.mode, default_report_interval));
-                sess.peer = from;
-                sess.mode = hello.mode;
+                    .or_insert(Session::new_hello(from, hello.mode, default_report_interval)?);
+                // Only allow HELLO to (re)bind peer before START.
+                if !sess.started {
+                    sess.peer = from;
+                    sess.mode = hello.mode;
+                }
             }
             UdpPerfControlPacket::Start(start) => {
-                let sess = sessions
-                    .entry(start.session_id)
-                    .or_insert_with(|| Session::new(from, start.mode, default_report_interval));
-                sess.apply_start(from, &start, default_report_interval);
-                // For reverse/bidir, send one packet immediately so client sees DATA before any REPORT.
-                if matches!(start.mode, UdpPerfMode::Reverse | UdpPerfMode::Bidir) {
-                    send_one(socket, start.session_id, sess, tokio::time::Instant::now()).await?;
+                // START begins a new measurement round: replace session (reset total+interval).
+                let new_sess = Session::new_start(from, &start, default_report_interval)?;
+                sessions.insert(start.session_id, new_sess);
+
+                // For reverse/bidir with valid send cfg, send one packet immediately so client sees DATA.
+                if let Some(sess) = sessions.get_mut(&start.session_id) {
+                    if matches!(start.mode, UdpPerfMode::Reverse | UdpPerfMode::Bidir)
+                        && sess.next_send_at.is_some()
+                    {
+                        send_one(socket, start.session_id, sess, tokio::time::Instant::now())
+                            .await?;
+                    }
                 }
             }
             UdpPerfControlPacket::Stop(stop) => {
@@ -222,7 +267,10 @@ async fn on_packet(
         },
         UdpPerfWirePacket::Data(data) => {
             if let Some(sess) = sessions.get_mut(&data.header.session_id) {
-                sess.peer = from;
+                // Do not allow other peers to hijack session_id by sending DATA.
+                if !sess.started || from != sess.peer {
+                    return Ok(());
+                }
                 sess.stats.record_data_packet(&data);
             }
         }
@@ -308,10 +356,13 @@ async fn send_one(
     sess.stats.record_data_packet(&pkt);
 
     // Next send time.
-    let pps = sess.send_pps.max(1);
-    let interval_micros = 1_000_000u64 / pps;
+    if sess.send_pps == 0 {
+        sess.next_send_at = None;
+        return Ok(());
+    }
+    let interval_micros = 1_000_000u64 / sess.send_pps;
     let interval = Duration::from_micros(interval_micros.max(1));
-    sess.next_send_at = Some(now + interval);
+    sess.next_send_at = checked_add(now, interval);
     Ok(())
 }
 
@@ -322,6 +373,11 @@ async fn send_report(
     now: tokio::time::Instant,
     is_final: bool,
 ) -> Result<()> {
+    if sess.report_interval.is_zero() {
+        // Defensive: never schedule a zero-interval report storm.
+        sess.next_report_at = None;
+        return Err(anyhow!("report interval is zero"));
+    }
     sess.report_seq = sess.report_seq.saturating_add(1);
     let total_elapsed = now.duration_since(sess.started_at);
     let interval_elapsed = now.duration_since(sess.last_report_at);
@@ -344,7 +400,7 @@ async fn send_report(
         .with_context(|| format!("udp send_to failed to [{}]", sess.peer))?;
 
     sess.last_report_at = now;
-    sess.next_report_at = now + sess.report_interval;
+    sess.next_report_at = checked_add(now, sess.report_interval);
     sess.stats.reset_interval();
     Ok(())
 }
@@ -365,17 +421,51 @@ fn dur_to_micros(d: Duration) -> u64 {
         .saturating_add(d.subsec_micros() as u64)
 }
 
+fn ensure_nonzero_interval(d: Duration) -> Result<()> {
+    if d.is_zero() {
+        bail!("report interval must be non-zero");
+    }
+    Ok(())
+}
+
+fn checked_add(
+    base: tokio::time::Instant,
+    delta: Duration,
+) -> Option<tokio::time::Instant> {
+    base.checked_add(delta)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{net::SocketAddr, time::Duration};
 
     use anyhow::Result;
+    use clap::Parser;
     use tokio::{net::UdpSocket, sync::oneshot};
 
     use super::super::udp_perf::{
         UdpPerfControlPacket, UdpPerfDataHeader, UdpPerfDataPacket, UdpPerfDirection,
         UdpPerfMode, UdpPerfStart, UdpPerfStop, UdpPerfWirePacket,
     };
+
+    #[test]
+    fn udp_server_cli_rejects_zero_interval() {
+        let err = super::CmdArgs::try_parse_from(["udp-server", "--interval", "0"])
+            .expect_err("interval=0 should be rejected");
+        let s = err.to_string();
+        assert!(s.contains("interval"), "unexpected clap error: {s}");
+    }
+
+    #[tokio::test]
+    async fn udp_server_loop_rejects_zero_default_interval() -> Result<()> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let (_tx, rx) = oneshot::channel();
+        let err = super::udp_server_loop(socket, Duration::from_millis(0), Some(rx))
+            .await
+            .expect_err("zero interval should error");
+        assert!(err.to_string().contains("interval"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn udp_server_forward_mode_receives_packets() -> Result<()> {
@@ -533,6 +623,234 @@ mod tests {
         let mut buf = vec![0u8; 2048];
         let r = tokio::time::timeout(Duration::from_millis(60), client.recv(&mut buf)).await;
         assert!(r.is_err(), "unexpected extra packet after STOP");
+
+        shutdown_tx.send(()).ok();
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_hello_does_not_emit_report_before_start() -> Result<()> {
+        let (server_addr, shutdown_tx, server_task) = spawn_server_for_test(5).await?;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        client.connect(server_addr).await?;
+
+        let session_id = 505;
+        client
+            .send(&wire_control(UdpPerfControlPacket::Hello(
+                super::super::udp_perf::UdpPerfHello {
+                    session_id,
+                    mode: UdpPerfMode::Forward,
+                },
+            ))?)
+            .await?;
+
+        // No START yet: should not receive any report.
+        let mut buf = vec![0u8; 2048];
+        let r = tokio::time::timeout(Duration::from_millis(40), client.recv(&mut buf)).await;
+        assert!(r.is_err(), "unexpected packet before START");
+
+        shutdown_tx.send(()).ok();
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_reverse_mode_pps_zero_does_not_send_data() -> Result<()> {
+        let (server_addr, shutdown_tx, server_task) = spawn_server_for_test(10).await?;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        client.connect(server_addr).await?;
+
+        let session_id = 606;
+        client
+            .send(&wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Reverse,
+                payload_len: 32,
+                packets_per_second: 0,
+                duration_micros: 200_000,
+                report_interval_micros: 10_000,
+            }))?)
+            .await?;
+
+        let pkt = recv_wire(&client, Duration::from_millis(80)).await?;
+        match pkt {
+            UdpPerfWirePacket::Control(UdpPerfControlPacket::Report(_)) => {}
+            other => panic!("expected report (no data), got {other:?}"),
+        }
+
+        shutdown_tx.send(()).ok();
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_reverse_mode_duration_zero_does_not_send_data() -> Result<()> {
+        let (server_addr, shutdown_tx, server_task) = spawn_server_for_test(10).await?;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        client.connect(server_addr).await?;
+
+        let session_id = 607;
+        client
+            .send(&wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Reverse,
+                payload_len: 32,
+                packets_per_second: 5_000,
+                duration_micros: 0,
+                report_interval_micros: 10_000,
+            }))?)
+            .await?;
+
+        let pkt = recv_wire(&client, Duration::from_millis(80)).await?;
+        match pkt {
+            UdpPerfWirePacket::Control(UdpPerfControlPacket::Report(_)) => {}
+            other => panic!("expected report (no data), got {other:?}"),
+        }
+
+        shutdown_tx.send(()).ok();
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_repeated_start_resets_total_stats() -> Result<()> {
+        let (server_addr, shutdown_tx, server_task) = spawn_server_for_test(10).await?;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        client.connect(server_addr).await?;
+
+        let session_id = 707;
+        client
+            .send(&wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Forward,
+                payload_len: 16,
+                packets_per_second: 1_000,
+                duration_micros: 200_000,
+                report_interval_micros: 10_000,
+            }))?)
+            .await?;
+
+        for seq in 1..=3 {
+            client
+                .send(&wire_data(session_id, UdpPerfDirection::Forward, seq, 16)?)
+                .await?;
+        }
+
+        let r1 = recv_report(&client, Duration::from_millis(200)).await?;
+        assert!(r1.summary.total.packets >= 3);
+
+        // Restart measurement: total should reset.
+        client
+            .send(&wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Forward,
+                payload_len: 16,
+                packets_per_second: 1_000,
+                duration_micros: 200_000,
+                report_interval_micros: 10_000,
+            }))?)
+            .await?;
+
+        client
+            .send(&wire_data(session_id, UdpPerfDirection::Forward, 1, 16)?)
+            .await?;
+
+        let r2 = recv_report(&client, Duration::from_millis(200)).await?;
+        assert_eq!(r2.summary.total.packets, 1);
+
+        shutdown_tx.send(()).ok();
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_ignores_overflowing_start_and_keeps_running() -> Result<()> {
+        let (server_addr, shutdown_tx, server_task) = spawn_server_for_test(10).await?;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        client.connect(server_addr).await?;
+
+        let session_id = 808;
+        // This should be rejected (deadline overflow) and produce no packet.
+        client
+            .send(&wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Forward,
+                payload_len: 16,
+                packets_per_second: 1,
+                duration_micros: u64::MAX,
+                report_interval_micros: u64::MAX,
+            }))?)
+            .await?;
+
+        let mut buf = vec![0u8; 2048];
+        let r = tokio::time::timeout(Duration::from_millis(40), client.recv(&mut buf)).await;
+        assert!(r.is_err(), "unexpected packet from invalid START");
+
+        // Then a valid START should work.
+        client
+            .send(&wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Forward,
+                payload_len: 16,
+                packets_per_second: 1_000,
+                duration_micros: 200_000,
+                report_interval_micros: 10_000,
+            }))?)
+            .await?;
+        client
+            .send(&wire_data(session_id, UdpPerfDirection::Forward, 1, 16)?)
+            .await?;
+        let report = recv_report(&client, Duration::from_millis(200)).await?;
+        assert_eq!(report.summary.session_id, session_id);
+
+        shutdown_tx.send(()).ok();
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_data_from_other_peer_does_not_hijack_session_peer() -> Result<()> {
+        let (server_addr, shutdown_tx, server_task) = spawn_server_for_test(10).await?;
+
+        let client1 = UdpSocket::bind("127.0.0.1:0").await?;
+        client1.connect(server_addr).await?;
+
+        let client2 = UdpSocket::bind("127.0.0.1:0").await?;
+
+        let session_id = 909;
+        client1
+            .send(&wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Forward,
+                payload_len: 16,
+                packets_per_second: 1_000,
+                duration_micros: 200_000,
+                report_interval_micros: 10_000,
+            }))?)
+            .await?;
+
+        client1
+            .send(&wire_data(session_id, UdpPerfDirection::Forward, 1, 16)?)
+            .await?;
+
+        // Spoof data from client2 using same session_id.
+        client2
+            .send_to(&wire_data(session_id, UdpPerfDirection::Forward, 2, 16)?, server_addr)
+            .await?;
+
+        // Report should still go to client1, not client2.
+        let report1 = recv_report(&client1, Duration::from_millis(200)).await?;
+        assert_eq!(report1.summary.session_id, session_id);
+
+        let mut buf = vec![0u8; 2048];
+        let r = tokio::time::timeout(Duration::from_millis(40), client2.recv_from(&mut buf)).await;
+        assert!(r.is_err(), "unexpected packet delivered to hijacker");
 
         shutdown_tx.send(()).ok();
         server_task.abort();
