@@ -41,8 +41,15 @@ async fn run_inner(args: CmdArgs) -> Result<ClientRunOutput> {
         .parse()
         .with_context(|| format!("invalid --target value [{}], expected ip:port", args.target))?;
     let pps = resolve_pps(&args)?;
-    let duration_micros = args.time.saturating_mul(1_000_000);
-    let report_interval_micros = args.interval.get().saturating_mul(1_000);
+    let duration_micros = args
+        .time
+        .checked_mul(1_000_000)
+        .context("--time is too large")?;
+    let report_interval_micros = args
+        .interval
+        .get()
+        .checked_mul(1_000)
+        .context("--interval is too large")?;
     let duration = Duration::from_micros(duration_micros);
 
     let socket = UdpSocket::bind("0.0.0.0:0")
@@ -54,10 +61,12 @@ async fn run_inner(args: CmdArgs) -> Result<ClientRunOutput> {
         .with_context(|| format!("udp-client connect to [{target}] failed"))?;
 
     let session_id = next_session_id();
-    info!(
-        "udp bench client start: target [{}], mode [{}], time [{}s], len [{}], pps [{}]",
-        target, args.mode, args.time, args.len, pps
-    );
+    if !args.json {
+        info!(
+            "udp bench client start: target [{}], mode [{}], time [{}s], len [{}], pps [{}]",
+            target, args.mode, args.time, args.len, pps
+        );
+    }
     send_control(
         &socket,
         UdpPerfControlPacket::Hello(UdpPerfHello {
@@ -85,11 +94,14 @@ async fn run_inner(args: CmdArgs) -> Result<ClientRunOutput> {
     .await?;
 
     let started_at = Instant::now();
-    let stop_at = started_at + duration;
+    let stop_at = started_at
+        .checked_add(duration)
+        .context("local stop deadline overflow")?;
     let mut stop_sent = false;
     let mut final_deadline: Option<Instant> = None;
     let mut next_send_at = first_send_deadline(started_at, args.mode, pps);
     let mut send_seq: u64 = 0;
+    let mut client_rx = ClientRxStats::default();
     let mut final_report: Option<UdpPerfReport> = None;
     let mut recv_buf = vec![0u8; 64 * 1024];
     let mut output = String::new();
@@ -116,7 +128,10 @@ async fn run_inner(args: CmdArgs) -> Result<ClientRunOutput> {
             .await?;
             stop_sent = true;
             next_send_at = None;
-            final_deadline = now.checked_add(FINAL_REPORT_TIMEOUT);
+            final_deadline = Some(
+                now.checked_add(FINAL_REPORT_TIMEOUT)
+                    .context("final report deadline overflow")?,
+            );
         }
 
         if let Some(deadline) = final_deadline {
@@ -126,9 +141,11 @@ async fn run_inner(args: CmdArgs) -> Result<ClientRunOutput> {
         }
 
         if let Some(report) = final_report.take() {
-            output.push_str(&render_final_summary(&report.summary, args.json)?);
+            let final_summary = build_client_view_summary(&report.summary, &client_rx);
+            output.push_str(&render_final_summary(&final_summary, args.json)?);
             return Ok(ClientRunOutput {
                 final_report: report,
+                client_rx,
                 output,
             });
         }
@@ -142,7 +159,7 @@ async fn run_inner(args: CmdArgs) -> Result<ClientRunOutput> {
         match tokio::time::timeout(wait, socket.recv(&mut recv_buf)).await {
             Ok(Ok(n)) => {
                 if let Some(report) =
-                    handle_incoming_packet(&recv_buf[..n], &mut output, !args.json)?
+                    handle_incoming_packet(&recv_buf[..n], &mut output, !args.json, &mut client_rx)?
                 {
                     if report.is_final {
                         final_report = Some(report);
@@ -165,7 +182,23 @@ async fn run_for_test(args: CmdArgs) -> Result<ClientRunOutput> {
 #[derive(Debug)]
 struct ClientRunOutput {
     final_report: UdpPerfReport,
+    client_rx: ClientRxStats,
     output: String,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ClientRxStats {
+    reverse_packets: u64,
+    reverse_bytes: u64,
+}
+
+impl ClientRxStats {
+    fn on_data_packet(&mut self, data: &UdpPerfDataPacket) {
+        if matches!(data.header.direction, UdpPerfDirection::Reverse) {
+            self.reverse_packets = self.reverse_packets.saturating_add(1);
+            self.reverse_bytes = self.reverse_bytes.saturating_add(data.payload.len() as u64);
+        }
+    }
 }
 
 fn resolve_pps(args: &CmdArgs) -> Result<u64> {
@@ -243,6 +276,7 @@ fn handle_incoming_packet(
     bytes: &[u8],
     output: &mut String,
     emit_interval: bool,
+    client_rx: &mut ClientRxStats,
 ) -> Result<Option<UdpPerfReport>> {
     let wire = UdpPerfWirePacket::decode(bytes)?;
     match wire {
@@ -252,7 +286,11 @@ fn handle_incoming_packet(
             }
             Ok(Some(report))
         }
-        UdpPerfWirePacket::Control(_) | UdpPerfWirePacket::Data(_) => Ok(None),
+        UdpPerfWirePacket::Data(data) => {
+            client_rx.on_data_packet(&data);
+            Ok(None)
+        }
+        UdpPerfWirePacket::Control(_) => Ok(None),
     }
 }
 
@@ -277,6 +315,65 @@ fn render_final_summary(summary: &UdpPerfSummary, as_json: bool) -> Result<Strin
         summary.forward.total.packets,
         summary.reverse.total.packets
     ))
+}
+
+fn build_client_view_summary(server: &UdpPerfSummary, client_rx: &ClientRxStats) -> UdpPerfSummary {
+    let mut merged = server.clone();
+    if matches!(server.mode, UdpPerfMode::Reverse | UdpPerfMode::Bidir) {
+        let reverse_total = counters_from_local(
+            client_rx.reverse_bytes,
+            client_rx.reverse_packets,
+            server.total_elapsed_micros,
+        );
+        let reverse_interval = counters_from_local(
+            client_rx.reverse_bytes,
+            client_rx.reverse_packets,
+            server.interval_elapsed_micros,
+        );
+        merged.reverse.total = reverse_total.clone();
+        merged.reverse.interval = reverse_interval;
+        merged.total.bytes = server
+            .forward
+            .total
+            .bytes
+            .saturating_add(reverse_total.bytes);
+        merged.total.packets = server
+            .forward
+            .total
+            .packets
+            .saturating_add(reverse_total.packets);
+    }
+    merged
+}
+
+fn counters_from_local(
+    bytes: u64,
+    packets: u64,
+    elapsed_micros: u64,
+) -> super::udp_perf::UdpPerfCountersSummary {
+    super::udp_perf::UdpPerfCountersSummary {
+        bytes,
+        packets,
+        loss: 0,
+        reorder: 0,
+        duplicate: 0,
+        mbps: bytes_to_mbps_local(bytes, elapsed_micros),
+        pps: packets_to_pps_local(packets, elapsed_micros),
+    }
+}
+
+fn bytes_to_mbps_local(bytes: u64, elapsed_micros: u64) -> f64 {
+    if elapsed_micros == 0 {
+        return 0.0;
+    }
+    (bytes as f64 * 8.0) / elapsed_micros as f64
+}
+
+fn packets_to_pps_local(packets: u64, elapsed_micros: u64) -> f64 {
+    if elapsed_micros == 0 {
+        return 0.0;
+    }
+    (packets as f64 * 1_000_000.0) / elapsed_micros as f64
 }
 
 fn compute_wait_timeout(
@@ -358,10 +455,15 @@ mod tests {
         let (target, _server_addr, server_task) = spawn_server(15).await?;
         let args = test_args(target, UdpPerfMode::Forward);
         let out = super::run_for_test(args).await?;
+        let expected_min = (300u64.saturating_mul(1)).saturating_div(3);
 
         assert!(out.final_report.is_final);
         assert_eq!(out.final_report.summary.mode, UdpPerfMode::Forward);
-        assert!(out.final_report.summary.forward.total.packets > 0);
+        assert!(
+            out.final_report.summary.forward.total.packets >= expected_min,
+            "forward packets too low, got={}, expected_min={expected_min}",
+            out.final_report.summary.forward.total.packets
+        );
 
         server_task.abort();
         Ok(())
@@ -376,7 +478,14 @@ mod tests {
 
         assert!(out.final_report.is_final);
         assert_eq!(out.final_report.summary.mode, UdpPerfMode::Reverse);
-        assert!(out.final_report.summary.reverse.total.packets > 0);
+        assert!(
+            out.client_rx.reverse_packets > 0,
+            "client should receive reverse data packets"
+        );
+        assert!(
+            out.client_rx.reverse_bytes > 0,
+            "client should receive reverse data bytes"
+        );
 
         server_task.abort();
         Ok(())
@@ -392,7 +501,10 @@ mod tests {
         assert!(out.final_report.is_final);
         assert_eq!(out.final_report.summary.mode, UdpPerfMode::Bidir);
         assert!(out.final_report.summary.forward.total.packets > 0);
-        assert!(out.final_report.summary.reverse.total.packets > 0);
+        assert!(
+            out.client_rx.reverse_packets > 0,
+            "client should receive reverse data packets in bidir"
+        );
 
         server_task.abort();
         Ok(())
@@ -410,6 +522,60 @@ mod tests {
             .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
         assert!(json.get("forward").is_some(), "missing forward field");
         assert!(json.get("reverse").is_some(), "missing reverse field");
+        assert!(
+            !out.output.contains("interval mode="),
+            "json output should not contain interval text"
+        );
+
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_client_json_mode_does_not_emit_startup_log_line() -> Result<()> {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                BufWriter(self.0.clone())
+            }
+        }
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (target, _server_addr, server_task) = spawn_server(2_000).await?;
+        let mut args = test_args(target, UdpPerfMode::Bidir);
+        args.json = true;
+        args.pps = Some(300);
+
+        let writer = Buf::default();
+        let captured = writer.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let _out = super::run_for_test(args).await?;
+        let logs = String::from_utf8(captured.lock().expect("lock").clone())
+            .context("captured logs should be utf8")?;
+        assert!(
+            !logs.contains("udp bench client start"),
+            "json mode should not emit startup log, got logs: {logs}"
+        );
 
         server_task.abort();
         Ok(())
