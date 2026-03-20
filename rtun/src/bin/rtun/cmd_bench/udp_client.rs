@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
+use serde::Serialize;
 use tokio::{net::UdpSocket, time::Instant};
 use tracing::info;
 
@@ -130,6 +131,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
         first_send_deadline(start_sent_at, args.mode, pps)
     };
     let mut send_seq: u64 = 0;
+    let mut client_tx = ClientTxStats::default();
     let mut client_rx = ClientRxStats::default();
     let mut final_report: Option<UdpPerfReport> = None;
     let mut final_report_drain_deadline: Option<Instant> = None;
@@ -179,6 +181,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                 &mut next_send_at,
                 now,
                 stop_at,
+                &mut client_tx,
             )
             .await?;
 
@@ -220,8 +223,21 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
             final_deadline,
             final_report_drain_deadline,
         )? {
-            let final_summary = build_final_client_view_summary(&report, &mut client_rx);
-            output.push_str(&render_final_summary(&final_summary, args.json)?);
+            let final_summary =
+                build_final_client_display_summary(&report, &mut client_rx, &mut client_tx);
+            output.push_str(&render_final_summary(
+                &final_summary,
+                args.json,
+                FinalSummaryContext {
+                    target: &args.target,
+                    mode: args.mode,
+                    session_id,
+                    duration_secs: args.time,
+                    payload_len: args.len as u64,
+                    pps,
+                    interval_ms: args.interval.get(),
+                },
+            )?);
             return Ok(ClientRunOutput {
                 final_report: report,
                 client_rx,
@@ -258,6 +274,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                         !args.json,
                         output_policy,
                         &mut client_rx,
+                        &mut client_tx,
                     )?;
                     if let Some(report) = incoming.report {
                         if report.is_final {
@@ -306,6 +323,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                 !args.json,
                 output_policy,
                 &mut client_rx,
+                &mut client_tx,
             )?;
             if let Some(report) = incoming.report {
                 if report.is_final {
@@ -597,6 +615,109 @@ impl ClientRxStats {
     }
 }
 
+#[derive(Debug, Default)]
+struct ClientTxStats {
+    forward_total_packets: u64,
+    forward_total_bytes: u64,
+    forward_interval_packets: u64,
+    forward_interval_bytes: u64,
+}
+
+impl ClientTxStats {
+    fn on_forward_packet_sent(&mut self, payload_len: u16) {
+        let bytes = payload_len as u64;
+        self.forward_total_packets = self.forward_total_packets.saturating_add(1);
+        self.forward_total_bytes = self.forward_total_bytes.saturating_add(bytes);
+        self.forward_interval_packets = self.forward_interval_packets.saturating_add(1);
+        self.forward_interval_bytes = self.forward_interval_bytes.saturating_add(bytes);
+    }
+
+    fn forward_total_summary(
+        &self,
+        elapsed_micros: u64,
+    ) -> super::udp_perf::UdpPerfCountersSummary {
+        counters_from_bytes_packets(
+            self.forward_total_bytes,
+            self.forward_total_packets,
+            elapsed_micros,
+        )
+    }
+
+    fn forward_interval_summary(
+        &self,
+        interval_elapsed_micros: u64,
+    ) -> super::udp_perf::UdpPerfCountersSummary {
+        counters_from_bytes_packets(
+            self.forward_interval_bytes,
+            self.forward_interval_packets,
+            interval_elapsed_micros,
+        )
+    }
+
+    fn take_forward_interval_summary(
+        &mut self,
+        interval_elapsed_micros: u64,
+    ) -> super::udp_perf::UdpPerfCountersSummary {
+        let summary = self.forward_interval_summary(interval_elapsed_micros);
+        self.forward_interval_packets = 0;
+        self.forward_interval_bytes = 0;
+        summary
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClientDisplaySummary {
+    mode: UdpPerfMode,
+    total_elapsed_micros: u64,
+    interval_elapsed_micros: u64,
+    forward_sender: DisplayDirectionSummary,
+    forward_receiver: DisplayDirectionSummary,
+    reverse_sender: DisplayDirectionSummary,
+    reverse_receiver: DisplayDirectionSummary,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct DisplayDirectionSummary {
+    total: super::udp_perf::UdpPerfCountersSummary,
+    interval: super::udp_perf::UdpPerfCountersSummary,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FinalSummaryContext<'a> {
+    target: &'a str,
+    mode: UdpPerfMode,
+    session_id: u64,
+    duration_secs: u64,
+    payload_len: u64,
+    pps: u64,
+    interval_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ClientFinalJson<'a> {
+    start: ClientFinalJsonStart<'a>,
+    end: ClientFinalJsonEnd,
+}
+
+#[derive(Debug, Serialize)]
+struct ClientFinalJsonStart<'a> {
+    session_id: u64,
+    mode: UdpPerfMode,
+    target: &'a str,
+    duration_secs: u64,
+    payload_len: u64,
+    pps: u64,
+    interval_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ClientFinalJsonEnd {
+    sum_forward_sender: super::udp_perf::UdpPerfCountersSummary,
+    sum_forward_receiver: super::udp_perf::UdpPerfCountersSummary,
+    sum_reverse_sender: super::udp_perf::UdpPerfCountersSummary,
+    sum_reverse_receiver: super::udp_perf::UdpPerfCountersSummary,
+}
+
 fn resolve_pps(args: &CmdArgs) -> Result<u64> {
     if let Some(pps) = args.pps {
         return Ok(pps);
@@ -645,6 +766,7 @@ async fn send_due_forward_packets(
     next_send_at: &mut Option<Instant>,
     now: Instant,
     stop_at: Option<Instant>,
+    client_tx: &mut ClientTxStats,
 ) -> Result<()> {
     let send_until = stop_at.map_or(now, |deadline| min(deadline, now));
     let mut sent = 0usize;
@@ -657,6 +779,7 @@ async fn send_due_forward_packets(
         }
         *send_seq = send_seq.saturating_add(1);
         send_forward_data(socket, session_id, *send_seq, payload_len).await?;
+        client_tx.on_forward_packet_sent(payload_len);
         *next_send_at = next_send_deadline(due, pps);
         sent += 1;
     }
@@ -746,6 +869,7 @@ fn handle_incoming_packet(
     emit_interval: bool,
     output_policy: OutputPolicy,
     client_rx: &mut ClientRxStats,
+    client_tx: &mut ClientTxStats,
 ) -> Result<IncomingPacketOutcome> {
     let wire = UdpPerfWirePacket::decode(bytes)?;
     match wire {
@@ -760,17 +884,21 @@ fn handle_incoming_packet(
                 match client_rx.observe_interval_report(report.report_seq) {
                     IntervalReportSync::Stale => {}
                     sync_state => {
+                        let forward_interval = client_tx
+                            .take_forward_interval_summary(report.summary.interval_elapsed_micros);
                         let reverse_interval = client_rx.take_interval_summary(
                             report.summary.total_elapsed_micros,
                             report.summary.interval_elapsed_micros,
                         );
                         if emit_interval && matches!(sync_state, IntervalReportSync::Synced) {
-                            let merged = build_client_view_summary(
+                            let display = build_client_display_summary(
                                 &report.summary,
                                 client_rx,
+                                client_tx,
                                 Some(reverse_interval),
+                                Some(forward_interval),
                             );
-                            let line = render_interval_summary(&merged);
+                            let line = render_interval_summary(&display);
                             if output_policy.collect_interval {
                                 output.push_str(&line);
                             }
@@ -807,27 +935,306 @@ fn handle_incoming_packet(
     }
 }
 
-fn render_interval_summary(summary: &UdpPerfSummary) -> String {
-    format!(
-        "interval mode={} total_pkts={} fwd_pkts={} rev_pkts={}\n",
-        summary.mode,
-        summary.interval.packets,
-        summary.forward.interval.packets,
-        summary.reverse.interval.packets
+fn render_interval_summary(summary: &ClientDisplaySummary) -> String {
+    let mut out = String::new();
+    let interval_start = elapsed_secs(
+        summary
+            .total_elapsed_micros
+            .saturating_sub(summary.interval_elapsed_micros),
+    );
+    let interval_end = elapsed_secs(summary.total_elapsed_micros);
+    match summary.mode {
+        UdpPerfMode::Forward => {
+            out.push_str(&render_direction_line(
+                interval_start,
+                interval_end,
+                &summary.forward_sender.interval,
+                &summary.forward_receiver.interval,
+                "FWD",
+                None,
+            ));
+        }
+        UdpPerfMode::Reverse => {
+            out.push_str(&render_direction_line(
+                interval_start,
+                interval_end,
+                &summary.reverse_sender.interval,
+                &summary.reverse_receiver.interval,
+                "REV",
+                None,
+            ));
+        }
+        UdpPerfMode::Bidir => {
+            out.push_str(&render_direction_line(
+                interval_start,
+                interval_end,
+                &summary.forward_sender.interval,
+                &summary.forward_receiver.interval,
+                "FWD",
+                None,
+            ));
+            out.push_str(&render_direction_line(
+                interval_start,
+                interval_end,
+                &summary.reverse_sender.interval,
+                &summary.reverse_receiver.interval,
+                "REV",
+                None,
+            ));
+        }
+    }
+    out
+}
+
+fn render_final_summary(
+    summary: &ClientDisplaySummary,
+    as_json: bool,
+    ctx: FinalSummaryContext<'_>,
+) -> Result<String> {
+    if as_json {
+        let json = ClientFinalJson {
+            start: ClientFinalJsonStart {
+                session_id: ctx.session_id,
+                mode: ctx.mode,
+                target: ctx.target,
+                duration_secs: ctx.duration_secs,
+                payload_len: ctx.payload_len,
+                pps: ctx.pps,
+                interval_ms: ctx.interval_ms,
+            },
+            end: ClientFinalJsonEnd {
+                sum_forward_sender: summary.forward_sender.total.clone(),
+                sum_forward_receiver: summary.forward_receiver.total.clone(),
+                sum_reverse_sender: summary.reverse_sender.total.clone(),
+                sum_reverse_receiver: summary.reverse_receiver.total.clone(),
+            },
+        };
+        return Ok(format!("{}\n", serde_json::to_string_pretty(&json)?));
+    }
+    let mut out = String::new();
+    let total_start = 0.0;
+    let total_end = elapsed_secs(summary.total_elapsed_micros);
+    match summary.mode {
+        UdpPerfMode::Forward => {
+            out.push_str(&render_direction_line(
+                total_start,
+                total_end,
+                &summary.forward_sender.total,
+                &summary.forward_receiver.total,
+                "FWD",
+                Some("sender"),
+            ));
+            out.push_str(&render_direction_line(
+                total_start,
+                total_end,
+                &summary.forward_receiver.total,
+                &summary.forward_sender.total,
+                "FWD",
+                Some("receiver"),
+            ));
+        }
+        UdpPerfMode::Reverse => {
+            out.push_str(&render_direction_line(
+                total_start,
+                total_end,
+                &summary.reverse_sender.total,
+                &summary.reverse_receiver.total,
+                "REV",
+                Some("sender"),
+            ));
+            out.push_str(&render_direction_line(
+                total_start,
+                total_end,
+                &summary.reverse_receiver.total,
+                &summary.reverse_sender.total,
+                "REV",
+                Some("receiver"),
+            ));
+        }
+        UdpPerfMode::Bidir => {
+            out.push_str(&render_direction_line(
+                total_start,
+                total_end,
+                &summary.forward_sender.total,
+                &summary.forward_receiver.total,
+                "FWD",
+                Some("sender"),
+            ));
+            out.push_str(&render_direction_line(
+                total_start,
+                total_end,
+                &summary.forward_receiver.total,
+                &summary.forward_sender.total,
+                "FWD",
+                Some("receiver"),
+            ));
+            out.push_str(&render_direction_line(
+                total_start,
+                total_end,
+                &summary.reverse_sender.total,
+                &summary.reverse_receiver.total,
+                "REV",
+                Some("sender"),
+            ));
+            out.push_str(&render_direction_line(
+                total_start,
+                total_end,
+                &summary.reverse_receiver.total,
+                &summary.reverse_sender.total,
+                "REV",
+                Some("receiver"),
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn build_client_display_summary(
+    server: &UdpPerfSummary,
+    client_rx: &ClientRxStats,
+    client_tx: &ClientTxStats,
+    reverse_interval_override: Option<super::udp_perf::UdpPerfCountersSummary>,
+    forward_interval_override: Option<super::udp_perf::UdpPerfCountersSummary>,
+) -> ClientDisplaySummary {
+    let reverse_local =
+        client_rx.reverse_summary(server.total_elapsed_micros, server.interval_elapsed_micros);
+    ClientDisplaySummary {
+        mode: server.mode,
+        total_elapsed_micros: server.total_elapsed_micros,
+        interval_elapsed_micros: server.interval_elapsed_micros,
+        forward_sender: DisplayDirectionSummary {
+            total: client_tx.forward_total_summary(server.total_elapsed_micros),
+            interval: forward_interval_override.unwrap_or_else(|| {
+                client_tx.forward_interval_summary(server.interval_elapsed_micros)
+            }),
+        },
+        forward_receiver: DisplayDirectionSummary {
+            total: server.forward.total.clone(),
+            interval: server.forward.interval.clone(),
+        },
+        reverse_sender: DisplayDirectionSummary {
+            total: server.reverse.total.clone(),
+            interval: server.reverse.interval.clone(),
+        },
+        reverse_receiver: DisplayDirectionSummary {
+            total: reverse_local.total,
+            interval: reverse_interval_override.unwrap_or(reverse_local.interval),
+        },
+    }
+}
+
+fn build_final_client_display_summary(
+    report: &UdpPerfReport,
+    client_rx: &mut ClientRxStats,
+    client_tx: &mut ClientTxStats,
+) -> ClientDisplaySummary {
+    if !matches!(
+        report.summary.mode,
+        UdpPerfMode::Reverse | UdpPerfMode::Bidir
+    ) {
+        return build_client_display_summary(&report.summary, client_rx, client_tx, None, None);
+    }
+
+    let (reverse_interval, forward_interval) = match client_rx
+        .observe_interval_report(report.report_seq)
+    {
+        IntervalReportSync::Synced => (
+            Some(client_rx.take_interval_summary(
+                report.summary.total_elapsed_micros,
+                report.summary.interval_elapsed_micros,
+            )),
+            Some(client_tx.take_forward_interval_summary(report.summary.interval_elapsed_micros)),
+        ),
+        IntervalReportSync::UnsyncedGap => {
+            let _ = client_rx.take_interval_summary(
+                report.summary.total_elapsed_micros,
+                report.summary.interval_elapsed_micros,
+            );
+            let _ = client_tx.take_forward_interval_summary(report.summary.interval_elapsed_micros);
+            (
+                Some(report.summary.reverse.interval.clone()),
+                Some(report.summary.forward.interval.clone()),
+            )
+        }
+        IntervalReportSync::Stale => (
+            Some(report.summary.reverse.interval.clone()),
+            Some(report.summary.forward.interval.clone()),
+        ),
+    };
+
+    build_client_display_summary(
+        &report.summary,
+        client_rx,
+        client_tx,
+        reverse_interval,
+        forward_interval,
     )
 }
 
-fn render_final_summary(summary: &UdpPerfSummary, as_json: bool) -> Result<String> {
-    if as_json {
-        return Ok(format!("{}\n", serde_json::to_string_pretty(summary)?));
+fn render_direction_line(
+    start_secs: f64,
+    end_secs: f64,
+    tx: &super::udp_perf::UdpPerfCountersSummary,
+    rx: &super::udp_perf::UdpPerfCountersSummary,
+    direction: &str,
+    role: Option<&str>,
+) -> String {
+    match role {
+        Some(role) => format!(
+            "[{:>3}] {:>6.2}-{:<6.2} sec  TX {:>10} {:>12}  RX {:>10} {:>12}  {} {}\n",
+            1,
+            start_secs,
+            end_secs,
+            format_transfer(tx.bytes),
+            format_bitrate(tx.mbps),
+            format_transfer(rx.bytes),
+            format_bitrate(rx.mbps),
+            direction,
+            role
+        ),
+        None => format!(
+            "[{:>3}] {:>6.2}-{:<6.2} sec  TX {:>10} {:>12}  RX {:>10} {:>12}  {}\n",
+            1,
+            start_secs,
+            end_secs,
+            format_transfer(tx.bytes),
+            format_bitrate(tx.mbps),
+            format_transfer(rx.bytes),
+            format_bitrate(rx.mbps),
+            direction
+        ),
     }
-    Ok(format!(
-        "final mode={} total_pkts={} fwd_pkts={} rev_pkts={}\n",
-        summary.mode,
-        summary.total.packets,
-        summary.forward.total.packets,
-        summary.reverse.total.packets
-    ))
+}
+
+fn format_transfer(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.2} GBytes", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.2} MBytes", bytes_f / MIB)
+    } else if bytes_f >= KIB {
+        format!("{:.2} KBytes", bytes_f / KIB)
+    } else {
+        format!("{bytes} Bytes")
+    }
+}
+
+fn format_bitrate(mbps: f64) -> String {
+    let bps = mbps * 1_000_000.0;
+    if bps >= 1_000_000_000.0 {
+        format!("{:.2} Gbits/sec", bps / 1_000_000_000.0)
+    } else if bps >= 1_000_000.0 {
+        format!("{:.2} Mbits/sec", bps / 1_000_000.0)
+    } else {
+        format!("{:.2} Kbits/sec", bps / 1_000.0)
+    }
+}
+
+fn elapsed_secs(elapsed_micros: u64) -> f64 {
+    elapsed_micros as f64 / 1_000_000.0
 }
 
 fn build_client_view_summary(
@@ -920,6 +1327,22 @@ fn merge_counters(
         loss: a.loss.saturating_add(b.loss),
         reorder: a.reorder.saturating_add(b.reorder),
         duplicate: a.duplicate.saturating_add(b.duplicate),
+        mbps: bytes_to_mbps_local(bytes, elapsed_micros),
+        pps: packets_to_pps_local(packets, elapsed_micros),
+    }
+}
+
+fn counters_from_bytes_packets(
+    bytes: u64,
+    packets: u64,
+    elapsed_micros: u64,
+) -> super::udp_perf::UdpPerfCountersSummary {
+    super::udp_perf::UdpPerfCountersSummary {
+        bytes,
+        packets,
+        loss: 0,
+        reorder: 0,
+        duplicate: 0,
         mbps: bytes_to_mbps_local(bytes, elapsed_micros),
         pps: packets_to_pps_local(packets, elapsed_micros),
     }
@@ -1120,8 +1543,24 @@ mod tests {
 
         let json: Value = serde_json::from_str(out.output.trim())
             .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
-        assert!(json.get("forward").is_some(), "missing forward field");
-        assert!(json.get("reverse").is_some(), "missing reverse field");
+        assert!(json.get("start").is_some(), "missing start field");
+        assert!(json.get("end").is_some(), "missing end field");
+        assert!(
+            json.pointer("/end/sum_forward_sender").is_some(),
+            "missing end.sum_forward_sender field"
+        );
+        assert!(
+            json.pointer("/end/sum_forward_receiver").is_some(),
+            "missing end.sum_forward_receiver field"
+        );
+        assert!(
+            json.pointer("/end/sum_reverse_sender").is_some(),
+            "missing end.sum_reverse_sender field"
+        );
+        assert!(
+            json.pointer("/end/sum_reverse_receiver").is_some(),
+            "missing end.sum_reverse_receiver field"
+        );
         assert!(
             !out.output.contains("interval mode="),
             "json output should not contain interval text"
@@ -1129,6 +1568,119 @@ mod tests {
 
         server_task.abort();
         Ok(())
+    }
+
+    #[test]
+    fn udp_client_render_final_summary_uses_sender_receiver_lines() -> Result<()> {
+        let summary = super::ClientDisplaySummary {
+            mode: UdpPerfMode::Forward,
+            total_elapsed_micros: 1_000_000,
+            interval_elapsed_micros: 1_000_000,
+            forward_sender: super::DisplayDirectionSummary {
+                total: UdpPerfCountersSummary {
+                    bytes: 10_000,
+                    packets: 20,
+                    mbps: 0.08,
+                    pps: 20.0,
+                    ..UdpPerfCountersSummary::default()
+                },
+                interval: UdpPerfCountersSummary::default(),
+            },
+            forward_receiver: super::DisplayDirectionSummary {
+                total: UdpPerfCountersSummary {
+                    bytes: 9_000,
+                    packets: 18,
+                    mbps: 0.072,
+                    pps: 18.0,
+                    ..UdpPerfCountersSummary::default()
+                },
+                interval: UdpPerfCountersSummary::default(),
+            },
+            reverse_sender: super::DisplayDirectionSummary::default(),
+            reverse_receiver: super::DisplayDirectionSummary::default(),
+        };
+
+        let out = super::render_final_summary(
+            &summary,
+            false,
+            super::FinalSummaryContext {
+                target: "127.0.0.1:1",
+                mode: UdpPerfMode::Forward,
+                session_id: 1,
+                duration_secs: 1,
+                payload_len: 100,
+                pps: 20,
+                interval_ms: 1_000,
+            },
+        )?;
+        assert!(
+            out.contains("sender"),
+            "final text should contain sender line, got: {out}"
+        );
+        assert!(
+            out.contains("receiver"),
+            "final text should contain receiver line, got: {out}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn udp_client_render_interval_summary_bidir_prints_two_direction_lines() {
+        let summary = super::ClientDisplaySummary {
+            mode: UdpPerfMode::Bidir,
+            total_elapsed_micros: 1_000_000,
+            interval_elapsed_micros: 1_000_000,
+            forward_sender: super::DisplayDirectionSummary {
+                total: UdpPerfCountersSummary::default(),
+                interval: UdpPerfCountersSummary {
+                    bytes: 1_000,
+                    packets: 10,
+                    mbps: 0.008,
+                    pps: 10.0,
+                    ..UdpPerfCountersSummary::default()
+                },
+            },
+            forward_receiver: super::DisplayDirectionSummary {
+                total: UdpPerfCountersSummary::default(),
+                interval: UdpPerfCountersSummary {
+                    bytes: 900,
+                    packets: 9,
+                    mbps: 0.0072,
+                    pps: 9.0,
+                    ..UdpPerfCountersSummary::default()
+                },
+            },
+            reverse_sender: super::DisplayDirectionSummary {
+                total: UdpPerfCountersSummary::default(),
+                interval: UdpPerfCountersSummary {
+                    bytes: 2_000,
+                    packets: 20,
+                    mbps: 0.016,
+                    pps: 20.0,
+                    ..UdpPerfCountersSummary::default()
+                },
+            },
+            reverse_receiver: super::DisplayDirectionSummary {
+                total: UdpPerfCountersSummary::default(),
+                interval: UdpPerfCountersSummary {
+                    bytes: 1_800,
+                    packets: 18,
+                    mbps: 0.0144,
+                    pps: 18.0,
+                    ..UdpPerfCountersSummary::default()
+                },
+            },
+        };
+
+        let out = super::render_interval_summary(&summary);
+        assert!(
+            out.contains("FWD"),
+            "bidir interval should contain FWD line, got: {out}"
+        );
+        assert!(
+            out.contains("REV"),
+            "bidir interval should contain REV line, got: {out}"
+        );
     }
 
     #[tokio::test]
@@ -1209,20 +1761,20 @@ mod tests {
         let out = super::run_for_test(args).await?;
         let json: Value = serde_json::from_str(out.output.trim())
             .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
-        let reverse_total = json
-            .pointer("/reverse/total/packets")
+        let reverse_sender = json
+            .pointer("/end/sum_reverse_sender/packets")
             .and_then(Value::as_u64)
-            .context("missing reverse.total.packets")?;
-        let reverse_interval = json
-            .pointer("/reverse/interval/packets")
+            .context("missing end.sum_reverse_sender.packets")?;
+        let reverse_receiver = json
+            .pointer("/end/sum_reverse_receiver/packets")
             .and_then(Value::as_u64)
-            .context("missing reverse.interval.packets")?;
+            .context("missing end.sum_reverse_receiver.packets")?;
 
-        assert!(reverse_total > 0, "reverse total should be > 0");
-        assert!(reverse_interval > 0, "reverse interval should be > 0");
+        assert!(reverse_sender > 0, "reverse sender should be > 0");
+        assert!(reverse_receiver > 0, "reverse receiver should be > 0");
         assert!(
-            reverse_interval < reverse_total,
-            "reverse interval should be smaller than total in json mode when interval < time, interval={reverse_interval}, total={reverse_total}"
+            reverse_receiver <= reverse_sender,
+            "reverse receiver should not exceed reverse sender, sender={reverse_sender}, receiver={reverse_receiver}"
         );
 
         server_task.abort();
@@ -1347,9 +1899,9 @@ mod tests {
         let json: Value = serde_json::from_str(out.output.trim())
             .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
         let forward_packets = json
-            .pointer("/forward/total/packets")
+            .pointer("/end/sum_forward_sender/packets")
             .and_then(Value::as_u64)
-            .context("missing forward.total.packets")?;
+            .context("missing end.sum_forward_sender.packets")?;
 
         assert_eq!(
             forward_packets,
@@ -1388,9 +1940,9 @@ mod tests {
         let json: Value = serde_json::from_str(out.output.trim())
             .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
         let total_packets = json
-            .pointer("/total/packets")
+            .pointer("/end/sum_forward_sender/packets")
             .and_then(Value::as_u64)
-            .context("missing total.packets")?;
+            .context("missing end.sum_forward_sender.packets")?;
 
         assert!(
             total_packets > 0,
@@ -1441,7 +1993,7 @@ mod tests {
         let json: Value = serde_json::from_str(out.output.trim())
             .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
         assert_eq!(
-            json.pointer("/reverse/total/packets")
+            json.pointer("/end/sum_reverse_receiver/packets")
                 .and_then(Value::as_u64),
             Some(1),
             "final reverse total should include tail packet received after final report"
@@ -1465,9 +2017,9 @@ mod tests {
         let json: Value = serde_json::from_str(out.output.trim())
             .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
         let reverse_packets = json
-            .pointer("/reverse/total/packets")
+            .pointer("/end/sum_reverse_receiver/packets")
             .and_then(Value::as_u64)
-            .context("missing reverse.total.packets")?;
+            .context("missing end.sum_reverse_receiver.packets")?;
 
         assert!(
             reverse_packets > 0,
@@ -1573,6 +2125,7 @@ mod tests {
 
         let now = Instant::now();
         let mut send_seq = 0u64;
+        let mut client_tx = super::ClientTxStats::default();
         let mut next_send_at = Some(
             now.checked_sub(Duration::from_millis(25))
                 .context("late wakeup deadline underflow")?,
@@ -1586,6 +2139,7 @@ mod tests {
             &mut next_send_at,
             now,
             Some(now),
+            &mut client_tx,
         )
         .await?;
 
@@ -1608,6 +2162,7 @@ mod tests {
 
         let now = Instant::now();
         let mut send_seq = 0u64;
+        let mut client_tx = super::ClientTxStats::default();
         let mut next_send_at = Some(now - Duration::from_millis(200));
         super::send_due_forward_packets(
             &sender,
@@ -1618,6 +2173,7 @@ mod tests {
             &mut next_send_at,
             now,
             Some(now),
+            &mut client_tx,
         )
         .await?;
 
@@ -1765,7 +2321,7 @@ mod tests {
         let json: Value = serde_json::from_str(out.output.trim())
             .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
         assert_eq!(
-            json.pointer("/reverse/total/packets")
+            json.pointer("/end/sum_reverse_receiver/packets")
                 .and_then(Value::as_u64),
             Some(1),
             "final reverse total should include delayed tail packet after final report"
@@ -1782,6 +2338,7 @@ mod tests {
             collect_interval: true,
         };
         let mut client_rx = super::ClientRxStats::default();
+        let mut client_tx = super::ClientTxStats::default();
         let mut output = String::new();
 
         for seq in 1..=2 {
@@ -1805,6 +2362,7 @@ mod tests {
             true,
             output_policy,
             &mut client_rx,
+            &mut client_tx,
         )?;
         assert!(
             output.is_empty(),
@@ -1829,10 +2387,11 @@ mod tests {
             true,
             output_policy,
             &mut client_rx,
+            &mut client_tx,
         )?;
         assert!(
-            output.contains("rev_pkts=1"),
-            "next in-order interval should resync to one packet, got: {output}"
+            output.contains("REV"),
+            "next in-order interval should output reverse direction line, got: {output}"
         );
         Ok(())
     }
@@ -1845,6 +2404,7 @@ mod tests {
             collect_interval: true,
         };
         let mut client_rx = super::ClientRxStats::default();
+        let mut client_tx = super::ClientTxStats::default();
         let mut output = String::new();
 
         client_rx.on_data_packet(&UdpPerfDataPacket {
@@ -1865,6 +2425,7 @@ mod tests {
             true,
             output_policy,
             &mut client_rx,
+            &mut client_tx,
         )?;
 
         for seq in [2, 3] {
@@ -1903,6 +2464,7 @@ mod tests {
             collect_interval: true,
         };
         let mut client_rx = super::ClientRxStats::default();
+        let mut client_tx = super::ClientTxStats::default();
         let mut output = String::new();
         let mut report = interval_report(1, 100_000, 100_000);
         report.summary.session_id = 2;
@@ -1914,6 +2476,7 @@ mod tests {
             true,
             output_policy,
             &mut client_rx,
+            &mut client_tx,
         )?;
 
         assert!(
@@ -1932,6 +2495,7 @@ mod tests {
             collect_interval: true,
         };
         let mut client_rx = super::ClientRxStats::default();
+        let mut client_tx = super::ClientTxStats::default();
         let mut output = String::new();
 
         let incoming = super::handle_incoming_packet(
@@ -1941,6 +2505,7 @@ mod tests {
             true,
             output_policy,
             &mut client_rx,
+            &mut client_tx,
         )?;
 
         assert!(
@@ -1962,13 +2527,13 @@ mod tests {
         let json: Value = serde_json::from_str(out.output.trim())
             .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
         let total_packets = json
-            .pointer("/total/packets")
+            .pointer("/end/sum_forward_sender/packets")
             .and_then(Value::as_u64)
-            .context("missing total.packets")?;
+            .context("missing end.sum_forward_sender.packets")?;
         let forward_packets = json
-            .pointer("/forward/total/packets")
+            .pointer("/end/sum_forward_receiver/packets")
             .and_then(Value::as_u64)
-            .context("missing forward.total.packets")?;
+            .context("missing end.sum_forward_receiver.packets")?;
 
         assert!(
             total_packets > 0,
@@ -1993,13 +2558,13 @@ mod tests {
         let json: Value = serde_json::from_str(out.output.trim())
             .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
         let total_packets = json
-            .pointer("/total/packets")
+            .pointer("/end/sum_reverse_sender/packets")
             .and_then(Value::as_u64)
-            .context("missing total.packets")?;
+            .context("missing end.sum_reverse_sender.packets")?;
         let reverse_packets = json
-            .pointer("/reverse/total/packets")
+            .pointer("/end/sum_reverse_receiver/packets")
             .and_then(Value::as_u64)
-            .context("missing reverse.total.packets")?;
+            .context("missing end.sum_reverse_receiver.packets")?;
 
         assert!(
             total_packets > 0,
@@ -2024,17 +2589,17 @@ mod tests {
         let json: Value = serde_json::from_str(out.output.trim())
             .with_context(|| format!("invalid json output: {}", out.output.trim()))?;
         let total_packets = json
-            .pointer("/total/packets")
+            .pointer("/end/sum_forward_sender/packets")
             .and_then(Value::as_u64)
-            .context("missing total.packets")?;
+            .context("missing end.sum_forward_sender.packets")?;
         let forward_packets = json
-            .pointer("/forward/total/packets")
+            .pointer("/end/sum_forward_receiver/packets")
             .and_then(Value::as_u64)
-            .context("missing forward.total.packets")?;
+            .context("missing end.sum_forward_receiver.packets")?;
         let reverse_packets = json
-            .pointer("/reverse/total/packets")
+            .pointer("/end/sum_reverse_receiver/packets")
             .and_then(Value::as_u64)
-            .context("missing reverse.total.packets")?;
+            .context("missing end.sum_reverse_receiver.packets")?;
 
         assert!(
             total_packets > 0,
