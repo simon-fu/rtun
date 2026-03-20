@@ -100,6 +100,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
 
     let start_sent_at = Instant::now();
     let wait_for_start_confirmation = mode_waits_for_start_confirmation(args.mode, pps, duration);
+    let retry_start_until_server_response = wait_for_start_confirmation;
     let mut stop_at = if wait_for_start_confirmation {
         None
     } else {
@@ -157,7 +158,11 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                 if due <= now {
                     let retry_sent_at =
                         send_start_retry_with_hello(&socket, session_id, args.mode, &start).await?;
-                    next_start_retry_at = next_start_retry_deadline(retry_sent_at)?;
+                    next_start_retry_at = if retry_start_until_server_response {
+                        next_start_retry_deadline(retry_sent_at)?
+                    } else {
+                        None
+                    };
                 }
             }
             if let Some(due) = next_send_at {
@@ -1253,6 +1258,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_client_forward_silent_server_stops_retrying_start_after_startup() -> Result<()> {
+        let (target, server_task) = spawn_silent_forward_final_report_server().await?;
+        let mut args = test_args(target, UdpPerfMode::Forward);
+        args.time = 1;
+        args.pps = Some(1);
+        args.interval = NonZeroU64::new(2_000).expect("nonzero");
+        args.json = true;
+
+        let _ = tokio::time::timeout(Duration::from_secs(4), super::run_for_test(args))
+            .await
+            .context("udp-client should finish against silent forward server")??;
+
+        server_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn udp_client_reverse_tail_drain_handles_high_latency_tail() -> Result<()> {
         let (target, server_task) =
             spawn_reverse_tail_after_final_report_server_with_delay(Duration::from_millis(400))
@@ -1863,6 +1885,96 @@ mod tests {
                         ensure!(
                             forward_packets == 1,
                             "expected exactly one forward packet, got {forward_packets}"
+                        );
+                        let sid = session_id.unwrap_or(stop.session_id);
+                        let peer = client.unwrap_or(from);
+                        socket
+                            .send_to(
+                                &wire_report(UdpPerfReport {
+                                    report_seq: 1,
+                                    is_final: true,
+                                    summary: UdpPerfSummary {
+                                        session_id: sid,
+                                        mode: UdpPerfMode::Forward,
+                                        total_elapsed_micros: 1_000_000,
+                                        interval_elapsed_micros: 1_000_000,
+                                        total: UdpPerfCountersSummary {
+                                            packets: forward_packets,
+                                            bytes: forward_packets.saturating_mul(96),
+                                            ..UdpPerfCountersSummary::default()
+                                        },
+                                        interval: UdpPerfCountersSummary {
+                                            packets: forward_packets,
+                                            bytes: forward_packets.saturating_mul(96),
+                                            ..UdpPerfCountersSummary::default()
+                                        },
+                                        forward: UdpPerfDirectionSummary {
+                                            total: UdpPerfCountersSummary {
+                                                packets: forward_packets,
+                                                bytes: forward_packets.saturating_mul(96),
+                                                ..UdpPerfCountersSummary::default()
+                                            },
+                                            interval: UdpPerfCountersSummary {
+                                                packets: forward_packets,
+                                                bytes: forward_packets.saturating_mul(96),
+                                                ..UdpPerfCountersSummary::default()
+                                            },
+                                        },
+                                        reverse: UdpPerfDirectionSummary::default(),
+                                    },
+                                })?,
+                                peer,
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        Ok((addr.to_string(), task))
+    }
+
+    async fn spawn_silent_forward_final_report_server(
+    ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = socket.local_addr()?;
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut client = None;
+            let mut session_id = None;
+            let mut hello_count = 0u64;
+            let mut start_count = 0u64;
+            let mut forward_packets = 0u64;
+
+            loop {
+                let (n, from) = socket.recv_from(&mut buf).await?;
+                match UdpPerfWirePacket::decode(&buf[..n])? {
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Hello(hello)) => {
+                        client = Some(from);
+                        session_id = Some(hello.session_id);
+                        hello_count = hello_count.saturating_add(1);
+                    }
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Start(start)) => {
+                        client = Some(from);
+                        session_id = Some(start.session_id);
+                        start_count = start_count.saturating_add(1);
+                    }
+                    UdpPerfWirePacket::Data(data) => {
+                        if matches!(data.header.direction, UdpPerfDirection::Forward) {
+                            forward_packets = forward_packets.saturating_add(1);
+                        }
+                    }
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Stop(stop)) => {
+                        ensure!(hello_count >= 1, "client did not send initial HELLO");
+                        ensure!(start_count >= 1, "client did not send initial START");
+                        ensure!(
+                            hello_count <= 2,
+                            "forward run retried HELLO too many times: {hello_count}"
+                        );
+                        ensure!(
+                            start_count <= 2,
+                            "forward run retried START too many times: {start_count}"
                         );
                         let sid = session_id.unwrap_or(stop.session_id);
                         let peer = client.unwrap_or(from);

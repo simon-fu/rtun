@@ -359,12 +359,24 @@ async fn advance_sessions(
         if let Some(end_at) = expired_at {
             if let Some(mut sess) = sessions.remove(&key) {
                 if sess.started {
-                    send_final_report(socket, session_id, &mut sess, end_at).await?;
-                    actions += 1;
+                    match send_final_report(socket, session_id, &mut sess, end_at).await {
+                        Ok(()) => {
+                            actions += 1;
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                peer = %peer,
+                                session_id,
+                                error = ?err,
+                                "udp-server drop expired session after final report error"
+                            );
+                        }
+                    }
                 }
             }
             continue;
         }
+
         let Some(sess) = sessions.get_mut(&key) else {
             continue;
         };
@@ -377,14 +389,56 @@ async fn advance_sessions(
         }
 
         // Send takes precedence over report for "first packet should be data" tests.
-        if actions < MAX_ACTIONS_PER_TICK && sess.should_send_now(now) {
-            send_one(socket, session_id, sess, now).await?;
-            actions += 1;
+        if actions < MAX_ACTIONS_PER_TICK
+            && sessions
+                .get(&key)
+                .is_some_and(|sess| sess.should_send_now(now))
+        {
+            let send_res = {
+                let sess = sessions.get_mut(&key).expect("session should still exist");
+                send_one(socket, session_id, sess, now).await
+            };
+            match send_res {
+                Ok(()) => {
+                    actions += 1;
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        peer = %peer,
+                        session_id,
+                        error = ?err,
+                        "udp-server drop session after timer send error"
+                    );
+                    sessions.remove(&key);
+                    continue;
+                }
+            }
         }
 
-        if actions < MAX_ACTIONS_PER_TICK && sess.should_report_now(now) {
-            send_report(socket, session_id, sess, now, false).await?;
-            actions += 1;
+        if actions < MAX_ACTIONS_PER_TICK
+            && sessions
+                .get(&key)
+                .is_some_and(|sess| sess.should_report_now(now))
+        {
+            let report_res = {
+                let sess = sessions.get_mut(&key).expect("session should still exist");
+                send_report(socket, session_id, sess, now, false).await
+            };
+            match report_res {
+                Ok(()) => {
+                    actions += 1;
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        peer = %peer,
+                        session_id,
+                        error = ?err,
+                        "udp-server drop session after timer report error"
+                    );
+                    sessions.remove(&key);
+                    continue;
+                }
+            }
         }
     }
 
@@ -1305,6 +1359,77 @@ mod tests {
 
         shutdown_tx.send(()).ok();
         server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_advance_sessions_ignores_send_errors_and_keeps_other_sessions() -> Result<()>
+    {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        let good_peer = client.local_addr()?;
+        let bad_peer: SocketAddr = "[::1]:9".parse()?;
+        let start = UdpPerfStart {
+            session_id: 1,
+            mode: UdpPerfMode::Forward,
+            payload_len: 16,
+            packets_per_second: 1_000,
+            duration_micros: 200_000,
+            report_interval_micros: 10_000,
+        };
+        let reverse_start = UdpPerfStart {
+            session_id: 2,
+            mode: UdpPerfMode::Reverse,
+            ..start.clone()
+        };
+
+        let mut sessions = std::collections::HashMap::new();
+        let mut bad_send =
+            super::Session::new_start(bad_peer, &reverse_start, Duration::from_millis(10))?;
+        let mut bad_report =
+            super::Session::new_start(bad_peer, &start, Duration::from_millis(10))?;
+        let mut good = super::Session::new_start(
+            good_peer,
+            &UdpPerfStart {
+                session_id: 3,
+                ..start.clone()
+            },
+            Duration::from_millis(10),
+        )?;
+
+        let now = tokio::time::Instant::now();
+        bad_send.next_send_at = Some(now);
+        bad_send.next_report_at = None;
+        bad_report.next_send_at = None;
+        bad_report.next_report_at = Some(now);
+        good.next_send_at = None;
+        good.next_report_at = Some(now);
+
+        let bad_send_key = super::session_key(bad_peer, reverse_start.session_id);
+        let bad_report_key = super::session_key(bad_peer, start.session_id);
+        let good_key = super::session_key(good_peer, 3);
+        sessions.insert(bad_send_key, bad_send);
+        sessions.insert(bad_report_key, bad_report);
+        sessions.insert(good_key, good);
+
+        super::advance_sessions(&socket, &mut sessions, now).await?;
+
+        assert!(
+            !sessions.contains_key(&bad_send_key),
+            "bad reverse send session should be removed after send error"
+        );
+        assert!(
+            !sessions.contains_key(&bad_report_key),
+            "bad report session should be removed after report error"
+        );
+        assert!(
+            sessions.contains_key(&good_key),
+            "good session should remain active after unrelated send errors"
+        );
+
+        let report = recv_report(&client, Duration::from_millis(200)).await?;
+        assert_eq!(report.summary.session_id, 3);
+        assert!(!report.is_final);
         Ok(())
     }
 
