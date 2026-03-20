@@ -1388,6 +1388,7 @@ async fn udp_relay_task_hard_nat(
     codec: UdpRelayCodec,
     shared_flows: SharedRelayFlows,
 ) -> Result<()> {
+    let hard_nat_session_id = hard_nat_session.session_id;
     let hard_nat_conn = open_udp_relay_hard_nat_socket(
         &ctrl,
         remote_ice,
@@ -1414,6 +1415,15 @@ async fn udp_relay_task_hard_nat(
         remote_addr,
         elapsed,
     } = hard_nat_conn;
+    tracing::warn!(
+        "[agent_hardnat_diag] udp relay hard-nat socket ready: session_id={}, role={}, local=[{}], remote=[{}], elapsed={}ms, target=[{}]",
+        hard_nat_session_id,
+        role.as_str(),
+        local_addr,
+        remote_addr,
+        elapsed.as_millis(),
+        target_addr
+    );
     socket.connect(remote_addr).await.with_context(|| {
         format!(
             "udp relay hard-nat connect remote failed, remote [{}], target [{}]",

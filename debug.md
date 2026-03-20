@@ -332,3 +332,38 @@ python3 rtun/tests/manual/run_manual_nat4_auto.py \
     - 如果 pane 宽度不够，`recommended peer command` 这一行会被折行，端口号可能被截断
     - 固定使用 `tmux capture-pane -pJ -t rtun-debug-agent ...`
     - `-pJ` 会把折行重新拼回一行，便于准确抠出 `<nat3_public_addr>`
+
+12. 不要把 `14433 -> 127.0.0.1:4433` 当成 UDP echo 验证口
+    - `rtun-full.toml` 里的这条默认规则，目标 `127.0.0.1:4433` 对应的是 `hy2` 内置脚本默认启动的 hysteria2 server
+    - 它不是“收到什么就原样回什么”的 UDP echo 服务
+    - 所以 `udp_probe_local.py --target-port 14433` 没回包，不能直接当成 hard-nat 或 relay 失败证据
+    - 如果要验证 post-connected 数据面，固定改用显式 echo 口：
+      - 远端 agent 设置 `RTUN_AGENT_DEFAULT_UDP_ECHO_ADDR=127.0.0.1:12346`
+      - 本地 relay 显式加 `-L 'udp://0.0.0.0:15433?to=127.0.0.1:12346'`
+      - 再对 `15433` 跑 `udp_probe_local.py`
+
+13. 显式加了 `15433 -> 12346` 之后，不要只 grep 第一条 `udp relay hard-nat connected`
+    - `rtun-full.toml` 里的默认 `14433 -> 127.0.0.1:4433` 规则仍然会同时存在
+    - 所以同一轮 relay 里，可能同时出现：
+      - `target=[127.0.0.1:4433]`
+      - `target=[127.0.0.1:12346]`
+    - 如果只看第一条 `connected`，很容易误把默认 `4433` 那条当成 echo 验证结果
+    - 做 relay hard-nat 稳定性结论时，必须以：
+      - `15433` 的 `udp_probe_local.py` 实际收包结果
+      - 以及 `target=[127.0.0.1:12346]` 那条 connected 日志
+      作为主证据
+
+14. 本机不要再假设有 `stdbuf`
+    - 当前本机环境直接执行 `stdbuf` 会报：
+      - `env: stdbuf: No such file or directory`
+    - 所以本机跑 relay 或本机侧一次性调试命令时，不要再写：
+      - `env ... stdbuf -oL -eL target/debug/rtun ...`
+    - `stdbuf` 只在已经确认存在的远端 ubuntu 环境里用
+
+15. nightly shell 不要再假设有 `rg`
+    - 当前 nightly shell 基础环境没有 `rg`
+    - 远端一次性排查日志时，默认改用：
+      - `grep`
+      - `sed`
+      - `awk`
+    - 如果脚本确实依赖 `rg`，要先在文档或脚本里显式声明环境前提，不能默认远端可用

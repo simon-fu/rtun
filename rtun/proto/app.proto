@@ -233,6 +233,8 @@ message HardNatConnected {
     string selected_nat4_ip            = 2;
     uint32 selected_port               = 3;
     uint32 restore_ttl                 = 4;
+    uint64 selected_socket_id          = 5;
+    uint64 selected_generation         = 6;
 }
 
 message HardNatAbort {

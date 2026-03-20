@@ -188,6 +188,8 @@ mod tests {
                         selected_nat4_ip: "198.51.100.20".into(),
                         selected_port: 40001,
                         restore_ttl: 64,
+                        selected_socket_id: 11,
+                        selected_generation: 2,
                         ..Default::default()
                     },
                 )),
