@@ -422,7 +422,7 @@ async fn send_one(
         payload: vec![0x5a; payload_len],
     };
 
-    let bytes = UdpPerfWirePacket::Data(pkt.clone()).encode()?;
+    let bytes = pkt.encode()?;
     socket
         .send_to(&bytes, sess.peer)
         .await
@@ -516,10 +516,7 @@ fn session_report_at(sess: &Session, now: tokio::time::Instant) -> tokio::time::
     sess.end_at.map_or(now, |end_at| std::cmp::min(end_at, now))
 }
 
-fn is_duplicate_start(
-    sess: &Session,
-    start: &UdpPerfStart,
-) -> bool {
+fn is_duplicate_start(sess: &Session, start: &UdpPerfStart) -> bool {
     sess.started && sess.start_cfg.as_ref().is_some_and(|cfg| cfg == start)
 }
 
@@ -815,7 +812,10 @@ mod tests {
         sessions.insert((peer, 1), sess);
 
         super::advance_sessions(&socket, &mut sessions, end_at).await?;
-        assert!(sessions.is_empty(), "expired hello session should be removed");
+        assert!(
+            sessions.is_empty(),
+            "expired hello session should be removed"
+        );
         Ok(())
     }
 
@@ -929,7 +929,10 @@ mod tests {
 
         let mut buf = vec![0u8; 2048];
         let r = tokio::time::timeout(Duration::from_millis(60), client.recv(&mut buf)).await;
-        assert!(r.is_err(), "unexpected final report for session without START");
+        assert!(
+            r.is_err(),
+            "unexpected final report for session without START"
+        );
 
         shutdown_tx.send(()).ok();
         server_task.abort();

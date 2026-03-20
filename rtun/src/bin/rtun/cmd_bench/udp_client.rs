@@ -98,14 +98,26 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
     };
     send_control(&socket, UdpPerfControlPacket::Start(start.clone())).await?;
 
-    let started_at = Instant::now();
-    let stop_at = started_at
-        .checked_add(duration)
-        .context("local stop deadline overflow")?;
+    let start_sent_at = Instant::now();
+    let wait_for_start_confirmation = mode_waits_for_start_confirmation(args.mode, pps, duration);
+    let mut stop_at = if wait_for_start_confirmation {
+        None
+    } else {
+        Some(stop_deadline(start_sent_at, duration)?)
+    };
     let mut stop_sent = false;
     let mut final_deadline: Option<Instant> = None;
-    let mut next_start_retry_at = next_start_retry_deadline(started_at)?;
-    let mut next_send_at = first_send_deadline(started_at, args.mode, pps);
+    let mut next_start_retry_at = next_start_retry_deadline(start_sent_at)?;
+    let mut start_confirmation_deadline = if wait_for_start_confirmation {
+        Some(start_confirmation_timeout(start_sent_at, duration)?)
+    } else {
+        None
+    };
+    let mut next_send_at = if wait_for_start_confirmation {
+        None
+    } else {
+        first_send_deadline(start_sent_at, args.mode, pps)
+    };
     let mut send_seq: u64 = 0;
     let mut client_rx = ClientRxStats::default();
     let mut final_report: Option<UdpPerfReport> = None;
@@ -116,26 +128,36 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
     loop {
         let now = Instant::now();
 
-        if !stop_sent && now >= stop_at {
-            send_control(
-                &socket,
-                UdpPerfControlPacket::Stop(UdpPerfStop { session_id }),
-            )
-            .await?;
-            stop_sent = true;
-            next_start_retry_at = None;
-            next_send_at = None;
-            final_deadline = Some(
-                now.checked_add(FINAL_REPORT_TIMEOUT)
-                    .context("final report deadline overflow")?,
-            );
+        if !stop_sent {
+            if let Some(deadline) = start_confirmation_deadline {
+                if now >= deadline {
+                    bail!("timeout waiting start confirmation");
+                }
+            }
+
+            if stop_at.is_some_and(|deadline| now >= deadline) {
+                send_control(
+                    &socket,
+                    UdpPerfControlPacket::Stop(UdpPerfStop { session_id }),
+                )
+                .await?;
+                stop_sent = true;
+                next_start_retry_at = None;
+                next_send_at = None;
+                start_confirmation_deadline = None;
+                final_deadline = Some(
+                    now.checked_add(FINAL_REPORT_TIMEOUT)
+                        .context("final report deadline overflow")?,
+                );
+            }
         }
 
         if !stop_sent {
             if let Some(due) = next_start_retry_at {
                 if due <= now {
-                    send_control(&socket, UdpPerfControlPacket::Start(start.clone())).await?;
-                    next_start_retry_at = next_start_retry_deadline(now)?;
+                    let retry_sent_at =
+                        send_start_retry_with_hello(&socket, session_id, args.mode, &start).await?;
+                    next_start_retry_at = next_start_retry_deadline(retry_sent_at)?;
                 }
             }
             if let Some(due) = next_send_at {
@@ -165,7 +187,8 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
         if let Some(deadline) = next_loop_deadline(
             next_send_at,
             next_start_retry_at,
-            (!stop_sent).then_some(stop_at),
+            if stop_sent { None } else { stop_at },
+            start_confirmation_deadline,
             if final_report.is_some() {
                 final_report_drain_deadline
             } else {
@@ -195,6 +218,11 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                         }
                     }
                     next_start_retry_at = None;
+                    if start_confirmation_deadline.take().is_some() {
+                        let anchor = Instant::now();
+                        stop_at = Some(stop_deadline(anchor, duration)?);
+                        next_send_at = first_send_deadline(anchor, args.mode, pps);
+                    }
                     if had_final_report {
                         refresh_final_report_drain_deadline(
                             final_report.as_ref(),
@@ -226,6 +254,11 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                 }
             }
             next_start_retry_at = None;
+            if start_confirmation_deadline.take().is_some() {
+                let anchor = Instant::now();
+                stop_at = Some(stop_deadline(anchor, duration)?);
+                next_send_at = first_send_deadline(anchor, args.mode, pps);
+            }
             if had_final_report {
                 refresh_final_report_drain_deadline(
                     final_report.as_ref(),
@@ -280,6 +313,7 @@ fn next_loop_deadline(
     next_send_at: Option<Instant>,
     next_start_retry_at: Option<Instant>,
     stop_at: Option<Instant>,
+    start_confirmation_deadline: Option<Instant>,
     final_deadline: Option<Instant>,
 ) -> Option<Instant> {
     let mut next = next_send_at;
@@ -287,6 +321,9 @@ fn next_loop_deadline(
         next = Some(next.map_or(t, |cur| min(cur, t)));
     }
     if let Some(t) = stop_at {
+        next = Some(next.map_or(t, |cur| min(cur, t)));
+    }
+    if let Some(t) = start_confirmation_deadline {
         next = Some(next.map_or(t, |cur| min(cur, t)));
     }
     if let Some(t) = final_deadline {
@@ -302,6 +339,10 @@ fn next_start_retry_deadline(now: Instant) -> Result<Option<Instant>> {
     ))
 }
 
+fn start_confirmation_timeout(started_at: Instant, duration: Duration) -> Result<Instant> {
+    stop_deadline(stop_deadline(started_at, duration)?, FINAL_REPORT_TIMEOUT)
+}
+
 fn refresh_final_report_drain_deadline(
     final_report: Option<&UdpPerfReport>,
     client_rx: &ClientRxStats,
@@ -309,7 +350,8 @@ fn refresh_final_report_drain_deadline(
     now: Instant,
 ) -> Result<()> {
     if let Some(report) = final_report {
-        *final_report_drain_deadline = schedule_final_report_drain_deadline(report, client_rx, now)?;
+        *final_report_drain_deadline =
+            schedule_final_report_drain_deadline(report, client_rx, now)?;
     }
     Ok(())
 }
@@ -381,7 +423,12 @@ impl ClientRxStats {
         interval_elapsed_micros: u64,
     ) -> super::udp_perf::UdpPerfDirectionSummary {
         self.reverse_stats
-            .build_summary(0, UdpPerfMode::Reverse, total_elapsed_micros, interval_elapsed_micros)
+            .build_summary(
+                0,
+                UdpPerfMode::Reverse,
+                total_elapsed_micros,
+                interval_elapsed_micros,
+            )
             .reverse
     }
 
@@ -434,7 +481,10 @@ impl ClientRxStats {
             report.summary.total_elapsed_micros,
             report.summary.interval_elapsed_micros,
         );
-        let unique_packets = reverse.total.packets.saturating_sub(reverse.total.duplicate);
+        let unique_packets = reverse
+            .total
+            .packets
+            .saturating_sub(reverse.total.duplicate);
         unique_packets < report.summary.reverse.total.packets
     }
 }
@@ -453,6 +503,16 @@ fn resolve_pps(args: &CmdArgs) -> Result<u64> {
         return Ok(pps);
     }
     Ok(DEFAULT_PPS)
+}
+
+fn mode_waits_for_start_confirmation(mode: UdpPerfMode, pps: u64, duration: Duration) -> bool {
+    !duration.is_zero() && pps > 0 && matches!(mode, UdpPerfMode::Reverse | UdpPerfMode::Bidir)
+}
+
+fn stop_deadline(started_at: Instant, duration: Duration) -> Result<Instant> {
+    started_at
+        .checked_add(duration)
+        .context("local stop deadline overflow")
 }
 
 fn first_send_deadline(started_at: Instant, mode: UdpPerfMode, pps: u64) -> Option<Instant> {
@@ -485,6 +545,21 @@ async fn send_control(socket: &UdpSocket, pkt: UdpPerfControlPacket) -> Result<(
         .await
         .with_context(|| "udp-client send control packet failed")?;
     Ok(())
+}
+
+async fn send_start_retry_with_hello(
+    socket: &UdpSocket,
+    session_id: u64,
+    mode: UdpPerfMode,
+    start: &UdpPerfStart,
+) -> Result<Instant> {
+    send_control(
+        socket,
+        UdpPerfControlPacket::Hello(UdpPerfHello { session_id, mode }),
+    )
+    .await?;
+    send_control(socket, UdpPerfControlPacket::Start(start.clone())).await?;
+    Ok(Instant::now())
 }
 
 async fn send_forward_data(
@@ -712,7 +787,7 @@ pub struct CmdArgs {
 mod tests {
     use std::{net::SocketAddr, num::NonZeroU64, time::Duration};
 
-    use anyhow::{Context, Result, bail, ensure};
+    use anyhow::{bail, ensure, Context, Result};
     use serde_json::Value;
     use tokio::net::UdpSocket;
     use tokio::time::Instant;
@@ -968,8 +1043,8 @@ mod tests {
     }
 
     #[test]
-    fn udp_client_build_client_view_summary_keeps_server_reverse_totals_for_tail_loss(
-    ) -> Result<()> {
+    fn udp_client_build_client_view_summary_keeps_server_reverse_totals_for_tail_loss() -> Result<()>
+    {
         let mut client_rx = super::ClientRxStats::default();
         for seq in 1..=4 {
             client_rx.on_data_packet(&UdpPerfDataPacket {
@@ -1017,7 +1092,8 @@ mod tests {
             .context("missing forward.total.packets")?;
 
         assert_eq!(
-            forward_packets, 1,
+            forward_packets,
+            1,
             "forward low-pps run should send one packet, output={}",
             out.output.trim()
         );
@@ -1133,7 +1209,44 @@ mod tests {
             .and_then(Value::as_u64)
             .context("missing reverse.total.packets")?;
 
-        assert!(reverse_packets > 0, "reverse run should complete after START retry");
+        assert!(
+            reverse_packets > 0,
+            "reverse run should complete after START retry"
+        );
+
+        server_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_client_reverse_retry_rebases_stop_deadline_on_first_server_packet() -> Result<()> {
+        let (target, server_task) =
+            spawn_drop_first_start_reverse_server_with_min_stop_delay(Duration::from_millis(950))
+                .await?;
+        let mut args = test_args(target, UdpPerfMode::Reverse);
+        args.time = 1;
+        args.pps = Some(100);
+        args.json = true;
+
+        let _ = tokio::time::timeout(Duration::from_secs(4), super::run_for_test(args))
+            .await
+            .context("udp-client should finish after retrying START")??;
+
+        server_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_client_retry_start_resends_hello_before_retry_start() -> Result<()> {
+        let (target, server_task) = spawn_drop_initial_hello_and_start_forward_server().await?;
+        let mut args = test_args(target, UdpPerfMode::Forward);
+        args.time = 1;
+        args.pps = Some(20);
+        args.json = true;
+
+        let _ = tokio::time::timeout(Duration::from_secs(4), super::run_for_test(args))
+            .await
+            .context("udp-client should finish after retrying HELLO/START")??;
 
         server_task.await??;
         Ok(())
@@ -1519,6 +1632,12 @@ mod tests {
 
     async fn spawn_drop_first_start_reverse_server(
     ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
+        spawn_drop_first_start_reverse_server_with_min_stop_delay(Duration::ZERO).await
+    }
+
+    async fn spawn_drop_first_start_reverse_server_with_min_stop_delay(
+        min_stop_delay: Duration,
+    ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
         let addr = socket.local_addr()?;
         let task = tokio::spawn(async move {
@@ -1526,6 +1645,7 @@ mod tests {
             let mut client = None;
             let mut session_id = None;
             let mut start_seen = 0u64;
+            let mut accepted_start_at = None;
 
             loop {
                 let (n, from) = socket.recv_from(&mut buf).await?;
@@ -1542,12 +1662,24 @@ mod tests {
                             continue;
                         }
 
+                        accepted_start_at = Some(Instant::now());
                         socket
                             .send_to(&wire_reverse_data(start.session_id, 1, 32)?, from)
                             .await?;
                     }
                     UdpPerfWirePacket::Control(UdpPerfControlPacket::Stop(stop)) => {
                         ensure!(start_seen >= 2, "client did not retry START before STOP");
+                        if !min_stop_delay.is_zero() {
+                            let accepted_start_at =
+                                accepted_start_at.context("missing accepted start timestamp")?;
+                            let elapsed = accepted_start_at.elapsed();
+                            ensure!(
+                                elapsed >= min_stop_delay,
+                                "stop arrived too early after accepted START: {:?} < {:?}",
+                                elapsed,
+                                min_stop_delay
+                            );
+                        }
                         let sid = session_id.unwrap_or(stop.session_id);
                         let peer = client.unwrap_or(from);
                         socket
@@ -1583,6 +1715,110 @@ mod tests {
                                                 ..UdpPerfCountersSummary::default()
                                             },
                                         },
+                                    },
+                                })?,
+                                peer,
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        Ok((addr.to_string(), task))
+    }
+
+    async fn spawn_drop_initial_hello_and_start_forward_server(
+    ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = socket.local_addr()?;
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut client = None;
+            let mut session_id = None;
+            let mut first_hello_dropped = false;
+            let mut first_start_dropped = false;
+            let mut retry_hello_seen = false;
+            let mut start_accepted = false;
+            let mut forward_packets = 0u64;
+
+            loop {
+                let (n, from) = socket.recv_from(&mut buf).await?;
+                match UdpPerfWirePacket::decode(&buf[..n])? {
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Hello(hello)) => {
+                        client = Some(from);
+                        session_id = Some(hello.session_id);
+                        if !first_hello_dropped {
+                            first_hello_dropped = true;
+                            continue;
+                        }
+                        retry_hello_seen = true;
+                    }
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Start(start)) => {
+                        client = Some(from);
+                        session_id = Some(start.session_id);
+                        if !first_start_dropped {
+                            first_start_dropped = true;
+                            continue;
+                        }
+                        ensure!(
+                            retry_hello_seen,
+                            "client retried START without resending HELLO"
+                        );
+                        retry_hello_seen = false;
+                        start_accepted = true;
+                    }
+                    UdpPerfWirePacket::Data(data) => {
+                        if start_accepted
+                            && matches!(data.header.direction, UdpPerfDirection::Forward)
+                        {
+                            forward_packets = forward_packets.saturating_add(1);
+                        }
+                    }
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Stop(stop)) => {
+                        ensure!(first_hello_dropped, "client did not send initial HELLO");
+                        ensure!(first_start_dropped, "client did not send initial START");
+                        ensure!(start_accepted, "client never recovered after retry");
+                        ensure!(
+                            forward_packets > 0,
+                            "client sent no forward data after retry"
+                        );
+                        let sid = session_id.unwrap_or(stop.session_id);
+                        let peer = client.unwrap_or(from);
+                        socket
+                            .send_to(
+                                &wire_report(UdpPerfReport {
+                                    report_seq: 1,
+                                    is_final: true,
+                                    summary: UdpPerfSummary {
+                                        session_id: sid,
+                                        mode: UdpPerfMode::Forward,
+                                        total_elapsed_micros: 1_000_000,
+                                        interval_elapsed_micros: 1_000_000,
+                                        total: UdpPerfCountersSummary {
+                                            packets: forward_packets,
+                                            bytes: forward_packets.saturating_mul(96),
+                                            ..UdpPerfCountersSummary::default()
+                                        },
+                                        interval: UdpPerfCountersSummary {
+                                            packets: forward_packets,
+                                            bytes: forward_packets.saturating_mul(96),
+                                            ..UdpPerfCountersSummary::default()
+                                        },
+                                        forward: UdpPerfDirectionSummary {
+                                            total: UdpPerfCountersSummary {
+                                                packets: forward_packets,
+                                                bytes: forward_packets.saturating_mul(96),
+                                                ..UdpPerfCountersSummary::default()
+                                            },
+                                            interval: UdpPerfCountersSummary {
+                                                packets: forward_packets,
+                                                bytes: forward_packets.saturating_mul(96),
+                                                ..UdpPerfCountersSummary::default()
+                                            },
+                                        },
+                                        reverse: UdpPerfDirectionSummary::default(),
                                     },
                                 })?,
                                 peer,
