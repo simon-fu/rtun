@@ -13,6 +13,7 @@ use super::udp_perf::{
 
 type SessionKey = (SocketAddr, u64);
 const HELLO_SESSION_TTL: Duration = Duration::from_secs(30);
+const FINAL_REPORT_RETRY_TTL: Duration = Duration::from_secs(30);
 
 pub async fn run(args: CmdArgs) -> Result<()> {
     let listen: SocketAddr = args
@@ -59,6 +60,8 @@ struct Session {
     report_seq: u64,
     start_cfg: Option<UdpPerfStart>,
     stats: UdpPerfStats,
+    final_report: Option<UdpPerfReport>,
+    final_report_retry_until: Option<tokio::time::Instant>,
 
     // Send loop config (reverse/bidir only).
     send_payload_len: usize,
@@ -91,6 +94,8 @@ impl Session {
             report_seq: 0,
             start_cfg: None,
             stats: UdpPerfStats::default(),
+            final_report: None,
+            final_report_retry_until: None,
             send_payload_len: 0,
             send_pps: 0,
             send_seq: 0,
@@ -133,6 +138,8 @@ impl Session {
             report_seq: 0,
             start_cfg: Some(start.clone()),
             stats: UdpPerfStats::default(),
+            final_report: None,
+            final_report_retry_until: None,
             send_payload_len: start.payload_len as usize,
             send_pps: start.packets_per_second,
             send_seq: 0,
@@ -169,6 +176,9 @@ impl Session {
         }
         if let Some(send_at) = self.next_send_at {
             next = Some(next.map_or(send_at, |cur| std::cmp::min(cur, send_at)));
+        }
+        if let Some(retry_until) = self.final_report_retry_until {
+            next = Some(next.map_or(retry_until, |cur| std::cmp::min(cur, retry_until)));
         }
         next
     }
@@ -296,11 +306,27 @@ async fn on_packet(
             UdpPerfControlPacket::Stop(stop) => {
                 let key = session_key(from, stop.session_id);
                 let now = tokio::time::Instant::now();
+                let cached_report = if let Some(sess) = sessions.get_mut(&key) {
+                    if let Some(report) = sess.final_report.clone() {
+                        refresh_final_report_retry_until(sess, now)?;
+                        Some((sess.peer, report))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some((peer, report)) = cached_report {
+                    send_report_packet(socket, peer, &report).await?;
+                    return Ok(());
+                }
+
                 let finalize_now = if let Some(sess) = sessions.get_mut(&key) {
                     if sess.started {
                         sess.stop_requested = true;
                         sess.next_report_at = None;
                         sess.next_send_at = None;
+                        sess.send_end_at = None;
                         sess.end_at.map_or(true, |end_at| now >= end_at)
                     } else {
                         false
@@ -309,10 +335,15 @@ async fn on_packet(
                     false
                 };
                 if finalize_now {
-                    if let Some(mut sess) = sessions.remove(&key) {
-                        let report_at = session_report_at(&sess, now);
-                        send_final_report(socket, stop.session_id, &mut sess, report_at).await?;
-                    }
+                    let (peer, report) = {
+                        let sess = sessions
+                            .get_mut(&key)
+                            .expect("session should still exist when finalizing STOP");
+                        let report_at = session_report_at(sess, now);
+                        let report = cache_final_report(stop.session_id, sess, report_at, now)?;
+                        (sess.peer, report)
+                    };
+                    send_report_packet(socket, peer, &report).await?;
                 }
             }
             UdpPerfControlPacket::Report(_) => {
@@ -321,6 +352,9 @@ async fn on_packet(
         },
         UdpPerfWirePacket::Data(data) => {
             if let Some(sess) = sessions.get_mut(&session_key(from, data.header.session_id)) {
+                if sess.final_report.is_some() {
+                    return Ok(());
+                }
                 if !sess.started {
                     if matches!(data.header.direction, UdpPerfDirection::Forward)
                         && matches!(sess.mode, UdpPerfMode::Forward | UdpPerfMode::Bidir)
@@ -353,24 +387,54 @@ async fn advance_sessions(
             break;
         }
         let key = session_key(peer, session_id);
-        let expired_at = sessions
+        let retry_expired = sessions
             .get(&key)
-            .and_then(|sess| sess.end_at.filter(|end_at| now >= *end_at));
+            .and_then(|sess| {
+                sess.final_report_retry_until
+                    .filter(|retry_until| now >= *retry_until)
+            })
+            .is_some();
+        if retry_expired {
+            sessions.remove(&key);
+            continue;
+        }
+        let expired_at = sessions.get(&key).and_then(|sess| {
+            if sess.final_report.is_some() {
+                None
+            } else {
+                sess.end_at.filter(|end_at| now >= *end_at)
+            }
+        });
         if let Some(end_at) = expired_at {
-            if let Some(mut sess) = sessions.remove(&key) {
+            let final_report = {
+                let Some(sess) = sessions.get_mut(&key) else {
+                    continue;
+                };
                 if sess.started {
-                    match send_final_report(socket, session_id, &mut sess, end_at).await {
-                        Ok(()) => {
-                            actions += 1;
-                        }
-                        Err(err) => {
-                            tracing::debug!(
-                                peer = %peer,
-                                session_id,
-                                error = ?err,
-                                "udp-server drop expired session after final report error"
-                            );
-                        }
+                    Some((
+                        sess.peer,
+                        cache_final_report(session_id, sess, end_at, now)?,
+                    ))
+                } else {
+                    None
+                }
+            };
+            if final_report.is_none() {
+                sessions.remove(&key);
+                continue;
+            }
+            if let Some((peer, report)) = final_report {
+                match send_report_packet(socket, peer, &report).await {
+                    Ok(()) => {
+                        actions += 1;
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            peer = %peer,
+                            session_id,
+                            error = ?err,
+                            "udp-server keep expired session for final report retry after send error"
+                        );
                     }
                 }
             }
@@ -507,26 +571,8 @@ async fn send_report(
         sess.next_report_at = None;
         return Err(anyhow!("report interval is zero"));
     }
-    sess.report_seq = sess.report_seq.saturating_add(1);
-    let total_elapsed = now.duration_since(sess.started_at);
-    let interval_elapsed = now.duration_since(sess.last_report_at);
-    let summary = sess.stats.build_summary(
-        session_id,
-        sess.mode,
-        dur_to_micros(total_elapsed),
-        dur_to_micros(interval_elapsed),
-    );
-    let report = UdpPerfReport {
-        report_seq: sess.report_seq,
-        is_final,
-        summary,
-    };
-
-    let bytes = UdpPerfWirePacket::Control(UdpPerfControlPacket::Report(report)).encode()?;
-    socket
-        .send_to(&bytes, sess.peer)
-        .await
-        .with_context(|| format!("udp send_to failed to [{}]", sess.peer))?;
+    let report = build_report(session_id, sess, now, is_final);
+    send_report_packet(socket, sess.peer, &report).await?;
 
     sess.last_report_at = now;
     if is_final {
@@ -539,13 +585,71 @@ async fn send_report(
     Ok(())
 }
 
-async fn send_final_report(
-    socket: &UdpSocket,
+fn build_report(
     session_id: u64,
     sess: &mut Session,
     now: tokio::time::Instant,
+    is_final: bool,
+) -> UdpPerfReport {
+    sess.report_seq = sess.report_seq.saturating_add(1);
+    let total_elapsed = now.duration_since(sess.started_at);
+    let interval_elapsed = now.duration_since(sess.last_report_at);
+    let summary = sess.stats.build_summary(
+        session_id,
+        sess.mode,
+        dur_to_micros(total_elapsed),
+        dur_to_micros(interval_elapsed),
+    );
+    UdpPerfReport {
+        report_seq: sess.report_seq,
+        is_final,
+        summary,
+    }
+}
+
+async fn send_report_packet(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    report: &UdpPerfReport,
 ) -> Result<()> {
-    send_report(socket, session_id, sess, now, true).await
+    let bytes =
+        UdpPerfWirePacket::Control(UdpPerfControlPacket::Report(report.clone())).encode()?;
+    socket
+        .send_to(&bytes, peer)
+        .await
+        .with_context(|| format!("udp send_to failed to [{peer}]"))?;
+    Ok(())
+}
+
+fn refresh_final_report_retry_until(sess: &mut Session, now: tokio::time::Instant) -> Result<()> {
+    sess.final_report_retry_until = Some(
+        checked_add(now, FINAL_REPORT_RETRY_TTL)
+            .with_context(|| "final report retry deadline overflow")?,
+    );
+    Ok(())
+}
+
+fn cache_final_report(
+    session_id: u64,
+    sess: &mut Session,
+    report_at: tokio::time::Instant,
+    retain_from: tokio::time::Instant,
+) -> Result<UdpPerfReport> {
+    if let Some(report) = sess.final_report.clone() {
+        refresh_final_report_retry_until(sess, retain_from)?;
+        return Ok(report);
+    }
+
+    let report = build_report(session_id, sess, report_at, true);
+    sess.last_report_at = report_at;
+    sess.next_report_at = None;
+    sess.next_send_at = None;
+    sess.send_end_at = None;
+    sess.end_at = None;
+    sess.stats.reset_interval();
+    sess.final_report = Some(report.clone());
+    refresh_final_report_retry_until(sess, retain_from)?;
+    Ok(report)
 }
 
 fn dur_to_micros(d: Duration) -> u64 {
@@ -1254,6 +1358,52 @@ mod tests {
         assert!(report.is_final);
         assert_eq!(report.summary.total.packets, 1);
         assert_eq!(report.summary.forward.total.packets, 1);
+
+        shutdown_tx.send(()).ok();
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_repeated_stop_resends_final_report() -> Result<()> {
+        let (server_addr, shutdown_tx, server_task) = spawn_server_for_test(1_000).await?;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        client.connect(server_addr).await?;
+
+        let session_id = 710;
+        client
+            .send(&wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Forward,
+                payload_len: 16,
+                packets_per_second: 1_000,
+                duration_micros: 80_000,
+                report_interval_micros: 0,
+            }))?)
+            .await?;
+        client
+            .send(&wire_data(session_id, UdpPerfDirection::Forward, 1, 16)?)
+            .await?;
+
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        client
+            .send(&wire_control(UdpPerfControlPacket::Stop(UdpPerfStop {
+                session_id,
+            }))?)
+            .await?;
+        let first = recv_final_report(&client, Duration::from_millis(250)).await?;
+        assert!(first.is_final);
+        assert_eq!(first.summary.forward.total.packets, 1);
+
+        client
+            .send(&wire_control(UdpPerfControlPacket::Stop(UdpPerfStop {
+                session_id,
+            }))?)
+            .await?;
+        let second = recv_final_report(&client, Duration::from_millis(250)).await?;
+        assert!(second.is_final);
+        assert_eq!(second.summary.forward.total.packets, 1);
 
         shutdown_tx.send(()).ok();
         server_task.abort();

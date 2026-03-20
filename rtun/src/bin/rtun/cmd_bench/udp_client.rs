@@ -188,7 +188,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
             final_deadline,
             final_report_drain_deadline,
         )? {
-            let final_summary = build_client_view_summary(&report.summary, &client_rx, None);
+            let final_summary = build_final_client_view_summary(&report, &mut client_rx);
             output.push_str(&render_final_summary(&final_summary, args.json)?);
             return Ok(ClientRunOutput {
                 final_report: report,
@@ -769,6 +769,35 @@ fn build_client_view_summary(
         );
     }
     merged
+}
+
+fn build_final_client_view_summary(
+    report: &UdpPerfReport,
+    client_rx: &mut ClientRxStats,
+) -> UdpPerfSummary {
+    if !matches!(
+        report.summary.mode,
+        UdpPerfMode::Reverse | UdpPerfMode::Bidir
+    ) {
+        return build_client_view_summary(&report.summary, client_rx, None);
+    }
+
+    let reverse_interval = match client_rx.observe_interval_report(report.report_seq) {
+        IntervalReportSync::Synced => Some(client_rx.take_interval_summary(
+            report.summary.total_elapsed_micros,
+            report.summary.interval_elapsed_micros,
+        )),
+        IntervalReportSync::UnsyncedGap => {
+            let _ = client_rx.take_interval_summary(
+                report.summary.total_elapsed_micros,
+                report.summary.interval_elapsed_micros,
+            );
+            Some(report.summary.reverse.interval.clone())
+        }
+        IntervalReportSync::Stale => Some(report.summary.reverse.interval.clone()),
+    };
+
+    build_client_view_summary(&report.summary, client_rx, reverse_interval)
 }
 
 fn merge_reverse_total(
@@ -1604,6 +1633,65 @@ mod tests {
         assert!(
             output.contains("rev_pkts=1"),
             "next in-order interval should resync to one packet, got: {output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn udp_client_final_summary_uses_synced_reverse_interval_after_lost_interval_report(
+    ) -> Result<()> {
+        let output_policy = super::OutputPolicy {
+            stream_interval: false,
+            collect_interval: true,
+        };
+        let mut client_rx = super::ClientRxStats::default();
+        let mut output = String::new();
+
+        client_rx.on_data_packet(&UdpPerfDataPacket {
+            header: UdpPerfDataHeader {
+                session_id: 1,
+                stream_id: 1,
+                direction: UdpPerfDirection::Reverse,
+                seq: 1,
+                send_ts_micros: 1_000,
+                payload_len: 32,
+            },
+            payload: vec![0x5a; 32],
+        });
+        let _ = super::handle_incoming_packet(
+            1,
+            &wire_report(interval_report(1, 100_000, 100_000))?,
+            &mut output,
+            true,
+            output_policy,
+            &mut client_rx,
+        )?;
+
+        for seq in [2, 3] {
+            client_rx.on_data_packet(&UdpPerfDataPacket {
+                header: UdpPerfDataHeader {
+                    session_id: 1,
+                    stream_id: 1,
+                    direction: UdpPerfDirection::Reverse,
+                    seq,
+                    send_ts_micros: seq * 1_000,
+                    payload_len: 32,
+                },
+                payload: vec![0x5a; 32],
+            });
+        }
+
+        let mut final_report = interval_report(3, 300_000, 100_000);
+        final_report.is_final = true;
+        let final_summary = super::build_final_client_view_summary(&final_report, &mut client_rx);
+
+        assert_eq!(
+            final_summary.reverse.interval.packets, 1,
+            "final reverse interval should stay aligned to final report window after a lost interval report"
+        );
+        assert_eq!(
+            final_summary.interval.packets, 1,
+            "merged final interval should not accumulate multiple windows after a lost interval report"
         );
         Ok(())
     }
