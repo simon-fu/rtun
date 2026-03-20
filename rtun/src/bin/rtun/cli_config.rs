@@ -225,6 +225,12 @@ mod tests {
 
     #[test]
     fn prepare_argv_without_config_keeps_input() -> Result<()> {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _restore = EnvRestore::new(CONFIG_ENV_VAR);
+        unsafe {
+            std::env::remove_var(CONFIG_ENV_VAR);
+        }
+
         let raw = vec![
             "rtun".to_string(),
             "relay".to_string(),
