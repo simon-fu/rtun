@@ -20,14 +20,19 @@ use rtun::{
 };
 use tokio::net::UdpSocket;
 
+use crate::cmd_bench::{start_udp_server_background_task, UDP_SERVER_DEFAULT_INTERVAL_MS};
 use crate::rest_proto::{make_pub_url, make_ws_scheme};
 use crate::secret::token_gen;
 
 const DEFAULT_UDP_ECHO_ADDR_ENV_VAR: &str = "RTUN_AGENT_DEFAULT_UDP_ECHO_ADDR";
 const DEFAULT_UDP_ECHO_ADDR: &str = "127.0.0.1:12345";
+const DEFAULT_UDP_BENCH_ADDR_ENV_VAR: &str = "RTUN_AGENT_DEFAULT_UDP_BENCH_ADDR";
+const DEFAULT_UDP_BENCH_DISABLE_VALUE: &str = "off";
+const DEFAULT_UDP_BENCH_ADDR: &str = "127.0.0.1:9001";
 
 pub async fn run(args0: CmdArgs) -> Result<()> {
     start_default_udp_echo_task().await?;
+    start_default_udp_bench_task().await?;
 
     let mut url = url::Url::parse(&args0.url).with_context(|| "invalid url")?;
 
@@ -127,6 +132,23 @@ async fn start_default_udp_echo_task() -> Result<()> {
     Ok(())
 }
 
+async fn start_default_udp_bench_task() -> Result<()> {
+    let Some(addr) = resolve_default_udp_bench_addr()? else {
+        tracing::info!(
+            "default udp bench server disabled by env [{}]",
+            DEFAULT_UDP_BENCH_ADDR_ENV_VAR
+        );
+        return Ok(());
+    };
+
+    start_udp_server_background_task(
+        addr,
+        Duration::from_millis(UDP_SERVER_DEFAULT_INTERVAL_MS),
+        "agent-udp-bench-default",
+    )
+    .await
+}
+
 fn resolve_default_udp_echo_addr() -> Result<SocketAddr> {
     let raw_addr = std::env::var(DEFAULT_UDP_ECHO_ADDR_ENV_VAR)
         .ok()
@@ -138,6 +160,27 @@ fn resolve_default_udp_echo_addr() -> Result<SocketAddr> {
             DEFAULT_UDP_ECHO_ADDR_ENV_VAR
         )
     })
+}
+
+fn resolve_default_udp_bench_addr() -> Result<Option<SocketAddr>> {
+    let Some(raw_addr) = std::env::var(DEFAULT_UDP_BENCH_ADDR_ENV_VAR).ok() else {
+        return Ok(Some(DEFAULT_UDP_BENCH_ADDR.parse()?));
+    };
+
+    if raw_addr
+        .trim()
+        .eq_ignore_ascii_case(DEFAULT_UDP_BENCH_DISABLE_VALUE)
+    {
+        return Ok(None);
+    }
+
+    let addr = raw_addr.parse().with_context(|| {
+        format!(
+            "invalid default udp bench addr [{raw_addr}] from env [{}]",
+            DEFAULT_UDP_BENCH_ADDR_ENV_VAR
+        )
+    })?;
+    Ok(Some(addr))
 }
 
 async fn run_default_udp_echo_task(addr: SocketAddr, socket: UdpSocket) -> Result<()> {
@@ -386,8 +429,9 @@ pub struct CmdArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_default_udp_echo_addr, start_default_udp_echo_task, DEFAULT_UDP_ECHO_ADDR,
-        DEFAULT_UDP_ECHO_ADDR_ENV_VAR,
+        resolve_default_udp_bench_addr, resolve_default_udp_echo_addr,
+        start_default_udp_bench_task, start_default_udp_echo_task, DEFAULT_UDP_BENCH_ADDR,
+        DEFAULT_UDP_BENCH_ADDR_ENV_VAR, DEFAULT_UDP_ECHO_ADDR, DEFAULT_UDP_ECHO_ADDR_ENV_VAR,
     };
     use anyhow::Result;
     use std::{
@@ -439,6 +483,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_default_udp_bench_addr_uses_default_when_env_missing() -> Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::new(DEFAULT_UDP_BENCH_ADDR_ENV_VAR);
+        unsafe {
+            std::env::remove_var(DEFAULT_UDP_BENCH_ADDR_ENV_VAR);
+        }
+
+        assert_eq!(
+            resolve_default_udp_bench_addr()?,
+            Some(DEFAULT_UDP_BENCH_ADDR.parse()?)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_default_udp_bench_addr_defaults_to_loopback() -> Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::new(DEFAULT_UDP_BENCH_ADDR_ENV_VAR);
+        unsafe {
+            std::env::remove_var(DEFAULT_UDP_BENCH_ADDR_ENV_VAR);
+        }
+
+        assert_eq!(
+            resolve_default_udp_bench_addr()?,
+            Some("127.0.0.1:9001".parse()?)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_default_udp_bench_addr_returns_none_when_env_off() -> Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::new(DEFAULT_UDP_BENCH_ADDR_ENV_VAR);
+        unsafe {
+            std::env::set_var(DEFAULT_UDP_BENCH_ADDR_ENV_VAR, "off");
+        }
+
+        assert_eq!(resolve_default_udp_bench_addr()?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn start_default_udp_echo_task_uses_default_addr_without_env_override() -> Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _restore = EnvRestore::new(DEFAULT_UDP_ECHO_ADDR_ENV_VAR);
@@ -455,6 +541,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_default_udp_bench_task_returns_bind_error_when_resolved_addr_busy() -> Result<()>
+    {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::new(DEFAULT_UDP_BENCH_ADDR_ENV_VAR);
+        let occupied = StdUdpSocket::bind("127.0.0.1:0")?;
+        let busy_addr = occupied.local_addr()?;
+        unsafe {
+            std::env::set_var(DEFAULT_UDP_BENCH_ADDR_ENV_VAR, busy_addr.to_string());
+        }
+
+        let err = start_default_udp_bench_task()
+            .await
+            .expect_err("busy udp bench addr should fail to bind");
+        assert!(err.to_string().contains("udp-server bind failed"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn start_default_udp_echo_task_allows_env_override_of_default_addr() -> Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _restore = EnvRestore::new(DEFAULT_UDP_ECHO_ADDR_ENV_VAR);
@@ -466,6 +570,20 @@ mod tests {
         start_default_udp_echo_task()
             .await
             .expect("env override should avoid the busy default addr");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_default_udp_bench_task_allows_env_override_of_default_addr() -> Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::new(DEFAULT_UDP_BENCH_ADDR_ENV_VAR);
+        unsafe {
+            std::env::set_var(DEFAULT_UDP_BENCH_ADDR_ENV_VAR, "127.0.0.1:0");
+        }
+
+        start_default_udp_bench_task()
+            .await
+            .expect("env override should allow starting udp bench task");
         Ok(())
     }
 }

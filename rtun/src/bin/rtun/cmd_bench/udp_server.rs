@@ -2,6 +2,7 @@ use std::{collections::HashMap, net::SocketAddr, num::NonZeroU64, time::Duration
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::Parser;
+use rtun::async_rt::spawn_with_name;
 use tokio::net::UdpSocket;
 use tracing::info;
 
@@ -14,36 +15,74 @@ use super::udp_perf::{
 type SessionKey = (SocketAddr, u64);
 const HELLO_SESSION_TTL: Duration = Duration::from_secs(30);
 const FINAL_REPORT_RETRY_TTL: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:9001";
+pub(crate) const DEFAULT_INTERVAL_MS: u64 = 1000;
 
 pub async fn run(args: CmdArgs) -> Result<()> {
     let listen: SocketAddr = args
         .listen
         .parse()
         .with_context(|| format!("invalid --listen value [{}], expected ip:port", args.listen))?;
-    let socket = UdpSocket::bind(listen)
-        .await
-        .with_context(|| format!("udp-server bind failed at [{listen}]"))?;
+    let socket = bind_socket(listen).await?;
+    run_with_socket(socket, Duration::from_millis(args.interval.get())).await
+}
+
+pub(crate) async fn start_background_task(
+    listen: SocketAddr,
+    default_report_interval: Duration,
+    task_name: &'static str,
+) -> Result<()> {
+    let socket = bind_socket(listen).await?;
     let local_addr = socket
         .local_addr()
         .with_context(|| "get local_addr failed")?;
     info!(
         "udp bench server listen [{}], report interval [{}ms]",
         local_addr,
-        args.interval.get()
+        default_report_interval.as_millis()
     );
 
-    // For CLI, run forever. Tests provide shutdown channel.
-    udp_server_loop(socket, Duration::from_millis(args.interval.get()), None).await
+    spawn_with_name(task_name, async move {
+        if let Err(e) = udp_server_loop(socket, default_report_interval, None).await {
+            tracing::warn!(
+                "udp bench server task stopped: listen [{}], err [{:#}]",
+                local_addr,
+                e
+            );
+        }
+    });
+
+    Ok(())
 }
 
 #[derive(Parser, Debug)]
 #[clap(name = "udp-server", author, about, version)]
 pub struct CmdArgs {
-    #[clap(long = "listen", default_value = "0.0.0.0:9001")]
+    #[clap(long = "listen", default_value = DEFAULT_LISTEN_ADDR)]
     pub listen: String,
 
-    #[clap(long = "interval", default_value = "1000")]
+    #[clap(long = "interval", default_value_t = NonZeroU64::new(DEFAULT_INTERVAL_MS).unwrap())]
     pub interval: NonZeroU64,
+}
+
+async fn bind_socket(listen: SocketAddr) -> Result<UdpSocket> {
+    UdpSocket::bind(listen)
+        .await
+        .with_context(|| format!("udp-server bind failed at [{listen}]"))
+}
+
+async fn run_with_socket(socket: UdpSocket, default_report_interval: Duration) -> Result<()> {
+    let local_addr = socket
+        .local_addr()
+        .with_context(|| "get local_addr failed")?;
+    info!(
+        "udp bench server listen [{}], report interval [{}ms]",
+        local_addr,
+        default_report_interval.as_millis()
+    );
+
+    // For CLI, run forever. Tests provide shutdown channel.
+    udp_server_loop(socket, default_report_interval, None).await
 }
 
 #[derive(Debug)]
