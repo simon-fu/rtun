@@ -491,7 +491,7 @@ async fn send_one(
     }
     let interval_micros = 1_000_000u64 / sess.send_pps;
     let interval = Duration::from_micros(interval_micros.max(1));
-    sess.next_send_at = checked_add(now, interval);
+    sess.next_send_at = checked_add(next_send_at, interval);
     Ok(())
 }
 
@@ -594,6 +594,7 @@ mod tests {
 
     use anyhow::{Context, Result};
     use clap::Parser;
+    use tokio::time::Instant;
     use tokio::{net::UdpSocket, sync::oneshot};
 
     use super::super::udp_perf::{
@@ -686,6 +687,37 @@ mod tests {
 
         shutdown_tx.send(()).ok();
         server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_send_one_keeps_cadence_when_loop_wakes_late() -> Result<()> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer = client.local_addr()?;
+        let start = UdpPerfStart {
+            session_id: 250,
+            mode: UdpPerfMode::Reverse,
+            payload_len: 32,
+            packets_per_second: 100,
+            duration_micros: 1_000_000,
+            report_interval_micros: 10_000,
+        };
+        let mut sess = super::Session::new_start(peer, &start, Duration::from_millis(10))?;
+        let interval = Duration::from_millis(10);
+        let first_due = Instant::now()
+            .checked_add(interval)
+            .context("first reverse send deadline overflow")?;
+        let late_now = first_due
+            .checked_add(Duration::from_millis(25))
+            .context("late send timestamp overflow")?;
+        sess.next_send_at = Some(first_due);
+
+        super::send_one(&socket, start.session_id, &mut sess, late_now).await?;
+
+        let data = recv_data(&client, Duration::from_millis(50)).await?;
+        assert_eq!(data.header.seq, 1);
+        assert_eq!(sess.next_send_at, first_due.checked_add(interval));
         Ok(())
     }
 

@@ -116,7 +116,6 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
     let mut start_confirmation_deadline = if wait_for_start_confirmation {
         Some(start_confirmation_timeout(
             start_sent_at,
-            duration,
             observed_control_rtt,
         )?)
     } else {
@@ -178,7 +177,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                 if due <= now {
                     send_seq = send_seq.saturating_add(1);
                     send_forward_data(&socket, session_id, send_seq, payload_len).await?;
-                    next_send_at = next_send_deadline(now, pps);
+                    next_send_at = next_send_deadline(due, pps);
                 }
             }
         }
@@ -373,13 +372,11 @@ fn next_start_retry_deadline(now: Instant) -> Result<Option<Instant>> {
 
 fn start_confirmation_timeout(
     started_at: Instant,
-    duration: Duration,
     observed_control_rtt: Option<Duration>,
 ) -> Result<Instant> {
-    stop_deadline(
-        stop_deadline(started_at, duration)?,
-        control_plane_timeout(observed_control_rtt),
-    )
+    started_at
+        .checked_add(control_plane_timeout(observed_control_rtt))
+        .context("start confirmation deadline overflow")
 }
 
 fn refresh_final_report_drain_deadline(
@@ -892,11 +889,20 @@ pub struct CmdArgs {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, num::NonZeroU64, time::Duration};
+    use std::{
+        net::SocketAddr,
+        num::NonZeroU64,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use anyhow::{bail, ensure, Context, Result};
     use serde_json::Value;
     use tokio::net::UdpSocket;
+    use tokio::sync::oneshot;
     use tokio::time::Instant;
 
     use super::super::udp_perf::{
@@ -1353,6 +1359,40 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn udp_client_reverse_unreachable_target_times_out_with_control_plane_deadline(
+    ) -> Result<()> {
+        let (target, start_seen, server_task) = spawn_blackhole_server().await?;
+        let mut args = test_args(target, UdpPerfMode::Reverse);
+        args.time = 60;
+        args.pps = Some(20);
+        args.json = true;
+
+        let client_task = tokio::spawn(async move { super::run_for_test(args).await });
+        start_seen.await.context("client never sent START")?;
+
+        std::thread::sleep(Duration::from_secs(6));
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            client_task.is_finished(),
+            "reverse run should fail after control-plane timeout instead of waiting benchmark duration"
+        );
+
+        let err = client_task.await.context("udp-client join failed")?;
+        let err = err.expect_err("unreachable reverse target should time out");
+        assert!(
+            err.to_string()
+                .contains("timeout waiting start confirmation"),
+            "unexpected error: {err:#}"
+        );
+
+        server_task.abort();
+        Ok(())
+    }
+
     #[tokio::test]
     async fn udp_client_retry_start_resends_hello_before_retry_start() -> Result<()> {
         let (target, server_task) = spawn_drop_initial_hello_and_start_forward_server().await?;
@@ -1366,6 +1406,35 @@ mod tests {
             .context("udp-client should finish after retrying HELLO/START")??;
 
         server_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn udp_client_forward_late_wakeup_catches_up_send_cadence() -> Result<()> {
+        let (target, start_seen, forward_packets, server_task) =
+            spawn_forward_cadence_probe_server().await?;
+        let mut args = test_args(target, UdpPerfMode::Forward);
+        args.time = 1;
+        args.pps = Some(100);
+        args.interval = NonZeroU64::new(2_000).expect("nonzero");
+        args.json = true;
+
+        let client_task = tokio::spawn(async move { super::run_for_test(args).await });
+        start_seen.await.context("client never sent START")?;
+
+        std::thread::sleep(Duration::from_millis(35));
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            forward_packets.load(Ordering::SeqCst),
+            3,
+            "client should catch up to the scheduled 10/20/30ms sends after a 35ms late wakeup"
+        );
+
+        client_task.abort();
+        server_task.abort();
         Ok(())
     }
 
@@ -2088,6 +2157,68 @@ mod tests {
             }
         });
         Ok((addr.to_string(), task))
+    }
+
+    async fn spawn_blackhole_server() -> Result<(
+        String,
+        oneshot::Receiver<()>,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = socket.local_addr()?;
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut tx = Some(tx);
+
+            loop {
+                let (n, _) = socket.recv_from(&mut buf).await?;
+                if matches!(
+                    UdpPerfWirePacket::decode(&buf[..n])?,
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Start(_))
+                ) {
+                    if let Some(tx) = tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+        });
+        Ok((addr.to_string(), rx, task))
+    }
+
+    async fn spawn_forward_cadence_probe_server() -> Result<(
+        String,
+        oneshot::Receiver<()>,
+        Arc<AtomicU64>,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = socket.local_addr()?;
+        let (tx, rx) = oneshot::channel();
+        let forward_packets = Arc::new(AtomicU64::new(0));
+        let observed_packets = Arc::clone(&forward_packets);
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut tx = Some(tx);
+
+            loop {
+                let (n, _) = socket.recv_from(&mut buf).await?;
+                match UdpPerfWirePacket::decode(&buf[..n])? {
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Start(_)) => {
+                        if let Some(tx) = tx.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    UdpPerfWirePacket::Data(data)
+                        if matches!(data.header.direction, UdpPerfDirection::Forward) =>
+                    {
+                        observed_packets.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        Ok((addr.to_string(), rx, forward_packets, task))
     }
 
     async fn spawn_forward_packet_counting_server(
