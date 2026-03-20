@@ -19,7 +19,9 @@ use super::udp_perf::{
 };
 
 const DEFAULT_PPS: u64 = 1_000;
-const FINAL_REPORT_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(5);
+const MIN_RTT_SCALED_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+const CONTROL_PLANE_TIMEOUT_RTT_MULTIPLIER: u32 = 4;
 const START_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_INITIAL_FORWARD_SEND_DELAY: Duration = Duration::from_millis(10);
 
@@ -99,8 +101,10 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
     send_control(&socket, UdpPerfControlPacket::Start(start.clone())).await?;
 
     let start_sent_at = Instant::now();
+    let mut last_start_tx_at = start_sent_at;
     let wait_for_start_confirmation = mode_waits_for_start_confirmation(args.mode, pps, duration);
     let retry_start_until_server_response = wait_for_start_confirmation;
+    let mut observed_control_rtt: Option<Duration> = None;
     let mut stop_at = if wait_for_start_confirmation {
         None
     } else {
@@ -110,7 +114,11 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
     let mut final_deadline: Option<Instant> = None;
     let mut next_start_retry_at = next_start_retry_deadline(start_sent_at)?;
     let mut start_confirmation_deadline = if wait_for_start_confirmation {
-        Some(start_confirmation_timeout(start_sent_at, duration)?)
+        Some(start_confirmation_timeout(
+            start_sent_at,
+            duration,
+            observed_control_rtt,
+        )?)
     } else {
         None
     };
@@ -147,7 +155,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                 next_send_at = None;
                 start_confirmation_deadline = None;
                 final_deadline = Some(
-                    now.checked_add(FINAL_REPORT_TIMEOUT)
+                    now.checked_add(control_plane_timeout(observed_control_rtt))
                         .context("final report deadline overflow")?,
                 );
             }
@@ -158,6 +166,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                 if due <= now {
                     let retry_sent_at =
                         send_start_retry_with_hello(&socket, session_id, args.mode, &start).await?;
+                    last_start_tx_at = retry_sent_at;
                     next_start_retry_at = if retry_start_until_server_response {
                         next_start_retry_deadline(retry_sent_at)?
                     } else {
@@ -220,6 +229,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                                 &report,
                                 &client_rx,
                                 Instant::now(),
+                                observed_control_rtt,
                             )?;
                             final_report = Some(report);
                         }
@@ -228,6 +238,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                         next_start_retry_at = None;
                         if start_confirmation_deadline.take().is_some() {
                             let anchor = Instant::now();
+                            observed_control_rtt = Some(measure_control_rtt(last_start_tx_at, anchor));
                             stop_at = Some(stop_deadline(anchor, duration)?);
                             next_send_at = first_send_deadline(anchor, args.mode, pps);
                         }
@@ -238,6 +249,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                             &client_rx,
                             &mut final_report_drain_deadline,
                             Instant::now(),
+                            observed_control_rtt,
                         )?;
                     }
                 }
@@ -259,8 +271,12 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
             )?;
             if let Some(report) = incoming.report {
                 if report.is_final {
-                    final_report_drain_deadline =
-                        schedule_final_report_drain_deadline(&report, &client_rx, Instant::now())?;
+                    final_report_drain_deadline = schedule_final_report_drain_deadline(
+                        &report,
+                        &client_rx,
+                        Instant::now(),
+                        observed_control_rtt,
+                    )?;
                     final_report = Some(report);
                 }
             }
@@ -268,6 +284,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                 next_start_retry_at = None;
                 if start_confirmation_deadline.take().is_some() {
                     let anchor = Instant::now();
+                    observed_control_rtt = Some(measure_control_rtt(last_start_tx_at, anchor));
                     stop_at = Some(stop_deadline(anchor, duration)?);
                     next_send_at = first_send_deadline(anchor, args.mode, pps);
                 }
@@ -278,6 +295,7 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                     &client_rx,
                     &mut final_report_drain_deadline,
                     Instant::now(),
+                    observed_control_rtt,
                 )?;
             }
         }
@@ -308,6 +326,7 @@ fn schedule_final_report_drain_deadline(
     report: &UdpPerfReport,
     client_rx: &ClientRxStats,
     now: Instant,
+    observed_control_rtt: Option<Duration>,
 ) -> Result<Option<Instant>> {
     if matches!(
         report.summary.mode,
@@ -315,7 +334,7 @@ fn schedule_final_report_drain_deadline(
     ) && client_rx.has_pending_reverse_packets(report)
     {
         return Ok(Some(
-            now.checked_add(reverse_tail_idle_timeout())
+            now.checked_add(reverse_tail_idle_timeout(observed_control_rtt))
                 .context("final reverse drain deadline overflow")?,
         ));
     }
@@ -352,8 +371,15 @@ fn next_start_retry_deadline(now: Instant) -> Result<Option<Instant>> {
     ))
 }
 
-fn start_confirmation_timeout(started_at: Instant, duration: Duration) -> Result<Instant> {
-    stop_deadline(stop_deadline(started_at, duration)?, FINAL_REPORT_TIMEOUT)
+fn start_confirmation_timeout(
+    started_at: Instant,
+    duration: Duration,
+    observed_control_rtt: Option<Duration>,
+) -> Result<Instant> {
+    stop_deadline(
+        stop_deadline(started_at, duration)?,
+        control_plane_timeout(observed_control_rtt),
+    )
 }
 
 fn refresh_final_report_drain_deadline(
@@ -361,16 +387,36 @@ fn refresh_final_report_drain_deadline(
     client_rx: &ClientRxStats,
     final_report_drain_deadline: &mut Option<Instant>,
     now: Instant,
+    observed_control_rtt: Option<Duration>,
 ) -> Result<()> {
     if let Some(report) = final_report {
         *final_report_drain_deadline =
-            schedule_final_report_drain_deadline(report, client_rx, now)?;
+            schedule_final_report_drain_deadline(report, client_rx, now, observed_control_rtt)?;
     }
     Ok(())
 }
 
-fn reverse_tail_idle_timeout() -> Duration {
-    FINAL_REPORT_TIMEOUT
+fn reverse_tail_idle_timeout(observed_control_rtt: Option<Duration>) -> Duration {
+    control_plane_timeout(observed_control_rtt)
+}
+
+fn control_plane_timeout(observed_control_rtt: Option<Duration>) -> Duration {
+    observed_control_rtt
+        .and_then(|rtt| scale_duration(rtt, CONTROL_PLANE_TIMEOUT_RTT_MULTIPLIER))
+        .map(|scaled| max_duration(scaled, MIN_RTT_SCALED_CONTROL_TIMEOUT))
+        .unwrap_or(DEFAULT_CONTROL_PLANE_TIMEOUT)
+}
+
+fn scale_duration(duration: Duration, factor: u32) -> Option<Duration> {
+    duration.checked_mul(factor)
+}
+
+fn max_duration(a: Duration, b: Duration) -> Duration {
+    std::cmp::max(a, b)
+}
+
+fn measure_control_rtt(sent_at: Instant, received_at: Instant) -> Duration {
+    received_at.saturating_duration_since(sent_at)
 }
 
 fn send_interval(pps: u64) -> Option<Duration> {
@@ -1363,6 +1409,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_client_forward_tolerates_high_rtt_final_report() -> Result<()> {
+        let (target, server_task) =
+            spawn_delayed_forward_final_report_server(Duration::from_millis(2_500)).await?;
+        let mut args = test_args(target, UdpPerfMode::Forward);
+        args.time = 0;
+        args.pps = Some(1);
+        args.json = true;
+
+        let out = tokio::time::timeout(Duration::from_secs(6), super::run_for_test(args))
+            .await
+            .context("udp-client should wait long enough for delayed final report")??;
+
+        assert!(out.final_report.is_final);
+        assert_eq!(out.final_report.summary.mode, UdpPerfMode::Forward);
+
+        server_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_client_reverse_tolerates_high_rtt_start_confirmation() -> Result<()> {
+        let (target, server_task) =
+            spawn_delayed_reverse_start_confirmation_server(Duration::from_millis(3_200)).await?;
+        let mut args = test_args(target, UdpPerfMode::Reverse);
+        args.time = 1;
+        args.pps = Some(20);
+        args.json = true;
+
+        let out = tokio::time::timeout(Duration::from_secs(8), super::run_for_test(args))
+            .await
+            .context(
+                "udp-client should wait long enough for delayed reverse start confirmation",
+            )??;
+
+        assert!(out.final_report.is_final);
+        assert_eq!(out.final_report.summary.mode, UdpPerfMode::Reverse);
+        assert!(out.client_rx.reverse_packets > 0);
+
+        server_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn udp_client_reverse_tail_drain_handles_high_latency_tail() -> Result<()> {
         let (target, server_task) =
             spawn_reverse_tail_after_final_report_server_with_delay(Duration::from_millis(400))
@@ -2260,6 +2349,142 @@ mod tests {
                                             },
                                         },
                                         reverse: UdpPerfDirectionSummary::default(),
+                                    },
+                                })?,
+                                peer,
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        Ok((addr.to_string(), task))
+    }
+
+    async fn spawn_delayed_forward_final_report_server(
+        final_report_delay: Duration,
+    ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = socket.local_addr()?;
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut client = None;
+            let mut session_id = None;
+
+            loop {
+                let (n, from) = socket.recv_from(&mut buf).await?;
+                match UdpPerfWirePacket::decode(&buf[..n])? {
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Hello(hello)) => {
+                        client = Some(from);
+                        session_id = Some(hello.session_id);
+                    }
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Start(start)) => {
+                        client = Some(from);
+                        session_id = Some(start.session_id);
+                    }
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Stop(stop)) => {
+                        let sid = session_id.unwrap_or(stop.session_id);
+                        let peer = client.unwrap_or(from);
+                        tokio::time::sleep(final_report_delay).await;
+                        socket
+                            .send_to(
+                                &wire_report(UdpPerfReport {
+                                    report_seq: 1,
+                                    is_final: true,
+                                    summary: UdpPerfSummary {
+                                        session_id: sid,
+                                        mode: UdpPerfMode::Forward,
+                                        total_elapsed_micros: 1_000_000,
+                                        interval_elapsed_micros: 1_000_000,
+                                        total: UdpPerfCountersSummary::default(),
+                                        interval: UdpPerfCountersSummary::default(),
+                                        forward: UdpPerfDirectionSummary::default(),
+                                        reverse: UdpPerfDirectionSummary::default(),
+                                    },
+                                })?,
+                                peer,
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        Ok((addr.to_string(), task))
+    }
+
+    async fn spawn_delayed_reverse_start_confirmation_server(
+        first_packet_delay: Duration,
+    ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = socket.local_addr()?;
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut client = None;
+            let mut session_id = None;
+            let mut first_packet_sent = false;
+
+            loop {
+                let (n, from) = socket.recv_from(&mut buf).await?;
+                match UdpPerfWirePacket::decode(&buf[..n])? {
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Hello(hello)) => {
+                        client = Some(from);
+                        session_id = Some(hello.session_id);
+                    }
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Start(start)) => {
+                        client = Some(from);
+                        session_id = Some(start.session_id);
+                        if !first_packet_sent {
+                            first_packet_sent = true;
+                            tokio::time::sleep(first_packet_delay).await;
+                            socket
+                                .send_to(&wire_reverse_data(start.session_id, 1, 32)?, from)
+                                .await?;
+                        }
+                    }
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Stop(stop)) => {
+                        ensure!(
+                            first_packet_sent,
+                            "server never sent delayed reverse start confirmation"
+                        );
+                        let sid = session_id.unwrap_or(stop.session_id);
+                        let peer = client.unwrap_or(from);
+                        socket
+                            .send_to(
+                                &wire_report(UdpPerfReport {
+                                    report_seq: 1,
+                                    is_final: true,
+                                    summary: UdpPerfSummary {
+                                        session_id: sid,
+                                        mode: UdpPerfMode::Reverse,
+                                        total_elapsed_micros: 1_000_000,
+                                        interval_elapsed_micros: 1_000_000,
+                                        total: UdpPerfCountersSummary {
+                                            packets: 1,
+                                            bytes: 32,
+                                            ..UdpPerfCountersSummary::default()
+                                        },
+                                        interval: UdpPerfCountersSummary {
+                                            packets: 1,
+                                            bytes: 32,
+                                            ..UdpPerfCountersSummary::default()
+                                        },
+                                        forward: UdpPerfDirectionSummary::default(),
+                                        reverse: UdpPerfDirectionSummary {
+                                            total: UdpPerfCountersSummary {
+                                                packets: 1,
+                                                bytes: 32,
+                                                ..UdpPerfCountersSummary::default()
+                                            },
+                                            interval: UdpPerfCountersSummary {
+                                                packets: 1,
+                                                bytes: 32,
+                                                ..UdpPerfCountersSummary::default()
+                                            },
+                                        },
                                     },
                                 })?,
                                 peer,
