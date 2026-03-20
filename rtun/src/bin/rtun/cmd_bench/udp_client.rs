@@ -74,9 +74,17 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
 
     let session_id = next_session_id();
     if !args.json {
+        let rate_desc = match args.bitrate {
+            Some(bitrate_bps) => format!(
+                "bitrate [{}], pps [{}]",
+                format_configured_bitrate(bitrate_bps),
+                pps
+            ),
+            None => format!("pps [{}]", pps),
+        };
         info!(
-            "udp bench client start: target [{}], mode [{}], time [{}s], len [{}], pps [{}]",
-            target, args.mode, args.time, args.len, pps
+            "udp bench client start: target [{}], mode [{}], time [{}s], len [{}], {}",
+            target, args.mode, args.time, args.len, rate_desc
         );
     }
     send_control(
@@ -734,6 +742,41 @@ fn resolve_pps(args: &CmdArgs) -> Result<u64> {
     Ok(DEFAULT_PPS)
 }
 
+fn parse_bitrate_bits_per_sec(raw: &str) -> std::result::Result<u64, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("bitrate must not be empty".to_string());
+    }
+    if raw.contains('/') {
+        return Err(format!(
+            "unsupported bitrate burst form [{}], only plain rates like 1M are supported",
+            raw
+        ));
+    }
+
+    let (number, multiplier) = match raw.as_bytes().last().copied() {
+        Some(b'k' | b'K') => (&raw[..raw.len() - 1], 1_000u64),
+        Some(b'm' | b'M') => (&raw[..raw.len() - 1], 1_000_000u64),
+        Some(b'g' | b'G') => (&raw[..raw.len() - 1], 1_000_000_000u64),
+        Some(b't' | b'T') => (&raw[..raw.len() - 1], 1_000_000_000_000u64),
+        _ => (raw, 1u64),
+    };
+
+    if number.is_empty() {
+        return Err(format!(
+            "invalid bitrate [{}], expected an integer optionally followed by K/M/G/T",
+            raw
+        ));
+    }
+
+    let value: u64 = number
+        .parse()
+        .map_err(|_| format!("invalid bitrate [{}], expected an integer", raw))?;
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("bitrate [{}] is too large", raw))
+}
+
 fn mode_waits_for_start_confirmation(mode: UdpPerfMode, pps: u64, duration: Duration) -> bool {
     !duration.is_zero() && pps > 0 && matches!(mode, UdpPerfMode::Reverse)
 }
@@ -1233,6 +1276,13 @@ fn format_bitrate(mbps: f64) -> String {
     }
 }
 
+fn format_configured_bitrate(bits_per_sec: u64) -> String {
+    if bits_per_sec == 0 {
+        return "0 bits/sec".to_string();
+    }
+    format_bitrate(bits_per_sec as f64 / 1_000_000.0)
+}
+
 fn elapsed_secs(elapsed_micros: u64) -> f64 {
     elapsed_micros as f64 / 1_000_000.0
 }
@@ -1411,10 +1461,17 @@ pub struct CmdArgs {
     #[clap(long = "len", default_value_t = 1200)]
     pub len: usize,
 
-    #[clap(long = "bitrate", conflicts_with = "pps")]
+    #[clap(
+        short = 'b',
+        long = "bitrate",
+        value_name = "RATE",
+        value_parser = parse_bitrate_bits_per_sec,
+        conflicts_with = "pps",
+        help = "target bitrate in bits/sec, supports K/M/G/T suffixes"
+    )]
     pub bitrate: Option<u64>,
 
-    #[clap(long = "pps", conflicts_with = "bitrate")]
+    #[clap(long = "pps", hide = true, conflicts_with = "bitrate")]
     pub pps: Option<u64>,
 
     #[clap(long = "interval", default_value = "1000")]
@@ -1440,6 +1497,7 @@ mod tests {
     };
 
     use anyhow::{bail, ensure, Context, Result};
+    use clap::{CommandFactory, Parser};
     use serde_json::Value;
     use tokio::net::UdpSocket;
     use tokio::sync::oneshot;
@@ -1782,12 +1840,76 @@ mod tests {
     }
 
     #[test]
+    fn udp_client_cli_parses_short_b_bitrate_with_suffixes() -> Result<()> {
+        for (raw, expected_bps) in [("1K", 1_000), ("2m", 2_000_000), ("3G", 3_000_000_000)] {
+            let args = CmdArgs::try_parse_from([
+                "udp-client",
+                "--target",
+                "127.0.0.1:9",
+                "-b",
+                raw,
+            ])
+            .with_context(|| format!("parse udp-client -b {raw}"))?;
+            assert_eq!(args.bitrate, Some(expected_bps), "raw={raw}");
+            assert_eq!(args.pps, None, "raw={raw}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn udp_client_help_prefers_bitrate_and_hides_pps() -> Result<()> {
+        let mut cmd = CmdArgs::command();
+        let mut help = Vec::new();
+        cmd.write_long_help(&mut help)?;
+        let help = String::from_utf8(help).context("help should be utf8")?;
+
+        assert!(
+            help.contains("-b, --bitrate"),
+            "udp-client help should expose -b/--bitrate, got: {help}"
+        );
+        assert!(
+            !help.contains("--pps"),
+            "udp-client help should hide --pps, got: {help}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn udp_client_bitrate_below_one_packet_resolves_to_zero_pps() -> Result<()> {
         let mut args = test_args("127.0.0.1:9".to_string(), UdpPerfMode::Forward);
         args.len = 1200;
         args.bitrate = Some(100);
         args.pps = None;
         assert_eq!(super::resolve_pps(&args)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn udp_client_bitrate_suffix_resolves_to_expected_pps() -> Result<()> {
+        let args = CmdArgs::try_parse_from([
+            "udp-client",
+            "--target",
+            "127.0.0.1:9",
+            "--len",
+            "250",
+            "-b",
+            "1M",
+        ])?;
+        assert_eq!(super::resolve_pps(&args)?, 500);
+        Ok(())
+    }
+
+    #[test]
+    fn udp_client_hidden_pps_flag_still_parses_for_compat() -> Result<()> {
+        let args = CmdArgs::try_parse_from([
+            "udp-client",
+            "--target",
+            "127.0.0.1:9",
+            "--pps",
+            "123",
+        ])?;
+        assert_eq!(args.pps, Some(123));
+        assert_eq!(args.bitrate, None);
         Ok(())
     }
 
