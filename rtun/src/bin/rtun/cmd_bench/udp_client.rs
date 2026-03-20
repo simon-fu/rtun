@@ -206,13 +206,15 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                 recv = socket.recv(&mut recv_buf) => {
                     let n = recv.with_context(|| "udp-client recv failed")?;
                     let had_final_report = final_report.is_some();
-                    if let Some(report) = handle_incoming_packet(
+                    let incoming = handle_incoming_packet(
+                        session_id,
                         &recv_buf[..n],
                         &mut output,
                         !args.json,
                         output_policy,
                         &mut client_rx,
-                    )? {
+                    )?;
+                    if let Some(report) = incoming.report {
                         if report.is_final {
                             final_report_drain_deadline = schedule_final_report_drain_deadline(
                                 &report,
@@ -222,13 +224,15 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                             final_report = Some(report);
                         }
                     }
-                    next_start_retry_at = None;
-                    if start_confirmation_deadline.take().is_some() {
-                        let anchor = Instant::now();
-                        stop_at = Some(stop_deadline(anchor, duration)?);
-                        next_send_at = first_send_deadline(anchor, args.mode, pps);
+                    if incoming.matched_session {
+                        next_start_retry_at = None;
+                        if start_confirmation_deadline.take().is_some() {
+                            let anchor = Instant::now();
+                            stop_at = Some(stop_deadline(anchor, duration)?);
+                            next_send_at = first_send_deadline(anchor, args.mode, pps);
+                        }
                     }
-                    if had_final_report {
+                    if had_final_report && incoming.matched_session {
                         refresh_final_report_drain_deadline(
                             final_report.as_ref(),
                             &client_rx,
@@ -245,26 +249,30 @@ async fn run_inner(args: CmdArgs, output_policy: OutputPolicy) -> Result<ClientR
                 .await
                 .with_context(|| "udp-client recv failed")?;
             let had_final_report = final_report.is_some();
-            if let Some(report) = handle_incoming_packet(
+            let incoming = handle_incoming_packet(
+                session_id,
                 &recv_buf[..n],
                 &mut output,
                 !args.json,
                 output_policy,
                 &mut client_rx,
-            )? {
+            )?;
+            if let Some(report) = incoming.report {
                 if report.is_final {
                     final_report_drain_deadline =
                         schedule_final_report_drain_deadline(&report, &client_rx, Instant::now())?;
                     final_report = Some(report);
                 }
             }
-            next_start_retry_at = None;
-            if start_confirmation_deadline.take().is_some() {
-                let anchor = Instant::now();
-                stop_at = Some(stop_deadline(anchor, duration)?);
-                next_send_at = first_send_deadline(anchor, args.mode, pps);
+            if incoming.matched_session {
+                next_start_retry_at = None;
+                if start_confirmation_deadline.take().is_some() {
+                    let anchor = Instant::now();
+                    stop_at = Some(stop_deadline(anchor, duration)?);
+                    next_send_at = first_send_deadline(anchor, args.mode, pps);
+                }
             }
-            if had_final_report {
+            if had_final_report && incoming.matched_session {
                 refresh_final_report_drain_deadline(
                     final_report.as_ref(),
                     &client_rx,
@@ -594,16 +602,29 @@ async fn send_forward_data(
     Ok(())
 }
 
+#[derive(Debug)]
+struct IncomingPacketOutcome {
+    matched_session: bool,
+    report: Option<UdpPerfReport>,
+}
+
 fn handle_incoming_packet(
+    expected_session_id: u64,
     bytes: &[u8],
     output: &mut String,
     emit_interval: bool,
     output_policy: OutputPolicy,
     client_rx: &mut ClientRxStats,
-) -> Result<Option<UdpPerfReport>> {
+) -> Result<IncomingPacketOutcome> {
     let wire = UdpPerfWirePacket::decode(bytes)?;
     match wire {
         UdpPerfWirePacket::Control(UdpPerfControlPacket::Report(report)) => {
+            if report.summary.session_id != expected_session_id {
+                return Ok(IncomingPacketOutcome {
+                    matched_session: false,
+                    report: None,
+                });
+            }
             if !report.is_final {
                 match client_rx.observe_interval_report(report.report_seq) {
                     IntervalReportSync::Stale => {}
@@ -630,13 +651,28 @@ fn handle_incoming_packet(
                     }
                 }
             }
-            Ok(Some(report))
+            Ok(IncomingPacketOutcome {
+                matched_session: true,
+                report: Some(report),
+            })
         }
         UdpPerfWirePacket::Data(data) => {
+            if data.header.session_id != expected_session_id {
+                return Ok(IncomingPacketOutcome {
+                    matched_session: false,
+                    report: None,
+                });
+            }
             client_rx.on_data_packet(&data);
-            Ok(None)
+            Ok(IncomingPacketOutcome {
+                matched_session: true,
+                report: None,
+            })
         }
-        UdpPerfWirePacket::Control(_) => Ok(None),
+        UdpPerfWirePacket::Control(_) => Ok(IncomingPacketOutcome {
+            matched_session: false,
+            report: None,
+        }),
     }
 }
 
@@ -754,7 +790,27 @@ fn now_unix_micros() -> u64 {
 }
 
 fn next_session_id() -> u64 {
-    NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+    let counter = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    let now_nanos = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as u64,
+        Err(_) => counter,
+    };
+    let pid = std::process::id() as u64;
+    let mixed = mix_session_id_seed(now_nanos ^ (pid << 32) ^ counter.rotate_left(17));
+    if mixed == 0 {
+        1
+    } else {
+        mixed
+    }
+}
+
+fn mix_session_id_seed(mut x: u64) -> u64 {
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+    x ^= x >> 33;
+    x
 }
 
 #[derive(Parser, Debug)]
@@ -992,6 +1048,16 @@ mod tests {
         args.pps = None;
         assert_eq!(super::resolve_pps(&args)?, 0);
         Ok(())
+    }
+
+    #[test]
+    fn udp_client_session_id_carries_cross_process_entropy() {
+        let session_id = super::next_session_id();
+        assert_ne!(
+            session_id >> 32,
+            0,
+            "session_id should not be a low 32-bit process-local counter"
+        );
     }
 
     #[test]
@@ -1275,6 +1341,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_client_ignores_final_report_from_other_session() -> Result<()> {
+        let (target, server_task) = spawn_mismatched_final_report_server().await?;
+        let mut args = test_args(target, UdpPerfMode::Forward);
+        args.time = 1;
+        args.pps = Some(20);
+        args.json = true;
+
+        let out = tokio::time::timeout(Duration::from_secs(4), super::run_for_test(args))
+            .await
+            .context("udp-client should finish after ignoring mismatched final report")??;
+
+        assert_ne!(
+            out.final_report.summary.session_id,
+            u64::MAX,
+            "client accepted final report from a different session"
+        );
+
+        server_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn udp_client_reverse_tail_drain_handles_high_latency_tail() -> Result<()> {
         let (target, server_task) =
             spawn_reverse_tail_after_final_report_server_with_delay(Duration::from_millis(400))
@@ -1324,6 +1412,7 @@ mod tests {
         }
 
         let _ = super::handle_incoming_packet(
+            1,
             &wire_report(interval_report(2, 100_000, 100_000))?,
             &mut output,
             true,
@@ -1347,6 +1436,7 @@ mod tests {
             payload: vec![0x5a; 32],
         });
         let _ = super::handle_incoming_packet(
+            1,
             &wire_report(interval_report(3, 200_000, 100_000))?,
             &mut output,
             true,
@@ -1357,6 +1447,62 @@ mod tests {
             output.contains("rev_pkts=1"),
             "next in-order interval should resync to one packet, got: {output}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn udp_client_ignores_report_from_other_session() -> Result<()> {
+        let output_policy = super::OutputPolicy {
+            stream_interval: false,
+            collect_interval: true,
+        };
+        let mut client_rx = super::ClientRxStats::default();
+        let mut output = String::new();
+        let mut report = interval_report(1, 100_000, 100_000);
+        report.summary.session_id = 2;
+
+        let incoming = super::handle_incoming_packet(
+            1,
+            &wire_report(report)?,
+            &mut output,
+            true,
+            output_policy,
+            &mut client_rx,
+        )?;
+
+        assert!(
+            !incoming.matched_session,
+            "report from another session should be ignored"
+        );
+        assert!(incoming.report.is_none());
+        assert!(output.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn udp_client_ignores_data_from_other_session() -> Result<()> {
+        let output_policy = super::OutputPolicy {
+            stream_interval: false,
+            collect_interval: true,
+        };
+        let mut client_rx = super::ClientRxStats::default();
+        let mut output = String::new();
+
+        let incoming = super::handle_incoming_packet(
+            1,
+            &wire_reverse_data(2, 1, 32)?,
+            &mut output,
+            true,
+            output_policy,
+            &mut client_rx,
+        )?;
+
+        assert!(
+            !incoming.matched_session,
+            "data from another session should be ignored"
+        );
+        assert!(incoming.report.is_none());
+        assert_eq!(client_rx.reverse_packets, 0);
         Ok(())
     }
 
@@ -1982,6 +2128,109 @@ mod tests {
                             .send_to(
                                 &wire_report(UdpPerfReport {
                                     report_seq: 1,
+                                    is_final: true,
+                                    summary: UdpPerfSummary {
+                                        session_id: sid,
+                                        mode: UdpPerfMode::Forward,
+                                        total_elapsed_micros: 1_000_000,
+                                        interval_elapsed_micros: 1_000_000,
+                                        total: UdpPerfCountersSummary {
+                                            packets: forward_packets,
+                                            bytes: forward_packets.saturating_mul(96),
+                                            ..UdpPerfCountersSummary::default()
+                                        },
+                                        interval: UdpPerfCountersSummary {
+                                            packets: forward_packets,
+                                            bytes: forward_packets.saturating_mul(96),
+                                            ..UdpPerfCountersSummary::default()
+                                        },
+                                        forward: UdpPerfDirectionSummary {
+                                            total: UdpPerfCountersSummary {
+                                                packets: forward_packets,
+                                                bytes: forward_packets.saturating_mul(96),
+                                                ..UdpPerfCountersSummary::default()
+                                            },
+                                            interval: UdpPerfCountersSummary {
+                                                packets: forward_packets,
+                                                bytes: forward_packets.saturating_mul(96),
+                                                ..UdpPerfCountersSummary::default()
+                                            },
+                                        },
+                                        reverse: UdpPerfDirectionSummary::default(),
+                                    },
+                                })?,
+                                peer,
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        Ok((addr.to_string(), task))
+    }
+
+    async fn spawn_mismatched_final_report_server(
+    ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = socket.local_addr()?;
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut client = None;
+            let mut session_id = None;
+            let mut fake_report_sent = false;
+            let mut forward_packets = 0u64;
+
+            loop {
+                let (n, from) = socket.recv_from(&mut buf).await?;
+                match UdpPerfWirePacket::decode(&buf[..n])? {
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Hello(hello)) => {
+                        client = Some(from);
+                        session_id = Some(hello.session_id);
+                    }
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Start(start)) => {
+                        client = Some(from);
+                        session_id = Some(start.session_id);
+                        if !fake_report_sent {
+                            fake_report_sent = true;
+                            socket
+                                .send_to(
+                                    &wire_report(UdpPerfReport {
+                                        report_seq: 1,
+                                        is_final: true,
+                                        summary: UdpPerfSummary {
+                                            session_id: u64::MAX,
+                                            mode: start.mode,
+                                            total_elapsed_micros: 1_000_000,
+                                            interval_elapsed_micros: 1_000_000,
+                                            total: UdpPerfCountersSummary::default(),
+                                            interval: UdpPerfCountersSummary::default(),
+                                            forward: UdpPerfDirectionSummary::default(),
+                                            reverse: UdpPerfDirectionSummary::default(),
+                                        },
+                                    })?,
+                                    from,
+                                )
+                                .await?;
+                        }
+                    }
+                    UdpPerfWirePacket::Data(data) => {
+                        if matches!(data.header.direction, UdpPerfDirection::Forward) {
+                            forward_packets = forward_packets.saturating_add(1);
+                        }
+                    }
+                    UdpPerfWirePacket::Control(UdpPerfControlPacket::Stop(stop)) => {
+                        ensure!(
+                            fake_report_sent,
+                            "server never sent mismatched final report before STOP"
+                        );
+                        let sid = session_id.unwrap_or(stop.session_id);
+                        let peer = client.unwrap_or(from);
+                        socket
+                            .send_to(
+                                &wire_report(UdpPerfReport {
+                                    report_seq: 2,
                                     is_final: true,
                                     summary: UdpPerfSummary {
                                         session_id: sid,
