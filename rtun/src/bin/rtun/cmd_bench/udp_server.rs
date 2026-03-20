@@ -398,6 +398,47 @@ async fn advance_sessions(
             sessions.remove(&key);
             continue;
         }
+        if actions < MAX_ACTIONS_PER_TICK
+            && sessions
+                .get(&key)
+                .is_some_and(|sess| sess.should_send_now(now))
+        {
+            let send_res = {
+                let sess = sessions.get_mut(&key).expect("session should still exist");
+                send_due_packets(
+                    socket,
+                    session_id,
+                    sess,
+                    now,
+                    MAX_ACTIONS_PER_TICK - actions,
+                )
+                .await
+            };
+            match send_res {
+                Ok(sent) => {
+                    actions += sent;
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        peer = %peer,
+                        session_id,
+                        error = ?err,
+                        "udp-server drop session after timer send error"
+                    );
+                    sessions.remove(&key);
+                    continue;
+                }
+            }
+        }
+        if sessions
+            .get(&key)
+            .is_some_and(|sess| sess.should_send_now(now))
+        {
+            // A late wakeup can leave more reverse packets due than one tick can drain.
+            // Keep the session alive so the next tick can finish sending before finalizing.
+            continue;
+        }
+
         let expired_at = sessions.get(&key).and_then(|sess| {
             if sess.final_report.is_some() {
                 None
@@ -441,44 +482,6 @@ async fn advance_sessions(
             continue;
         }
 
-        let Some(sess) = sessions.get_mut(&key) else {
-            continue;
-        };
-
-        // Stop sending when duration ends.
-        if let Some(end_at) = sess.send_end_at {
-            if now >= end_at {
-                sess.next_send_at = None;
-            }
-        }
-
-        // Send takes precedence over report for "first packet should be data" tests.
-        if actions < MAX_ACTIONS_PER_TICK
-            && sessions
-                .get(&key)
-                .is_some_and(|sess| sess.should_send_now(now))
-        {
-            let send_res = {
-                let sess = sessions.get_mut(&key).expect("session should still exist");
-                send_one(socket, session_id, sess, now).await
-            };
-            match send_res {
-                Ok(()) => {
-                    actions += 1;
-                }
-                Err(err) => {
-                    tracing::debug!(
-                        peer = %peer,
-                        session_id,
-                        error = ?err,
-                        "udp-server drop session after timer send error"
-                    );
-                    sessions.remove(&key);
-                    continue;
-                }
-            }
-        }
-
         if actions < MAX_ACTIONS_PER_TICK
             && sessions
                 .get(&key)
@@ -507,6 +510,38 @@ async fn advance_sessions(
     }
 
     Ok(())
+}
+
+async fn send_due_packets(
+    socket: &UdpSocket,
+    session_id: u64,
+    sess: &mut Session,
+    now: tokio::time::Instant,
+    max_packets: usize,
+) -> Result<usize> {
+    let mut sent = 0usize;
+    while sent < max_packets {
+        let Some(next_send_at) = sess.next_send_at else {
+            break;
+        };
+        if next_send_at > now {
+            break;
+        }
+        if sess.send_end_at.is_some_and(|end_at| next_send_at > end_at) {
+            sess.next_send_at = None;
+            break;
+        }
+        send_one(socket, session_id, sess, now).await?;
+        sent += 1;
+    }
+    if sess
+        .send_end_at
+        .zip(sess.next_send_at)
+        .is_some_and(|(end_at, next_send_at)| next_send_at > end_at)
+    {
+        sess.next_send_at = None;
+    }
+    Ok(sent)
 }
 
 async fn send_one(
@@ -822,6 +857,118 @@ mod tests {
         let data = recv_data(&client, Duration::from_millis(50)).await?;
         assert_eq!(data.header.seq, 1);
         assert_eq!(sess.next_send_at, first_due.checked_add(interval));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_expiry_tick_sends_reverse_tail_before_final_report() -> Result<()> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer = client.local_addr()?;
+        let start = UdpPerfStart {
+            session_id: 251,
+            mode: UdpPerfMode::Reverse,
+            payload_len: 32,
+            packets_per_second: 100,
+            duration_micros: 30_000,
+            report_interval_micros: 1_000_000,
+        };
+        let mut sess = super::Session::new_start(peer, &start, Duration::from_secs(1))?;
+        let started_at = Instant::now();
+        let end_at = started_at
+            .checked_add(Duration::from_millis(30))
+            .context("reverse session end deadline overflow")?;
+        sess.started_at = started_at;
+        sess.last_report_at = started_at;
+        sess.end_at = Some(end_at);
+        sess.send_end_at = Some(end_at);
+        sess.next_send_at = Some(end_at);
+        sess.send_seq = 3;
+        for seq in 1..=3 {
+            sess.stats.record_data_packet(&UdpPerfDataPacket {
+                header: UdpPerfDataHeader {
+                    session_id: start.session_id,
+                    stream_id: 1,
+                    direction: UdpPerfDirection::Reverse,
+                    seq,
+                    send_ts_micros: seq * 1_000,
+                    payload_len: 32,
+                },
+                payload: vec![0x5a; 32],
+            });
+        }
+
+        let mut sessions = std::collections::HashMap::new();
+        sessions.insert(super::session_key(peer, start.session_id), sess);
+
+        super::advance_sessions(&socket, &mut sessions, end_at).await?;
+
+        let first = recv_wire(&client, Duration::from_millis(50)).await?;
+        let data = match first {
+            UdpPerfWirePacket::Data(data) => data,
+            other => panic!("expected reverse data before final report, got {other:?}"),
+        };
+        assert_eq!(data.header.seq, 4);
+
+        super::advance_sessions(&socket, &mut sessions, end_at).await?;
+
+        let report = recv_final_report(&client, Duration::from_millis(50)).await?;
+        assert!(report.is_final);
+        assert_eq!(report.summary.reverse.total.packets, 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_expiry_waits_for_all_due_reverse_packets_before_finalizing(
+    ) -> Result<()> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer = client.local_addr()?;
+        let start = UdpPerfStart {
+            session_id: 252,
+            mode: UdpPerfMode::Reverse,
+            payload_len: 32,
+            packets_per_second: 1_000,
+            duration_micros: 200_000,
+            report_interval_micros: 1_000_000,
+        };
+        let mut sess = super::Session::new_start(peer, &start, Duration::from_secs(1))?;
+        let started_at = Instant::now();
+        let first_due = started_at
+            .checked_add(Duration::from_millis(1))
+            .context("reverse session first send deadline overflow")?;
+        let end_at = started_at
+            .checked_add(Duration::from_millis(200))
+            .context("reverse session end deadline overflow")?;
+        sess.started_at = started_at;
+        sess.last_report_at = started_at;
+        sess.end_at = Some(end_at);
+        sess.send_end_at = Some(end_at);
+        sess.next_send_at = Some(first_due);
+
+        let key = super::session_key(peer, start.session_id);
+        let mut sessions = std::collections::HashMap::new();
+        sessions.insert(key, sess);
+
+        super::advance_sessions(&socket, &mut sessions, end_at).await?;
+
+        let sess = sessions
+            .get(&key)
+            .context("session should stay alive until all due reverse packets are drained")?;
+        assert!(
+            sess.final_report.is_none(),
+            "session should not finalize while overdue reverse packets remain"
+        );
+        assert!(
+            sess.next_send_at.is_some_and(|next| next <= end_at),
+            "session should keep overdue reverse sends queued for the next tick"
+        );
+
+        super::advance_sessions(&socket, &mut sessions, end_at).await?;
+
+        let report = recv_final_report(&client, Duration::from_millis(200)).await?;
+        assert!(report.is_final);
+        assert_eq!(report.summary.reverse.total.packets, 200);
         Ok(())
     }
 
