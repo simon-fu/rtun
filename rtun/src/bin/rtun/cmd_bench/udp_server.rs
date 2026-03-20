@@ -52,6 +52,7 @@ struct Session {
     mode: UdpPerfMode,
     started: bool,
     stop_requested: bool,
+    buffered_forward_start_at: Option<tokio::time::Instant>,
     started_at: tokio::time::Instant,
     end_at: Option<tokio::time::Instant>,
     last_report_at: tokio::time::Instant,
@@ -86,6 +87,7 @@ impl Session {
             mode,
             started: false,
             stop_requested: false,
+            buffered_forward_start_at: None,
             started_at: now,
             end_at: Some(end_at),
             last_report_at: now,
@@ -130,6 +132,7 @@ impl Session {
             mode: start.mode,
             started: true,
             stop_requested: false,
+            buffered_forward_start_at: None,
             started_at: now,
             end_at: Some(end_at),
             last_report_at: now,
@@ -159,12 +162,43 @@ impl Session {
             return Ok(());
         }
 
-        let end = checked_add(now, Duration::from_micros(start.duration_micros))
-            .with_context(|| "duration deadline overflow")?;
-        self.send_end_at = Some(end);
+        let send_end_at = checked_add(now, Duration::from_micros(start.duration_micros))
+            .with_context(|| "reverse send deadline overflow")?;
+        self.send_end_at = Some(send_end_at);
         match start.mode {
             UdpPerfMode::Forward => self.next_send_at = None,
             UdpPerfMode::Reverse | UdpPerfMode::Bidir => self.next_send_at = Some(now),
+        }
+        Ok(())
+    }
+
+    fn rebase_forward_measurement_start(
+        &mut self,
+        started_at: tokio::time::Instant,
+        start: &UdpPerfStart,
+    ) -> Result<()> {
+        let now = tokio::time::Instant::now();
+        self.started_at = started_at;
+        self.last_report_at = started_at;
+        self.next_report_at = Some(
+            checked_add(started_at, self.report_interval)
+                .with_context(|| "buffered report deadline overflow")?,
+        );
+        let end_at = checked_add(started_at, Duration::from_micros(start.duration_micros))
+            .with_context(|| "buffered duration deadline overflow")?;
+        self.end_at = Some(end_at);
+        if self.next_send_at.is_some() || self.send_end_at.is_some() {
+            self.send_end_at = Some(
+                self.send_end_at
+                    .map_or(end_at, |cur| std::cmp::min(cur, end_at)),
+            );
+            if now >= end_at
+                || self
+                    .next_send_at
+                    .is_some_and(|next_send_at| next_send_at >= end_at)
+            {
+                self.next_send_at = None;
+            }
         }
         Ok(())
     }
@@ -205,6 +239,7 @@ async fn udp_server_loop(
 ) -> Result<()> {
     ensure_nonzero_interval(default_report_interval)?;
     let mut sessions: HashMap<SessionKey, Session> = HashMap::new();
+    let mut session_scan_offset = 0usize;
     let mut buf = vec![0u8; 64 * 1024];
 
     loop {
@@ -244,7 +279,7 @@ async fn udp_server_loop(
 
         // Timer tick: advance due sessions (send first, then report).
         let now = tokio::time::Instant::now();
-        advance_sessions(&socket, &mut sessions, now).await?;
+        advance_sessions(&socket, &mut sessions, now, &mut session_scan_offset).await?;
     }
 
     Ok(())
@@ -284,13 +319,18 @@ async fn on_packet(
 
                 // START begins a new measurement round unless it is a retransmit that matches the
                 // in-flight session before the first report.
-                let buffered_stats = sessions
+                let (buffered_stats, buffered_forward_start_at) = sessions
                     .remove(&key)
                     .filter(|sess| !sess.started)
-                    .map(|sess| sess.stats)
+                    .map(|sess| (sess.stats, sess.buffered_forward_start_at))
                     .unwrap_or_default();
                 let mut new_sess = Session::new_start(from, &start, default_report_interval)?;
                 new_sess.stats = buffered_stats;
+                if let Some(buffered_start_at) = buffered_forward_start_at
+                    .filter(|_| matches!(start.mode, UdpPerfMode::Forward | UdpPerfMode::Bidir))
+                {
+                    new_sess.rebase_forward_measurement_start(buffered_start_at, &start)?;
+                }
                 sessions.insert(key, new_sess);
 
                 // For reverse/bidir with valid send cfg, send one packet immediately so client sees DATA.
@@ -359,6 +399,12 @@ async fn on_packet(
                     if matches!(data.header.direction, UdpPerfDirection::Forward)
                         && matches!(sess.mode, UdpPerfMode::Forward | UdpPerfMode::Bidir)
                     {
+                        if sess.buffered_forward_start_at.is_none() {
+                            let now = tokio::time::Instant::now();
+                            sess.buffered_forward_start_at = Some(now);
+                            sess.started_at = now;
+                            sess.last_report_at = now;
+                        }
                         sess.stats.record_data_packet(&data);
                     }
                     return Ok(());
@@ -375,13 +421,28 @@ async fn advance_sessions(
     socket: &UdpSocket,
     sessions: &mut HashMap<SessionKey, Session>,
     now: tokio::time::Instant,
+    session_scan_offset: &mut usize,
 ) -> Result<()> {
     // Avoid long per-tick work; especially if pps is huge.
     const MAX_ACTIONS_PER_TICK: usize = 128;
     let mut actions = 0usize;
 
     // To avoid borrow issues, operate on a snapshot of ids.
-    let session_keys: Vec<SessionKey> = sessions.keys().copied().collect();
+    let mut session_keys: Vec<SessionKey> = sessions.keys().copied().collect();
+    if session_keys.is_empty() {
+        *session_scan_offset = 0;
+        return Ok(());
+    }
+    let session_keys_len = session_keys.len();
+    session_keys.rotate_left(*session_scan_offset % session_keys_len);
+    let mut send_ready_remaining = session_keys
+        .iter()
+        .filter(|&&(peer, session_id)| {
+            sessions
+                .get(&session_key(peer, session_id))
+                .is_some_and(|sess| sess.should_send_now(now))
+        })
+        .count();
     for (peer, session_id) in session_keys {
         if actions >= MAX_ACTIONS_PER_TICK {
             break;
@@ -398,22 +459,19 @@ async fn advance_sessions(
             sessions.remove(&key);
             continue;
         }
-        if actions < MAX_ACTIONS_PER_TICK
-            && sessions
-                .get(&key)
-                .is_some_and(|sess| sess.should_send_now(now))
-        {
+        let session_was_send_ready = sessions
+            .get(&key)
+            .is_some_and(|sess| sess.should_send_now(now));
+        if actions < MAX_ACTIONS_PER_TICK && session_was_send_ready {
+            let fair_share = std::cmp::max(
+                1,
+                (MAX_ACTIONS_PER_TICK - actions) / std::cmp::max(send_ready_remaining, 1),
+            );
             let send_res = {
                 let sess = sessions.get_mut(&key).expect("session should still exist");
-                send_due_packets(
-                    socket,
-                    session_id,
-                    sess,
-                    now,
-                    MAX_ACTIONS_PER_TICK - actions,
-                )
-                .await
+                send_due_packets(socket, session_id, sess, now, fair_share).await
             };
+            send_ready_remaining = send_ready_remaining.saturating_sub(1);
             match send_res {
                 Ok(sent) => {
                     actions += sent;
@@ -509,6 +567,8 @@ async fn advance_sessions(
         }
     }
 
+    *session_scan_offset = (*session_scan_offset + 1) % session_keys_len;
+
     Ok(())
 }
 
@@ -527,7 +587,10 @@ async fn send_due_packets(
         if next_send_at > now {
             break;
         }
-        if sess.send_end_at.is_some_and(|end_at| next_send_at > end_at) {
+        if sess
+            .send_end_at
+            .is_some_and(|end_at| next_send_at >= end_at)
+        {
             sess.next_send_at = None;
             break;
         }
@@ -537,7 +600,7 @@ async fn send_due_packets(
     if sess
         .send_end_at
         .zip(sess.next_send_at)
-        .is_some_and(|(end_at, next_send_at)| next_send_at > end_at)
+        .is_some_and(|(end_at, next_send_at)| next_send_at >= end_at)
     {
         sess.next_send_at = None;
     }
@@ -830,6 +893,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_server_reverse_low_pps_does_not_send_extra_initial_packet() -> Result<()> {
+        let (server_addr, shutdown_tx, server_task) = spawn_server_for_test(2_000).await?;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        client.connect(server_addr).await?;
+
+        let session_id = 203;
+        client
+            .send(&wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Reverse,
+                payload_len: 32,
+                packets_per_second: 1,
+                duration_micros: 1_000_000,
+                report_interval_micros: 0,
+            }))?)
+            .await?;
+
+        let first = recv_data(&client, Duration::from_millis(150)).await?;
+        assert_eq!(first.header.seq, 1);
+
+        let report = recv_final_report(&client, Duration::from_millis(1_500)).await?;
+        assert!(report.is_final);
+        assert_eq!(report.summary.reverse.total.packets, 1);
+
+        shutdown_tx.send(()).ok();
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_reverse_fractional_duration_keeps_tail_packet_due_before_end() -> Result<()>
+    {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer = client.local_addr()?;
+        let start = UdpPerfStart {
+            session_id: 204,
+            mode: UdpPerfMode::Reverse,
+            payload_len: 32,
+            packets_per_second: 2,
+            duration_micros: 600_000,
+            report_interval_micros: 1_000_000,
+        };
+        let mut sess = super::Session::new_start(peer, &start, Duration::from_secs(1))?;
+        let started_at = sess.started_at;
+        let first_sent =
+            super::send_due_packets(&socket, start.session_id, &mut sess, started_at, 8).await?;
+        assert_eq!(first_sent, 1);
+
+        let late_now = started_at
+            .checked_add(Duration::from_millis(550))
+            .context("fractional reverse late wakeup overflow")?;
+        let second_sent =
+            super::send_due_packets(&socket, start.session_id, &mut sess, late_now, 8).await?;
+        assert_eq!(
+            second_sent, 1,
+            "the reverse packet due at 500ms should still be sent within a 600ms session"
+        );
+        assert_eq!(sess.send_seq, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn udp_server_send_one_keeps_cadence_when_loop_wakes_late() -> Result<()> {
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
         let client = UdpSocket::bind("127.0.0.1:0").await?;
@@ -878,11 +1005,14 @@ mod tests {
         let end_at = started_at
             .checked_add(Duration::from_millis(30))
             .context("reverse session end deadline overflow")?;
+        let tail_due = end_at
+            .checked_sub(Duration::from_millis(1))
+            .context("reverse tail send deadline underflow")?;
         sess.started_at = started_at;
         sess.last_report_at = started_at;
         sess.end_at = Some(end_at);
         sess.send_end_at = Some(end_at);
-        sess.next_send_at = Some(end_at);
+        sess.next_send_at = Some(tail_due);
         sess.send_seq = 3;
         for seq in 1..=3 {
             sess.stats.record_data_packet(&UdpPerfDataPacket {
@@ -900,8 +1030,9 @@ mod tests {
 
         let mut sessions = std::collections::HashMap::new();
         sessions.insert(super::session_key(peer, start.session_id), sess);
+        let mut session_scan_offset = 0usize;
 
-        super::advance_sessions(&socket, &mut sessions, end_at).await?;
+        super::advance_sessions(&socket, &mut sessions, end_at, &mut session_scan_offset).await?;
 
         let first = recv_wire(&client, Duration::from_millis(50)).await?;
         let data = match first {
@@ -910,7 +1041,7 @@ mod tests {
         };
         assert_eq!(data.header.seq, 4);
 
-        super::advance_sessions(&socket, &mut sessions, end_at).await?;
+        super::advance_sessions(&socket, &mut sessions, end_at, &mut session_scan_offset).await?;
 
         let report = recv_final_report(&client, Duration::from_millis(50)).await?;
         assert!(report.is_final);
@@ -919,8 +1050,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_server_expiry_waits_for_all_due_reverse_packets_before_finalizing(
-    ) -> Result<()> {
+    async fn udp_server_expiry_waits_for_all_due_reverse_packets_before_finalizing() -> Result<()> {
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
         let client = UdpSocket::bind("127.0.0.1:0").await?;
         let peer = client.local_addr()?;
@@ -938,7 +1068,7 @@ mod tests {
             .checked_add(Duration::from_millis(1))
             .context("reverse session first send deadline overflow")?;
         let end_at = started_at
-            .checked_add(Duration::from_millis(200))
+            .checked_add(Duration::from_millis(201))
             .context("reverse session end deadline overflow")?;
         sess.started_at = started_at;
         sess.last_report_at = started_at;
@@ -949,8 +1079,9 @@ mod tests {
         let key = super::session_key(peer, start.session_id);
         let mut sessions = std::collections::HashMap::new();
         sessions.insert(key, sess);
+        let mut session_scan_offset = 0usize;
 
-        super::advance_sessions(&socket, &mut sessions, end_at).await?;
+        super::advance_sessions(&socket, &mut sessions, end_at, &mut session_scan_offset).await?;
 
         let sess = sessions
             .get(&key)
@@ -964,11 +1095,112 @@ mod tests {
             "session should keep overdue reverse sends queued for the next tick"
         );
 
-        super::advance_sessions(&socket, &mut sessions, end_at).await?;
+        super::advance_sessions(&socket, &mut sessions, end_at, &mut session_scan_offset).await?;
 
         let report = recv_final_report(&client, Duration::from_millis(200)).await?;
         assert!(report.is_final);
         assert_eq!(report.summary.reverse.total.packets, 200);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_single_session_backlog_does_not_starve_other_sessions() -> Result<()> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let client1 = UdpSocket::bind("127.0.0.1:0").await?;
+        let client2 = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer1 = client1.local_addr()?;
+        let peer2 = client2.local_addr()?;
+        let now = Instant::now();
+        let started_at = now - Duration::from_millis(200);
+        let first_due = started_at
+            .checked_add(Duration::from_millis(1))
+            .context("reverse backlog first due overflow")?;
+        let end_at = now
+            .checked_add(Duration::from_secs(1))
+            .context("reverse backlog end overflow")?;
+
+        let start1 = UdpPerfStart {
+            session_id: 901,
+            mode: UdpPerfMode::Reverse,
+            payload_len: 32,
+            packets_per_second: 1_000,
+            duration_micros: 1_000_000,
+            report_interval_micros: 1_000_000,
+        };
+        let start2 = UdpPerfStart {
+            session_id: 902,
+            ..start1.clone()
+        };
+        let mut sess1 = super::Session::new_start(peer1, &start1, Duration::from_secs(10))?;
+        let mut sess2 = super::Session::new_start(peer2, &start2, Duration::from_secs(10))?;
+        for sess in [&mut sess1, &mut sess2] {
+            sess.started_at = started_at;
+            sess.last_report_at = started_at;
+            sess.end_at = Some(end_at);
+            sess.send_end_at = Some(end_at);
+            sess.next_send_at = Some(first_due);
+        }
+
+        let mut sessions = std::collections::HashMap::new();
+        sessions.insert(super::session_key(peer1, start1.session_id), sess1);
+        sessions.insert(super::session_key(peer2, start2.session_id), sess2);
+        let mut session_scan_offset = 0usize;
+
+        super::advance_sessions(&socket, &mut sessions, now, &mut session_scan_offset).await?;
+
+        let first1 = recv_data(&client1, Duration::from_millis(200)).await?;
+        let first2 = recv_data(&client2, Duration::from_millis(200)).await?;
+        assert_eq!(first1.header.direction, UdpPerfDirection::Reverse);
+        assert_eq!(first2.header.direction, UdpPerfDirection::Reverse);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_rotates_backlog_sessions_across_ticks() -> Result<()> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let now = Instant::now();
+        let started_at = now - Duration::from_millis(200);
+        let first_due = started_at
+            .checked_add(Duration::from_millis(1))
+            .context("reverse backlog first due overflow")?;
+        let end_at = now
+            .checked_add(Duration::from_secs(1))
+            .context("reverse backlog end overflow")?;
+        let template = UdpPerfStart {
+            session_id: 1,
+            mode: UdpPerfMode::Reverse,
+            payload_len: 32,
+            packets_per_second: 1_000,
+            duration_micros: 1_000_000,
+            report_interval_micros: 1_000_000,
+        };
+        let mut sessions = std::collections::HashMap::new();
+        for idx in 0..129u16 {
+            let session_id = 1_000 + idx as u64;
+            let peer: SocketAddr =
+                format!("127.0.0.1:{}", 40_000u16.saturating_add(idx)).parse()?;
+            let start = UdpPerfStart {
+                session_id,
+                ..template.clone()
+            };
+            let mut sess = super::Session::new_start(peer, &start, Duration::from_secs(10))?;
+            sess.started_at = started_at;
+            sess.last_report_at = started_at;
+            sess.end_at = Some(end_at);
+            sess.send_end_at = Some(end_at);
+            sess.next_send_at = Some(first_due);
+            sessions.insert(super::session_key(peer, session_id), sess);
+        }
+        let mut session_scan_offset = 0usize;
+
+        super::advance_sessions(&socket, &mut sessions, now, &mut session_scan_offset).await?;
+        super::advance_sessions(&socket, &mut sessions, now, &mut session_scan_offset).await?;
+
+        let starved = sessions.values().filter(|sess| sess.send_seq == 0).count();
+        assert_eq!(
+            starved, 0,
+            "successive ticks should rotate across backlog sessions instead of starving the tail"
+        );
         Ok(())
     }
 
@@ -1147,8 +1379,9 @@ mod tests {
         let sess = super::Session::new_hello(peer, UdpPerfMode::Forward, Duration::from_secs(1))?;
         let end_at = sess.end_at.context("hello session should have an expiry")?;
         sessions.insert((peer, 1), sess);
+        let mut session_scan_offset = 0usize;
 
-        super::advance_sessions(&socket, &mut sessions, end_at).await?;
+        super::advance_sessions(&socket, &mut sessions, end_at, &mut session_scan_offset).await?;
         assert!(
             sessions.is_empty(),
             "expired hello session should be removed"
@@ -1197,6 +1430,242 @@ mod tests {
 
         shutdown_tx.send(()).ok();
         server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_buffered_forward_data_uses_first_data_time_not_hello_time() -> Result<()> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer: SocketAddr = "127.0.0.1:54001".parse()?;
+        let session_id = 541;
+        let key = super::session_key(peer, session_id);
+        let mut sessions = std::collections::HashMap::new();
+
+        super::on_packet(
+            &socket,
+            &mut sessions,
+            Duration::from_secs(1),
+            &wire_control(UdpPerfControlPacket::Hello(
+                super::super::udp_perf::UdpPerfHello {
+                    session_id,
+                    mode: UdpPerfMode::Forward,
+                },
+            ))?,
+            peer,
+        )
+        .await?;
+        let hello_started_at = sessions
+            .get(&key)
+            .context("hello session missing after HELLO")?
+            .started_at;
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let data_started_at = Instant::now();
+        super::on_packet(
+            &socket,
+            &mut sessions,
+            Duration::from_secs(1),
+            &wire_data(session_id, UdpPerfDirection::Forward, 1, 16)?,
+            peer,
+        )
+        .await?;
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        super::on_packet(
+            &socket,
+            &mut sessions,
+            Duration::from_secs(1),
+            &wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Forward,
+                payload_len: 16,
+                packets_per_second: 1_000,
+                duration_micros: 1_000_000,
+                report_interval_micros: 0,
+            }))?,
+            peer,
+        )
+        .await?;
+
+        let sess = sessions
+            .get(&key)
+            .context("started session missing after START")?;
+        assert!(sess.started);
+        assert_eq!(
+            sess.stats
+                .build_summary(session_id, UdpPerfMode::Forward, 1, 1)
+                .forward
+                .total
+                .packets,
+            1
+        );
+        assert!(
+            sess.started_at >= data_started_at,
+            "started_at should not move earlier than the first buffered data timestamp"
+        );
+        assert!(
+            sess.started_at.duration_since(data_started_at) < Duration::from_millis(40),
+            "started_at should stay close to first buffered data arrival"
+        );
+        assert!(
+            sess.started_at.duration_since(hello_started_at) >= Duration::from_millis(100),
+            "started_at should not stay anchored to HELLO creation time"
+        );
+        assert_eq!(sess.last_report_at, sess.started_at);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_bidir_buffered_forward_data_uses_first_data_time_not_start_retry_time(
+    ) -> Result<()> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer: SocketAddr = "127.0.0.1:54002".parse()?;
+        let session_id = 542;
+        let key = super::session_key(peer, session_id);
+        let mut sessions = std::collections::HashMap::new();
+
+        super::on_packet(
+            &socket,
+            &mut sessions,
+            Duration::from_secs(1),
+            &wire_control(UdpPerfControlPacket::Hello(
+                super::super::udp_perf::UdpPerfHello {
+                    session_id,
+                    mode: UdpPerfMode::Bidir,
+                },
+            ))?,
+            peer,
+        )
+        .await?;
+        let hello_started_at = sessions
+            .get(&key)
+            .context("hello session missing after HELLO")?
+            .started_at;
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let data_started_at = Instant::now();
+        super::on_packet(
+            &socket,
+            &mut sessions,
+            Duration::from_secs(1),
+            &wire_data(session_id, UdpPerfDirection::Forward, 1, 16)?,
+            peer,
+        )
+        .await?;
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        super::on_packet(
+            &socket,
+            &mut sessions,
+            Duration::from_secs(1),
+            &wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Bidir,
+                payload_len: 16,
+                packets_per_second: 1_000,
+                duration_micros: 1_000_000,
+                report_interval_micros: 0,
+            }))?,
+            peer,
+        )
+        .await?;
+
+        let sess = sessions
+            .get(&key)
+            .context("started session missing after START")?;
+        assert!(sess.started);
+        assert_eq!(
+            sess.stats
+                .build_summary(session_id, UdpPerfMode::Bidir, 1, 1)
+                .forward
+                .total
+                .packets,
+            1
+        );
+        assert!(
+            sess.started_at >= data_started_at,
+            "started_at should not move earlier than the first buffered data timestamp"
+        );
+        assert!(
+            sess.started_at.duration_since(data_started_at) < Duration::from_millis(40),
+            "bidir session should stay anchored to first buffered forward arrival"
+        );
+        assert!(
+            sess.started_at.duration_since(hello_started_at) >= Duration::from_millis(100),
+            "started_at should not stay anchored to HELLO creation time"
+        );
+        assert_eq!(sess.last_report_at, sess.started_at);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_server_bidir_late_start_after_buffered_window_does_not_count_reverse_packets(
+    ) -> Result<()> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer = client.local_addr()?;
+        let session_id = 543;
+        let key = super::session_key(peer, session_id);
+        let mut sessions = std::collections::HashMap::new();
+
+        super::on_packet(
+            &socket,
+            &mut sessions,
+            Duration::from_secs(1),
+            &wire_control(UdpPerfControlPacket::Hello(
+                super::super::udp_perf::UdpPerfHello {
+                    session_id,
+                    mode: UdpPerfMode::Bidir,
+                },
+            ))?,
+            peer,
+        )
+        .await?;
+        super::on_packet(
+            &socket,
+            &mut sessions,
+            Duration::from_secs(1),
+            &wire_data(session_id, UdpPerfDirection::Forward, 1, 16)?,
+            peer,
+        )
+        .await?;
+
+        tokio::time::sleep(Duration::from_millis(140)).await;
+        super::on_packet(
+            &socket,
+            &mut sessions,
+            Duration::from_secs(1),
+            &wire_control(UdpPerfControlPacket::Start(UdpPerfStart {
+                session_id,
+                mode: UdpPerfMode::Bidir,
+                payload_len: 16,
+                packets_per_second: 1_000,
+                duration_micros: 100_000,
+                report_interval_micros: 0,
+            }))?,
+            peer,
+        )
+        .await?;
+
+        let sess = sessions
+            .get(&key)
+            .context("started session missing after late START")?;
+        assert!(sess.started);
+        assert_eq!(
+            sess.stats
+                .build_summary(session_id, UdpPerfMode::Bidir, 1, 1)
+                .reverse
+                .total
+                .packets,
+            0,
+            "late START after the buffered bidir window must not add reverse packets to the session"
+        );
+        let mut buf = vec![0u8; 64 * 1024];
+        let r = tokio::time::timeout(Duration::from_millis(40), client.recv(&mut buf)).await;
+        assert!(
+            r.is_err(),
+            "late START after the buffered bidir window should not emit reverse data"
+        );
         Ok(())
     }
 
@@ -1740,8 +2209,9 @@ mod tests {
         sessions.insert(bad_send_key, bad_send);
         sessions.insert(bad_report_key, bad_report);
         sessions.insert(good_key, good);
+        let mut session_scan_offset = 0usize;
 
-        super::advance_sessions(&socket, &mut sessions, now).await?;
+        super::advance_sessions(&socket, &mut sessions, now, &mut session_scan_offset).await?;
 
         assert!(
             !sessions.contains_key(&bad_send_key),

@@ -30,7 +30,7 @@ pub const UDP_PERF_CONTROL_REPORT_LEN: usize =
     UDP_PERF_CONTROL_META_LEN + 8 + 1 + UDP_PERF_SUMMARY_LEN;
 
 pub const UDP_PERF_DATA_META_LEN: usize = UDP_PERF_WIRE_META_LEN + 8 + 1 + 1 + 8 + 8 + 2;
-pub const MAX_UDP_DATAGRAM_PAYLOAD_LEN: usize = 65_507;
+pub const MAX_UDP_DATAGRAM_PAYLOAD_LEN: usize = 65_487;
 pub const MAX_UDP_SAFE_PAYLOAD_LEN: usize = MAX_UDP_DATAGRAM_PAYLOAD_LEN - UDP_PERF_DATA_META_LEN;
 
 const UDP_PERF_PACKET_TYPE_CONTROL: u8 = 1;
@@ -1076,6 +1076,11 @@ mod tests {
         assert!((summary.interval.pps - 2.0).abs() < f64::EPSILON);
         assert_eq!(summary.forward.interval.bytes, 125_000);
         assert_eq!(summary.forward.interval.packets, 2);
+    }
+
+    #[test]
+    fn udp_perf_safe_payload_len_uses_ipv6_budget() {
+        assert_eq!(MAX_UDP_SAFE_PAYLOAD_LEN, 65_487 - UDP_PERF_DATA_META_LEN);
     }
 
     fn data_packet(direction: UdpPerfDirection, seq: u64, payload_len: usize) -> UdpPerfDataPacket {
