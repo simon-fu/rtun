@@ -5,7 +5,10 @@ use std::{
     io::{self, IsTerminal, Write},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -19,6 +22,7 @@ use crossterm::{
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use parking_lot::RwLock;
 use regex::Regex;
 use rtun::{
     async_rt::{run_multi_thread, spawn_with_name},
@@ -1940,9 +1944,9 @@ fn spawn_relay_session_task(
     let task_name = format!("relay-session-{}", selected.name);
     let handle = spawn_with_name(task_name, async move {
         if worker.signal_url.scheme().eq_ignore_ascii_case("quic") {
-            run_with_quic_signal(&worker, local.as_ref(), &selected, stop_rx).await
+            run_with_quic_signal(&worker, local, &selected, stop_rx).await
         } else {
-            run_with_ws_signal(&worker, local.as_ref(), &selected, stop_rx).await
+            run_with_ws_signal(&worker, local, &selected, stop_rx).await
         }
     });
     (stop_tx, handle)
@@ -2097,7 +2101,7 @@ fn handle_session_task_result(
 
 async fn run_with_ws_signal(
     worker: &RelayWorker,
-    local: &UdpSocket,
+    local: Arc<UdpSocket>,
     selected: &AgentInfo,
     mut stop_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
@@ -2155,7 +2159,7 @@ async fn run_with_ws_signal(
 
 async fn run_with_quic_signal(
     worker: &RelayWorker,
-    local: &UdpSocket,
+    local: Arc<UdpSocket>,
     selected: &AgentInfo,
     mut stop_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
@@ -2310,7 +2314,7 @@ fn format_exec_agent_script_summary(rsp: &ExecAgentScriptResult) -> String {
 
 async fn run_relay_session<H: CtrlHandler>(
     ctrl: CtrlInvoker<H>,
-    local: &UdpSocket,
+    local: Arc<UdpSocket>,
     selected: &AgentInfo,
     state_hub: &RelayStateHub,
     target: SocketAddr,
@@ -2329,6 +2333,7 @@ async fn run_relay_session<H: CtrlHandler>(
     let mut tunnel_states: Vec<Option<RelayTunnelState>> = Vec::with_capacity(desired);
     let mut tunnel_activity: Vec<Option<Instant>> = Vec::with_capacity(desired);
     let mut next_tunnel_id = 1_u64;
+    let flow_routes = SharedClientFlowRoutes::new();
     let (inbound_tx, inbound_rx) = mpsc::channel::<TunnelRecvEvent>(1024);
     for _ in 0..desired {
         let tunnel_idx = tunnels.len();
@@ -2348,6 +2353,8 @@ async fn run_relay_session<H: CtrlHandler>(
         let recv_task = spawn_tunnel_recv_task(
             tunnel_idx,
             tunnel.socket.clone(),
+            local.clone(),
+            flow_routes.clone(),
             tunnel.codec,
             max_payload,
             inbound_tx.clone(),
@@ -2400,6 +2407,7 @@ async fn run_relay_session<H: CtrlHandler>(
         p2p_open_retry_min_interval,
         udp_relay_hard_nat,
         next_tunnel_id,
+        flow_routes,
         inbound_tx,
         inbound_rx,
     )
@@ -2821,6 +2829,8 @@ async fn open_udp_relay_tunnel_hard_nat_socket(
 fn spawn_tunnel_recv_task(
     tunnel_idx: usize,
     socket: Arc<UdpSocket>,
+    local: Arc<UdpSocket>,
+    flow_routes: SharedClientFlowRoutes,
     codec: UdpRelayCodec,
     max_payload: usize,
     inbound_tx: mpsc::Sender<TunnelRecvEvent>,
@@ -2900,7 +2910,8 @@ fn spawn_tunnel_recv_task(
                             continue;
                         }
                     };
-                    last_valid_recv_at = Instant::now();
+                    let now = Instant::now();
+                    last_valid_recv_at = now;
 
                     if flow_id == UDP_RELAY_HEARTBEAT_FLOW_ID && payload.is_empty() {
                         if inbound_tx
@@ -2923,16 +2934,22 @@ fn spawn_tunnel_recv_task(
                         continue;
                     }
 
-                    if inbound_tx
-                        .send(TunnelRecvEvent::Packet(TunnelInboundPacket {
-                            tunnel_idx,
+                    if let Some(src) = flow_routes.touch_and_get_src(flow_id, now) {
+                        if let Err(e) = local.send_to(payload, src).await {
+                            tracing::warn!(
+                                "relay flow closed(error): id [{}], src [{}], tunnel [{}], reason [{}]",
+                                flow_id,
+                                src,
+                                tunnel_idx,
+                                e
+                            );
+                        }
+                    } else {
+                        tracing::debug!(
+                            "drop tunnel packet for unknown flow [{}], tunnel [{}]",
                             flow_id,
-                            payload: payload.to_vec(),
-                        }))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                            tunnel_idx
+                        );
                     }
                 }
             }
@@ -2943,6 +2960,7 @@ fn spawn_tunnel_recv_task(
 async fn try_expand_tunnels<H: CtrlHandler>(
     ctrl: &CtrlInvoker<H>,
     state_hub: &RelayStateHub,
+    local: Arc<UdpSocket>,
     target: SocketAddr,
     idle_timeout_secs: u32,
     max_payload: usize,
@@ -2954,6 +2972,7 @@ async fn try_expand_tunnels<H: CtrlHandler>(
     tunnel_states: &mut Vec<Option<RelayTunnelState>>,
     tunnel_activity: &mut Vec<Option<Instant>>,
     next_tunnel_id: &mut u64,
+    flow_routes: &SharedClientFlowRoutes,
     inbound_tx: &mpsc::Sender<TunnelRecvEvent>,
     connect_timeout: &mut Duration,
 ) {
@@ -2987,6 +3006,8 @@ async fn try_expand_tunnels<H: CtrlHandler>(
                 let recv_task = spawn_tunnel_recv_task(
                     tunnel_idx,
                     tunnel.socket.clone(),
+                    local.clone(),
+                    flow_routes.clone(),
                     tunnel.codec,
                     max_payload,
                     inbound_tx.clone(),
@@ -3360,6 +3381,7 @@ fn rebalance_client_flows(
 async fn try_rotate_expired_tunnels<H: CtrlHandler>(
     ctrl: &CtrlInvoker<H>,
     state_hub: &RelayStateHub,
+    local: Arc<UdpSocket>,
     target: SocketAddr,
     idle_timeout_secs: u32,
     max_payload: usize,
@@ -3370,6 +3392,7 @@ async fn try_rotate_expired_tunnels<H: CtrlHandler>(
     tunnel_states: &mut Vec<Option<RelayTunnelState>>,
     tunnel_activity: &mut Vec<Option<Instant>>,
     next_tunnel_id: &mut u64,
+    flow_routes: &SharedClientFlowRoutes,
     inbound_tx: &mpsc::Sender<TunnelRecvEvent>,
     connect_timeout: &mut Duration,
 ) {
@@ -3408,6 +3431,8 @@ async fn try_rotate_expired_tunnels<H: CtrlHandler>(
                 let recv_task = spawn_tunnel_recv_task(
                     new_idx,
                     new_tunnel.socket.clone(),
+                    local.clone(),
+                    flow_routes.clone(),
                     new_tunnel.codec,
                     max_payload,
                     inbound_tx.clone(),
@@ -3656,10 +3681,12 @@ fn spawn_tunnel_open_task<H: CtrlHandler>(
 
 fn apply_opened_tunnel(
     tunnel: RelayTunnel,
+    local: Arc<UdpSocket>,
     now: Instant,
     p2p_channel_lifetime: Duration,
     max_payload: usize,
     next_tunnel_id: &mut u64,
+    flow_routes: SharedClientFlowRoutes,
     inbound_tx: &mpsc::Sender<TunnelRecvEvent>,
     tunnels: &mut Vec<Option<RelayTunnel>>,
     recv_tasks: &mut Vec<Option<JoinHandle<()>>>,
@@ -3674,6 +3701,8 @@ fn apply_opened_tunnel(
     let recv_task = spawn_tunnel_recv_task(
         tunnel_idx,
         tunnel.socket.clone(),
+        local,
+        flow_routes,
         tunnel.codec,
         max_payload,
         inbound_tx.clone(),
@@ -3709,7 +3738,7 @@ fn apply_opened_tunnel(
 
 async fn relay_loop<H: CtrlHandler>(
     ctrl: CtrlInvoker<H>,
-    local: &UdpSocket,
+    local: Arc<UdpSocket>,
     selected: &AgentInfo,
     state_hub: &RelayStateHub,
     target: SocketAddr,
@@ -3724,6 +3753,7 @@ async fn relay_loop<H: CtrlHandler>(
     p2p_open_retry_min_interval: Duration,
     udp_relay_hard_nat: RelayUdpHardNatConfig,
     mut next_tunnel_id: u64,
+    flow_routes: SharedClientFlowRoutes,
     inbound_tx: mpsc::Sender<TunnelRecvEvent>,
     mut inbound_rx: mpsc::Receiver<TunnelRecvEvent>,
 ) -> Result<()> {
@@ -3808,6 +3838,7 @@ async fn relay_loop<H: CtrlHandler>(
                 let mut flow_loads = build_tunnel_flow_loads(tunnels.len(), &src_to_flow);
                 let (flow_id, tunnel_idx) = if let Some(flow) = src_to_flow.get_mut(&from) {
                     flow.updated_at = now;
+                    flow_routes.upsert(flow.flow_id, from, now);
                     if tunnels
                         .get(flow.tunnel_idx)
                         .and_then(|slot| slot.as_ref())
@@ -3898,6 +3929,7 @@ async fn relay_loop<H: CtrlHandler>(
                         flow_loads[tunnel_idx] = flow_loads[tunnel_idx].saturating_add(1);
                     }
                     flow_to_src.insert(flow_id, from);
+                    flow_routes.upsert(flow_id, from, now);
                     tracing::debug!(
                         "relay flow created: id [{}], src [{}], target [{}], tunnel [{}]",
                         flow_id,
@@ -3967,10 +3999,12 @@ async fn relay_loop<H: CtrlHandler>(
                         let now = Instant::now();
                         let (new_idx, new_tunnel_id, mode) = apply_opened_tunnel(
                             tunnel,
+                            local.clone(),
                             now,
                             p2p_channel_lifetime,
                             max_payload,
                             &mut next_tunnel_id,
+                            flow_routes.clone(),
                             &inbound_tx,
                             &mut tunnels,
                             &mut recv_tasks,
@@ -4191,39 +4225,6 @@ async fn relay_loop<H: CtrlHandler>(
                     break Err(anyhow::anyhow!("relay tunnel recv loop channel closed"));
                 };
                 match evt {
-                    TunnelRecvEvent::Packet(pkt) => {
-                        if pkt.tunnel_idx >= tunnels.len() || tunnels[pkt.tunnel_idx].is_none() {
-                            tracing::debug!(
-                                "drop stale tunnel packet: flow [{}], tunnel [{}]",
-                                pkt.flow_id,
-                                pkt.tunnel_idx
-                            );
-                            continue;
-                        }
-                        if pkt.tunnel_idx < tunnel_activity.len() {
-                            tunnel_activity[pkt.tunnel_idx] = Some(Instant::now());
-                        }
-                        if let Some(from) = flow_to_src.get(&pkt.flow_id).copied() {
-                    if let Some(flow) = src_to_flow.get_mut(&from) {
-                        flow.updated_at = Instant::now();
-                    }
-                            if let Err(e) = local.send_to(&pkt.payload, from).await {
-                        tracing::warn!(
-                                    "relay flow closed(error): id [{}], src [{}], tunnel [{}], reason [{}]",
-                                    pkt.flow_id,
-                            from,
-                                    pkt.tunnel_idx,
-                            e
-                        );
-                    }
-                } else {
-                            tracing::debug!(
-                                "drop tunnel packet for unknown flow [{}], tunnel [{}]",
-                                pkt.flow_id,
-                                pkt.tunnel_idx
-                            );
-                        }
-                    }
                     TunnelRecvEvent::Heartbeat { tunnel_idx } => {
                         if tunnel_idx >= tunnels.len() || tunnels[tunnel_idx].is_none() {
                             continue;
@@ -4274,6 +4275,7 @@ async fn relay_loop<H: CtrlHandler>(
                         for (src, flow_id, flow_tunnel_id) in removed {
                             src_to_flow.remove(&src);
                             flow_to_src.remove(&flow_id);
+                            flow_routes.remove(flow_id);
                             tracing::debug!(
                                 "relay flow closed(tunnel-lost): id [{}], src [{}], tunnel [{}]",
                                 flow_id,
@@ -4302,7 +4304,14 @@ async fn relay_loop<H: CtrlHandler>(
                 }
             }
             _ = cleanup.tick() => {
-                cleanup_client_flows(state_hub, &mut src_to_flow, &mut flow_to_src, idle_timeout);
+                sync_client_flow_activity(&mut src_to_flow, &flow_routes);
+                cleanup_client_flows(
+                    state_hub,
+                    &mut src_to_flow,
+                    &mut flow_to_src,
+                    &flow_routes,
+                    idle_timeout,
+                );
                 let desired = channel_pool.desired_channels(src_to_flow.len());
                 rebalance_client_flows(
                     state_hub,
@@ -4447,23 +4456,107 @@ impl RelayTunnelState {
 }
 
 #[derive(Debug)]
-struct TunnelInboundPacket {
-    tunnel_idx: usize,
-    flow_id: u64,
-    payload: Vec<u8>,
+enum TunnelRecvEvent {
+    Heartbeat { tunnel_idx: usize },
+    Closed { tunnel_idx: usize, reason: String },
+}
+
+#[derive(Debug, Clone)]
+struct SharedClientFlowRoutes {
+    clock_base: Instant,
+    routes: Arc<RwLock<HashMap<u64, SharedClientFlowRoute>>>,
 }
 
 #[derive(Debug)]
-enum TunnelRecvEvent {
-    Packet(TunnelInboundPacket),
-    Heartbeat { tunnel_idx: usize },
-    Closed { tunnel_idx: usize, reason: String },
+struct SharedClientFlowRoute {
+    src: SocketAddr,
+    last_active_ms: AtomicU64,
+}
+
+impl SharedClientFlowRoutes {
+    fn new() -> Self {
+        Self {
+            clock_base: Instant::now(),
+            routes: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn upsert(&self, flow_id: u64, src: SocketAddr, now: Instant) {
+        let now_ms = self.elapsed_ms(now);
+        let mut routes = self.routes.write();
+        match routes.entry(flow_id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().src == src {
+                    entry.get().touch(now_ms);
+                } else {
+                    entry.insert(SharedClientFlowRoute::new(src, now_ms));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(SharedClientFlowRoute::new(src, now_ms));
+            }
+        }
+    }
+
+    fn touch_and_get_src(&self, flow_id: u64, now: Instant) -> Option<SocketAddr> {
+        let now_ms = self.elapsed_ms(now);
+        let routes = self.routes.read();
+        let route = routes.get(&flow_id)?;
+        route.touch(now_ms);
+        Some(route.src)
+    }
+
+    fn last_active_at(&self, flow_id: u64) -> Option<Instant> {
+        let routes = self.routes.read();
+        let route = routes.get(&flow_id)?;
+        Some(self.clock_base + Duration::from_millis(route.last_active_ms()))
+    }
+
+    fn remove(&self, flow_id: u64) {
+        self.routes.write().remove(&flow_id);
+    }
+
+    fn elapsed_ms(&self, now: Instant) -> u64 {
+        let elapsed_ms = now.saturating_duration_since(self.clock_base).as_millis();
+        elapsed_ms.min(u64::MAX as u128) as u64
+    }
+}
+
+impl SharedClientFlowRoute {
+    fn new(src: SocketAddr, last_active_ms: u64) -> Self {
+        Self {
+            src,
+            last_active_ms: AtomicU64::new(last_active_ms),
+        }
+    }
+
+    fn touch(&self, now_ms: u64) {
+        self.last_active_ms.store(now_ms, AtomicOrdering::Relaxed);
+    }
+
+    fn last_active_ms(&self) -> u64 {
+        self.last_active_ms.load(AtomicOrdering::Relaxed)
+    }
+}
+
+fn sync_client_flow_activity(
+    src_to_flow: &mut HashMap<SocketAddr, ClientFlow>,
+    flow_routes: &SharedClientFlowRoutes,
+) {
+    for flow in src_to_flow.values_mut() {
+        if let Some(last_active_at) = flow_routes.last_active_at(flow.flow_id) {
+            if last_active_at > flow.updated_at {
+                flow.updated_at = last_active_at;
+            }
+        }
+    }
 }
 
 fn cleanup_client_flows(
     state_hub: &RelayStateHub,
     src_to_flow: &mut HashMap<SocketAddr, ClientFlow>,
     flow_to_src: &mut HashMap<u64, SocketAddr>,
+    flow_routes: &SharedClientFlowRoutes,
     idle_timeout: Duration,
 ) {
     let now = Instant::now();
@@ -4492,6 +4585,7 @@ fn cleanup_client_flows(
         }
         src_to_flow.remove(&src);
         flow_to_src.remove(&flow_id);
+        flow_routes.remove(flow_id);
     }
 }
 
@@ -5197,8 +5291,9 @@ mod tests {
         duration_until_replacement_window_at, encode_udp_relay_packet, format_millis,
         max_udp_payload_auto, parse_script_specs_from_args, parse_udp_relay_hard_nat_target_addr,
         pick_best_tunnel_idx_by, pick_latest_agent, resolve_relay_udp_hard_nat_config,
-        resolve_udp_max_payload, ChannelPoolConfig, CmdArgs, RelayAgentScriptSource,
-        RelayHardNatModeCli, RelayHardNatRoleCli, RelayRule, UdpRelayCodec,
+        resolve_udp_max_payload, spawn_tunnel_recv_task, ChannelPoolConfig, CmdArgs,
+        RelayAgentScriptSource, RelayHardNatModeCli, RelayHardNatRoleCli, RelayRule,
+        SharedClientFlowRoutes, TunnelRecvEvent, UdpRelayCodec,
         DEFAULT_P2P_HARDNAT_ASSIST_DELAY_MS, DEFAULT_P2P_HARDNAT_BATCH_INTERVAL_MS,
         DEFAULT_P2P_HARDNAT_INTERVAL_MS, DEFAULT_P2P_HARDNAT_SCAN_COUNT,
         DEFAULT_P2P_HARDNAT_SOCKET_COUNT,
@@ -5210,7 +5305,11 @@ mod tests {
         HARD_NAT_MAX_SCAN_COUNT, HARD_NAT_MAX_SOCKET_COUNT, HARD_NAT_MAX_TTL,
     };
     use rtun::proto::UdpRelayArgs;
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+    use tokio::{net::UdpSocket, sync::mpsc, time::timeout};
 
     fn parse_cmd_args_for_test(extra: &[&str]) -> CmdArgs {
         let mut argv = vec![
@@ -5404,6 +5503,59 @@ mod tests {
             err.to_string().contains("tag mismatch"),
             "unexpected decode err: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_tunnel_recv_task_forwards_packet_directly_to_local_socket() {
+        let codec = UdpRelayCodec::new(0);
+        let tunnel_rx = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let tunnel_tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        tunnel_tx
+            .connect(tunnel_rx.local_addr().unwrap())
+            .await
+            .unwrap();
+        tunnel_rx
+            .connect(tunnel_tx.local_addr().unwrap())
+            .await
+            .unwrap();
+
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let flow_id = 42_u64;
+        let flow_routes = SharedClientFlowRoutes::new();
+        flow_routes.upsert(flow_id, client.local_addr().unwrap(), Instant::now());
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<TunnelRecvEvent>(4);
+        let recv_task = spawn_tunnel_recv_task(
+            0,
+            tunnel_rx,
+            local.clone(),
+            flow_routes,
+            codec,
+            1500,
+            inbound_tx,
+        );
+
+        let mut frame = [0_u8; 64];
+        let frame_len = encode_udp_relay_packet(&mut frame, flow_id, b"hello", codec).unwrap();
+        tunnel_tx.send(&frame[..frame_len]).await.unwrap();
+
+        let mut recv_buf = [0_u8; 64];
+        let (recv_len, from) = timeout(Duration::from_millis(500), client.recv_from(&mut recv_buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&recv_buf[..recv_len], b"hello");
+        assert_eq!(from, local.local_addr().unwrap());
+
+        assert!(
+            timeout(Duration::from_millis(100), inbound_rx.recv())
+                .await
+                .is_err(),
+            "data packet should bypass inbound event queue"
+        );
+
+        recv_task.abort();
     }
 
     #[test]
